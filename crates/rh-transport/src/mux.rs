@@ -751,8 +751,11 @@ impl YamuxMultiplexer {
         // 抬到 6MiB,对齐 frp 两端同设的 fmux MaxStreamWindowSize=6MiB
         // (FRP-YAMUX-ANALYSIS.md §2.1)。机制不变:仍受上面 256MiB 共享
         // 预算钳制(16 流 × 6MiB = 96MiB 在预算内,额度不足仍退回 256KiB
-        // 规约保底),首个读 poll 以标准窗口更新帧预授差额;发送端初窗
-        // 仍 256KiB——对端只见普通 WU,线路兼容。本改动只覆盖 yamux
+        // 规约保底);round-4/B1(2026-10-15)起差额在建流时以带初始
+        // flag 的窗口更新帧授出(outbound SYN|WU / inbound ACK|WU,upstream
+        // 合法组合,对齐 frp OpenStream/AcceptStream),不再等首个读 poll,
+        // 首个读 WU 起才可能进入 BDP 自增;发送端初窗仍 256KiB——对端
+        // 只见标准 WU,线路兼容。本改动只覆盖 yamux
         // (mux 路径),不声称修复 nomux/QUIC/KCP。
         cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
         let conn: MuxConn = yamux::Connection::new(YamuxCarrier::new(io), cfg, mode);

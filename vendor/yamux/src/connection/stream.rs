@@ -135,7 +135,7 @@ impl Stream {
         rtt: rtt::Rtt,
         accumulated_max_stream_windows: Arc<Mutex<usize>>,
     ) -> Self {
-        Self {
+        let mut stream = Self {
             id,
             conn,
             config: config.clone(),
@@ -149,7 +149,9 @@ impl Stream {
                 rtt,
                 config,
             ))),
-        }
+        };
+        stream.queue_creation_grant();
+        stream
     }
 
     pub(crate) fn new_outbound(
@@ -160,7 +162,7 @@ impl Stream {
         rtt: rtt::Rtt,
         accumulated_max_stream_windows: Arc<Mutex<usize>>,
     ) -> Self {
-        Self {
+        let mut stream = Self {
             id,
             conn,
             config: config.clone(),
@@ -174,6 +176,49 @@ impl Stream {
                 rtt,
                 config,
             ))),
+        };
+        stream.queue_creation_grant();
+        stream
+    }
+
+    /// 建流即授信(round-4/B1,对齐 frp OpenStream/AcceptStream 时机):
+    /// 构造完成后立即把预授差额(max_receive_window − DEFAULT_CREDIT)以带
+    /// 初始 flag 的窗口更新帧排队授出——outbound SYN|WU 合帧(hashicorp
+    /// OpenStream 的 initialStreamFlags 行为)、inbound ACK|WU(镜像
+    /// `into_halves` 的 ACK 副作用记账),均为 upstream 合法组合,不再等
+    /// 读路径首个窗口更新 poll。通道在 make_new_*_stream 皆为容量 10 的
+    /// 全新通道,建流时必空,try_send 必成;失败兜底(测试以容量 0 通道
+    /// 直接构造流的用法)不得丢授信——flag 恢复原值(Syn/Ack)、
+    /// pregrant_pending 恢复 true,行为退回旧路径(读 poll 授信 /
+    /// into_halves 补 ACK)。
+    fn queue_creation_grant(&mut self) {
+        let delta = self.shared.lock().flow_controller.take_creation_grant();
+        if delta == 0 {
+            // 无预授(预算钳制回退/已授出):flag 不动,维持现状——
+            // lazy SYN 由首数据帧携带、ACK 由 into_halves 补。
+            return;
+        }
+        let prev_flag = self.flag;
+        let mut frame = Frame::window_update(self.id, delta).right();
+        self.add_flag(frame.header_mut());
+        let cmd = StreamCommand::SendFrame(frame);
+        if self.window_update_sender.try_send(cmd).is_ok() {
+            if prev_flag == Flag::Ack {
+                self.shared()
+                    .update_state(self.conn, self.id, State::Open { acknowledged: true });
+            }
+        } else {
+            // 回滚:flag 与预授记账复原,授信交还旧路径
+            self.flag = prev_flag;
+            self.shared
+                .lock()
+                .flow_controller
+                .restore_creation_grant(delta);
+            log::debug!(
+                "{}/{}: creation grant frame not queued, deferring to read-poll grant",
+                self.conn,
+                self.id
+            );
         }
     }
 

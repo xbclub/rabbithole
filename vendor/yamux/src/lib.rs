@@ -177,13 +177,16 @@ impl Config {
     /// Wire semantics stay per yamux specification: the remote sender starts
     /// with [`DEFAULT_CREDIT`] (256 KiB) of credit. What this configures is the
     /// receiver side: a freshly created stream's `max_receive_window` starts at
-    /// `n` instead of [`DEFAULT_CREDIT`], so the receiver's **first** window
-    /// update poll grants `n - 256 KiB` of additional credit via a regular
-    /// window update frame (upstream-legal for any peer). The pregrant is
+    /// `n` instead of [`DEFAULT_CREDIT`], and the difference `n - 256 KiB` is
+    /// granted at stream creation via a window update frame carrying the
+    /// initial flag (outbound SYN|WU / inbound ACK|WU, both upstream-legal
+    /// combinations; round-4/B1, aligned with frp OpenStream/AcceptStream)
+    /// instead of waiting for the receiver's first read poll. From the first
+    /// read-driven window update on, BDP growth may engage. The pregrant is
     /// charged against the connection budget
     /// (`max_connection_receive_window - 256 KiB * max_num_streams`, shared
     /// with auto-tuning) and clamped when the budget is exhausted, and the
-    /// first window update never triggers BDP doubling (the pregrant is not
+    /// creation grant never triggers BDP doubling (the pregrant is not
     /// measured receive throughput).
     ///
     /// Motivation (rabbithole round-1, measured on the 3-machine testbed,

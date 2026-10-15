@@ -1708,4 +1708,140 @@ mod tests {
             other => panic!("stream 1 must be writable again after WU, got {other:?}"),
         }
     }
+
+    // ===== Round-B1 建流即授信守卫(对齐 frp OpenStream/AcceptStream 时机) =====
+
+    /// G1(红→绿):outbound 建流即授信——`poll_new_outbound` 开流后不写任何
+    /// 数据,drive 后 wire 上流 1 的首个帧必须是 WindowUpdate 且携带 SYN
+    /// (SYN|WU 合帧,即 frp OpenStream 的 initialStreamFlags 行为),
+    /// len == 6MiB − 256KiB(预授差额);该帧之前不得有流 1 的其他帧
+    /// (过滤 stream id 0 的 RTT ping)。修前:SYN 为 lazy(随首数据帧),
+    /// 建流后 wire 上没有任何流 1 的帧。
+    #[test]
+    fn creation_grant_outbound_syn_wu_on_open() {
+        let (socket, st) = TestSocket::new();
+        let mut cfg = Config::default();
+        cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
+        let mut conn = Connection::new(socket, cfg, Mode::Client);
+
+        // 存活到断言之后:避免 drop 触发 RST 污染 wire 观察
+        let _stream = futures::executor::block_on(poll_fn(|cx| conn.poll_new_outbound(cx)))
+            .expect("open outbound stream");
+
+        let mut cx = noop_cx();
+        drive_to_pending(&mut conn, &mut cx);
+
+        // 只看流 1 的帧(过滤 stream id 0 的 RTT ping)
+        let hdrs: Vec<_> = written_headers(&st)
+            .into_iter()
+            .filter(|h| h.stream_id() == StreamId::new(1))
+            .collect();
+        assert!(
+            !hdrs.is_empty(),
+            "creation grant must reach the wire without any write"
+        );
+        let h = &hdrs[0];
+        assert_eq!(
+            h.tag(),
+            Tag::WindowUpdate,
+            "first stream-1 frame must be a window update, got {h:?}"
+        );
+        assert!(
+            h.flags().contains(header::SYN),
+            "creation grant must carry SYN (SYN|WU), got {:?}",
+            h.flags()
+        );
+        assert_eq!(
+            h.len().val(),
+            6 * 1024 * 1024 - DEFAULT_CREDIT,
+            "grant size must be the pregrant delta 6MiB − 256KiB"
+        );
+    }
+
+    /// G2(红→绿):inbound 建流即授信——SYN|DATA 交付流后 `into_halves`,
+    /// 再 drive,wire 上流 2 恰有**一个** WU 帧:携带 ACK 且
+    /// len == 6MiB − 256KiB。授信帧已在构造时排队并消费 ACK flag,
+    /// `into_halves` 不得再补发 ACK|WU(0) 第二帧。修前:仅有
+    /// `into_halves` 的 ACK|WU(0),len 为 0。
+    #[test]
+    fn creation_grant_inbound_ack_wu_no_duplicate() {
+        let (socket, st) = TestSocket::new();
+        st.borrow_mut()
+            .read_blocks
+            .lock()
+            .unwrap()
+            .push_back(syn_data_block(2, b"x"));
+        let mut cfg = Config::default();
+        cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
+        let mut conn = Connection::new(socket, cfg, Mode::Client);
+
+        let stream = futures::executor::block_on(poll_fn(|cx| conn.poll_next_inbound(cx)))
+            .expect("inbound stream")
+            .expect("ok stream");
+        // 半壳存活到断言之后:避免 drop 触发 RST 污染 wire 观察
+        let (_read_half, _write_half) = stream.into_halves();
+
+        let mut cx = noop_cx();
+        drive_to_pending(&mut conn, &mut cx);
+
+        let wus: Vec<_> = written_headers(&st)
+            .into_iter()
+            .filter(|h| h.tag() == Tag::WindowUpdate && h.stream_id() == StreamId::new(2))
+            .collect();
+        assert_eq!(
+            wus.len(),
+            1,
+            "exactly one WU frame for stream 2 (no duplicate ACK|WU(0)), got {wus:?}"
+        );
+        let h = &wus[0];
+        assert!(
+            h.flags().contains(header::ACK),
+            "creation grant must carry ACK (ACK|WU), got {:?}",
+            h.flags()
+        );
+        assert_eq!(
+            h.len().val(),
+            6 * 1024 * 1024 - DEFAULT_CREDIT,
+            "grant size must be the pregrant delta 6MiB − 256KiB, got {}",
+            h.len().val()
+        );
+    }
+
+    /// G4(锁现有为):预算归 0(连接总窗 = 256KiB × max_streams)时
+    /// 预授信自然回退——开流并写 4 字节数据后 drive,流 1 无任何 WU 帧,
+    /// 且首个数据帧携带 SYN(额度回退 + lazy SYN 未被消费)。
+    #[test]
+    fn creation_grant_budget_exhausted_no_frame() {
+        let (socket, st) = TestSocket::new();
+        let mut cfg = Config::default();
+        // 预算 = 总窗 − 256KiB×512(默认流数)= 0:预授信退回规约保底
+        cfg.set_max_connection_receive_window(Some(512 * DEFAULT_CREDIT as usize));
+        cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
+        let mut conn = Connection::new(socket, cfg, Mode::Client);
+
+        let mut stream = futures::executor::block_on(poll_fn(|cx| conn.poll_new_outbound(cx)))
+            .expect("open outbound stream");
+        let mut cx = noop_cx();
+        match Pin::new(&mut stream).poll_write(&mut cx, b"data") {
+            Poll::Ready(Ok(4)) => {}
+            other => panic!("write must be ready, got {other:?}"),
+        }
+        drive_to_pending(&mut conn, &mut cx);
+
+        let hdrs = stream1_data_headers(&st);
+        assert!(!hdrs.is_empty(), "data frame must reach the wire");
+        assert!(
+            hdrs[0].flags().contains(header::SYN),
+            "lazy SYN must be unconsumed under budget fallback, got {:?}",
+            hdrs[0].flags()
+        );
+        let wus: Vec<_> = written_headers(&st)
+            .into_iter()
+            .filter(|h| h.tag() == Tag::WindowUpdate && h.stream_id() == StreamId::new(1))
+            .collect();
+        assert!(
+            wus.is_empty(),
+            "no WU frame may be sent under exhausted budget, got {wus:?}"
+        );
+    }
 }

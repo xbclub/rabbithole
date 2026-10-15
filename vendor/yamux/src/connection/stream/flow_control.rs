@@ -17,8 +17,10 @@ pub(crate) struct FlowController {
     max_receive_window: u32,
     send_window: u32,
     /// round-2 预授信:建流抬高的 (max − DEFAULT_CREDIT) 差额尚未经
-    /// 窗口更新帧授出前为 `true`。此差额不是实测接收吞吐,在它授出
-    /// (本流首个窗口更新)之前不进入 BDP 自增窗——否则首个 WU 会以
+    /// 窗口更新帧授出前为 `true`。round-4/B1 起该差额在流创建时即由
+    /// [`FlowController::take_creation_grant`] 授出(排队失败的兜底会
+    /// 回滚本标记,差额回落由读路径授出)。此差额不是实测接收吞吐,
+    /// 在它授出之前不进入 BDP 自增窗——否则首个 WU 会以
     /// "建流瞬间消耗了初窗" 的假速率立刻翻倍。
     pregrant_pending: bool,
 }
@@ -48,9 +50,10 @@ impl FlowController {
     ) -> Self {
         // 预授信初窗(round-2):max_receive_window 从配置初窗起步(默认
         // DEFAULT_CREDIT = upstream 原行为)。receive_window 仍按规约从
-        // DEFAULT_CREDIT 开始——首个窗口更新 poll 会以普通 WU 帧把
-        // (初窗 − 256KiB) 的差额授给对端(max − receive_window ≥ max/2
-        // 恒成立,半窗阈值天然放行),对端任何版本都只见到标准 WU。
+        // DEFAULT_CREDIT 开始——(初窗 − 256KiB) 的差额自 round-4/B1 起
+        // 由 take_creation_grant 在建流时以带初始 flag 的 WU 帧授给对端
+        //(排队失败的兜底回落读路径 next_window_update:max − receive_window
+        // ≥ max/2 恒成立,半窗阈值同样放行),对端任何版本都只见到标准 WU。
         //
         // 预授信必须先吃连接预算的剩余额度:预算
         // (max_connection_receive_window − 256KiB×max_num_streams)是
@@ -164,14 +167,47 @@ impl FlowController {
         }
 
         self.last_window_update = Instant::now();
-        // 预授信差额已随本窗口更新授出:自此的窗口消耗才是实测接收
-        // 吞吐,下一个满足时延条件的更新可进入 BDP 自增窗。
+        // 预授信差额在建流时已授出(round-4/B1;排队失败的兜底路径则随
+        // 本窗口更新授出):自此的窗口消耗才是实测接收吞吐,下一个满足
+        // 时延条件的更新可进入 BDP 自增窗。
         self.pregrant_pending = false;
         self.receive_window += next_window_update;
 
         self.assert_invariants(buffer_len);
 
         Some(next_window_update)
+    }
+
+    /// 建流即授信(round-4/B1,对齐 frp OpenStream/AcceptStream 时机):
+    /// 把预授差额(max_receive_window − DEFAULT_CREDIT)在流创建时一次性授出,
+    /// 不再等读路径首个窗口更新 poll。返回授出额度(0 = 无预授或已授出)。
+    /// 记账与读路径 next_window_update 同构:consume pregrant_pending、
+    /// receive_window += delta、刷新 last_window_update;不动
+    /// accumulated_max_stream_windows(max 未变,Drop 守恒不受影响)。
+    pub(crate) fn take_creation_grant(&mut self) -> u32 {
+        let delta = self.max_receive_window - DEFAULT_CREDIT;
+        if !self.pregrant_pending || delta == 0 {
+            // 无预授(预算钳制的流在此自然回退)或已授出:返回 0;
+            // 差额为 0 时也把 pregrant_pending 置 false(读路径无需再守)。
+            self.pregrant_pending = false;
+            return 0;
+        }
+        self.pregrant_pending = false;
+        self.receive_window += delta;
+        self.last_window_update = Instant::now();
+        delta
+    }
+
+    /// [`FlowController::take_creation_grant`] 的回滚入口(建流授信帧排队
+    /// 失败的兜底专用):复原 take 时刻的记账,使差额重新交由读路径
+    /// [`FlowController::next_window_update`] 授出。仅在流构造路径调用
+    /// (`Shared` 尚未共享,receive_window 减法无并发、不会下溢)。
+    pub(crate) fn restore_creation_grant(&mut self, delta: u32) {
+        if delta == 0 {
+            return;
+        }
+        self.receive_window -= delta;
+        self.pregrant_pending = true;
     }
 
     fn assert_invariants(&self, buffer_len: usize) {

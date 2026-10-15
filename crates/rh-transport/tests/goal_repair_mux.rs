@@ -778,10 +778,12 @@ async fn mux_relay_sibling_aborted_on_pump_panic() {
 //
 // 修复:接收端建流即把 max_receive_window 提到配置初值
 //   (vendor Config::set_initial_stream_receive_window;rabbithole 接线见
-//   mux.rs YamuxMultiplexer::new,受 256MiB 共享预算钳制),首个读 poll
-//   以**标准窗口更新帧**(WU;入站流带 ACK flag,upstream 既有合法组合)
-//   预授差额信用,且该首 WU 不触发 BDP 倍增。发送端初值仍 256KiB 不变
-//   ——混合版本部署时对端无论新旧均只看到普通 WU,线路兼容(方案红线 8)。
+//   mux.rs YamuxMultiplexer::new,受 256MiB 共享预算钳制);round-4/B1 起
+//   差额在**建流时**即以**标准窗口更新帧**(WU;出站流 SYN|WU、入站流
+//   ACK|WU,upstream 既有合法组合,对齐 frp OpenStream/AcceptStream 的
+//   授信时机)授出,不再等首个读 poll,首个读 WU 起才可能进入 BDP
+//   自增。发送端初值仍 256KiB 不变——混合版本部署时对端无论新旧均
+//   只看到普通 WU,线路兼容(方案红线 8)。
 //
 // 红取证:01-red-initial-window.log 是修前**测试自身缺陷**的记录——
 //   先 open_stream 再 accept,而 yamux SYN 是 lazy 的(Flag::Syn 随首个
@@ -794,13 +796,18 @@ async fn mux_relay_sibling_aborted_on_pump_panic() {
 //
 // 判据(确定性,无计时竞态、无自增窗混入):接收端只读**一次**
 // (弹出随 SYN 到达的 1 字节)即永久停读——全程只发过一个窗口更新
-// (即预授信 WU),自增窗(BDP 倍增)只会在后续 next_window_update 里
-// 触发,永不介入。发送端逐 64KiB 写入,被窗口卡住(2s 超时)前的累计
-// 可写字节数 == 规约初窗 256KiB + 首个 WU 授出的预授信差额。
+// (round-4/B1 起即建流时授出的预授信 WU),自增窗(BDP 倍增)只会在
+// 后续 next_window_update 里触发,永不介入。发送端逐 64KiB 写入,被
+// 窗口卡住(2s 超时)前的累计可写字节数 == 规约初窗 256KiB + 建流 WU
+// 授出的预授信差额。
 // 修前(无预授信,upstream 行为):首 poll 消费 1 字节 < 半窗阈值,
-// 无 WU,恒 3×64KiB = 196608;修后(6MiB 初窗,round-3 对齐 frp):
-// 首个 WU 授出 6MiB−256KiB+1,恒 1+96×64KiB = 6291457(6MiB+1)。
-// 断言取 ≥ 5.5MiB 下界。
+// 无 WU,恒 3×64KiB = 196608;round-3(首个读 poll 授信):首个 WU 授出
+// 6MiB−256KiB+1,总量恒 6MiB+1 = 6291457(1+96×64KiB);round-4/B1
+// (建流即授信,2026-10-15):建流 WU 授出 6MiB−256KiB,接收端首读
+// bytes_received=1 < 半窗不再发 WU,预授信总量 6MiB+1 → 6MiB,written
+// 恒 1+95×64KiB 中可整块计数者 = 95×64KiB = 6225920(首字节 1 后余
+// 6MiB−1 = 95 整块 + 尾差 65535 不足整块、不计入 written)。
+// 断言取 ≥ 5.5MiB 下界(CHUNK*88)不变。
 // (注:接收端持续读的形态下,本地 duplex 的自增窗会把修前形态也抬到
 // ~1.75MiB——回路时延 < 2×RTT 时倍增合法触发;故必须用单次读设计
 // 把预授信与自增窗解耦。)
@@ -1097,9 +1104,10 @@ async fn two_hop_relay_upload_emulator() {
 
 // 合成 RTT 信用钳制实验(诊断,#[ignore] 显式运行,不作 CI 判据):
 // 在 RTT ≈ 2ms 的合成载体上重复预授信测试的判据(接收端单次读后停读,
-// 发送端可写总量 == 初窗 + 唯一 WU 授信)。修前(无预授信)恒
-// 196608(256KiB 初窗);修后(6MiB 初窗,round-3 对齐 frp)恒 6291457
-// (6MiB+1)——即 RTT 载体上单流在途窗口被预授信抬高 24 倍,持续态
+// 发送端可写总量 == 初窗 + 建流 WU 授信)。修前(无预授信)恒
+// 196608(256KiB 初窗);round-4/B1(建流即授信,2026-10-15)总授信恒
+// 6MiB(written 恒 95×64KiB = 6225920;round-3 读 poll 授信为 6MiB+1
+// = 6291457)——即 RTT 载体上单流在途窗口被预授信抬高 24 倍,持续态
 // 吞吐钳制相应从 256KiB/RTT ≈ 1.0Gbps 抬到 6MiB/RTT ≈ 24Gbps
 // (每轮窗口/RTT 静态算术;修前 1.0Gbps 与 round-1 测试床 mux 上行
 // 1051-1225 Mbps 同量级,是一致性佐证而非因果证明——测试床回路时延
