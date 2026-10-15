@@ -463,16 +463,32 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
             // 都复位计数,保证任意两次入站读服务之间的载体写 ≤ 预算;预算从
             // 0 起步,空闲连接(无写入)不探测;`pending_read_frame` 在途
             // (Pong/Terminate)时跳过探测,保持其发送优先级不变。
+            // Round-C:探测为批量排空至 Pending/交付/批量上界——同一探测内
+            // 连续服务入站,对齐「收发对等排空」语义(写侧两次探测间 ≤ 预算
+            // 次写,读侧单次探测 ≤ 预算帧读,对称操作预算)。
             if self.pending_read_frame.is_none()
                 && (self.writes_since_read_probe >= FAIRNESS_MAX_WRITE_OPS_BETWEEN_READ_PROBES
                     || self.bytes_since_read_probe >= FAIRNESS_MAX_WRITE_BYTES_BETWEEN_READ_PROBES)
             {
                 self.writes_since_read_probe = 0;
                 self.bytes_since_read_probe = 0;
-                match self.service_inbound(cx)? {
-                    InboundOutcome::NewStream(stream) => return Poll::Ready(Ok(stream)),
-                    InboundOutcome::Closed => return Poll::Ready(Err(ConnectionError::Closed)),
-                    InboundOutcome::Progress | InboundOutcome::Pending => {}
+                // 批量排空:直至读侧 Pending、NewStream/Closed 交付,或本次
+                // 探测已消费 FAIRNESS_MAX_WRITE_OPS_BETWEEN_READ_PROBES 个
+                // 入站帧(帧体 ≤64KiB,16 帧上界 1MiB,不做字节预算)。
+                // 循环内显式复查 `pending_read_frame`:本轮 service_inbound
+                // 置入 Ping/Terminate 待发帧时立即终止批量,防止 Pong 未
+                // 发出时继续吞读。
+                let mut probed_frames = 0usize;
+                while self.pending_read_frame.is_none()
+                    && probed_frames < FAIRNESS_MAX_WRITE_OPS_BETWEEN_READ_PROBES
+                {
+                    match self.service_inbound(cx)? {
+                        InboundOutcome::NewStream(stream) => return Poll::Ready(Ok(stream)),
+                        InboundOutcome::Closed => return Poll::Ready(Err(ConnectionError::Closed)),
+                        InboundOutcome::Pending => break,
+                        InboundOutcome::Progress => {}
+                    }
+                    probed_frames += 1;
                 }
                 continue;
             }
@@ -1034,6 +1050,9 @@ mod tests {
         /// Arc 包装:公平调度 T3 的 waker 需跨 `Rc` 句柄快照「唤醒时刻的
         /// 载体写次数」;计数语义不变(经 Deref 照常 fetch_add/load)。
         write_calls: Arc<AtomicUsize>,
+        /// T5 事件序列(测试基建):载体写成功记 'w',读返回 Ready(Ok(n>0))
+        /// 记 'r'(0 字节 EOF 不记)——用于强制读探测批量排空的断言。
+        events: Mutex<Vec<char>>,
         closed: AtomicBool,
         eof: AtomicBool,
     }
@@ -1061,6 +1080,7 @@ mod tests {
             st.write_calls.fetch_add(1, Ordering::SeqCst);
             st.written.lock().unwrap().extend_from_slice(a);
             st.written.lock().unwrap().extend_from_slice(b);
+            st.events.lock().unwrap().push('w');
             Poll::Ready(Ok(a.len() + b.len()))
         }
     }
@@ -1086,6 +1106,9 @@ mod tests {
                 let n = (st.cur_block.len() - st.cur_off).min(buf.len());
                 buf[..n].copy_from_slice(&st.cur_block[st.cur_off..st.cur_off + n]);
                 st.cur_off += n;
+                if n > 0 {
+                    st.events.lock().unwrap().push('r');
+                }
                 return Poll::Ready(Ok(n));
             }
             if st.eof.load(Ordering::SeqCst) {
@@ -1707,6 +1730,91 @@ mod tests {
             Poll::Ready(Ok(4096)) => {}
             other => panic!("stream 1 must be writable again after WU, got {other:?}"),
         }
+    }
+
+    // ===== Round-C 公平调度守卫:探测批量排空(先红后绿) =====
+
+    /// T5(红→绿):强制读探测必须**批量排空**入站——同一探测内连续消费
+    /// 多个已就绪入站帧(对称操作预算,单次探测 ≤16 帧),而不是每探测
+    /// 仅 1 帧即回写路径(×16 写洪峰下读侧成批消化能力被稀释)。修前
+    /// 事件序列中 'r' 的连续运行恒为 1。
+    #[test]
+    fn fair_probe_drains_inbound_batch() {
+        let (socket, st) = TestSocket::new();
+        let mut conn = Connection::new(socket, Config::default(), Mode::Client);
+
+        // 与 T1 同构:16 条 outbound 流各 queue 8 × 4096B(单流 32KiB ≤ 256KiB
+        // 信用、8 条命令 < 通道容量,TestSocket 写侧恒 Ready → 写洪峰持续就绪)
+        let mut cx = noop_cx();
+        let payload = [7u8; 4096];
+        let mut streams = Vec::new();
+        for _ in 0..16 {
+            let mut s = futures::executor::block_on(poll_fn(|cx| conn.poll_new_outbound(cx)))
+                .expect("open outbound stream");
+            for _ in 0..8 {
+                match Pin::new(&mut s).poll_write(&mut cx, &payload) {
+                    Poll::Ready(Ok(4096)) => {}
+                    other => panic!("storm write must be ready, got {other:?}"),
+                }
+            }
+            streams.push(s);
+        }
+
+        // 读侧预置 5 块:前置 4 个纯数据块(目标流 2 未知,被静默丢弃但
+        // 照常消费,保证批量运行可观测),syn_data_block 放最后——NewStream
+        // 交付即返回,不打断前面的批量运行
+        {
+            let st_mut = st.borrow_mut();
+            let mut blocks = st_mut.read_blocks.lock().unwrap();
+            for _ in 0..4 {
+                blocks.push_back(data_block(2, &payload));
+            }
+            blocks.push_back(syn_data_block(2, b"syn"));
+        }
+
+        let inbound = match futures::executor::block_on(poll_fn(|cx| conn.poll_next_inbound(cx))) {
+            Some(Ok(s)) => s,
+            other => panic!("batch-draining probe must deliver the inbound stream, got {other:?}"),
+        };
+        assert_eq!(inbound.id(), StreamId::new(2));
+
+        // 冲掉剩余写洪峰,事件序列覆盖完整(流存活到断言之后,避免 drop
+        // 触发 RST 污染观察)
+        drive_to_pending(&mut conn, &mut cx);
+
+        let events = st.borrow().events.lock().unwrap().clone();
+        // 连续 'r' 运行长度序列
+        let mut runs = Vec::new();
+        let mut cur = 0usize;
+        for &e in &events {
+            if e == 'r' {
+                cur += 1;
+            } else if cur > 0 {
+                runs.push(cur);
+                cur = 0;
+            }
+        }
+        if cur > 0 {
+            runs.push(cur);
+        }
+
+        assert!(
+            runs.iter().any(|&r| r >= 3),
+            "probe must drain inbound in batches (some 'r' run >= 3), events: {events:?}, runs: {runs:?}"
+        );
+        assert!(
+            runs.iter().all(|&r| r <= FAIRNESS_MAX_WRITE_OPS_BETWEEN_READ_PROBES),
+            "probe batch must respect the symmetric op budget (run <= 16), events: {events:?}, runs: {runs:?}"
+        );
+        let writes = events.iter().filter(|&&e| e == 'w').count();
+        assert!(
+            writes >= 100,
+            "write storm must actually happen, got {writes} 'w' events, events: {events:?}"
+        );
+        assert!(
+            st.borrow().read_blocks.lock().unwrap().is_empty(),
+            "all 5 read blocks must be consumed"
+        );
     }
 
     // ===== Round-B1 建流即授信守卫(对齐 frp OpenStream/AcceptStream 时机) =====
