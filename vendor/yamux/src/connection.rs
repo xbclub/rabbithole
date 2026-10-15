@@ -42,6 +42,21 @@ pub use stream::{Packet, State, Stream, StreamReadHalf, StreamWriteHalf};
 /// Next connection identifier, used for debug logging.
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
+/// 两次入站读探测之间允许的最大载体写操作数。
+///
+/// 写优先有界化:`Active::poll` 的写分支 `continue` 会在写洪峰期间饿死
+/// 已就绪的入站帧(WU/ACK/SYN/DATA),推高对端写阻塞与建流时延。累计
+/// 载体写操作数达到本值即强制做一次入站读探测,给 WU/ACK 的处理时延
+/// 一个上界;探测成本被两次探测之间 ≥ 本值的真实载体写摊薄。
+const FAIRNESS_MAX_WRITE_OPS_BETWEEN_READ_PROBES: usize = 16;
+
+/// 两次入站读探测之间允许的最大载体写字节数(帧体计)。
+///
+/// 与 [`FAIRNESS_MAX_WRITE_OPS_BETWEEN_READ_PROBES`] 同理,按字节体量对
+/// 写优先做有界化:大帧写洪峰下(操作数增长慢、字节增长快)同样保证
+/// 入站读探测的有界时延。计数只记帧体长度,帧头固定开销不计。
+const FAIRNESS_MAX_WRITE_BYTES_BETWEEN_READ_PROBES: usize = 256 * 1024;
+
 /// How the connection is used.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Mode {
@@ -302,6 +317,14 @@ struct Active<T> {
 
     rtt: rtt::Rtt,
 
+    /// 公平调度:自上次入站读探测以来累计的载体写操作数(连接生命周期
+    /// 内累计,不跨重启)。达到 [`FAIRNESS_MAX_WRITE_OPS_BETWEEN_READ_PROBES`]
+    /// 即在写路径循环顶部强制做一次入站读探测。
+    writes_since_read_probe: usize,
+    /// 公平调度:自上次入站读探测以来累计的载体写帧体字节数,达到
+    /// [`FAIRNESS_MAX_WRITE_BYTES_BETWEEN_READ_PROBES`] 即强制读探测。
+    bytes_since_read_probe: usize,
+
     /// A stream's `max_stream_receive_window` can grow beyond [`DEFAULT_CREDIT`], see
     /// [`Stream::next_window_update`]. This field is the sum of the bytes by which all streams'
     /// `max_stream_receive_window` have each exceeded [`DEFAULT_CREDIT`]. Used to enforce
@@ -328,6 +351,21 @@ pub(crate) enum Action {
     Ping(Frame<Ping>),
     /// The connection should be terminated.
     Terminate(Frame<GoAway>),
+}
+
+/// [`Active::service_inbound`] 的一次入站读服务结果。
+///
+/// 常规读分支与写预算耗尽后的强制读探测共用;`NewStream`/`Closed` 在
+/// 两条路径的语义一致(立即交付新流 / 返回 `ConnectionError::Closed`)。
+enum InboundOutcome {
+    /// 读侧暂无数据(`poll_next` 已登记读 waker)。
+    Pending,
+    /// 载体 EOF。
+    Closed,
+    /// 已处理一帧(Ping/Terminate 已入 `pending_read_frame`,保持其发送优先级)。
+    Progress,
+    /// 远端开出新流。
+    NewStream(Stream),
 }
 
 impl<T> fmt::Debug for Active<T> {
@@ -375,6 +413,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
             pending_write_frame: None,
             new_outbound_stream_waker: None,
             rtt: rtt::Rtt::new(),
+            writes_since_read_probe: 0,
+            bytes_since_read_probe: 0,
             accumulated_max_stream_windows: Default::default(),
         }
     }
@@ -416,6 +456,27 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
         loop {
+            // Round-A 公平调度(强制读探测):写优先的 A/B 分支持续 `continue`
+            // 会饿死已就绪的入站帧(WU/ACK/SYN/DATA),写洪峰下读只在载体
+            // sink Pending(背压)时才被服务。载体写累计(操作数或帧体字节)
+            // 达到预算即先做一次入站服务,再回到写路径。探测无论 Ready/Pending
+            // 都复位计数,保证任意两次入站读服务之间的载体写 ≤ 预算;预算从
+            // 0 起步,空闲连接(无写入)不探测;`pending_read_frame` 在途
+            // (Pong/Terminate)时跳过探测,保持其发送优先级不变。
+            if self.pending_read_frame.is_none()
+                && (self.writes_since_read_probe >= FAIRNESS_MAX_WRITE_OPS_BETWEEN_READ_PROBES
+                    || self.bytes_since_read_probe >= FAIRNESS_MAX_WRITE_BYTES_BETWEEN_READ_PROBES)
+            {
+                self.writes_since_read_probe = 0;
+                self.bytes_since_read_probe = 0;
+                match self.service_inbound(cx)? {
+                    InboundOutcome::NewStream(stream) => return Poll::Ready(Ok(stream)),
+                    InboundOutcome::Closed => return Poll::Ready(Err(ConnectionError::Closed)),
+                    InboundOutcome::Progress | InboundOutcome::Pending => {}
+                }
+                continue;
+            }
+
             // B4:`Poll::is_ready` 对 `Ready(Err)` 同样为真,会把写错误当
             // 就绪吞掉,随后 `start_send` 覆盖 Poisoned 半写状态续发新帧。
             // 这里区分三态:Err 以**原始 IO 错误**立即传播并触发 cleanup。
@@ -425,7 +486,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
                     // connection) no ping is sent. This is deliberate as an idle connection does not
                     // need RTT measurements to increase its stream receive window.
                     if let Some(frame) = self.rtt.next_ping() {
+                        let body_len = frame.header().len().val() as usize;
                         self.socket.start_send_unpin(frame.into())?;
+                        self.writes_since_read_probe += 1;
+                        self.bytes_since_read_probe += body_len;
                         continue;
                     }
 
@@ -436,7 +500,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
                         .take()
                         .or_else(|| self.pending_write_frame.take())
                     {
+                        let body_len = frame.header().len().val() as usize;
                         self.socket.start_send_unpin(frame)?;
+                        self.writes_since_read_probe += 1;
+                        self.bytes_since_read_probe += body_len;
                         continue;
                     }
                 }
@@ -483,34 +550,45 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
             }
 
             if self.pending_read_frame.is_none() {
-                match self.socket.poll_next_unpin(cx) {
-                    Poll::Ready(Some(frame)) => {
-                        match self.on_frame(frame?)? {
-                            Action::None => {}
-                            Action::New(stream) => {
-                                log::trace!("{}: new inbound {} of {}", self.id, stream, self);
-                                return Poll::Ready(Ok(stream));
-                            }
-                            Action::Ping(f) => {
-                                log::trace!("{}/{}: pong", self.id, f.header().stream_id());
-                                self.pending_read_frame.replace(f.into());
-                            }
-                            Action::Terminate(f) => {
-                                log::trace!("{}: sending term", self.id);
-                                self.pending_read_frame.replace(f.into());
-                            }
-                        }
-                        continue;
-                    }
-                    Poll::Ready(None) => {
-                        return Poll::Ready(Err(ConnectionError::Closed));
-                    }
-                    Poll::Pending => {}
+                match self.service_inbound(cx)? {
+                    InboundOutcome::NewStream(stream) => return Poll::Ready(Ok(stream)),
+                    InboundOutcome::Closed => return Poll::Ready(Err(ConnectionError::Closed)),
+                    InboundOutcome::Progress => continue,
+                    InboundOutcome::Pending => {}
                 }
             }
 
             // If we make it this far, at least one of the above must have registered a waker.
             return Poll::Pending;
+        }
+    }
+
+    /// 服务一次入站读:读单帧并经 `on_frame` 分派。
+    ///
+    /// [`Active::poll`] 的常规读分支与写预算耗尽后的强制读探测共用本方法,
+    /// 行为与去重前的读分支逐分支等价(含 `NewStream`/EOF 的返回语义与
+    /// Ping/Terminate 入 `pending_read_frame` 的优先级)。
+    fn service_inbound(&mut self, cx: &mut Context<'_>) -> Result<InboundOutcome> {
+        match self.socket.poll_next_unpin(cx) {
+            Poll::Ready(Some(frame)) => match self.on_frame(frame?)? {
+                Action::None => Ok(InboundOutcome::Progress),
+                Action::New(stream) => {
+                    log::trace!("{}: new inbound {} of {}", self.id, stream, self);
+                    Ok(InboundOutcome::NewStream(stream))
+                }
+                Action::Ping(f) => {
+                    log::trace!("{}/{}: pong", self.id, f.header().stream_id());
+                    self.pending_read_frame.replace(f.into());
+                    Ok(InboundOutcome::Progress)
+                }
+                Action::Terminate(f) => {
+                    log::trace!("{}: sending term", self.id);
+                    self.pending_read_frame.replace(f.into());
+                    Ok(InboundOutcome::Progress)
+                }
+            },
+            Poll::Ready(None) => Ok(InboundOutcome::Closed),
+            Poll::Pending => Ok(InboundOutcome::Pending),
         }
     }
 
@@ -953,7 +1031,9 @@ mod tests {
         cur_off: usize,
         written: Mutex<Vec<u8>>,
         fail_writes: AtomicBool,
-        write_calls: AtomicUsize,
+        /// Arc 包装:公平调度 T3 的 waker 需跨 `Rc` 句柄快照「唤醒时刻的
+        /// 载体写次数」;计数语义不变(经 Deref 照常 fetch_add/load)。
+        write_calls: Arc<AtomicUsize>,
         closed: AtomicBool,
         eof: AtomicBool,
     }
@@ -1044,6 +1124,36 @@ mod tests {
         let mut h = header::Header::window_update(StreamId::new(id), 0);
         h.ack();
         header::encode(&h).to_vec()
+    }
+
+    /// 普通入站数据块(无 SYN/FIN):读洪峰预置用,目标流未知时被静默丢弃。
+    fn data_block(id: u32, body: &[u8]) -> Vec<u8> {
+        let h = header::Header::data(StreamId::new(id), body.len() as u32);
+        let mut v = header::encode(&h).to_vec();
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// 对指定流授信的入站窗口更新块(无 SYN/ACK/FIN)。
+    fn wu_credit_block(id: u32, credit: u32) -> Vec<u8> {
+        let h = header::Header::window_update(StreamId::new(id), credit);
+        header::encode(&h).to_vec()
+    }
+
+    /// 首次唤醒时刻的载体写次数快照(公平调度 T3 用:断言被阻塞的
+    /// writer 在有界载体写内被 WU 唤醒)。
+    struct WakeAtSnapshot {
+        writes: Arc<AtomicUsize>,
+        wake_at: Mutex<Option<usize>>,
+    }
+
+    impl futures::task::ArcWake for WakeAtSnapshot {
+        fn wake_by_ref(me: &Arc<Self>) {
+            let mut slot = me.wake_at.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(me.writes.load(Ordering::SeqCst));
+            }
+        }
     }
 
     /// B4(红→绿):连接层写错误必须以**原始 IO 错误**传播并使连接进入
@@ -1408,6 +1518,194 @@ mod tests {
         match poll_fn(|cx| Pin::new(&mut inbound).poll_read(cx, &mut buf)).poll_unpin(&mut cx) {
             Poll::Ready(Ok(0)) => {}
             other => panic!("peer must see immediate EOF, got {other:?}"),
+        }
+    }
+
+    // ===== Round-A 公平调度守卫:写优先有界化(先红后绿) =====
+
+    /// T1(红→绿):16 条 outbound 流 × 8 × 4096B 的写洪峰中,已就绪的
+    /// 入站 SYN|DATA 必须在有界载体写(≤ 预算+2)内被服务并交付新流
+    /// (修前恒 ~129 次载体写入后读才被服务,读饿死)。
+    #[test]
+    fn fair_inbound_stream_serviced_under_write_storm() {
+        let (socket, st) = TestSocket::new();
+        let mut conn = Connection::new(socket, Config::default(), Mode::Client);
+
+        // 16 条 outbound 流各 queue 8 次 4096B 写:单流 32KiB ≤ 256KiB 信用、
+        // 8 条命令 < 通道容量(buffer 10 + 2 发送句柄),poll_write 全 Ready
+        let mut cx = noop_cx();
+        let payload = [7u8; 4096];
+        let mut streams = Vec::new();
+        for _ in 0..16 {
+            let mut s = futures::executor::block_on(poll_fn(|cx| conn.poll_new_outbound(cx)))
+                .expect("open outbound stream");
+            for _ in 0..8 {
+                match Pin::new(&mut s).poll_write(&mut cx, &payload) {
+                    Poll::Ready(Ok(4096)) => {}
+                    other => panic!("storm write must be ready, got {other:?}"),
+                }
+            }
+            streams.push(s);
+        }
+
+        // 入站 SYN|DATA 在驱动前已就绪
+        st.borrow_mut()
+            .read_blocks
+            .lock()
+            .unwrap()
+            .push_back(syn_data_block(2, b"x"));
+
+        let inbound = match futures::executor::block_on(poll_fn(|cx| conn.poll_next_inbound(cx))) {
+            Some(Ok(s)) => s,
+            other => panic!("inbound stream must be serviced under write storm, got {other:?}"),
+        };
+        assert_eq!(inbound.id(), StreamId::new(2));
+
+        let calls = st.borrow().write_calls.load(Ordering::SeqCst);
+        assert!(
+            calls <= FAIRNESS_MAX_WRITE_OPS_BETWEEN_READ_PROBES + 2,
+            "first inbound service must happen within bounded carrier writes, got {calls}"
+        );
+    }
+
+    /// T2(锁现有为):≥100 个入站数据块的读洪峰中,已 queue 的出站 Data 帧
+    /// 仍须在 read_blocks 未耗尽前上 wire——读侧持续就绪不得饿死待写
+    /// (公平调度只给写侧加预算,不引入反向偏置)。
+    #[test]
+    fn fair_pending_write_progresses_under_read_storm() {
+        let (socket, st) = TestSocket::new();
+        let mut conn = Connection::new(socket, Config::default(), Mode::Client);
+
+        let mut stream = futures::executor::block_on(poll_fn(|cx| conn.poll_new_outbound(cx)))
+            .expect("open outbound stream");
+        let mut cx = noop_cx();
+        match Pin::new(&mut stream).poll_write(&mut cx, b"outbound") {
+            Poll::Ready(Ok(8)) => {}
+            other => panic!("queue data frame, got {other:?}"),
+        }
+
+        // 读洪峰:50 块丢弃数据 → SYN|DATA 检查点(驱动在此返回新流)→ 50 块剩余
+        {
+            let st_mut = st.borrow_mut();
+            let mut blocks = st_mut.read_blocks.lock().unwrap();
+            for _ in 0..50 {
+                blocks.push_back(data_block(6, b"storm"));
+            }
+            blocks.push_back(syn_data_block(4, b"probe"));
+            for _ in 0..50 {
+                blocks.push_back(data_block(6, b"storm"));
+            }
+        }
+
+        let inbound = match futures::executor::block_on(poll_fn(|cx| conn.poll_next_inbound(cx))) {
+            Some(Ok(s)) => s,
+            other => panic!("checkpoint inbound stream expected, got {other:?}"),
+        };
+        assert_eq!(inbound.id(), StreamId::new(4));
+
+        // 检查点返回时读洪峰未耗尽(还有整整 50 块未读)
+        let remaining = st.borrow().read_blocks.lock().unwrap().len();
+        assert!(
+            remaining >= 50,
+            "read storm must not be exhausted at checkpoint, {remaining} blocks left"
+        );
+
+        // 出站 Data 帧已在检查点之前上 wire
+        let hdrs = stream1_data_headers(&st);
+        assert!(
+            !hdrs.is_empty(),
+            "outbound data frame must reach wire during read storm"
+        );
+    }
+
+    /// T3(红→绿):outbound 流 1 写到信用耗尽(pending)后,其他流写洪峰中
+    /// 预置的对 流 1 窗口更新必须在 ≤ 预算+2 次载体写内唤醒流 1 的 writer
+    /// (WU 处理时延有界;修前须等全部 120 帧洪峰写完才读到 WU)。
+    #[test]
+    fn fair_wu_reaches_blocked_writer_under_write_storm() {
+        let (socket, st) = TestSocket::new();
+        let mut conn = Connection::new(socket, Config::default(), Mode::Client);
+
+        let mut streams = Vec::new();
+        for _ in 0..16 {
+            let s = futures::executor::block_on(poll_fn(|cx| conn.poll_new_outbound(cx)))
+                .expect("open outbound stream");
+            streams.push(s);
+        }
+        let mut blocked = streams.remove(0); // 流 1
+
+        // 流 1 写到信用耗尽:256KiB / 4KiB = 64 次。通道容量为
+        // buffer(10)+2 发送句柄,每 8 次驱动一次连接清空队列,保证
+        // 后续 Pending 只可能因信用耗尽(而非通道满)。
+        let mut cx = noop_cx();
+        let payload = [7u8; 4096];
+        let mut total = 0usize;
+        loop {
+            match Pin::new(&mut blocked).poll_write(&mut cx, &payload) {
+                Poll::Ready(Ok(4096)) => {
+                    total += 4096;
+                    if total % (4096 * 8) == 0 {
+                        drive_to_pending(&mut conn, &mut cx);
+                    }
+                }
+                Poll::Pending => break,
+                other => panic!("unexpected stream-1 write: {other:?}"),
+            }
+        }
+        assert_eq!(
+            total, DEFAULT_CREDIT as usize,
+            "stream 1 must block on exhausted credit, not channel capacity"
+        );
+
+        // 用「唤醒时刻载体写次数」快照 waker 重新挂起流 1 的写
+        let writes = st.borrow().write_calls.clone();
+        let rec = Arc::new(WakeAtSnapshot {
+            writes: writes.clone(),
+            wake_at: Mutex::new(None),
+        });
+        let w = futures::task::waker(rec.clone());
+        let mut block_cx = Context::from_waker(&w);
+        match Pin::new(&mut blocked).poll_write(&mut block_cx, &payload) {
+            Poll::Pending => {}
+            other => panic!("stream 1 must stay credit-blocked, got {other:?}"),
+        }
+
+        // 其他 15 条流写洪峰(15 × 8 × 4096B = 120 帧)
+        for s in streams.iter_mut() {
+            for _ in 0..8 {
+                match Pin::new(&mut *s).poll_write(&mut cx, &payload) {
+                    Poll::Ready(Ok(4096)) => {}
+                    other => panic!("storm write must be ready, got {other:?}"),
+                }
+            }
+        }
+
+        // 洪峰中预置对 流 1 的窗口更新(授 4096 信用)
+        st.borrow_mut()
+            .read_blocks
+            .lock()
+            .unwrap()
+            .push_back(wu_credit_block(1, 4096));
+
+        let before = writes.load(Ordering::SeqCst);
+        drive_to_pending(&mut conn, &mut cx);
+
+        // WU 必须在有界载体写内被处理(唤醒快照与洪峰起点之差 ≤ 预算+2)
+        let wake_at = rec
+            .wake_at
+            .lock()
+            .unwrap()
+            .expect("stream-1 writer must be woken by the window update");
+        assert!(
+            wake_at - before <= FAIRNESS_MAX_WRITE_OPS_BETWEEN_READ_PROBES + 2,
+            "WU must be processed within bounded carrier writes, woke at {wake_at} (+{})",
+            wake_at - before
+        );
+
+        // 解锁后可继续写(授信已生效)
+        match Pin::new(&mut blocked).poll_write(&mut cx, &payload) {
+            Poll::Ready(Ok(4096)) => {}
+            other => panic!("stream 1 must be writable again after WU, got {other:?}"),
         }
     }
 }
