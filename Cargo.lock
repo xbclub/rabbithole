@@ -2630,7 +2630,7 @@ dependencies = [
 
 [[package]]
 name = "rh-client"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -2663,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "rh-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytes",
  "rand 0.9.5",
@@ -2678,7 +2678,7 @@ dependencies = [
 
 [[package]]
 name = "rh-protocol"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytes",
  "serde",
@@ -2690,7 +2690,7 @@ dependencies = [
 
 [[package]]
 name = "rh-server"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -2750,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "rh-transport"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytes",
  "futures",
