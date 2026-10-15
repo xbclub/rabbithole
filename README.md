@@ -142,22 +142,6 @@ git tag v0.1.0 && git push origin v0.1.0
 - **Docker 镜像**:`ghcr.io/xbclub/rabbithole:<tag>` 与 `:latest`(amd64 + arm64)
 
 
-## 测试与验证
-
-```bash
-cargo fmt --all && cargo clippy --workspace --all-targets && cargo test --workspace
-bash tests/e2e.sh target/release        # 55 项多进程 E2E(全部代理类型/插件/健康检查/SSH/DNS/轮换/恢复/负载均衡/限速/首启引导/改密)
-bash tests/e2e-resilience.sh target/release  # 19 项韧性场景(拒连/DB 故障回滚/数据通道断开/迟到 ACK/重复上线)
-bash tests/e2e-transports.sh target/release  # 12 项传输变体(tcp/tls/ws/wss/quic/kcp 全链路)
-bash tests/xtcp-isolated.sh target/release   # 9 项 XTCP 隔离网络(用户态 NAT 网关,打洞直连+失败回退)
-bash tests/e2e-plugins.sh target/release     # 15 项客户端插件(七插件语义全链路)
-bash tests/e2e-vhost.sh target/release       # 10 项 vhost 进阶(HTTPS SNI/头改写/Basic/自定义 404)
-bash tests/e2e-embed.sh target/release       # 9 项内嵌控制台(单二进制托管/static_dir 覆盖;需先构建前端并重编)
-bash tests/load.sh target/release 600  # 100 并发 TCP × 10 分钟持续
-```
-
-历史验证记录见 `docs/acceptance.md`;已知限制与未验证项亦在该文件列明。
-
 ## 仓库结构
 
 ```
