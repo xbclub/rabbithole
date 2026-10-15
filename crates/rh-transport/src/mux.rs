@@ -1,6 +1,10 @@
 //! yamux 多路复用驱动:yamux(vendor 零拷贝版)是 poll 风格 + futures IO,
-//! 这里封装为 async open/accept(返回 tokio IO)+ 独立驱动任务。
-//! 载体经 [`YamuxCarrier`] 适配:帧头+帧体由 writev 一次下发。
+//! 这里封装为 async open/accept(返回 tokio IO)+ 收/发双任务驱动
+//! (Round-D:连接拆分 RecvHalf/SendHalf,对齐 Go yamux 的
+//! `go s.recv()` / `go s.send()` 双 goroutine 模型——收(解帧+派发)与
+//! 发(取命令+编帧+写出)物理并行;接收侧 accept 背压只停读侧任务,
+//! 不再拖死发送)。载体经 [`YamuxCarrier`] 适配:帧头+帧体由 writev
+//! 一次下发。
 
 use crate::{BoxedIo, MultiplexerInner};
 use bytes::{BufMut as _, Bytes};
@@ -759,10 +763,15 @@ impl YamuxMultiplexer {
         // (mux 路径),不声称修复 nomux/QUIC/KCP。
         cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
         let conn: MuxConn = yamux::Connection::new(YamuxCarrier::new(io), cfg, mode);
+        // Round-D:收/发双任务驱动(对齐 Go yamux recv/send 双 goroutine)。
+        // 接收任务:解帧+派发,新流入 accept_tx(容量 256 背压——接收
+        // 阻塞只停读侧,不影响发送任务);发送任务:开流请求 + 写路径。
+        let (recv_half, send_half) = conn.into_halves();
         let (open_tx, open_rx) = mpsc::channel::<oneshot::Sender<io::Result<yamux::Stream>>>(64);
         let (accept_tx, accept_rx) = mpsc::channel::<yamux::Stream>(256);
         let dead = Arc::new(AtomicBool::new(false));
-        tokio::spawn(driver(conn, open_rx, accept_tx, dead.clone()));
+        tokio::spawn(send_driver(send_half, open_rx, dead.clone()));
+        tokio::spawn(recv_driver(recv_half, accept_tx, dead.clone()));
         Self {
             open_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
@@ -799,44 +808,33 @@ fn other(msg: &str) -> io::Error {
     io::Error::other(msg.to_string())
 }
 
-enum Ev {
-    /// 一轮批量开流已交付(数量仅用于打断循环让出)
-    Batch(usize),
-    Inbound(yamux::Stream),
-    Done,
-}
-
-async fn driver(
-    mut conn: MuxConn,
+/// 发送任务:开流请求 → `SendHalf::poll_new_outbound`;否则驱动写路径
+/// (`SendHalf::poll`:Pong/GoAway、rtt ping、流命令帧、部分写/flush)。
+/// 错误 → 置 `dead`(共享错误槽同时唤醒接收任务,双侧收敛)。
+async fn send_driver(
+    mut send_half: yamux::SendHalf<YamuxCarrier>,
     mut open_rx: mpsc::Receiver<oneshot::Sender<io::Result<yamux::Stream>>>,
-    accept_tx: mpsc::Sender<yamux::Stream>,
     dead: Arc<AtomicBool>,
 ) {
     let mut pending_open: Option<oneshot::Sender<io::Result<yamux::Stream>>> = None;
-    let mut buffered_inbound: Option<yamux::Stream> = None;
     loop {
-        // 有待交付的入站流:等接收方取走(背压)。
-        if let Some(stream) = buffered_inbound.take() {
-            if accept_tx.send(stream).await.is_err() {
-                break;
-            }
-        }
-        let ev = std::future::poll_fn(|cx| {
+        // 返回 true = 终结(错误);false 不会出现,park 以 Pending 表达
+        let fatal = std::future::poll_fn(|cx| {
             // 批量收集开流请求:高并发建连(1024+)时逐请求一轮循环会把
-            // 每次开流摊到一次 socket 轮询上,建连 p99 恶化到秒级;
-            // 一轮最多取 64 个请求逐个开流,摊薄驱动循环开销
+            // 每次开流摊到一次驱动上,建连 p99 恶化到秒级;一轮最多取
+            // 64 个请求逐个开流,摊薄驱动循环开销(同旧单任务 driver)
             let mut batch = 0;
             while pending_open.is_none() && batch < 64 {
                 match open_rx.poll_recv(cx) {
                     Poll::Ready(Some(req)) => {
-                        match conn.poll_new_outbound(cx) {
+                        match send_half.poll_new_outbound(cx) {
                             Poll::Ready(Ok(s)) => {
                                 let _ = req.send(Ok(s));
                             }
                             Poll::Ready(Err(e)) => {
-                                let _ = req.send(Err(io::Error::other(format!("yamux: {e}"))));
+                                let _ = req.send(Err(other(&format!("yamux: {e}"))));
                                 dead.store(true, Ordering::Relaxed);
-                                return Poll::Ready(Ev::Done);
+                                return Poll::Ready(true);
                             }
                             Poll::Pending => {
                                 pending_open = Some(req);
@@ -846,50 +844,44 @@ async fn driver(
                     }
                     // open_tx 全部释放:流句柄不持有 mux 引用,连接仍需
                     // 继续服务存量流直至对端/IO 结束 —— 与旧语义一致,忽略
-                    Poll::Ready(None) => break,
-                    Poll::Pending => break,
+                    Poll::Ready(None) | Poll::Pending => break,
                 }
             }
-            if batch > 0 {
-                // 本轮已处理开流批,先让外层循环走一遍(避免饿死 accept 交付)
-                return Poll::Ready(Ev::Batch(batch));
-            }
+            // ACK backlog 门控的挂起请求:每轮重试(ACK 到达经共享 waker
+            // 唤醒本任务)
             if let Some(req) = pending_open.take() {
-                match conn.poll_new_outbound(cx) {
+                match send_half.poll_new_outbound(cx) {
                     Poll::Ready(Ok(s)) => {
                         let _ = req.send(Ok(s));
                     }
                     Poll::Ready(Err(e)) => {
-                        let _ = req.send(Err(io::Error::other(format!("yamux: {e}"))));
+                        let _ = req.send(Err(other(&format!("yamux: {e}"))));
                         dead.store(true, Ordering::Relaxed);
-                        return Poll::Ready(Ev::Done);
+                        return Poll::Ready(true);
                     }
                     Poll::Pending => {
                         pending_open = Some(req);
                     }
                 }
             }
-            match conn.poll_next_inbound(cx) {
-                Poll::Ready(Some(Ok(s))) => Poll::Ready(Ev::Inbound(s)),
-                Poll::Ready(Some(Err(e))) => {
-                    tracing::debug!(error = %e, "yamux inbound error");
+            match send_half.poll(cx) {
+                Poll::Ready(Err(e)) => {
+                    tracing::debug!(error = %e, "yamux send driver error");
                     dead.store(true, Ordering::Relaxed);
-                    Poll::Ready(Ev::Done)
+                    return Poll::Ready(true);
                 }
-                Poll::Ready(None) => {
+                // Ready(Ok(())) 防御分支:发送半不会正常终结,按终结处理
+                Poll::Ready(Ok(())) => {
                     dead.store(true, Ordering::Relaxed);
-                    Poll::Ready(Ev::Done)
+                    return Poll::Ready(true);
                 }
-                Poll::Pending => Poll::Pending,
+                Poll::Pending => {}
             }
+            Poll::Pending
         })
         .await;
-        match ev {
-            Ev::Batch(_) => {}
-            Ev::Inbound(s) => {
-                buffered_inbound = Some(s);
-            }
-            Ev::Done => break,
+        if fatal {
+            break;
         }
     }
     dead.store(true, Ordering::Relaxed);
@@ -899,6 +891,29 @@ async fn driver(
     while let Ok(req) = open_rx.try_recv() {
         let _ = req.send(Err(other("mux connection closed")));
     }
+}
+
+/// 接收任务:解帧+派发;新流入 `accept_tx`(容量 256 背压——接收阻塞
+/// 只停读侧任务,不影响发送任务)。EOF/错误 → 置 `dead`。
+async fn recv_driver(
+    mut recv_half: yamux::RecvHalf<YamuxCarrier>,
+    accept_tx: mpsc::Sender<yamux::Stream>,
+    dead: Arc<AtomicBool>,
+) {
+    loop {
+        let inbound = match std::future::poll_fn(|cx| recv_half.poll(cx)).await {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
+                tracing::debug!(error = %e, "yamux inbound error");
+                break;
+            }
+            None => break,
+        };
+        if accept_tx.send(inbound).await.is_err() {
+            break;
+        }
+    }
+    dead.store(true, Ordering::Relaxed);
 }
 
 /// 服务端:把已建立的字节流包装为 Multiplexer(multiplex=true → yamux 服务端)。

@@ -37,6 +37,7 @@ use std::collections::VecDeque;
 use std::task::{Context, Waker};
 use std::{fmt, sync::Arc, task::Poll};
 
+pub use halves::{RecvHalf, SendHalf};
 pub use stream::{Packet, State, Stream, StreamReadHalf, StreamWriteHalf};
 
 /// Next connection identifier, used for debug logging.
@@ -103,8 +104,12 @@ pub struct Connection<T> {
 
 impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Connection<T> {
     pub fn new(socket: T, cfg: Config, mode: Mode) -> Self {
+        // Round-D:延迟物化——新建连接先持原始载体,首个 poll 才构造
+        // `Active`(未拆分路径行为不变:物化即走既有 Active::new)。
+        // `into_halves` 由此取回原始载体做收/发拆分(Active 的 fused
+        // socket 不可逆,拆分必须在物化前)。
         Self {
-            inner: ConnectionState::Active(Active::new(socket, cfg, mode)),
+            inner: ConnectionState::Init(socket, cfg, mode),
         }
     }
 
@@ -114,6 +119,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Connection<T> {
     pub fn poll_new_outbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
         loop {
             match std::mem::replace(&mut self.inner, ConnectionState::Poisoned) {
+                ConnectionState::Init(socket, cfg, mode) => {
+                    self.inner = ConnectionState::Active(Active::new(socket, cfg, mode));
+                    continue;
+                }
                 ConnectionState::Active(mut active) => match active.poll_new_outbound(cx) {
                     Poll::Ready(Ok(stream)) => {
                         self.inner = ConnectionState::Active(active);
@@ -167,6 +176,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Connection<T> {
     pub fn poll_next_inbound(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Stream>>> {
         loop {
             match std::mem::replace(&mut self.inner, ConnectionState::Poisoned) {
+                ConnectionState::Init(socket, cfg, mode) => {
+                    self.inner = ConnectionState::Active(Active::new(socket, cfg, mode));
+                    continue;
+                }
                 ConnectionState::Active(mut active) => match active.poll(cx) {
                     Poll::Ready(Ok(stream)) => {
                         self.inner = ConnectionState::Active(active);
@@ -222,6 +235,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Connection<T> {
     pub fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         loop {
             match std::mem::replace(&mut self.inner, ConnectionState::Poisoned) {
+                ConnectionState::Init(socket, cfg, mode) => {
+                    self.inner = ConnectionState::Active(Active::new(socket, cfg, mode));
+                    continue;
+                }
                 ConnectionState::Active(active) => {
                     self.inner = ConnectionState::Closing(active.close());
                 }
@@ -265,6 +282,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Connection<T> {
 impl<T> Drop for Connection<T> {
     fn drop(&mut self) {
         match &mut self.inner {
+            ConnectionState::Init(..) => {}
             ConnectionState::Active(active) => active.drop_all_streams(),
             ConnectionState::Closing(_) => {}
             ConnectionState::Cleanup(_) => {}
@@ -275,6 +293,9 @@ impl<T> Drop for Connection<T> {
 }
 
 enum ConnectionState<T> {
+    /// 新建未激活:载体/配置/模式原样持有,首个 poll 物化为 `Active`
+    /// (Round-D 拆分支持,见 [`Connection::into_halves`])。
+    Init(T, Config, Mode),
     /// The connection is alive and healthy.
     Active(Active<T>),
     /// Our user requested to shutdown the connection, we are working on it.
@@ -290,6 +311,7 @@ enum ConnectionState<T> {
 impl<T> fmt::Debug for ConnectionState<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ConnectionState::Init(..) => write!(f, "Init"),
             ConnectionState::Active(_) => write!(f, "Active"),
             ConnectionState::Closing(_) => write!(f, "Closing"),
             ConnectionState::Cleanup(_) => write!(f, "Cleanup"),
@@ -1025,6 +1047,900 @@ impl<T> Active<T> {
             if let Some(w) = shared.writer.take() {
                 w.wake()
             }
+        }
+    }
+}
+
+/// Connection 拆分收/发双半(Round-D,rabbithole 专用;先例
+/// [`Stream::into_halves`])。
+///
+/// 对齐 Go yamux 的 `go s.recv()` / `go s.send()` 双 goroutine 模型:收
+/// (解帧+派发)与发(取命令+编帧+写出)由两个任务独立 poll,物理并行。
+/// 未拆分路径([`Active`])不受影响;拆分后的发送侧 poll **不含** Round-A/C
+/// 的公平调度读探测与批量排空——读任务物理独立,无需写侧让位。
+///
+/// 共享状态经 [`halves`::ConnShared]:锁只护数据结构,临界区内无 await、
+/// 无载体 IO;载体访问经 [`halves`::SplitSocket] 的 futures 原生互斥串行,
+/// 锁粒度 = 单次载体操作。错误双向传播(要点 1):任一半的 IO 错误/EOF
+/// 进入共享错误槽并唤醒对端 park 点;接收侧压来的 Pong/GoAway 帧与 rtt
+/// ping 的发送优先级不低于未拆分路径(要点 2)。
+mod halves {
+    use super::*;
+    use crate::{FrameDecodeError, Writev2};
+    use futures::ready;
+    use futures::{AsyncRead, AsyncWrite};
+    use std::{io, pin::Pin};
+
+    /// 载体拆分插座:单一 IO 经 futures 原生互斥(`futures::lock::Mutex`,
+    /// waker 传递正确)供收/发两个任务分别做读/写。BiLock 的语义等价物
+    /// (futures 的 `BiLock`/`WriteHalf` 需要未启用的 `bilock`+`unstable`
+    /// feature,Cargo.toml 不在本次改动范围)。`poll_write2` 在锁内委托
+    /// `T::poll_write2`,保持「帧头+帧体一次向量写」(要点 6)。
+    pub(crate) struct SplitSocket<T> {
+        io: Arc<futures::lock::Mutex<T>>,
+    }
+
+    // 手写 Clone:derive 会给 T 加 Clone 约束,这里只克隆 Arc。
+    impl<T> Clone for SplitSocket<T> {
+        fn clone(&self) -> Self {
+            SplitSocket {
+                io: self.io.clone(),
+            }
+        }
+    }
+    pub(crate) fn split_socket<T>(io: T) -> SplitSocket<T> {
+        SplitSocket {
+            io: Arc::new(futures::lock::Mutex::new(io)),
+        }
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for SplitSocket<T> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let mut guard = ready!(this.io.lock().poll_unpin(cx));
+            Pin::new(&mut *guard).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: AsyncWrite + Writev2 + Unpin> AsyncWrite for SplitSocket<T> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Writev2::poll_write2(self, cx, &[], buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let mut guard = ready!(this.io.lock().poll_unpin(cx));
+            Pin::new(&mut *guard).poll_flush(cx)
+        }
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let mut guard = ready!(this.io.lock().poll_unpin(cx));
+            Pin::new(&mut *guard).poll_close(cx)
+        }
+    }
+
+    impl<T: AsyncWrite + Writev2 + Unpin> Writev2 for SplitSocket<T> {
+        fn poll_write2(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            a: &[u8],
+            b: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let mut guard = ready!(this.io.lock().poll_unpin(cx));
+            Pin::new(&mut *guard).poll_write2(cx, a, b)
+        }
+    }
+
+    /// 双半共享的连接状态。
+    ///
+    /// 锁纪律(要点 3):所有 parking_lot Mutex 临界区内只操作数据结构,
+    /// 无 await、无载体 IO、无跨锁回调;固定加锁顺序
+    /// `streams → stream::Shared / new_receivers → send_waker`,发送侧
+    /// 只单独取叶锁,不构成环路。
+    pub(crate) struct ConnShared {
+        id: Id,
+        mode: Mode,
+        config: Arc<Config>,
+        /// 流表:收侧(入站建流/数据派发/RST)与发侧(开流/on_drop_stream/
+        /// ACK backlog)共同读写。
+        streams: Mutex<IntMap<StreamId, Arc<Mutex<stream::Shared>>>>,
+        /// 连接级接收窗预算累计(建流时传引用,本就是 Arc)。
+        accumulated_max_stream_windows: Arc<Mutex<usize>>,
+        /// recv → send 帧队列(Pong/GoAway):发送优先级最高(要点 2)。
+        to_send: Mutex<VecDeque<Frame<()>>>,
+        /// 接收侧(入站建流)注册的新流命令接收器:发送半 poll 时收编入
+        /// `SelectAll`。
+        new_receivers: Mutex<VecDeque<(StreamId, mpsc::Receiver<StreamCommand>)>>,
+        /// 错误槽:首个错误生效;存重建副本(原始错误由产生侧直接返回,
+        /// 见 [`make_shadow`])。
+        error: Mutex<Option<ConnectionError>>,
+        /// 发送半 park 点:压帧/置错/注册新接收器时唤醒。
+        send_waker: Mutex<Option<Waker>>,
+        /// 接收半 park 点:发送侧置错时唤醒(要点 1)。
+        recv_waker: Mutex<Option<Waker>>,
+        /// ACK backlog 门控的 open_stream 等待者(发侧登记,收侧 ACK 唤醒)。
+        new_outbound_stream_waker: Mutex<Option<Waker>>,
+    }
+
+    impl ConnShared {
+        fn new(id: Id, mode: Mode, config: Config) -> Self {
+            ConnShared {
+                id,
+                mode,
+                config: Arc::new(config),
+                streams: Mutex::new(IntMap::default()),
+                accumulated_max_stream_windows: Default::default(),
+                to_send: Mutex::new(VecDeque::new()),
+                new_receivers: Mutex::new(VecDeque::new()),
+                error: Mutex::new(None),
+                send_waker: Mutex::new(None),
+                recv_waker: Mutex::new(None),
+                new_outbound_stream_waker: Mutex::new(None),
+            }
+        }
+
+        /// 置共享错误(首错生效)并唤醒两个半的 park 点与 backlog 等待者
+        /// (要点 1:另一半个下次 poll 立即可见,不得死等)。
+        fn set_error(&self, e: ConnectionError) {
+            let mut slot = self.error.lock();
+            if slot.is_some() {
+                return;
+            }
+            *slot = Some(e);
+            drop(slot);
+            if let Some(w) = self.send_waker.lock().take() {
+                w.wake()
+            }
+            if let Some(w) = self.recv_waker.lock().take() {
+                w.wake()
+            }
+            if let Some(w) = self.new_outbound_stream_waker.lock().take() {
+                w.wake()
+            }
+        }
+
+        /// 观察侧取错误(一次性)。错误产生侧自身直接返回原始错误、不经此
+        /// 槽;最多一个对端观察者,取走即空。
+        fn take_error(&self) -> Option<ConnectionError> {
+            self.error.lock().take()
+        }
+
+        /// 接收侧压来的待发帧(Pong/GoAway):压入即唤醒发送半。
+        fn push_to_send(&self, f: Frame<()>) {
+            self.to_send.lock().push_back(f);
+            if let Some(w) = self.send_waker.lock().take() {
+                w.wake()
+            }
+        }
+
+        fn pop_to_send(&self) -> Option<Frame<()>> {
+            self.to_send.lock().pop_front()
+        }
+
+        /// 发送半 park 前的复查项:接收侧压来的帧/新接收器/错误。
+        fn has_send_work(&self) -> bool {
+            !self.to_send.lock().is_empty()
+                || !self.new_receivers.lock().is_empty()
+                || self.error.lock().is_some()
+        }
+
+        /// 入站建流:注册命令接收器并唤醒发送半收编。
+        fn push_new_receiver(&self, id: StreamId, r: mpsc::Receiver<StreamCommand>) {
+            self.new_receivers.lock().push_back((id, r));
+            if let Some(w) = self.send_waker.lock().take() {
+                w.wake()
+            }
+        }
+
+        fn set_send_waker(&self, w: &Waker) {
+            *self.send_waker.lock() = Some(w.clone());
+        }
+
+        fn set_recv_waker(&self, w: &Waker) {
+            *self.recv_waker.lock() = Some(w.clone());
+        }
+
+        /// 等价 [`Active::drop_all_streams`](要点 4):Closed + 唤醒全部流
+        /// 的 reader/writer waker,使其见到错误而非死等。已缓冲数据仍可读
+        /// (读路径缓冲优先)。
+        fn drop_all_streams(&self) {
+            let streams: Vec<_> = self.streams.lock().drain().collect();
+            for (id, s) in streams {
+                let mut shared = s.lock();
+                shared.update_state(self.id, id, State::Closed);
+                if let Some(w) = shared.reader.take() {
+                    w.wake()
+                }
+                if let Some(w) = shared.writer.take() {
+                    w.wake()
+                }
+            }
+        }
+    }
+
+    /// 非错误持有侧观察到的重建副本:`io::Error` 不可 Clone,以 Display
+    /// 语义等价的方式重建;单元变体原样保留(EOF → Closed 精确传递)。
+    /// 原始错误始终由产生侧直接返回其调用者(对齐 B4)。
+    fn make_shadow(e: &ConnectionError) -> ConnectionError {
+        match e {
+            ConnectionError::Io(err) => ConnectionError::Io(io::Error::other(err.to_string())),
+            ConnectionError::Decode(err) => {
+                ConnectionError::Decode(FrameDecodeError::Io(io::Error::other(err.to_string())))
+            }
+            ConnectionError::Closed => ConnectionError::Closed,
+            ConnectionError::NoMoreStreamIds => ConnectionError::NoMoreStreamIds,
+            ConnectionError::TooManyStreams => ConnectionError::TooManyStreams,
+            ConnectionError::InvalidWindowUpdate => ConnectionError::InvalidWindowUpdate,
+        }
+    }
+
+    impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Connection<T> {
+        /// 拆分收/发双半(rabbithole 专用;先例 [`Stream::into_halves`])。
+        /// 两个半可由不同任务独立 poll(收:解帧+派发;发:取命令+编帧+
+        /// 写出),对齐 Go yamux 的 `go s.recv()` / `go s.send()`。
+        ///
+        /// 仅支持未激活的连接(`Connection::new` 之后、任何 poll 之前):
+        /// 激活后载体已并入未拆分路径的 fused socket,不可取回。
+        pub fn into_halves(mut self) -> (RecvHalf<T>, SendHalf<T>) {
+            let inner = std::mem::replace(&mut self.inner, ConnectionState::Poisoned);
+            drop(self); // Poisoned 分支无 drop_all_streams 副作用
+            match inner {
+                ConnectionState::Init(socket, cfg, mode) => {
+                    let id = Id::next();
+                    log::debug!("new connection: {id} ({mode:?}) [split halves]");
+                    let shared = Arc::new(ConnShared::new(id, mode, cfg));
+                    let split = split_socket(socket);
+                    let rtt = rtt::Rtt::new();
+                    (
+                        RecvHalf {
+                            socket: frame::Io::new(id, split.clone()).fuse(),
+                            shared: shared.clone(),
+                            rtt: rtt.clone(),
+                            finished: false,
+                        },
+                        SendHalf {
+                            socket: frame::Io::new(id, split).fuse(),
+                            shared,
+                            stream_receivers: SelectAll::default(),
+                            next_id: match mode {
+                                Mode::Client => 1,
+                                Mode::Server => 2,
+                            },
+                            pending_write_frame: None,
+                            rtt,
+                            finished: false,
+                        },
+                    )
+                }
+                _ => panic!(
+                    "into_halves requires an unpolled connection \
+                     (between Connection::new and the first poll)"
+                ),
+            }
+        }
+    }
+
+    /// Connection 的接收半:载体读侧。解帧、`on_frame` 派发入各流 staging、
+    /// 交付新入站流;Ping → 向发送队列压 Pong;Terminate → 压 GoAway;
+    /// EOF/错误 → 记共享错误并唤醒发送侧。
+    pub struct RecvHalf<T> {
+        socket: Fuse<frame::Io<SplitSocket<T>>>,
+        shared: Arc<ConnShared>,
+        rtt: rtt::Rtt,
+        finished: bool,
+    }
+
+    impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> RecvHalf<T> {
+        /// 驱动接收:交付新入站流;`Ready(None)` = EOF;`Ready(Some(Err))`
+        /// = IO/协议错误。错误只交付一次,此后收敛为 `Ready(None)`
+        /// (对齐未拆分 `Connection::poll_next_inbound` 的状态机语义)。
+        pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Stream>>> {
+            loop {
+                if self.finished {
+                    return Poll::Ready(None);
+                }
+                if let Some(e) = self.shared.take_error() {
+                    self.shared.drop_all_streams();
+                    self.finished = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                match self.socket.poll_next_unpin(cx) {
+                    Poll::Ready(Some(Ok(frame))) => match self.on_frame(frame) {
+                        Ok(Action::None) => {}
+                        Ok(Action::New(stream)) => {
+                            log::trace!("{}: new inbound {}", self.shared.id, stream);
+                            return Poll::Ready(Some(Ok(stream)));
+                        }
+                        Ok(Action::Ping(f)) => {
+                            log::trace!("{}/{}: pong", self.shared.id, f.header().stream_id());
+                            self.shared.push_to_send(f.into());
+                        }
+                        Ok(Action::Terminate(f)) => {
+                            log::trace!("{}: sending term", self.shared.id);
+                            self.shared.push_to_send(f.into());
+                        }
+                        Err(e) => return Poll::Ready(Some(Err(self.fatal(e)))),
+                    },
+                    Poll::Ready(Some(Err(e))) => {
+                        let e: ConnectionError = e.into();
+                        return Poll::Ready(Some(Err(self.fatal(e))));
+                    }
+                    Poll::Ready(None) => {
+                        self.fatal(ConnectionError::Closed);
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => {
+                        // park 前登记 waker 并复查:发送侧错误不丢唤醒(要点 1)
+                        self.shared.set_recv_waker(cx.waker());
+                        if self.shared.error.lock().is_some() {
+                            continue;
+                        }
+                        return Poll::Pending;
+                    }
+                }
+            }
+        }
+
+        fn fatal(&mut self, e: ConnectionError) -> ConnectionError {
+            self.shared.set_error(make_shadow(&e));
+            self.shared.drop_all_streams();
+            self.finished = true;
+            e
+        }
+
+        /// 处理一帧:与未拆分 `Active::on_frame` 逐分支等价,操作对象换为
+        /// 共享流表/共享 waker 槽。
+        fn on_frame(&mut self, frame: Frame<()>) -> Result<Action> {
+            log::trace!("{}: received: {}", self.shared.id, frame.header());
+
+            if frame.header().flags().contains(header::ACK)
+                && matches!(frame.header().tag(), Tag::Data | Tag::WindowUpdate)
+            {
+                let id = frame.header().stream_id();
+                {
+                    let streams = self.shared.streams.lock();
+                    if let Some(stream) = streams.get(&id) {
+                        stream.lock().update_state(
+                            self.shared.id,
+                            id,
+                            State::Open { acknowledged: true },
+                        );
+                    }
+                }
+                if let Some(waker) = self.shared.new_outbound_stream_waker.lock().take() {
+                    waker.wake();
+                }
+            }
+
+            let action = match frame.header().tag() {
+                Tag::Data => self.on_data(frame.into_data()),
+                Tag::WindowUpdate => self.on_window_update(&frame.into_window_update()),
+                Tag::Ping => self.on_ping(&frame.into_ping()),
+                Tag::GoAway => return Err(ConnectionError::Closed),
+            };
+            Ok(action)
+        }
+
+        fn on_data(&mut self, frame: Frame<Data>) -> Action {
+            let stream_id = frame.header().stream_id();
+
+            if frame.header().flags().contains(header::RST) {
+                // stream reset
+                let streams = self.shared.streams.lock();
+                if let Some(s) = streams.get(&stream_id) {
+                    let mut shared = s.lock();
+                    shared.update_state(self.shared.id, stream_id, State::Closed);
+                    if let Some(w) = shared.reader.take() {
+                        w.wake()
+                    }
+                    if let Some(w) = shared.writer.take() {
+                        w.wake()
+                    }
+                }
+                return Action::None;
+            }
+
+            let is_finish = frame.header().flags().contains(header::FIN); // half-close
+
+            if frame.header().flags().contains(header::SYN) {
+                // new stream
+                if !self.is_valid_remote_id(stream_id, Tag::Data) {
+                    log::error!("{}: invalid stream id {}", self.shared.id, stream_id);
+                    return Action::Terminate(Frame::protocol_error());
+                }
+                {
+                    // 存在性/上限校验(入站流 id 只由本任务插入,与发送侧
+                    // on_drop_stream 的 remove 无检查-插入竞态)
+                    let streams = self.shared.streams.lock();
+                    if streams.contains_key(&stream_id) {
+                        log::error!("{}/{}: stream already exists", self.shared.id, stream_id);
+                        return Action::Terminate(Frame::protocol_error());
+                    }
+                    if streams.len() == self.shared.config.max_num_streams {
+                        log::error!("{}: maximum number of streams reached", self.shared.id);
+                        return Action::Terminate(Frame::internal_error());
+                    }
+                }
+                if frame.body().len() > DEFAULT_CREDIT as usize {
+                    log::error!(
+                        "{}/{}: 1st body of stream exceeds default credit",
+                        self.shared.id,
+                        stream_id
+                    );
+                    return Action::Terminate(Frame::protocol_error());
+                }
+                let stream = self.make_new_inbound_stream(stream_id, DEFAULT_CREDIT);
+                {
+                    let mut shared = stream.shared();
+                    if is_finish {
+                        shared.update_state(self.shared.id, stream_id, State::RecvClosed);
+                    }
+                    if let Err(_err) = shared.consume_receive_window(frame.body_len()) {
+                        log::error!(
+                            "{}/{}: 1st body of stream exceeds default credit",
+                            self.shared.id,
+                            stream_id
+                        );
+                        return Action::Terminate(Frame::protocol_error());
+                    }
+                    shared.buffer.push(frame.into_body());
+                }
+                self.shared
+                    .streams
+                    .lock()
+                    .insert(stream_id, stream.clone_shared());
+                return Action::New(stream);
+            }
+
+            {
+                let streams = self.shared.streams.lock();
+                if let Some(s) = streams.get(&stream_id) {
+                    let mut shared = s.lock();
+
+                    if let Err(_err) = shared.consume_receive_window(frame.body_len()) {
+                        log::error!(
+                            "{}/{}: frame body larger than window of stream",
+                            self.shared.id,
+                            stream_id
+                        );
+                        return Action::Terminate(Frame::protocol_error());
+                    }
+
+                    if is_finish {
+                        shared.update_state(self.shared.id, stream_id, State::RecvClosed);
+                    }
+
+                    shared.buffer.push(frame.into_body());
+                    if let Some(w) = shared.reader.take() {
+                        w.wake()
+                    }
+                } else {
+                    log::trace!(
+                        "{}/{}: data frame for unknown stream, possibly dropped earlier: {:?}",
+                        self.shared.id,
+                        stream_id,
+                        frame
+                    );
+                    // 与未拆分路径一致:不视为协议违规、不回 RST(仍可能有
+                    // 该流在途命令,见 paritytech/yamux#110)。
+                }
+            }
+
+            Action::None
+        }
+
+        fn on_window_update(&mut self, frame: &Frame<WindowUpdate>) -> Action {
+            let stream_id = frame.header().stream_id();
+
+            if frame.header().flags().contains(header::RST) {
+                // stream reset
+                let streams = self.shared.streams.lock();
+                if let Some(s) = streams.get(&stream_id) {
+                    let mut shared = s.lock();
+                    shared.update_state(self.shared.id, stream_id, State::Closed);
+                    if let Some(w) = shared.reader.take() {
+                        w.wake()
+                    }
+                    if let Some(w) = shared.writer.take() {
+                        w.wake()
+                    }
+                }
+                return Action::None;
+            }
+
+            let is_finish = frame.header().flags().contains(header::FIN); // half-close
+
+            if frame.header().flags().contains(header::SYN) {
+                // new stream
+                if !self.is_valid_remote_id(stream_id, Tag::WindowUpdate) {
+                    log::error!("{}: invalid stream id {}", self.shared.id, stream_id);
+                    return Action::Terminate(Frame::protocol_error());
+                }
+                {
+                    let streams = self.shared.streams.lock();
+                    if streams.contains_key(&stream_id) {
+                        log::error!("{}/{}: stream already exists", self.shared.id, stream_id);
+                        return Action::Terminate(Frame::protocol_error());
+                    }
+                    if streams.len() == self.shared.config.max_num_streams {
+                        log::error!("{}: maximum number of streams reached", self.shared.id);
+                        return Action::Terminate(Frame::protocol_error());
+                    }
+                }
+
+                let Some(credit) = frame.header().credit().checked_add(DEFAULT_CREDIT) else {
+                    log::error!("{}: header contains invalid credit", self.shared.id);
+                    return Action::Terminate(Frame::protocol_error());
+                };
+                let stream = self.make_new_inbound_stream(stream_id, credit);
+
+                if is_finish {
+                    stream
+                        .shared()
+                        .update_state(self.shared.id, stream_id, State::RecvClosed);
+                }
+                self.shared
+                    .streams
+                    .lock()
+                    .insert(stream_id, stream.clone_shared());
+                return Action::New(stream);
+            }
+
+            {
+                let streams = self.shared.streams.lock();
+                if let Some(s) = streams.get(&stream_id) {
+                    let mut shared = s.lock();
+                    if let Err(err) = shared.increase_send_window_by(frame.header().credit()) {
+                        log::error!(
+                            "{}/{}: could not increase the send window, {err}",
+                            self.shared.id,
+                            stream_id
+                        );
+                        return Action::Terminate(Frame::protocol_error());
+                    }
+                    if is_finish {
+                        shared.update_state(self.shared.id, stream_id, State::RecvClosed);
+
+                        if let Some(w) = shared.reader.take() {
+                            w.wake()
+                        }
+                    }
+                    if let Some(w) = shared.writer.take() {
+                        w.wake()
+                    }
+                } else {
+                    log::trace!(
+                        "{}/{}: window update for unknown stream, possibly dropped earlier: {:?}",
+                        self.shared.id,
+                        stream_id,
+                        frame
+                    );
+                    // 与未拆分路径一致:不视为协议违规、不回 RST
+                    //(paritytech/yamux#110)。
+                }
+            }
+
+            Action::None
+        }
+
+        fn on_ping(&mut self, frame: &Frame<Ping>) -> Action {
+            let stream_id = frame.header().stream_id();
+            if frame.header().flags().contains(header::ACK) {
+                return self.rtt.handle_pong(frame.id());
+            }
+            if stream_id == CONNECTION_ID || self.shared.streams.lock().contains_key(&stream_id) {
+                let mut hdr = Header::ping(frame.header().id());
+                hdr.ack();
+                return Action::Ping(Frame::new(hdr));
+            }
+            log::debug!(
+                "{}/{}: ping for unknown stream, possibly dropped earlier: {:?}",
+                self.shared.id,
+                stream_id,
+                frame
+            );
+            // 与未拆分路径一致:不视为协议违规、不回 RST(paritytech/yamux#110)。
+            Action::None
+        }
+
+        fn is_valid_remote_id(&self, id: StreamId, tag: Tag) -> bool {
+            if tag == Tag::Ping || tag == Tag::GoAway {
+                return id.is_session();
+            }
+            match self.shared.mode {
+                Mode::Client => id.is_server(),
+                Mode::Server => id.is_client(),
+            }
+        }
+
+        fn make_new_inbound_stream(&self, id: StreamId, credit: u32) -> Stream {
+            let (sender, receiver) = mpsc::channel(10); // 10 is an arbitrary number.
+            self.shared.push_new_receiver(id, receiver);
+            Stream::new_inbound(
+                id,
+                self.shared.id,
+                self.shared.config.clone(),
+                credit,
+                sender,
+                self.rtt.clone(),
+                self.shared.accumulated_max_stream_windows.clone(),
+            )
+        }
+    }
+
+    impl<T> Drop for RecvHalf<T> {
+        fn drop(&mut self) {
+            // 要点 4:接收半弃置 → 共享错误置 Closed,唤醒发送侧。
+            self.shared.set_error(ConnectionError::Closed);
+        }
+    }
+
+    /// Connection 的发送半:载体写侧。`poll_new_outbound` 开流(分配 id、
+    /// 注册流,建流即授信照旧走流命令通道);`poll` 驱动写路径——接收侧
+    /// 压来的 Pong/GoAway、rtt ping、各流命令帧(`stream_receivers`)、
+    /// 部分写/flush;流通道关闭 → `on_drop_stream`(RST/FIN)。不含
+    /// Round-A/C 公平调度读探测(读任务物理独立,无需写侧让位)。
+    pub struct SendHalf<T> {
+        socket: Fuse<frame::Io<SplitSocket<T>>>,
+        shared: Arc<ConnShared>,
+        stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
+        next_id: u32,
+        pending_write_frame: Option<Frame<()>>,
+        rtt: rtt::Rtt,
+        finished: bool,
+    }
+
+    impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> SendHalf<T> {
+        /// 开新出站流(分配 id、注册流;ACK backlog 门控经共享 waker 由
+        /// 接收半的 ACK 处理唤醒——与未拆分路径同语义)。
+        pub fn poll_new_outbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
+            if self.finished {
+                return Poll::Ready(Err(ConnectionError::Closed));
+            }
+            if let Some(e) = self.shared.take_error() {
+                self.shared.drop_all_streams();
+                self.finished = true;
+                return Poll::Ready(Err(e));
+            }
+            if self.shared.streams.lock().len() >= self.shared.config.max_num_streams {
+                log::error!("{}: maximum number of streams reached", self.shared.id);
+                return Poll::Ready(Err(ConnectionError::TooManyStreams));
+            }
+            // 先登记 waker 再查 backlog:ACK 恰在登记与检查之间到达时由
+            // 复查兜住(至多多一次虚假唤醒,不丢唤醒)
+            *self.shared.new_outbound_stream_waker.lock() = Some(cx.waker().clone());
+            if self.ack_backlog() >= MAX_ACK_BACKLOG {
+                log::debug!(
+                    "{MAX_ACK_BACKLOG} streams waiting for ACK, registering task for wake-up \
+                     until remote acknowledges at least one stream"
+                );
+                return Poll::Pending;
+            }
+
+            log::trace!("{}: creating new outbound stream", self.shared.id);
+
+            let id = self.next_stream_id()?;
+            let stream = self.make_new_outbound_stream(id);
+
+            log::debug!("{}: new outbound {}", self.shared.id, stream);
+            self.shared.streams.lock().insert(id, stream.clone_shared());
+
+            Poll::Ready(Ok(stream))
+        }
+
+        /// 驱动发送路径,尽可能推进到 Pending。`Ready(Err(e))` = 本侧或
+        /// 对侧错误(终结态);此后 poll 恒 `Err(Closed)`(对齐未拆分
+        /// `Connection` 的 Closed 语义)。`Ready(Ok(()))` 不会出现
+        /// (防御:调用方按终结处理)。
+        pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+            loop {
+                if self.finished {
+                    return Poll::Ready(Err(ConnectionError::Closed));
+                }
+                if let Some(e) = self.shared.take_error() {
+                    self.shared.drop_all_streams();
+                    self.finished = true;
+                    return Poll::Ready(Err(e));
+                }
+                // 收编接收侧注册的新流命令接收器(入站流的命令通道)
+                {
+                    let mut q = self.shared.new_receivers.lock();
+                    for (id, r) in q.drain(..) {
+                        self.stream_receivers.push(TaggedStream::new(id, r));
+                    }
+                }
+                // B4 同款三态:Ready(Err) 以原始 IO 错误传播并终结
+                match self.socket.poll_ready_unpin(cx) {
+                    Poll::Ready(Ok(())) => {
+                        // Note `next_ping` does not register a waker and thus if not called
+                        // regularly (idle connection) no ping is sent. This is deliberate
+                        // as an idle connection does not need RTT measurements.
+                        //
+                        // 帧优先级(要点 2):接收侧压来的 Pong/GoAway > rtt ping
+                        // > 流命令帧——不低于未拆分路径
+                        // (pending_read_frame > ping/pending_write_frame > 流命令)。
+                        if let Some(frame) = self.shared.pop_to_send() {
+                            if let Err(e) = self.socket.start_send_unpin(frame) {
+                                return Poll::Ready(Err(self.fatal(e.into())));
+                            }
+                            continue;
+                        }
+                        if let Some(frame) = self.rtt.next_ping() {
+                            if let Err(e) = self.socket.start_send_unpin(frame.into()) {
+                                return Poll::Ready(Err(self.fatal(e.into())));
+                            }
+                            continue;
+                        }
+                        if let Some(frame) = self.pending_write_frame.take() {
+                            if let Err(e) = self.socket.start_send_unpin(frame) {
+                                return Poll::Ready(Err(self.fatal(e.into())));
+                            }
+                            continue;
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(self.fatal(e.into()))),
+                    Poll::Pending => {}
+                }
+
+                match self.socket.poll_flush_unpin(cx) {
+                    Poll::Ready(Ok(())) | Poll::Pending => {}
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(self.fatal(e.into()))),
+                }
+
+                if self.pending_write_frame.is_none() {
+                    match self.stream_receivers.poll_next_unpin(cx) {
+                        Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
+                            log::trace!(
+                                "{}/{}: sending: {}",
+                                self.shared.id,
+                                frame.header().stream_id(),
+                                frame.header()
+                            );
+                            self.pending_write_frame.replace(frame.into());
+                            continue;
+                        }
+                        Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack, syn })))) => {
+                            log::trace!("{}/{}: sending close", self.shared.id, id);
+                            self.pending_write_frame
+                                .replace(Frame::close_stream(id, ack, syn).into());
+                            continue;
+                        }
+                        Poll::Ready(Some((id, None))) => {
+                            if let Some(frame) = self.on_drop_stream(id) {
+                                log::trace!(
+                                    "{}/{}: sending: {}",
+                                    self.shared.id,
+                                    id,
+                                    frame.header()
+                                );
+                                self.pending_write_frame.replace(frame);
+                            };
+                            continue;
+                        }
+                        // SelectAll 空:无接收器可挂 waker——新接收器到达时经
+                        // shared.send_waker 唤醒后收编(park 前已登记)
+                        Poll::Ready(None) => {}
+                        Poll::Pending => {}
+                    }
+                }
+
+                // park:先登记 send waker 再复查,防接收侧压帧/置错丢唤醒
+                self.shared.set_send_waker(cx.waker());
+                if self.shared.has_send_work() {
+                    continue;
+                }
+                return Poll::Pending;
+            }
+        }
+
+        fn fatal(&mut self, e: ConnectionError) -> ConnectionError {
+            self.shared.set_error(make_shadow(&e));
+            self.shared.drop_all_streams();
+            self.finished = true;
+            e
+        }
+
+        fn make_new_outbound_stream(&mut self, id: StreamId) -> Stream {
+            let (sender, receiver) = mpsc::channel(10); // 10 is an arbitrary number.
+            self.stream_receivers.push(TaggedStream::new(id, receiver));
+
+            Stream::new_outbound(
+                id,
+                self.shared.id,
+                self.shared.config.clone(),
+                sender,
+                self.rtt.clone(),
+                self.shared.accumulated_max_stream_windows.clone(),
+            )
+        }
+
+        fn next_stream_id(&mut self) -> Result<StreamId> {
+            let proposed = StreamId::new(self.next_id);
+            self.next_id = self
+                .next_id
+                .checked_add(2)
+                .ok_or(ConnectionError::NoMoreStreamIds)?;
+            match self.shared.mode {
+                Mode::Client => assert!(proposed.is_client()),
+                Mode::Server => assert!(proposed.is_server()),
+            }
+            Ok(proposed)
+        }
+
+        /// The ACK backlog is defined as the number of outbound streams that
+        /// have not yet been acknowledged(流表共享,只读遍历)。
+        fn ack_backlog(&self) -> usize {
+            let streams = self.shared.streams.lock();
+            streams
+                .iter()
+                // Clients use odd IDs and servers use even IDs.
+                .filter(|(id, _)| match self.shared.mode {
+                    Mode::Client => id.is_client(),
+                    Mode::Server => id.is_server(),
+                })
+                .filter(|(_, s)| s.lock().is_pending_ack())
+                .count()
+        }
+
+        fn on_drop_stream(&mut self, stream_id: StreamId) -> Option<Frame<()>> {
+            let s = self
+                .shared
+                .streams
+                .lock()
+                .remove(&stream_id)
+                .expect("stream not found");
+
+            log::trace!("{}: removing dropped stream {}", self.shared.id, stream_id);
+            let frame = {
+                let mut shared = s.lock();
+                let frame = match shared.update_state(self.shared.id, stream_id, State::Closed) {
+                    // The stream was dropped without calling `poll_close`.
+                    // We reset the stream to inform the remote of the closure.
+                    State::Open { .. } => {
+                        let mut hdr = Header::data(stream_id, 0);
+                        hdr.rst();
+                        Some(Frame::new(hdr))
+                    }
+                    // The stream was dropped without calling `poll_close`.
+                    // We have already received a FIN from remote and send one
+                    // back which closes the stream for good.
+                    State::RecvClosed => {
+                        let mut hdr = Header::data(stream_id, 0);
+                        hdr.fin();
+                        Some(Frame::new(hdr))
+                    }
+                    // The stream was properly closed. We already sent our FIN frame.
+                    State::SendClosed => None,
+                    // The stream was properly closed. We already have sent our FIN frame.
+                    // The remote end has already done so in the past.
+                    State::Closed => None,
+                };
+                if let Some(w) = shared.reader.take() {
+                    w.wake()
+                }
+                if let Some(w) = shared.writer.take() {
+                    w.wake()
+                }
+                frame
+            };
+            frame.map(Into::into)
+        }
+    }
+
+    impl<T> Drop for SendHalf<T> {
+        fn drop(&mut self) {
+            // 要点 4:发送半弃置 → 等价 drop_all_streams(唤醒全部流的
+            // reader/writer waker,使其见到错误而非死等);命令通道随
+            // stream_receivers drop 断开,流侧 sender 由此报 WriteZero。
+            self.shared.drop_all_streams();
         }
     }
 }
@@ -1951,5 +2867,249 @@ mod tests {
             wus.is_empty(),
             "no WU frame may be sent under exhausted budget, got {wus:?}"
         );
+    }
+
+    // ===== Round-D 拆分守卫:收/发双半(先红后绿) =====
+    // 形态:`Connection::into_halves() -> (RecvHalf<T>, SendHalf<T>)`;
+    // `RecvHalf::poll -> Poll<Option<Result<Stream>>>`;
+    // `SendHalf::poll -> Poll<Result<()>>`、`SendHalf::poll_new_outbound`。
+
+    /// S1(红→绿):16 流 ×8×4096B 写命令已入队 + 入站 SYN|DATA 预置时,
+    /// 仅驱动接收半即可交付入站流——读推进不依赖写侧让位(未拆分路径须
+    /// 等写预算耗尽后的强制读探测)。断言交付发生在载体尚未写完风暴帧
+    /// (written < 风暴总量)之时。
+    #[test]
+    fn split_recv_delivers_while_send_commands_pending() {
+        let (socket, st) = TestSocket::new();
+        let conn = Connection::new(socket, Config::default(), Mode::Client);
+        let (mut recv_half, mut send_half) = conn.into_halves();
+
+        let mut cx = noop_cx();
+        let payload = [7u8; 4096];
+        let mut streams = Vec::new();
+        for _ in 0..16 {
+            let mut s = match send_half.poll_new_outbound(&mut cx) {
+                Poll::Ready(Ok(s)) => s,
+                other => panic!("open outbound via send half, got {other:?}"),
+            };
+            for _ in 0..8 {
+                match Pin::new(&mut s).poll_write(&mut cx, &payload) {
+                    Poll::Ready(Ok(4096)) => {}
+                    other => panic!("storm write must be ready, got {other:?}"),
+                }
+            }
+            streams.push(s);
+        }
+
+        st.borrow_mut()
+            .read_blocks
+            .lock()
+            .unwrap()
+            .push_back(syn_data_block(2, b"x"));
+
+        let inbound = match poll_fn(|cx| recv_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Ready(Some(Ok(s))) => s,
+            other => {
+                panic!("recv half must deliver inbound without send-side progress, got {other:?}")
+            }
+        };
+        assert_eq!(inbound.id(), StreamId::new(2));
+
+        let storm_total = 16 * 8 * (4096 + header::HEADER_SIZE);
+        let written = st.borrow().written.lock().unwrap().len();
+        assert!(
+            written < storm_total,
+            "inbound delivery must precede the storm drain on the wire, wrote {written}"
+        );
+    }
+
+    /// S2(红→绿):G1 等价——SendHalf 开流后驱动发送半,wire 上流 1 首帧
+    /// = SYN|WU(6MiB−256KiB),建流即授信在拆分路径照旧(规格要点 5)。
+    #[test]
+    fn split_creation_grant_syn_wu() {
+        let (socket, st) = TestSocket::new();
+        let mut cfg = Config::default();
+        cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
+        let conn = Connection::new(socket, cfg, Mode::Client);
+        let (_recv_half, mut send_half) = conn.into_halves();
+
+        let mut cx = noop_cx();
+        let _stream = match send_half.poll_new_outbound(&mut cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("open outbound via send half, got {other:?}"),
+        };
+        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("send half must park after flushing the grant, got {other:?}"),
+        }
+
+        let hdrs: Vec<_> = written_headers(&st)
+            .into_iter()
+            .filter(|h| h.stream_id() == StreamId::new(1))
+            .collect();
+        assert!(
+            !hdrs.is_empty(),
+            "creation grant must reach the wire without any write"
+        );
+        let h = &hdrs[0];
+        assert_eq!(
+            h.tag(),
+            Tag::WindowUpdate,
+            "first stream-1 frame must be a window update, got {h:?}"
+        );
+        assert!(
+            h.flags().contains(header::SYN),
+            "creation grant must carry SYN (SYN|WU), got {:?}",
+            h.flags()
+        );
+        assert_eq!(
+            h.len().val(),
+            6 * 1024 * 1024 - DEFAULT_CREDIT,
+            "grant size must be the pregrant delta 6MiB − 256KiB"
+        );
+    }
+
+    /// S3(红→绿):读侧 EOF → 共享错误;SendHalf 再 poll 立即错误返回,
+    /// 不再产出新写(规格要点 1 的 EOF 方向)。
+    #[test]
+    fn split_recv_eof_stops_sender() {
+        let (socket, st) = TestSocket::new();
+        let conn = Connection::new(socket, Config::default(), Mode::Client);
+        let (mut recv_half, mut send_half) = conn.into_halves();
+
+        let mut cx = noop_cx();
+        let mut stream = match send_half.poll_new_outbound(&mut cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("open outbound via send half, got {other:?}"),
+        };
+        match Pin::new(&mut stream).poll_write(&mut cx, b"payload") {
+            Poll::Ready(Ok(7)) => {}
+            other => panic!("queue data frame, got {other:?}"),
+        }
+
+        st.borrow().eof.store(true, Ordering::SeqCst);
+        match poll_fn(|cx| recv_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Ready(None) => {}
+            other => panic!("recv half must observe EOF, got {other:?}"),
+        }
+
+        let before = st.borrow().write_calls.load(Ordering::SeqCst);
+        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Ready(Err(e)) => {
+                assert!(
+                    matches!(e, ConnectionError::Closed),
+                    "EOF must surface as Closed, got {e:?}"
+                );
+            }
+            other => panic!("send half must fail fast after recv EOF, got {other:?}"),
+        }
+        assert_eq!(
+            st.borrow().write_calls.load(Ordering::SeqCst),
+            before,
+            "no carrier writes after recv-side EOF"
+        );
+    }
+
+    /// S4(红→绿):SendHalf 开流 → 写载荷 → 双半驱动 → 从该流读到载荷
+    /// (单连接自环,验证派发入 staging 全链)。自环回喂剥除 SYN 的流 1
+    /// Data 帧(带 SYN 会被 is_valid_remote_id 判非法——本端流 id)。
+    #[test]
+    fn split_open_write_read_roundtrip() {
+        let (socket, st) = TestSocket::new();
+        let conn = Connection::new(socket, Config::default(), Mode::Client);
+        let (mut recv_half, mut send_half) = conn.into_halves();
+
+        let mut cx = noop_cx();
+        let mut stream = match send_half.poll_new_outbound(&mut cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("open outbound via send half, got {other:?}"),
+        };
+        match Pin::new(&mut stream).poll_write(&mut cx, b"roundtrip") {
+            Poll::Ready(Ok(9)) => {}
+            other => panic!("queue data frame, got {other:?}"),
+        }
+        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("send half must park, got {other:?}"),
+        }
+
+        // 自环:把已写的流 1 Data 帧剥除 SYN 后回喂读侧
+        {
+            let bytes = st.borrow().written.lock().unwrap().clone();
+            let st_mut = st.borrow_mut();
+            let mut blocks = st_mut.read_blocks.lock().unwrap();
+            let mut off = 0;
+            while off + header::HEADER_SIZE <= bytes.len() {
+                let block: [u8; header::HEADER_SIZE] =
+                    bytes[off..off + header::HEADER_SIZE].try_into().unwrap();
+                let hdr = header::decode(&block).expect("written bytes must be valid frames");
+                let body_end = off + header::HEADER_SIZE + hdr.len().val() as usize;
+                if hdr.stream_id() == StreamId::new(1) && hdr.tag() == Tag::Data {
+                    let clean = header::Header::data(StreamId::new(1), hdr.len().val());
+                    let mut blk = header::encode(&clean).to_vec();
+                    blk.extend_from_slice(&bytes[off + header::HEADER_SIZE..body_end]);
+                    blocks.push_back(blk);
+                }
+                off = body_end;
+            }
+        }
+
+        match poll_fn(|cx| recv_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("recv half must park after dispatch, got {other:?}"),
+        }
+
+        let mut buf = [0u8; 16];
+        let n = match Pin::new(&mut stream).poll_read(&mut cx, &mut buf) {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("roundtrip payload must be readable from the stream, got {other:?}"),
+        };
+        assert_eq!(&buf[..n], b"roundtrip");
+    }
+
+    /// S5(红→绿):接收半不 poll(模拟 accept 背压满),发送半仍能持续
+    /// 写出(载体 written 增长)——接收停摆不再拖死发送(旧单任务
+    /// driver 的结构问题)。
+    #[test]
+    fn split_accept_backpressure_does_not_stall_sender() {
+        let (socket, st) = TestSocket::new();
+        let conn = Connection::new(socket, Config::default(), Mode::Client);
+        let (recv_half, mut send_half) = conn.into_halves();
+
+        let mut cx = noop_cx();
+        let mut stream = match send_half.poll_new_outbound(&mut cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("open outbound via send half, got {other:?}"),
+        };
+        let payload = [7u8; 4096];
+        for _ in 0..8 {
+            match Pin::new(&mut stream).poll_write(&mut cx, &payload) {
+                Poll::Ready(Ok(4096)) => {}
+                other => panic!("storm write must be ready, got {other:?}"),
+            }
+        }
+        // 预置未读的入站块(接收半全程不 poll)
+        st.borrow_mut()
+            .read_blocks
+            .lock()
+            .unwrap()
+            .push_back(syn_data_block(2, b"x"));
+
+        let before = st.borrow().written.lock().unwrap().len();
+        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("send half must park after draining commands, got {other:?}"),
+        }
+        let after = st.borrow().written.lock().unwrap().len();
+        assert!(
+            after - before >= 8 * (4096 + header::HEADER_SIZE),
+            "sender must keep writing while the receiver stalls, delta {}",
+            after - before
+        );
+        assert!(
+            !st.borrow().read_blocks.lock().unwrap().is_empty(),
+            "receiver side must stay untouched"
+        );
+        drop(recv_half); // 收尾:接收半弃置不影响已完成观察
     }
 }
