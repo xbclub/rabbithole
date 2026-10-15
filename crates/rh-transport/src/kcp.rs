@@ -3201,7 +3201,8 @@ mod boundary_tests {
     /// 送达且校验一致(读端有界 + 窗口重开唤醒的端到端验证)。
     #[tokio::test]
     async fn b08_public_mux_stalled_reader_backpressure_and_recovery() {
-        const TOTAL: usize = 4 * 1024 * 1024;
+        // TOTAL 必须超过 256KiB 规约初窗 + 6MiB 预授信用(≈6.25MiB),否则停读窗口内写端不会停顿
+        const TOTAL: usize = 8 * 1024 * 1024;
         const CHUNK: usize = 64 * 1024;
 
         let server_cfg = ServerTransportConfig {

@@ -729,26 +729,32 @@ impl YamuxMultiplexer {
             .min(usize::MAX as u64) as usize;
         cfg.set_max_connection_receive_window(Some(window));
         cfg.set_max_num_streams(streams);
-        // 单流吞吐:yamux 默认 16KiB 分片在 10GbE 内网下帧封装/唤醒开销过大,
-        // 提高分片让单流单次上 wire 的数据量 ×4(多流同样受益)
-        cfg.set_split_send_size(64 * 1024);
-        // 单流初始接收窗预授信(round-2,goal-repair G2/G6):
+        // 分片帽对齐 frp(2026-10-15):frp 的 fmux 无分片发送概念,帧大小
+        // 上限即发送窗(见 benchmark/runs/tcp-multiflow-frp-20261015/
+        // FRP-YAMUX-ANALYSIS.md §2.1)。上游默认 16KiB 曾提到 64KiB,
+        // 现抬到 6MiB=单流窗口界,即"不再人为分片"。数据面经 CHUNK_CAP
+        // =64KiB 块写入(mux.rs 中继路径),实际上线帧大小不变,此改动
+        // 只移除人为帽,行为等价 frp 的"写多少发多少,上限受 sendWindow"。
+        cfg.set_split_send_size(6 * 1024 * 1024);
+        // 单流初始接收窗预授信(round-2,goal-repair G2/G6;round-3 对齐 frp):
         // 【实测】round-1 三机测试床(benchmark/runs/goal-repair/round-1/
         // single-stream-medians.txt):tcp/tls/ws/wss mux 单流全部卡在
         // 1051-1225 Mbps 上行 / 1468-1962 Mbps 下行,与是否 TLS 无关
         // (tcp-mux 无 TLS 与 tls-mux 同卡);同路径 16 流 2160-2970 Mbps
         // ——每字节成本解释不了,瓶颈随"流数"摊薄,指向每流独立约束
         // (yamux 流控信用回路)。
-        // 【假设,本轮未闭合】信用回路时延 > 2×ping RTT,RTT 门控的自增窗
+        // 【假设,未闭合】信用回路时延 > 2×ping RTT,RTT 门控的自增窗
         // 不触发,单流被钳在 初窗/回路时延;本地合成 RTT 实验
         // (goal_repair_mux.rs mux_single_stream_credit_stall_under_synthetic_rtt)
         // 复现钳制机制,测试床 RTT/回路时延待下一轮实测。
-        // 【修复】接收端建流即从 2MiB 起步(受上面 256MiB 共享预算钳制),
-        // 首个读 poll 以标准窗口更新帧预授差额;发送端初窗仍 256KiB 不变
-        // ——混合版本对端只见普通 WU(线路兼容),且首个 WU 不触发 BDP
-        // 倍增(预授信不是实测吞吐)。本改动只覆盖 yamux(mux 路径),
-        // 不声称修复 nomux/QUIC/KCP。
-        cfg.set_initial_stream_receive_window(2 * 1024 * 1024);
+        // 【修复】round-2 接收端建流即从 2MiB 起步;round-3(2026-10-15)
+        // 抬到 6MiB,对齐 frp 两端同设的 fmux MaxStreamWindowSize=6MiB
+        // (FRP-YAMUX-ANALYSIS.md §2.1)。机制不变:仍受上面 256MiB 共享
+        // 预算钳制(16 流 × 6MiB = 96MiB 在预算内,额度不足仍退回 256KiB
+        // 规约保底),首个读 poll 以标准窗口更新帧预授差额;发送端初窗
+        // 仍 256KiB——对端只见普通 WU,线路兼容。本改动只覆盖 yamux
+        // (mux 路径),不声称修复 nomux/QUIC/KCP。
+        cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
         let conn: MuxConn = yamux::Connection::new(YamuxCarrier::new(io), cfg, mode);
         let (open_tx, open_rx) = mpsc::channel::<oneshot::Sender<io::Result<yamux::Stream>>>(64);
         let (accept_tx, accept_rx) = mpsc::channel::<yamux::Stream>(256);

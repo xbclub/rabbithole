@@ -798,8 +798,9 @@ async fn mux_relay_sibling_aborted_on_pump_panic() {
 // 触发,永不介入。发送端逐 64KiB 写入,被窗口卡住(2s 超时)前的累计
 // 可写字节数 == 规约初窗 256KiB + 首个 WU 授出的预授信差额。
 // 修前(无预授信,upstream 行为):首 poll 消费 1 字节 < 半窗阈值,
-// 无 WU,恒 3×64KiB = 196608;修后(2MiB 初窗):首个 WU 授出
-// 2MiB−256KiB+1,恒 31×64KiB = 2031616。断言取 ≥ 1.5MiB 下界。
+// 无 WU,恒 3×64KiB = 196608;修后(6MiB 初窗,round-3 对齐 frp):
+// 首个 WU 授出 6MiB−256KiB+1,恒 1+96×64KiB = 6291457(6MiB+1)。
+// 断言取 ≥ 5.5MiB 下界。
 // (注:接收端持续读的形态下,本地 duplex 的自增窗会把修前形态也抬到
 // ~1.75MiB——回路时延 < 2×RTT 时倍增合法触发;故必须用单次读设计
 // 把预授信与自增窗解耦。)
@@ -856,12 +857,12 @@ async fn mux_initial_window_pregrant_unlocks_single_stream() {
             written > 0,
             "初窗 256KiB 至少应容纳 3×64KiB(实际 {written},载体/实现异常)"
         );
-        eprintln!("pregrant: written={written} (唯一 WU 应授 2MiB-256KiB+1)");
+        eprintln!("pregrant: written={written} (唯一 WU 应授 6MiB-256KiB+1)");
 
         // 断言后回收 reader(abort 挂起任务,读半随任务 drop)
         reader.abort();
         assert!(
-            written >= CHUNK * 24, // ≥ 1.5MiB(修前恒 196608)
+            written >= CHUNK * 88, // ≥ 5.5MiB:钉住 6MiB 接线(回退 2MiB 接线恒 2MiB+1 必须 FAIL;修前无预授信恒 196608)
             "单流初信用必须包含预授信差额(修前 3×64KiB=196608;实际 {written})"
         );
     })
@@ -1097,11 +1098,12 @@ async fn two_hop_relay_upload_emulator() {
 // 合成 RTT 信用钳制实验(诊断,#[ignore] 显式运行,不作 CI 判据):
 // 在 RTT ≈ 2ms 的合成载体上重复预授信测试的判据(接收端单次读后停读,
 // 发送端可写总量 == 初窗 + 唯一 WU 授信)。修前(无预授信)恒
-// 196608(256KiB 初窗);修后(2MiB 初窗)恒 2031616——即 RTT 载体上
-// 单流在途窗口被预授信抬高 8 倍,持续态吞吐钳制相应从
-// 256KiB/RTT ≈ 1.0Gbps 抬到 2MiB/RTT ≈ 8Gbps(每轮窗口/RTT 静态算术;
-// 修前 1.0Gbps 与 round-1 测试床 mux 上行 1051-1225 Mbps 同量级,
-// 是一致性佐证而非因果证明——测试床回路时延与 RTT 的实测关系待下轮)。
+// 196608(256KiB 初窗);修后(6MiB 初窗,round-3 对齐 frp)恒 6291457
+// (6MiB+1)——即 RTT 载体上单流在途窗口被预授信抬高 24 倍,持续态
+// 吞吐钳制相应从 256KiB/RTT ≈ 1.0Gbps 抬到 6MiB/RTT ≈ 24Gbps
+// (每轮窗口/RTT 静态算术;修前 1.0Gbps 与 round-1 测试床 mux 上行
+// 1051-1225 Mbps 同量级,是一致性佐证而非因果证明——测试床回路时延
+// 与 RTT 的实测关系待下轮)。
 // 运行: cargo test -p rh-transport --test goal_repair_mux \
 //   mux_single_stream_credit_stall -- --ignored --nocapture
 #[tokio::test]
@@ -1157,15 +1159,15 @@ async fn mux_single_stream_credit_stall_under_synthetic_rtt() {
         //(静态算术,非本实验测量;持续吞吐另受自增窗/泵速率影响)。
         eprintln!(
             "credit-stall@rtt≈{}us: written={written} ({:.2} MiB), fill-elapsed={elapsed:?}, \
-             per-round-clamp: 256KiB/RTT≈{:.0}Mbps, 2MiB/RTT≈{:.0}Mbps",
+             per-round-clamp: 256KiB/RTT≈{:.0}Mbps, 6MiB/RTT≈{:.0}Mbps",
             DELAY.as_micros() * 2,
             written as f64 / (1024.0 * 1024.0),
             256.0 * 1024.0 * 8.0 / (2.0 * DELAY.as_secs_f64()) / 1e6,
-            2.0 * 1024.0 * 1024.0 * 8.0 / (2.0 * DELAY.as_secs_f64()) / 1e6,
+            6.0 * 1024.0 * 1024.0 * 8.0 / (2.0 * DELAY.as_secs_f64()) / 1e6,
         );
         reader.abort();
         assert!(
-            written >= CHUNK * 24, // ≥ 1.5MiB:预授信生效(修前恒 196608)
+            written >= CHUNK * 88, // ≥ 5.5MiB:预授信生效且接线为 6MiB(修前恒 196608;2MiB 接线恒 2MiB+1)
             "合成 RTT 载体上单流初信用必须跟随预授信窗口(修前 3×64KiB=196608;实际 {written})"
         );
     })
