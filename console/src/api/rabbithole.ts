@@ -1,7 +1,7 @@
 /**
  * rabbithole 管理面业务 API(后端 envelope: {code:0,data,message})。
- * 接口与类型自 web/apps/web-antd/src/api/rabbithole.ts 原样平移,契约零变更;
- * 计量/配额字段(F1/F2)后端落地前按 optional 处理,字段缺失不渲染。
+ * 接口与类型自旧版 console 原样平移,契约零变更;计量/配额字段由后端 M1/M2
+ * 提供,此处保持 optional 以兼容旧库数据。
  */
 import { httpDelete, httpGet, httpPost, httpPut } from './request';
 
@@ -44,7 +44,7 @@ export interface ServiceRow {
   healthy: boolean;
   pool_ready: number;
   plugin: null | string;
-  spec: Record<string, any>;
+  spec: Record<string, unknown>;
   /** F1 计量(M1 后端落地前不返回)。 */
   bytes_in?: number;
   bytes_out?: number;
@@ -62,7 +62,7 @@ export interface VisitorRow {
   bind_port: number;
   target_proxy_name: string;
   /** 完整 visitor spec(use_compression / secret_key 等在此读取)。 */
-  spec: Record<string, any>;
+  spec: Record<string, unknown>;
 }
 
 export interface StatsOverview {
@@ -124,10 +124,10 @@ export async function rotateClientSecret(id: string): Promise<{ secret: string }
 export async function listServices(params?: { client_id?: string }): Promise<ServiceRow[]> {
   return httpGet<ServiceRow[]>('/services', { params });
 }
-export async function createService(spec: Record<string, any>): Promise<unknown> {
+export async function createService(spec: Record<string, unknown>): Promise<unknown> {
   return httpPost('/services', spec);
 }
-export async function updateService(id: number, spec: Record<string, any>): Promise<unknown> {
+export async function updateService(id: number, spec: Record<string, unknown>): Promise<unknown> {
   return httpPut(`/services/${id}`, spec);
 }
 export async function deleteService(id: number): Promise<unknown> {
@@ -155,10 +155,10 @@ export async function batchServices(
 export async function listVisitors(params?: { client_id?: string }): Promise<VisitorRow[]> {
   return httpGet<VisitorRow[]>('/visitors', { params });
 }
-export async function createVisitor(spec: Record<string, any>): Promise<unknown> {
+export async function createVisitor(spec: Record<string, unknown>): Promise<unknown> {
   return httpPost('/visitors', spec);
 }
-export async function updateVisitor(id: number, spec: Record<string, any>): Promise<unknown> {
+export async function updateVisitor(id: number, spec: Record<string, unknown>): Promise<unknown> {
   return httpPut(`/visitors/${id}`, spec);
 }
 export async function deleteVisitor(id: number): Promise<unknown> {
@@ -237,7 +237,7 @@ export interface LimitsConfig {
 }
 
 export interface ServerConfigView {
-  config: Record<string, any>;
+  config: Record<string, unknown>;
   hot: {
     allow_ports: string[];
     log_level: string;
@@ -278,7 +278,10 @@ export async function putServerConfig(update: ServerConfigUpdate): Promise<Serve
 }
 
 /** 修改自身密码:成功后所有会话失效(后端轮换 JWT 密钥),需重新登录。 */
-export async function changePassword(oldPassword: string, newPassword: string): Promise<{ relogin: boolean }> {
+export async function changePassword(
+  oldPassword: string,
+  newPassword: string,
+): Promise<{ relogin: boolean }> {
   return httpPost('/auth/password', {
     new_password: newPassword,
     old_password: oldPassword,

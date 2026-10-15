@@ -172,3 +172,133 @@ README.md;deploy/(server/client 示例 + systemd 单元×2);.github/workflows/ci
   (上游 form-integration 时序 flake 如实披露:三连跑 1/1/0,第三次全绿)。
 - 文档:README/acceptance(§5 55 例+boot 段、§12 三轮、§2 flake 披露)/
   matrix D1/E2/design §7.1 §9.5 §13/review-log R13。
+
+## 会话 11(2026-10-12)—— console 前端整体重写:Umi Max + antd v6 → Vite + Tailwind v4 + shadcn/ui
+
+用户指令:「给 console 前端的整体 UI 一个版本并提交 PR,换成 React + shadcn/ui,
+尽量用 shadcn 组件、界面规范与交互按 shadcn 的设计规范,API 与部分逻辑复用,
+UI 全部重写,后端代码不要动」。
+
+### 决策(逐条与用户确认,共 25 问)
+- 范围:全量功能对等重写(登录 + 8 页 + 规则表单全字段矩阵 + 访问器 + 批量导入 +
+  证书 + 图表),不是骨架版。
+- 底座:Vite + React 19 + TS strict + Tailwind v4 + shadcn(new-york / neutral /
+  CSS 变量)+ lucide;**彻底移除 Umi Max / antd / ProComponents / antd-style**。
+- 主题:亮色默认 + 完整暗色 token + 顶栏切换器(首访跟随系统,localStorage 持久);
+  主色用 shadcn neutral 单色(无品牌蓝)。
+- 复用边界:平移 `api/`(request/rabbithole/auth)+ auth store + 纯 utils;把
+  **spec↔表单值组装/反解、kind 字段矩阵、状态映射**抽成无 UI 纯模块并配单测;
+  components/ 与 pages/ 全部重写。
+- 表单 shadcn Form + react-hook-form + zod;表格 shadcn data-table(TanStack Table);
+  外壳 shadcn sidebar(collapsible=icon);路由 react-router v7 library mode;
+  数据层 axios + TanStack Query + zustand(平移)。
+- 术语(写入新建的 `CONTEXT.md`):用户可见统一叫**「转发规则」**(禁用"服务/隧道/代理"
+  混用);**「客户端密钥」**(接入凭据)与**「访问密钥」**(stcp/sudp/xtcp 共享密钥)分开写。
+- 92 处 `InfoLabel` 的 ℹ 文案(R27 用户指令)**一处不少逐字平移**成 87 key 的字典。
+- 规格来源:现役代码 + `review-log` R20–R33;`CONSOLE-REWRITE-PROMPT.md` 标注**已废止**
+  (它要求的"表单填密钥 / allow_users / `/auth/login` / M1·M3 未实现需降级"全被推翻)。
+- 其它:字体改**纯系统字体栈**(删自托管 AlibabaSans 240K);响应式补全到文档 §4.6
+  (侧栏抽屉 + 表格 <768 卡片降级 + 触控 ≥44px);可选交互加 **⌘K 命令面板 / 骨架屏 /
+  表格列可见性**;规则表单用**居中 Dialog**;总览保留 R22 的**单卡分格指标条**
+  (不退回被 §2.2 批评过的"四张同质白卡");暗色做全;走查截图入库。
+
+### 交付结构
+- `console/`:Vite 工程;`src/{api,stores,lib,features,components/{ui,layout},pages,router}`。
+- `src/features/field-info.ts`:87 key 的 ℹ 文案字典(89 条文案,2 处重复合并)。
+- `src/features/services/`:types / matrix(8 kind 字段矩阵 + 9 插件子表单声明式定义)/
+  spec(组装·回读·校验)+ `__tests__/spec.test.ts`。
+- `src/components/`:proxy-list-page(参数化四页共用)、proxy-form-modal(**按矩阵泛型渲染**,
+  不手写 40 字段)、visitors-panel、secret-modal(三档接入指令)、data-table(排序/分页/
+  列可见性/行选择/骨架/空态/小屏卡片)、info-label(悬停 + **触屏点按**)、status-badge、
+  mono/mono-copy、confirm-dialog、empty-state、page-header、header-pairs-input、
+  command-palette(⌘K)、theme-toggle、brand-mark。
+
+### 关键修复(重写过程中发现并解决)
+1. **shadcn CLI 生成物导入 `cn` 包**:registry 原文用的是 `from "@/lib/utils"`,
+   CLI 4.21.4 内部改写成了新发布的 `cn` 包;已统一改回文档口径(clsx + tailwind-merge),
+   并把 CLI 顺带塞入的 `next-themes`(sonner 组件给 Next.js 用的)换成自研主题模块。
+2. **数值字段必须是 number**:后端 serde 不接受字符串;数值输入统一经 `valueAsNumber`
+   转数字、空值转 `null`(旧版靠 antd InputNumber 隐式保证)。
+3. **旧版必填校验在 antd rules 层**,`handleFinish` 里没有 → 新表单用 zod 承接
+   (name 正则、必填、域名必填),`validateServiceForm` 只管依赖编辑态的业务校验。
+4. **非法 HTML 嵌套**:ℹ 按钮曾被塞进 `<button>`(高级配置触发器)与 `<label>` 里,
+   已把 ℹ 移出并给 InfoLabel 加 `iconOnly`。
+5. **R33 的根因被结构性消除**:antd message 出口需要布局内绑定者,登录页 layout:false
+   收不到报错;新方案 `<Toaster />` 挂在应用根部、与路由无关。
+6. eslint-plugin-react-hooks v7 新规则对两处**正当**写法(轮询驱动滚动窗口、
+   一次性 seed 消费)报错,已加带中文理由的作用域豁免;shadcn 生成目录
+   (`components/ui/**`、`hooks/**`)整体豁免三条规则以保持可被 CLI 覆盖升级。
+
+### 质量门(全绿)
+prettier --check ✓;eslint **0 error**(4 warning,均为 HMR 粒度提示);tsc --noEmit ✓;
+vitest **50/50**;pnpm build ✓(JS ≈420 KB gz + CSS 15.5 KB gz,已拆 vendor)。
+
+### 验收(生产构建 + 真实后端)
+- `cargo build -p rh-server`(需 rustc 1.98.1:仓库 `rust-toolchain.toml` 钉的版本,
+  本机只有 1.92.0,已按镜像装 1.98.1)日志出现
+  `embedding web console from .../console/dist`;服务端启动日志
+  `web api up with embedded ui (static_dir not configured) files=8`。
+- **Playwright 真机走查**(空库新实例,34 张截图入库 `docs/screenshots/console-shadcn/`):
+  登录 → 八页 → 新建客户端(一次性凭据 + 三档接入指令)→ 新建 TCP 规则(含高级区)→
+  域名页多 kind + socks5 插件子表单 → ⌘K → 暗色重走 → 390px 小屏(表格卡片降级 + 侧栏抽屉)
+  → 登出二次确认 → 重新登录核对审计事件出现「已登出」→ 深链刷新 → 旧路径重定向 → 404。
+  **功能问题 0,控制台错误 0**。
+- **可编程视觉审计**(亮/暗 × 桌面/小屏 × 10 页 = 40 组合):横向溢出 0、越界 0、
+  文字裁切 0、对比度不足 0、交互元素 <24×24 为 0(修复前 ℹ 按钮 14×14、开关 18.4×32)。
+- 走查过程中修掉 5 个真实缺陷:①`FormControl` 里套 div 导致 label 关联断裂;
+  ②Radix `Select.Root` 不渲染 DOM,`FormControl` 放错位置导致下拉无可访问名;
+  ③自写 `NumberControl` 吃掉注入的 id;④`InfoLabel` 的 `onFocus` 让弹窗一打开就弹出
+  首个字段的说明浮层(且第一次 Esc 只关浮层);⑤规则表单「所属客户端」下拉选项为空
+  (矩阵里 client_id 是动态选项,不是静态 `options`)。
+### 首屏体积与秒开优化(用户反馈「产出物有点大、首页白屏」)
+- **登录页首屏**:6 个资源 1450 KB(未压缩)/ 约 440 KB gz → **2 个资源 543 KB / 162 KB gz**。
+  原先登录页会连带下载 recharts(357 KB)与 react-hook-form + zod(122 KB)。
+- **路由级懒加载**:全部 `/rabbithole/*` 页面与控制台外壳改 `React.lazy` + `Suspense`
+  (加载期给 Spinner/骨架,不再白屏);登录页保持静态引入。
+- **Provider 下移**:`QueryClientProvider` 与 `TooltipProvider` 从应用根部移到控制台外壳
+  —— 登录页不用它们,放根部会让首屏白背 93 KB(react-query)+ 一份 radix tooltip。
+- **登录页去掉 RHF + zod**:只有「两个必填」一条规则,改受控 state + 行内错误,
+  校验与交互不变;其余页面表单仍走 shadcn Form + RHF + zod。
+- **弹窗与图表按需加载**:规则表单弹窗(约 130 KB,含 RHF/zod/Form)首次打开才加载;
+  总览的 recharts 拆成独立 chunk(数据 hook 留在 `traffic-rate.ts`),指标条与事件先渲染。
+- **根因修复(重要)**:object 形式的 `rollupOptions.output.manualChunks` 会把列出的包
+  当成 chunk 入口挂进**静态依赖图**,Vite 因此给 `charts`/`query` 生成 `modulepreload`,
+  即使登录页根本不引用它们也会预加载。去掉手动分包、交给自动分包后,
+  `index.html` 只剩 CSS 一条 preload。
+- **白屏的另一半**:`#rh-boot` 原先在 `createRoot().render()` 之后**同步**移除,
+  而 render 是异步的 → 会露出一帧空白;改到 App 的 effect(首次提交后)移除。
+- 走查新增首屏体积门禁:登录页 JS ≤2 个、合计 ≤700 KB、不得出现图表/表单/外壳块。
+
+### 合并上游 v0.3.1 并移植其新增设置项
+- 上游 main 前进 2 个 commit(`c84f631` 传输层修复 + `79bb1a9` release v0.3.1),
+  其中**只改了 console/ 两个文件**且都是我们已重写覆盖的路径:
+  - `console/src/api/rabbithole.ts` —— 自动合并成功(上游新增 `LimitsConfig` /
+    `hot.limits` / `ServerConfigUpdate.limits` 已并入);
+  - `console/src/pages/settings/index.tsx` —— 冲突,取我们的 shadcn 重写版,
+    并把上游新增的**「并发与限流」九项完整移植**(校验范围与后端一致、默认值/
+    回填/提交载荷齐备、独立分节渲染,九条 ℹ 文案进 `features/field-info.ts`)。
+- 后端与上游 main **零差异**(crates/ migrations/ tests/ deploy/ vendor/ benchmark/
+  .github 全部无 diff),差异仅 `console/` 与文档。
+- 端到端验证(重编 rh-server 到 0.3.1 后):`/api/server/config` 的 `hot.limits`
+  九项与前端字段一一对应;改 128/4/8000 保存后服务端确认落库;默认池深填 999
+  被前端拦下且未写库。
+- 顺带修掉一个**触屏缺陷**:说明统一改用 Tooltip 后,触屏点按失效 ——
+  Radix Tooltip 的 trigger 对 touch 会 `pointerdown → onClose`、`click → onClose`,
+  自己不会打开还会吃掉我们同步设置的 open;改为在 pointerdown 记录按下前状态、
+  点按取反并把定态推迟到下一个宏任务。鼠标路径不受影响。
+- 教训(已自查出并修):两次出现「提交了引用方、漏了被引用方」——
+  `vite.config.ts` 与 `field-info.ts` 都曾留在工作区,导致**已提交状态类型检查失败**。
+  之后一律用**干净检出的 worktree** 验证已提交状态,而不是只看工作区。
+
+- **视觉判读未能按约定执行**:本会话模型不支持图像输入,子代理继承同一模型,
+  workflow 的 provider/model 覆盖在本会话不可用 → 已如实说明,改以可编程客观测量 + 原图交付人工过目。
+
+### 已知遗留(未在本会话改动语义,如实记录)
+- 编辑态无法关闭静态缓存 / 无法清除 `not_found_html`(旧版只在"启用/非空"时写入,
+  从不 delete)。
+- 客户端配额**无法清空**:后端 `update_client_quota` 用 `COALESCE(?n, 列)`,
+  已设的数值配额改不回"不限"(rate_limit 传空串可清空,行为不一致)。
+- 编辑态"自动分配端口"在旧版不可表达(bind_port=0 回读显示 0 且 bind_auto 恒 false);
+  新版按设计文档把 `bind_port === 0` 回读为**开关打开**并在编辑态禁用该开关。
+- 访问器目标候选是三种 kind 的并集、**不按当前 kind 过滤**(旧版注释写"同类型"但代码未过滤)。
+- `qk.visitors()` = `['visitors','all']`,失效范围比旧版 `['visitors']` 前缀窄。

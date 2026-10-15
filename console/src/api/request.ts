@@ -1,6 +1,7 @@
 import axios from 'axios';
 import type { AxiosError, AxiosRequestConfig } from 'axios';
-import { feedbackError } from '@/components/feedback';
+
+import { feedbackError } from '@/lib/feedback';
 import { useAuthStore } from '@/stores/auth';
 
 /** 后端 envelope:HTTP 200 + {code, data, message},code===0 取 data。 */
@@ -10,7 +11,7 @@ interface Envelope<T = unknown> {
   message: string;
 }
 
-/** 生产由 rh-server 同源托管 /api;开发走 umi dev proxy。 */
+/** 生产由 rh-server 同源托管 /api;开发走 vite dev proxy(见 vite.config.ts)。 */
 const API_BASE = '/api';
 
 export const LOGIN_PATH = '/user/login';
@@ -84,11 +85,19 @@ export async function httpGet<T>(url: string, config?: AxiosRequestConfig): Prom
   return (await requestClient.get(url, config)) as unknown as T;
 }
 
-export async function httpPost<T>(url: string, body?: unknown, config?: AxiosRequestConfig): Promise<T> {
+export async function httpPost<T>(
+  url: string,
+  body?: unknown,
+  config?: AxiosRequestConfig,
+): Promise<T> {
   return (await requestClient.post(url, body, config)) as unknown as T;
 }
 
-export async function httpPut<T>(url: string, body?: unknown, config?: AxiosRequestConfig): Promise<T> {
+export async function httpPut<T>(
+  url: string,
+  body?: unknown,
+  config?: AxiosRequestConfig,
+): Promise<T> {
   return (await requestClient.put(url, body, config)) as unknown as T;
 }
 

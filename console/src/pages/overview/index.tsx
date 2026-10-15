@@ -1,321 +1,377 @@
-import { listEvents, listServices, statsOverview } from '@/api/rabbithole';
-import { fmtBytes, fmtTime } from '@/utils/format';
-import { InfoLabel } from '@/components/ui';
-import { Mono, StatusBadge, proxyStatusSignal } from '@/components/ui';
 import { useQuery } from '@tanstack/react-query';
-import { PageContainer } from '@ant-design/pro-components';
-import { Button, Card, Select, Table, Tooltip } from 'antd';
-import React, { useMemo, useRef, useState } from 'react';
+import { ChevronDown, ChevronUp, Inbox, Waypoints } from 'lucide-react';
+import { Suspense, lazy, useState } from 'react';
+import type { ReactNode } from 'react';
+
+import type { ServiceRow } from '@/api/rabbithole';
+
+/**
+ * 图表按需加载:recharts 约 367 KB,是总览页最大的一块。
+ * 指标条与事件先渲染,图表随后到(期间显示骨架),避免整页等图表库。
+ */
+const TrafficRateChart = lazy(() =>
+  import('@/components/traffic-chart').then((module) => ({
+    default: module.TrafficRateChart,
+  })),
+);
+import { listEvents, listServices, statsOverview } from '@/api/rabbithole';
+import { EmptyState } from '@/components/empty-state';
+import { InfoLabel } from '@/components/info-label';
+import { Mono } from '@/components/mono';
+import { PageHeader } from '@/components/page-header';
+import { StatusBadge, eventLevelSignal, proxyStatusSignal } from '@/components/status-badge';
+import { useTrafficRateWindow } from '@/components/traffic-rate';
+import { Button } from '@/components/ui/button';
 import {
-  Area,
-  AreaChart,
-  CartesianGrid,
-  ResponsiveContainer,
-  Tooltip as RTooltip,
-  XAxis,
-  YAxis,
-} from 'recharts';
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import type { FieldInfoKey } from '@/features/field-info';
+import { fmtBytes, fmtTime } from '@/lib/format';
+import { qk } from '@/lib/query-keys';
 
-const WINDOW_POINTS = 60; // 5s × 60 = 5 分钟滚动窗口
+/** 轮询间隔:指标条 / 速率窗口 / 最近事件统一 5 秒。 */
+const POLL_MS = 5000;
+/** 最近事件拉取条数(与 qk.events 的 key 一一对应)。 */
+const EVENTS_LIMIT = 20;
+/** 事件表默认展示条数,其余点「展开全部」查看。 */
+const EVENTS_COLLAPSED = 5;
 
-interface RatePoint {
-  in: number;
-  out: number;
-  t: string;
+/**
+ * 转发规则的监听标识:TCP/UDP 是 bind_ip:bind_port;HTTP(S) 走域名/子域;
+ * 其余 kind 的 spec 段里没有域名,回落到 bind 地址(旧版此处显示占位符「—」)。
+ */
+function listenAddress(rule: ServiceRow): string {
+  const bind = `${rule.bind_ip}:${rule.bind_port}`;
+  if (rule.kind === 'tcp' || rule.kind === 'udp') return bind;
+
+  const section = rule.spec?.[rule.kind];
+  if (section !== null && typeof section === 'object') {
+    const spec = section as Record<string, unknown>;
+    const domains = spec.custom_domains;
+    const first = Array.isArray(domains) ? domains.find((d) => typeof d === 'string') : undefined;
+    if (typeof first === 'string' && first.length > 0) return first;
+    if (typeof spec.subdomain === 'string' && spec.subdomain.length > 0) return spec.subdomain;
+  }
+  return bind;
 }
 
-/** 总览(§6.2):指标条 / 流量速率图 + 隧道健康 / 最近事件;5s 轮询,失败保持上次数据。 */
-const OverviewPage: React.FC = () => {
-  // 失败不清空:TanStack Query 出错时保留上次成功数据(data 不变)
-  const statsQ = useQuery({
-    queryKey: ['stats-overview'],
-    queryFn: statsOverview,
-    refetchInterval: 5000,
-  });
-  const [level, setLevel] = useState('');
-  const eventsQ = useQuery({
-    queryKey: ['events', 20, level],
-    queryFn: () => listEvents(level ? { limit: 20, level } : { limit: 20 }),
-    refetchInterval: 5000,
-  });
-  const servicesQ = useQuery({ queryKey: ['services'], queryFn: () => listServices() });
-
-  const stats = statsQ.data;
-  const events = eventsQ.data ?? [];
-  const [eventsExpanded, setEventsExpanded] = useState(false);
-  const shownEvents = eventsExpanded ? events : events.slice(0, 5);
-
-  // 差分速率窗口:仅成功样本入列,失败期断线,不外推不补零
-  const winRef = useRef<{
-    lastIn: null | number;
-    lastOut: null | number;
-    lastTs: null | number;
-    points: RatePoint[];
-  }>({ lastIn: null, lastOut: null, lastTs: null, points: [] });
-  let curIn = 0;
-  let curOut = 0;
-  if (stats && statsQ.dataUpdatedAt !== winRef.current.lastTs) {
-    const w = winRef.current;
-    if (w.lastIn !== null && w.lastOut !== null && w.lastTs !== null) {
-      const dt = (statsQ.dataUpdatedAt - w.lastTs) / 1000;
-      if (dt > 0) {
-        curIn = Math.max(0, (stats.bytes_in - w.lastIn) / dt);
-        curOut = Math.max(0, (stats.bytes_out - w.lastOut) / dt);
-        w.points = [
-          ...w.points,
-          {
-            t: new Date(statsQ.dataUpdatedAt).toLocaleTimeString('zh-CN', {
-              hour12: false,
-              minute: '2-digit',
-              second: '2-digit',
-            }),
-            in: curIn,
-            out: curOut,
-          },
-        ].slice(-WINDOW_POINTS);
-      }
-    }
-    w.lastIn = stats.bytes_in;
-    w.lastOut = stats.bytes_out;
-    w.lastTs = statsQ.dataUpdatedAt;
-  } else if (winRef.current.points.length > 0) {
-    curIn = winRef.current.points[winRef.current.points.length - 1].in;
-    curOut = winRef.current.points[winRef.current.points.length - 1].out;
-  }
-  const points = winRef.current.points;
-
-  // 隧道健康面板:启用中的转发规则(运行态存在)
-  const tunnels = useMemo(
-    () => (servicesQ.data ?? []).filter((r) => r.status !== 'disabled'),
-    [servicesQ.data],
-  );
-
-  const metricCell = (label: string, value: React.ReactNode, extra?: React.ReactNode, info?: string) => (
-    <div
-      key={label}
-      style={{
-        flex: '1 1 0',
-        minWidth: 128,
-        padding: '16px 20px',
-        borderRight: '1px solid rgba(5,5,5,0.06)',
-      }}
-    >
-      <div style={{ color: 'rgba(0,0,0,0.45)', fontSize: 12, marginBottom: 8 }}>{info ? <InfoLabel info={info} title={label} /> : label}</div>
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
-        <span className="rh-mono" style={{ fontSize: 28, fontWeight: 600, lineHeight: 1 }}>
-          {value}
-        </span>
-        {extra}
+/** 指标条单格:名词 + 说明浮层 + mono 数值(tabular-nums,轮询刷新不抖动)。 */
+function MetricCell({
+  infoKey,
+  loading,
+  suffix,
+  title,
+  value,
+}: {
+  infoKey: FieldInfoKey;
+  loading: boolean;
+  suffix?: ReactNode;
+  title: string;
+  value: ReactNode;
+}) {
+  return (
+    <div className="bg-card px-4 py-3.5">
+      <div className="text-xs text-muted-foreground">
+        <InfoLabel infoKey={infoKey} title={title} />
       </div>
+      {loading ? (
+        <Skeleton className="mt-2 h-7 w-24" />
+      ) : (
+        <div className="mt-2 flex items-baseline gap-1.5">
+          <Mono className="text-2xl leading-none font-semibold">{value}</Mono>
+          {suffix === undefined ? null : <Mono className="text-muted-foreground">{suffix}</Mono>}
+        </div>
+      )}
     </div>
   );
+}
 
-  const eventColumns = [
-    {
-      title: '级别',
-      dataIndex: 'level',
-      key: 'level',
-      width: 84,
-      render: (v: string) => (
-        <StatusBadge signal={v === 'error' ? 'error' : v === 'warn' ? 'warn' : 'idle'} text={v} />
-      ),
-    },
-    {
-      title: '时间',
-      dataIndex: 'ts',
-      key: 'ts',
-      width: 170,
-      render: (v: number) => <Mono>{fmtTime(v)}</Mono>,
-    },
-    {
-      title: '来源',
-      dataIndex: 'source',
-      key: 'source',
-      width: 90,
-      render: (v: string) => <Mono>{v}</Mono>,
-    },
-    { title: '消息', dataIndex: 'message', key: 'message' },
-  ];
+/**
+ * 总览页:指标条 / 流量速率 + 转发规则健康 / 最近事件。
+ * 三个查询都是 5 秒轮询;queryKey 稳定,失败时 TanStack Query 保留上一次成功的 data
+ * (不写 placeholderData:key 不变时它不会带来额外语义,失败清空只可能由换 key 引起)。
+ */
+export default function OverviewPage() {
+  const statsQ = useQuery({
+    queryKey: qk.stats,
+    queryFn: statsOverview,
+    refetchInterval: POLL_MS,
+  });
+  const eventsQ = useQuery({
+    queryKey: qk.events(EVENTS_LIMIT),
+    queryFn: () => listEvents({ limit: EVENTS_LIMIT }),
+    refetchInterval: POLL_MS,
+  });
+  const servicesQ = useQuery({
+    queryKey: qk.services(),
+    queryFn: () => listServices(),
+  });
+
+  const stats = statsQ.data;
+  // 失败判定:最近一次失败晚于最近一次成功 → 速率窗口在该处断线(不补零、不外推)
+  const rateFailed = statsQ.errorUpdatedAt > statsQ.dataUpdatedAt;
+  const { currentIn, currentOut, points } = useTrafficRateWindow(
+    stats,
+    statsQ.dataUpdatedAt,
+    rateFailed,
+  );
+  // 至少有一个真实速率点才显示速率,否则显示 `-`(不把「还没采到」伪装成 0 B/s)
+  const hasRate = points.some((point) => point.in !== null);
+  const rateIn = hasRate ? `${fmtBytes(currentIn)}/s` : '-';
+  const rateOut = hasRate ? `${fmtBytes(currentOut)}/s` : '-';
+
+  const events = eventsQ.data ?? [];
+  const [eventsExpanded, setEventsExpanded] = useState(false);
+  const shownEvents = eventsExpanded ? events : events.slice(0, EVENTS_COLLAPSED);
+
+  // 转发规则健康面板:启用中的规则(enabled 且状态不是 disabled)
+  const tunnels = (servicesQ.data ?? []).filter(
+    (rule) => rule.enabled && rule.status !== 'disabled',
+  );
+
+  const statsLoading = statsQ.isPending;
 
   return (
-    <PageContainer subTitle="服务端运行状态与转发面健康" title="总览">
-      {/* 指标条:单卡分格,mono + tabular-nums,刷新不抖动(§6.2) */}
-      <Card styles={{ body: { padding: 0 } }} style={{ borderRadius: 8 }}>
-        <div style={{ display: 'flex', flexWrap: 'wrap' }}>
-          {metricCell(
-            '在线客户端',
-            stats ? `${stats.clients_online}` : '-',
-            stats ? <Mono style={{ color: 'rgba(0,0,0,0.45)' }}>/ {stats.clients_total}</Mono> : undefined,
-            '已连接服务端的客户端数 / 注册总数',
-          )}
-          {metricCell(
-            '运行服务',
-            stats?.services_running ?? 0,
-            stats ? <Mono style={{ color: 'rgba(0,0,0,0.45)' }}>/ {stats.services_total}</Mono> : undefined,
-            '正在监听公网入口的规则数 / 启用总数',
-          )}
-          {metricCell('当前连接', stats?.conns_current ?? 0, undefined, '全部规则当前承载的并发连接')}
-          {metricCell('入站速率', `${fmtBytes(curIn)}/s`, undefined, '公网侧流入服务端的流量速率(按最近采样)')}
-          {metricCell('出站速率', `${fmtBytes(curOut)}/s`, undefined, '服务端流向公网侧的流量速率(按最近采样)')}
-          {metricCell('累计流量', stats ? `${fmtBytes(stats.bytes_in + stats.bytes_out)}` : '-', undefined, '服务端启动以来的入+出累计(进程内计量,重启归零)')}
+    <div className="space-y-4">
+      <PageHeader description="服务端运行状态与转发面健康" title="总览" />
+
+      {/* 指标条:单卡内部分格(gap-px + bg-border 画分隔线),6 个指标 */}
+      <Card className="gap-0 overflow-hidden py-0">
+        <div className="grid grid-cols-2 gap-px bg-border sm:grid-cols-3 xl:grid-cols-6">
+          <MetricCell
+            infoKey="overview.clients_online"
+            loading={statsLoading}
+            suffix={stats ? `/ ${stats.clients_total}` : undefined}
+            title="在线客户端"
+            value={stats ? stats.clients_online : '-'}
+          />
+          <MetricCell
+            infoKey="overview.services_running"
+            loading={statsLoading}
+            suffix={stats ? `/ ${stats.services_total}` : undefined}
+            title="运行规则"
+            value={stats ? stats.services_running : '-'}
+          />
+          <MetricCell
+            infoKey="overview.conns_current"
+            loading={statsLoading}
+            title="当前连接"
+            value={stats ? stats.conns_current : '-'}
+          />
+          <MetricCell
+            infoKey="overview.rate_in"
+            loading={statsLoading}
+            title="入站速率"
+            value={rateIn}
+          />
+          <MetricCell
+            infoKey="overview.rate_out"
+            loading={statsLoading}
+            title="出站速率"
+            value={rateOut}
+          />
+          <MetricCell
+            infoKey="overview.bytes_total"
+            loading={statsLoading}
+            title="累计流量"
+            value={stats ? fmtBytes(stats.bytes_in + stats.bytes_out) : '-'}
+          />
         </div>
       </Card>
 
-      <div style={{ display: 'flex', gap: 16, marginTop: 16, flexWrap: 'wrap' }}>
-        {/* 流量速率图:渐变填充 + 当前值标注(§6.2) */}
-        <Card
-          extra={
-            <span style={{ fontSize: 12, color: 'rgba(0,0,0,0.45)' }}>
-              入 <Mono style={{ color: '#1890ff' }}>{fmtBytes(curIn)}/s</Mono>
-              <span style={{ margin: '0 8px' }}>·</span>
-              出 <Mono style={{ color: '#52c41a' }}>{fmtBytes(curOut)}/s</Mono>
-            </span>
-          }
-          style={{ borderRadius: 8, flex: '1 1 480px' }}
-          title="流量速率(近 5 分钟)"
-        >
-          <ResponsiveContainer height={220} width="100%">
-            <AreaChart data={points}>
-              <defs>
-                <linearGradient id="rh-in" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#1890ff" stopOpacity={0.28} />
-                  <stop offset="100%" stopColor="#1890ff" stopOpacity={0.02} />
-                </linearGradient>
-                <linearGradient id="rh-out" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#52c41a" stopOpacity={0.24} />
-                  <stop offset="100%" stopColor="#52c41a" stopOpacity={0.02} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-              <XAxis dataKey="t" fontSize={11} />
-              <YAxis fontSize={11} tickFormatter={(v: number) => fmtBytes(v)} width={70} />
-              <RTooltip formatter={(v) => `${fmtBytes(Number(v ?? 0))}/s`} labelFormatter={(l) => String(l)} />
-              <Area
-                connectNulls={false}
-                dataKey="in"
-                fill="url(#rh-in)"
-                name="入站"
-                stroke="#1890ff"
-                strokeWidth={2}
-                type="monotone"
-              />
-              <Area
-                connectNulls={false}
-                dataKey="out"
-                fill="url(#rh-out)"
-                name="出站"
-                stroke="#52c41a"
-                strokeWidth={2}
-                type="monotone"
-              />
-            </AreaChart>
-          </ResponsiveContainer>
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+        {/* 流量速率图:渐变填充 + 右上角当前值 mono 标注 */}
+        <Card>
+          <CardHeader>
+            <CardTitle>流量速率</CardTitle>
+            <CardDescription>近 5 分钟 · 每 5 秒采样</CardDescription>
+            <CardAction>
+              <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                <span className="flex items-center gap-1.5">
+                  <span
+                    aria-hidden="true"
+                    className="size-2 shrink-0 rounded-[2px] bg-(--chart-1)"
+                  />
+                  入<Mono className="text-sm font-medium text-foreground">{rateIn}</Mono>
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span
+                    aria-hidden="true"
+                    className="size-2 shrink-0 rounded-[2px] bg-(--chart-2)"
+                  />
+                  出<Mono className="text-sm font-medium text-foreground">{rateOut}</Mono>
+                </span>
+              </div>
+            </CardAction>
+          </CardHeader>
+          <CardContent>
+            {statsLoading ? (
+              <Skeleton className="h-[220px] w-full" />
+            ) : (
+              <Suspense fallback={<Skeleton className="h-[220px] w-full" />}>
+                <TrafficRateChart points={points} />
+              </Suspense>
+            )}
+          </CardContent>
         </Card>
 
-        {/* 隧道健康:每条启用规则一行(§6.2) */}
-        <Card style={{ borderRadius: 8, flex: '1 1 360px' }} title={`隧道健康(${tunnels.length})`}>
-          {tunnels.length === 0 ? (
-            <div style={{ color: 'rgba(0,0,0,0.45)', fontSize: 13, padding: '24px 0' }}>
-              还没有启用中的转发规则。先到「客户端」页接入客户端,再创建规则。
-            </div>
-          ) : (
-            <div style={{ maxHeight: 264, overflow: 'auto' }}>
-              {tunnels.map((r) => {
-                const sig = proxyStatusSignal(r.status, r.healthy);
-                const sec = r.spec?.[r.kind] as Record<string, any> | undefined;
-                const listen =
-                  r.kind === 'tcp' || r.kind === 'udp'
-                    ? `${r.bind_ip}:${r.bind_port}`
-                    : (sec?.custom_domains?.[0] ?? sec?.subdomain ?? '—');
-                return (
-                  <div
-                    key={r.id}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 12,
-                      padding: '8px 0',
-                      borderBottom: '1px solid rgba(5,5,5,0.04)',
-                    }}
-                  >
-                    <span
-                      style={{
-                        fontWeight: 500,
-                        flex: '0 0 auto',
-                        maxWidth: 140,
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
+        {/* 转发规则健康:每条启用中的规则一行(名称 / 监听 / 状态 / 池 / 连接) */}
+        <Card>
+          <CardHeader>
+            <CardTitle>转发规则健康</CardTitle>
+            <CardDescription>
+              {servicesQ.isPending ? '加载中…' : `${tunnels.length} 条启用中的转发规则`}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="max-h-[320px] overflow-y-auto">
+            {servicesQ.isPending ? (
+              <div className="space-y-2">
+                {[0, 1, 2, 3].map((index) => (
+                  <Skeleton className="h-9 w-full" key={index} />
+                ))}
+              </div>
+            ) : tunnels.length === 0 ? (
+              <EmptyState
+                description="先到「客户端」页接入客户端,再创建转发规则;启用后这里逐条显示监听地址与运行状态。"
+                icon={<Waypoints aria-hidden="true" className="size-4" />}
+                title="还没有启用中的转发规则"
+              />
+            ) : (
+              <>
+                <div className="hidden gap-x-3 border-b border-border/60 pb-2 text-xs text-muted-foreground sm:grid sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1.1fr)_auto_auto_auto]">
+                  <span>规则</span>
+                  <span>监听</span>
+                  <span>
+                    <InfoLabel infoKey="service.list.status" title="状态" />
+                  </span>
+                  <span>
+                    <InfoLabel infoKey="service.list.pool" title="池" />
+                  </span>
+                  <span>
+                    <InfoLabel infoKey="service.list.conns" title="连接" />
+                  </span>
+                </div>
+                {tunnels.map((rule) => {
+                  const signal = proxyStatusSignal(rule.status, rule.healthy);
+                  return (
+                    <div
+                      className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 border-b border-border/60 py-2.5 text-sm last:border-b-0 sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1.1fr)_auto_auto_auto]"
+                      key={rule.id}
                     >
-                      {r.name}
-                    </span>
-                    <Mono
-                      style={{
-                        flex: 1,
-                        color: 'rgba(0,0,0,0.55)',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {String(listen)}
-                    </Mono>
-                    {r.status_reason ? (
-                      <Tooltip title={r.status_reason}>
-                        <StatusBadge signal={sig.signal} text={sig.text} />
-                      </Tooltip>
-                    ) : (
-                      <StatusBadge signal={sig.signal} text={sig.text} />
-                    )}
-                    <Mono style={{ color: 'rgba(0,0,0,0.4)', flex: '0 0 auto' }}>池{r.pool_ready}</Mono>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+                      <span className="min-w-0 truncate font-medium">{rule.name}</span>
+                      <Mono className="col-span-2 col-start-1 row-start-2 min-w-0 truncate text-muted-foreground sm:col-span-1 sm:col-start-2 sm:row-start-1">
+                        {listenAddress(rule)}
+                      </Mono>
+                      <span className="col-start-2 row-start-1 justify-self-end sm:col-start-3 sm:justify-self-start">
+                        {rule.status_reason ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="inline-flex cursor-help">
+                                <StatusBadge signal={signal.signal} text={signal.text} />
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>{rule.status_reason}</TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          <StatusBadge signal={signal.signal} text={signal.text} />
+                        )}
+                      </span>
+                      <Mono className="col-start-1 row-start-3 text-muted-foreground sm:col-start-4 sm:row-start-1">
+                        池 {rule.pool_ready}
+                      </Mono>
+                      <Mono className="col-start-2 row-start-3 justify-self-end text-muted-foreground sm:col-start-5 sm:row-start-1 sm:justify-self-start">
+                        连接 {rule.conns_current ?? '-'}
+                      </Mono>
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </CardContent>
         </Card>
       </div>
 
-      {/* 最近事件:默认 5 条,可展开(§6.2);级别筛选 */}
-      <Card
-        extra={
-          <>
-            <Select
-              allowClear
-              onChange={(v) => setLevel(v ?? '')}
-              options={[
-                { label: '全部', value: '' },
-                { label: 'info', value: 'info' },
-                { label: 'warn', value: 'warn' },
-                { label: 'error', value: 'error' },
-              ]}
-              placeholder="级别"
-              size="small"
-              style={{ width: 100, marginRight: 8 }}
-              value={level || undefined}
-            />
-            {events.length > 5 && (
-              <Button onClick={() => setEventsExpanded((v) => !v)} size="small" type="link">
+      {/* 最近事件:默认 5 条,可展开全部 20 条 */}
+      <Card>
+        <CardHeader>
+          <CardTitle>最近事件</CardTitle>
+          <CardDescription>最新 {EVENTS_LIMIT} 条 · 每 5 秒刷新</CardDescription>
+          <CardAction>
+            {events.length > EVENTS_COLLAPSED ? (
+              <Button
+                aria-expanded={eventsExpanded}
+                onClick={() => setEventsExpanded((value) => !value)}
+                size="sm"
+                variant="ghost"
+              >
                 {eventsExpanded ? '收起' : `展开全部(${events.length})`}
+                {eventsExpanded ? (
+                  <ChevronUp aria-hidden="true" className="size-4" />
+                ) : (
+                  <ChevronDown aria-hidden="true" className="size-4" />
+                )}
               </Button>
-            )}
-          </>
-        }
-        style={{ borderRadius: 8, marginTop: 16 }}
-        title="最近事件"
-      >
-        <Table
-          columns={eventColumns}
-          dataSource={shownEvents}
-          loading={eventsQ.isLoading}
-          pagination={false}
-          rowKey="id"
-          size="small"
-        />
+            ) : null}
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          {eventsQ.isPending ? (
+            <div className="space-y-2">
+              {[0, 1, 2, 3].map((index) => (
+                <Skeleton className="h-8 w-full" key={index} />
+              ))}
+            </div>
+          ) : events.length === 0 ? (
+            <EmptyState
+              description="客户端上下线、转发规则发布结果都会记录在这里;当前还没有任何事件。"
+              icon={<Inbox aria-hidden="true" className="size-4" />}
+              title="暂无事件"
+            />
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-[170px]">时间</TableHead>
+                  <TableHead className="w-[92px]">级别</TableHead>
+                  <TableHead className="hidden w-[92px] sm:table-cell">来源</TableHead>
+                  <TableHead>消息</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {shownEvents.map((event) => (
+                  <TableRow key={event.id}>
+                    <TableCell className="text-muted-foreground">
+                      <Mono>{fmtTime(event.ts)}</Mono>
+                    </TableCell>
+                    <TableCell>
+                      <StatusBadge signal={eventLevelSignal(event.level)} text={event.level} />
+                    </TableCell>
+                    <TableCell className="hidden text-muted-foreground sm:table-cell">
+                      <Mono>{event.source}</Mono>
+                    </TableCell>
+                    <TableCell className="whitespace-normal">{event.message}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
       </Card>
-    </PageContainer>
+    </div>
   );
-};
-
-export default OverviewPage;
+}

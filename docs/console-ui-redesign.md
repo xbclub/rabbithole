@@ -1,5 +1,18 @@
 # console UI 重设计文档(全面版)
 
+> **执行状态(2026-10-12 更新)。**
+>
+> - **§1–§9 已由 R22 全量落地**(antd 体系下):去模板脸、token 与 mono、字体自托管、
+>   IA 分组、总览重排、ProxyListPage 参数化、空态三件套、弹窗改造、文案与 i18n 决策 A。
+>   验收记录见 `docs/review-log.md` R22。
+> - **后续已演进的条目**:§2.6 的字体自托管在 2026-10-12 的整体重写中**改为纯系统字体栈**
+>   (不再打包字体文件);§4.2"本次不做配色调整"随之失效——新体系用 shadcn/ui 的
+>   neutral 单色主色 + 语义状态色。
+> - **2026-10-12 起前端整体重写为 Vite + Tailwind v4 + shadcn/ui**,§4 的形状/层次/动效/
+>   响应式/组件模式规范继续有效,但具体实现与色值以 `console/src/index.css` 的
+>   token 与 shadcn/ui 约定为准。
+> - 本文档保留为设计依据与诊断记录,不再逐条对应实现文件行号(旧行号基于 v0.1.0)。
+
 > 证据来源:线上 v0.1.0 控制台(172.16.1.2:8080)10 个视图实拍截图(登录/总览/客户端/
 > TCP 隧道/UDP 隧道/域名服务/密钥访问/证书/设置/新建规则弹窗)+ console/ 全源码走查。
 > 方法论:[Anthropic frontend-design](https://github.com/anthropics/claude-code/tree/main/plugins/frontend-design)

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)" />
+    <title>rabbithole 控制台</title>
+    <script>
+      /* 主题预置:在首帧前定 dark class,避免亮/暗闪烁 */
+      (function () {
+        try {
+          var t = localStorage.getItem('rabbithole-console-theme');
+          var dark =
+            t === 'dark' ||
+            ((!t || t === 'system') &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (dark) document.documentElement.classList.add('dark');
+        } catch (e) {
+          /* localStorage 不可用(隐私模式)时按亮色渲染 */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- 首屏占位:避免 JS 加载期间白屏;React 挂载后由 main.tsx 移除 -->
+    <div id="rh-boot" role="status" aria-live="polite">
+      <span class="rh-boot-mark" aria-hidden="true"></span>
+      <span>正在载入控制台…</span>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

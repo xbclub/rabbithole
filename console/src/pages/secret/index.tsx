@@ -1,53 +1,62 @@
-import ProxyListPage from '@/components/ProxyListPage';
-import VisitorsPanel from '@/components/VisitorsPanel';
-import type { VisitorSeed } from '@/components/VisitorsPanel';
-import { history, useLocation } from '@umijs/max';
-import { PageContainer } from '@ant-design/pro-components';
-import { Tabs } from 'antd';
-import React, { useState } from 'react';
+import { useState } from 'react';
+import { useSearchParams } from 'react-router';
 
-/** 密钥访问:规则(stcp/sudp/xtcp)+ 访问器双 tab,tab 状态写 query 持久化。 */
-const SecretPage: React.FC = () => {
-  const location = useLocation();
-  const tab = new URLSearchParams(location.search).get('tab') === 'visitors' ? 'visitors' : 'rules';
-  // 规则行「创建访问器」带入的目标(密钥由服务端从目标规则继承,不再手工传递)
+import type { ServiceRow } from '@/api/rabbithole';
+import { PageHeader } from '@/components/page-header';
+import { ProxyListPage } from '@/components/proxy-list-page';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { VisitorsPanel } from '@/components/visitors-panel';
+import type { VisitorSeed } from '@/components/visitors-panel';
+import type { ProxyKind } from '@/features/services/types';
+
+const KINDS: ProxyKind[] = ['stcp', 'sudp', 'xtcp'];
+
+/**
+ * 密钥访问:规则(stcp/sudp/xtcp)+ 访问器双 Tab。
+ * Tab 状态写 query 参数 `?tab=visitors`,刷新后保持(旧路由 /rabbithole/visitors 重定向到此)。
+ */
+export default function SecretPage() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = searchParams.get('tab') === 'visitors' ? 'visitors' : 'rules';
+  // 规则行「创建访问器」带入的目标(访问密钥由服务端从目标规则继承,不手工传递)
   const [visitorSeed, setVisitorSeed] = useState<VisitorSeed | null>(null);
-  return (
-    <PageContainer subTitle="STCP / SUDP / XTCP 密钥访问规则与访问器" title="密钥访问">
-      <Tabs
-        activeKey={tab}
-        items={[
-          {
-            key: 'rules',
-            label: '规则',
-            children: (
-              <ProxyListPage
-                bare
-                defaultKind="stcp"
-                emptyNoun="密钥规则"
-                kinds={['stcp', 'sudp', 'xtcp'] as const}
-                onCreateVisitor={(row) => {
-                  setVisitorSeed({ kind: row.kind as VisitorSeed['kind'], target: row.name });
-                  history.replace('/rabbithole/secret?tab=visitors');
-                }}
-              />
-            ),
-          },
-          {
-            key: 'visitors',
-            label: '访问器',
-            children: (
-              <VisitorsPanel
-                seed={visitorSeed}
-                onSeedUsed={() => setVisitorSeed(null)}
-              />
-            ),
-          },
-        ]}
-        onChange={(key) => history.replace(`/rabbithole/secret?tab=${key === 'visitors' ? 'visitors' : 'rules'}`)}
-      />
-    </PageContainer>
-  );
-};
 
-export default SecretPage;
+  const onTabChange = (next: string) => {
+    const params = new URLSearchParams(searchParams);
+    if (next === 'visitors') {
+      params.set('tab', 'visitors');
+    } else {
+      params.delete('tab');
+    }
+    setSearchParams(params, { replace: true });
+  };
+
+  const handleCreateVisitor = (row: ServiceRow) => {
+    setVisitorSeed({ kind: row.kind as VisitorSeed['kind'], target: row.name });
+    onTabChange('visitors');
+  };
+
+  return (
+    <div className="flex min-w-0 flex-col gap-6">
+      <PageHeader title="密钥访问" description="STCP / SUDP / XTCP 密钥访问规则与访问器" />
+      <Tabs value={tab} onValueChange={onTabChange}>
+        <TabsList>
+          <TabsTrigger value="rules">规则</TabsTrigger>
+          <TabsTrigger value="visitors">访问器</TabsTrigger>
+        </TabsList>
+        <TabsContent value="rules" className="pt-4">
+          <ProxyListPage
+            bare
+            kinds={KINDS}
+            defaultKind="stcp"
+            emptyNoun="密钥转发规则"
+            onCreateVisitor={handleCreateVisitor}
+          />
+        </TabsContent>
+        <TabsContent value="visitors" className="pt-4">
+          <VisitorsPanel seed={visitorSeed} onSeedUsed={() => setVisitorSeed(null)} />
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}

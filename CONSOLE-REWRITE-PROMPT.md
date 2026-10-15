@@ -1,3 +1,20 @@
+> **已废止(历史存档,2026-10-12)。**
+>
+> 本文档描述的是 2026-10 早期"用 React + Ant Design v6 重写 console"的一次性任务书,
+> 其中多项要求后来已被用户拍板推翻或已被实现超越,例如:
+>
+> - 表单内填写 `secret_key` → **R24 定稿:密钥完全服务端托管,表单零输入**
+> - `allow_users` 多值白名单 → **R32:字段已从后端与前端一并删除**
+> - 登录路径 `/auth/login` → 现役为 `/user/login`(R33 修复的正是这条路上的报错)
+> - 以 `web/`(vue-vben-admin)为行为参照 → `web/` 已删除
+> - antd 组件体系 → **2026-10-12 起整体改为 Vite + Tailwind v4 + shadcn/ui**
+> - "M1 计量 / M3 证书未实现,需容错降级" → 二者均已落地
+>
+> **现行契约 = `console/` 现役代码行为 + `docs/review-log.md` R20 之后的全部条目。**
+> 本文档仅作历史追溯保留,不要再作为实现依据。
+
+---
+
 # 任务:用 React + Ant Design v6 重写 rabbithole 管理台(新 console/ 工程,R0→R3)
 
 你是一名前端工程师。仓库根目录:`/Users/yii/Documents/mycode/rabbithole`。后端 Rust(`crates/rh-server`,axum,静态托管/内嵌 UI 机制已就绪),现有前端是 `web/`(vue-vben-admin 裁剪版,**本次任务冻结不动,仅作行为参照**)。你的任务:按 `docs/design-parity.md` §10(F9)新建顶层 `console/` 独立工程,用 React 19 + Ant Design v6 重写管理台,完成 R0→R3 四个阶段。**CUT(删除 web/、切换默认产物路径)不在本任务内**,见文末。

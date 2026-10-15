@@ -1,13 +1,16 @@
-import ProxyListPage from '@/components/ProxyListPage';
-import React from 'react';
+import { ProxyListPage } from '@/components/proxy-list-page';
+import type { ProxyKind } from '@/features/services/types';
 
-const TcpPage: React.FC = () => (
-  <ProxyListPage
-    defaultKind='tcp'
-    description="TCP 端口转发规则"
-    kinds={['tcp'] as const}
-    title="TCP 隧道"
-  />
-);
+const KINDS: ProxyKind[] = ['tcp'];
 
-export default TcpPage;
+export default function TcpPage() {
+  return (
+    <ProxyListPage
+      kinds={KINDS}
+      defaultKind="tcp"
+      title="TCP 隧道"
+      description="TCP 端口转发规则"
+      emptyNoun="TCP 转发规则"
+    />
+  );
+}
