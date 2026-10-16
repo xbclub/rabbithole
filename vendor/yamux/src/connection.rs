@@ -1314,13 +1314,6 @@ mod halves {
             self.to_send.lock().pop_front()
         }
 
-        /// 发送半 park 前的复查项:接收侧压来的帧/新接收器/错误。
-        fn has_send_work(&self) -> bool {
-            !self.to_send.lock().is_empty()
-                || !self.new_receivers.lock().is_empty()
-                || self.error.lock().is_some()
-        }
-
         /// 入站建流:注册命令接收器并唤醒发送半收编。
         fn push_new_receiver(&self, id: StreamId, r: mpsc::Receiver<StreamCommand>) {
             self.new_receivers.lock().push_back((id, r));
@@ -1329,6 +1322,18 @@ mod halves {
             }
         }
 
+        /// Round-D3-2 回归测试专用(不得用于生产):直压 to_send,走生产
+        /// `push_to_send` 语义(压入即取 send_waker 槽唤醒)。规格变更 4
+        /// 预判的"tests 模块内直接调 push_to_send"路线的可见性缝。
+        #[cfg(test)]
+        pub(crate) fn push_to_send_for_test(&self, f: Frame<()>) {
+            self.push_to_send(f)
+        }
+
+        /// 登记发送半 park 点 waker。唤醒方(唤醒语义,勿丢):
+        /// [`ConnShared::push_to_send`](接收侧压来 Pong/GoAway 帧即唤醒)、
+        /// [`ConnShared::push_new_receiver`](入站建流注册新命令接收器即
+        /// 唤醒收编)、[`ConnShared::set_error`](任一半 IO 错误即唤醒)。
         fn set_send_waker(&self, w: &Waker) {
             *self.send_waker.lock() = Some(w.clone());
         }
@@ -1846,8 +1851,11 @@ mod halves {
                         self.stream_receivers.push(TaggedStream::new(id, r));
                     }
                 }
-                // B4 同款三态:Ready(Err) 以原始 IO 错误传播并终结
-                match self.socket.poll_ready_unpin(cx) {
+                // B4 同款三态:Ready(Err) 以原始 IO 错误传播并终结。
+                // Round-D3-2(复核修复):捕获本轮 poll_ready 是否未被阻塞
+                //(Ready(Ok) ⟙ sink 无在途半写帧、可立即接收新帧)——
+                // park 复查对 to_send 的保留以此为门,见下方 park 段注释。
+                let sink_idle = match self.socket.poll_ready_unpin(cx) {
                     Poll::Ready(Ok(())) => {
                         // Note `next_ping` does not register a waker and thus if not called
                         // regularly (idle connection) no ping is sent. This is deliberate
@@ -1874,10 +1882,11 @@ mod halves {
                             }
                             continue;
                         }
+                        true
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(self.fatal(e.into()))),
-                    Poll::Pending => {}
-                }
+                    Poll::Pending => false,
+                };
 
                 match self.socket.poll_flush_unpin(cx) {
                     Poll::Ready(Ok(())) | Poll::Pending => {}
@@ -1921,9 +1930,28 @@ mod halves {
                     }
                 }
 
-                // park:先登记 send waker 再复查,防接收侧压帧/置错丢唤醒
                 self.shared.set_send_waker(cx.waker());
-                if self.shared.has_send_work() {
+                // Round-D3(自旋修复)+ Round-D3-2(独立复核:丢唤醒修复):
+                // 复查项 = 无需载体即可推进的新接收器/错误,**加** to_send——
+                // 但 to_send 以「本轮 poll_ready 未被阻塞」(sink_idle)为门:
+                //
+                // - sink_idle == false(半写帧未写穿,poll_ready 恒 Pending):
+                //   to_send 帧无法出队,把它当作"有工作"会让 poll 永不返回
+                //   Pending(单核自旋,三机实测 260 万次迭代);此形态下 park
+                //   时 EPOLLOUT 必已武装(半写阻塞必经 poll_write 的
+                //   WouldBlock),可写即唤醒,不存在丢唤醒——to_send 不参与。
+                // - sink_idle == true(空 sink 型 park):本轮 poll_ready 曾
+                //   Ready(Ok),未武装任何载体写 waker;若当次 poll 由消耗
+                //   send_waker 槽的唤醒(push_to_send/push_new_receiver/
+                //   set_error)启动,则在 pop_to_send 与本 set_send_waker
+                //   之间压入的 Pong/GoAway 既不触发唤醒、也无人复查,滞留
+                //   to_send 直到下一个无关事件——to_send 必须复查;门保证了
+                //   continue 后下一轮真正出队写穿(poll_ready Ready(Ok) ⟹
+                //   pop_to_send 后可写),不复活自旋。
+                if (sink_idle && !self.shared.to_send.lock().is_empty())
+                    || !self.shared.new_receivers.lock().is_empty()
+                    || self.shared.error.lock().is_some()
+                {
                     continue;
                 }
                 return Poll::Pending;
@@ -2021,6 +2049,16 @@ mod halves {
                 frame
             };
             frame.map(Into::into)
+        }
+    }
+
+    /// Round-D3-2 回归测试专用(不得用于生产):暴露共享状态句柄,供测试
+    /// 在丢唤醒窗口内直压 to_send(测试闭包在载体 flush 钩子内同步执行,
+    /// 此刻 SendHalf 正被 &mut 借用,须持有独立 Arc 句柄)。
+    #[cfg(test)]
+    impl<T> SendHalf<T> {
+        pub(crate) fn shared_for_test(&self) -> Arc<ConnShared> {
+            self.shared.clone()
         }
     }
 
@@ -3359,5 +3397,340 @@ mod tests {
             Poll::Ready(Ok(n)) => assert_eq!(&buf[..n], b"y"),
             other => panic!("(d) reader must read preset data, got {other:?}"),
         }
+    }
+
+    // ===== Round-D3 守卫:SendHalf park 复查自旋修复(先红后绿) =====
+
+    /// T7 专用载体(工作线程模式):写侧固定小容量(耗尽 → Pending 并
+    /// 登记写 waker;`poison` 置位后返回 Err,让看门狗超时后的自旋线程
+    /// 有界退出,不烧核到进程结束),读侧按脚本块返回、耗尽 Pending。
+    /// 状态经 `Arc<std::sync::Mutex>` 持有:`Send` 绑定,poll 可移入工作
+    /// 线程执行。
+    struct SpinSocketState {
+        cap: usize,
+        written: Vec<u8>,
+        write_waker: Option<Waker>,
+        read_blocks: std::collections::VecDeque<Vec<u8>>,
+        cur: Vec<u8>,
+        cur_off: usize,
+        poison: bool,
+    }
+
+    struct SpinSocket(Arc<Mutex<SpinSocketState>>);
+
+    impl crate::Writev2 for SpinSocket {
+        fn poll_write2(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            a: &[u8],
+            b: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut st = self.0.lock().unwrap();
+            if st.poison {
+                return Poll::Ready(Err(std::io::Error::other("spin-watchdog poison")));
+            }
+            if st.cap == 0 {
+                st.write_waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            let total = a.len() + b.len();
+            let n = total.min(st.cap);
+            let (na, nb) = if n <= a.len() {
+                (n, 0)
+            } else {
+                (a.len(), n - a.len())
+            };
+            st.written.extend_from_slice(&a[..na]);
+            st.written.extend_from_slice(&b[..nb]);
+            st.cap -= n;
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    impl futures::io::AsyncRead for SpinSocket {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut st = self.0.lock().unwrap();
+            if st.cur_off >= st.cur.len() {
+                st.cur = st.read_blocks.pop_front().unwrap_or_default();
+                st.cur_off = 0;
+            }
+            if st.cur_off < st.cur.len() {
+                let n = (st.cur.len() - st.cur_off).min(buf.len());
+                buf[..n].copy_from_slice(&st.cur[st.cur_off..st.cur_off + n]);
+                st.cur_off += n;
+                return Poll::Ready(Ok(n));
+            }
+            Poll::Pending
+        }
+    }
+
+    impl futures::io::AsyncWrite for SpinSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            crate::Writev2::poll_write2(self, cx, &[], buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// T7(红→绿,工作线程 + 超时看门狗):半写帧(poll_ready 恒 Pending)
+    /// + to_send 非空(接收侧压入 Pong)时,SendHalf::poll 的 park 复查
+    /// 不得把 to_send 当作"无需载体即可推进的工作"——修前
+    /// `has_send_work` 命中 to_send 非空 → `continue` 无限自旋,poll 永不
+    /// 返回 Pending(三机实测 260 万次迭代、烧 1 核)。看门狗:poll 在
+    /// 工作线程执行,主线程 3s 收不到返回即判自旋失败(红)。
+    /// 反向断言:写侧恢复可写后(waker 唤醒 + 复 poll)应写穿半写帧并
+    /// 把 Pong 发上 wire。
+    #[test]
+    fn send_park_returns_pending_when_tosend_blocked_by_partial_write() {
+        let state = Arc::new(Mutex::new(SpinSocketState {
+            cap: 8, // 首帧(12B 帧头)只写穿 8B → 半写帧
+            written: Vec::new(),
+            write_waker: None,
+            read_blocks: std::collections::VecDeque::new(),
+            cur: Vec::new(),
+            cur_off: 0,
+            poison: false,
+        }));
+        let sock = SpinSocket(state.clone());
+        let conn = Connection::new(sock, Config::default(), Mode::Client);
+        let (mut recv_half, mut send_half) = conn.into_halves();
+
+        // (1) 首次驱动发送半:Rtt::new 的 next_ping 立即到期(Round-B 后
+        //     next=now),8B 容量只写穿 12B 帧头的前 8B → 半写帧,
+        //     此后 poll_ready 恒 Pending(载体写 Pending 登记了写 waker)。
+        let mut cx = noop_cx();
+        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("send half must park after the partial write, got {other:?}"),
+        }
+        assert_eq!(
+            state.lock().unwrap().written.len(),
+            8,
+            "exactly 8B of the 12B frame header must be written"
+        );
+
+        // (2) 接收半收到连接级 Ping(id=7,无 ACK)→ Pong 压入 to_send;
+        //     读侧脚本耗尽 → 接收半 park(对齐线上形态:client 空闲 ping)。
+        state
+            .lock()
+            .unwrap()
+            .read_blocks
+            .push_back(header::encode(&header::Header::ping(7)).to_vec());
+        match poll_fn(|cx| recv_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("recv half must park after answering the ping, got {other:?}"),
+        }
+
+        // (3) 工作线程 poll 发送半:修前 park 复查命中 to_send 非空 →
+        //     无限自旋,poll 永不返回 → 看门狗超时判失败(红);修后
+        //     复查只看"无需载体即可推进"项,立即返回 Pending(绿)。
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let worker = std::thread::spawn(move || {
+            let w = futures::task::noop_waker();
+            let mut wcx = Context::from_waker(&w);
+            let outcome = send_half.poll(&mut wcx);
+            let _ = tx.send(format!("{outcome:?}"));
+            send_half
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(outcome) => {
+                assert_eq!(
+                    outcome, "Pending",
+                    "send half must return Pending (not spin) while the partial-write \
+                     frame blocks the carrier and to_send holds a Pong"
+                );
+                let mut send_half = worker.join().expect("worker must finish cleanly");
+
+                // (4) 反向断言:写侧恢复可写(唤醒 + 复 poll)→ 半写帧写穿,
+                //     Pong 发上 wire,随后重新 park。
+                {
+                    let mut st = state.lock().unwrap();
+                    st.cap = 4096;
+                    if let Some(w) = st.write_waker.take() {
+                        w.wake(); // EPOLLOUT 就绪唤醒的对齐(此处 noop,复 poll 推进)
+                    }
+                }
+                match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+                    Poll::Pending => {}
+                    other => panic!("send half must re-park after draining, got {other:?}"),
+                }
+                let written = state.lock().unwrap().written.clone();
+                assert_eq!(
+                    written.len(),
+                    24,
+                    "rtt ping (12B) + pong (12B) must be fully written, got {written:?}"
+                );
+                let h0 = header::decode(&written[0..12].try_into().unwrap())
+                    .expect("first frame is the rtt ping");
+                assert_eq!(h0.tag(), Tag::Ping, "first frame is the rtt ping");
+                let h1 = header::decode(&written[12..24].try_into().unwrap())
+                    .expect("second frame is the pong");
+                assert_eq!(h1.tag(), Tag::Ping, "second frame is the pong");
+                assert!(
+                    h1.flags().contains(header::ACK),
+                    "pong must carry ACK, got {:?}",
+                    h1.flags()
+                );
+                assert_eq!(
+                    h1.len().val(),
+                    7,
+                    "pong must echo the ping id (opaque id in the length field)"
+                );
+                drop(recv_half); // 收尾
+            }
+            Err(_) => {
+                // 看门狗超时:poison 让自旋中的 poll_write2 返回 Err,
+                // 工作线程有界退出(不烧核到进程结束),然后判失败。
+                state.lock().unwrap().poison = true;
+                let _ = worker.join();
+                panic!(
+                    "spin detected: SendHalf::poll did not return within 3s while \
+                     to_send holds a Pong blocked by a partial write"
+                );
+            }
+        }
+    }
+
+    // ===== Round-D3-2 守卫:park 复查丢唤醒窗口(独立复核修复,先红后绿) =====
+
+    /// T8 专用载体:TestSocket 同款行为 + `poll_flush` 一次性注入钩子。
+    /// 发送半 park 前必经一次 flush(poll_ready 无帧可发而落到 flush 的
+    /// 路径),钩子在该点同步执行——精确落在 pop_to_send(本轮已空)与
+    /// set_send_warker 之间的丢唤醒窗口内。
+    struct FlushInjectSocket {
+        base: TestSocket,
+        armed: Rc<std::cell::Cell<bool>>,
+        inject: Rc<dyn Fn()>,
+    }
+
+    impl crate::Writev2 for FlushInjectSocket {
+        fn poll_write2(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            a: &[u8],
+            b: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            crate::Writev2::poll_write2(Pin::new(&mut this.base), cx, a, b)
+        }
+    }
+
+    impl futures::io::AsyncRead for FlushInjectSocket {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            futures::io::AsyncRead::poll_read(Pin::new(&mut this.base), cx, buf)
+        }
+    }
+
+    impl futures::io::AsyncWrite for FlushInjectSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            crate::Writev2::poll_write2(self, cx, &[], buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.armed.get() {
+                this.armed.set(false);
+                (this.inject)();
+            }
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// T8(红→绿):sink 空闲型 park 的丢唤醒窗口——当次 poll 内,在
+    /// `pop_to_send`(返回空)与 `set_send_waker` 之间压入的 Pong,此刻
+    /// send_waker 槽为空(push 不产生唤醒)、sink 空闲(本轮 poll_ready
+    /// 曾 Ready(Ok),未武装任何载体写 waker),park 复查必须把 to_send
+    /// 纳入(以"本轮 poll_ready 未被阻塞"为门),否则帧滞留 to_send
+    /// 直到下一个无关事件。修前(Round-D3 首版)复查只看
+    /// new_receivers/error,窗口内的 Pong 无人认领(红)。
+    /// 注意与 T7 的边界:T7 守卫半写阻塞型 park(poll_ready 恒 Pending)
+    /// 不得因 to_send 复活自旋——本修复以 sink 空闲为门,两类 park 分别
+    /// 守卫。
+    #[test]
+    fn send_park_rechecks_tosend_pushed_before_waker_registration() {
+        let (base, st) = TestSocket::new();
+        let armed = Rc::new(std::cell::Cell::new(false));
+        // 共享状态句柄经测试缝取回:注入闭包在载体 flush 钩子内执行时,
+        // SendHalf 正处于 poll 的 &mut 借用中,须持独立 Arc 句柄。
+        let shared_slot: Rc<RefCell<Option<Arc<halves::ConnShared>>>> = Rc::new(RefCell::new(None));
+        let slot = shared_slot.clone();
+        let inject = Rc::new(move || {
+            // 窗口内压入 Pong:走生产 push_to_send 语义——此刻 send_waker
+            // 槽为空,take() 无 waker 可取,不产生任何唤醒。
+            let mut hdr = header::Header::ping(9);
+            hdr.ack();
+            let pong: Frame<()> = Frame::new(hdr).into();
+            slot.borrow()
+                .as_ref()
+                .expect("shared handle installed before poll")
+                .push_to_send_for_test(pong);
+        });
+        let sock = FlushInjectSocket {
+            base,
+            armed: armed.clone(),
+            inject,
+        };
+        let conn = Connection::new(sock, Config::default(), Mode::Client);
+        let (recv_half, mut send_half) = conn.into_halves();
+        *shared_slot.borrow_mut() = Some(send_half.shared_for_test());
+
+        // 单次 poll:sink 空闲(写恒 Ready),rtt ping 立即到期发出并写穿,
+        // 随后 pop_to_send 空 → flush 钩子在窗口内压入 Pong → park 复查。
+        let mut cx = noop_cx();
+        armed.set(true);
+        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("send half must eventually park, got {other:?}"),
+        }
+
+        // 窗口内压入的 Pong 不得滞留:必须在同一轮 poll 内被复查出队并
+        // 写上 wire(rtt ping 12B + Pong 12B)。修前:written 只有 12B 的
+        // rtt ping,Pong 滞留 to_send(红)。
+        let written = st.borrow().written.lock().unwrap().clone();
+        assert_eq!(
+            written.len(),
+            24,
+            "rtt ping (12B) + window-injected pong (12B) must be written, got {written:?}"
+        );
+        let h0 = header::decode(&written[0..12].try_into().unwrap())
+            .expect("first frame is the rtt ping");
+        assert_eq!(h0.tag(), Tag::Ping, "first frame is the rtt ping");
+        let h1 = header::decode(&written[12..24].try_into().unwrap())
+            .expect("second frame must be the injected pong");
+        assert_eq!(h1.tag(), Tag::Ping, "second frame is the injected pong");
+        assert!(
+            h1.flags().contains(header::ACK),
+            "injected pong must carry ACK, got {:?}",
+            h1.flags()
+        );
+        assert_eq!(
+            h1.len().val(),
+            9,
+            "injected pong keeps its opaque id (length field)"
+        );
+        drop(recv_half); // 收尾
     }
 }

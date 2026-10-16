@@ -17,6 +17,40 @@ cleanup() {
   # 只清理本脚本亲自 spawn 的进程(PIDS 均为 $! 记录,身份确定);
   # 不做任何按 /tmp/rh-* 模式的广域扫杀(可能是其他会话的服务)。
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+  # SIGTERM 后有界等待**本脚本自己的** PID 退出(绝不触碰未知进程):
+  # rh-server 优雅关停需数秒(会话下线、在途连接收尾、SSH 网关清理),
+  # 不等待会让紧随其后的下一次运行在端口预检撞上仍在 LISTEN 的旧
+  # 服务端(实测 run1 退出后 rh-server 仍持有 127.0.0.1:18080 LISTEN
+  # 约 2-5s → run2 预检 exit=2"端口已被占用")。等待有界(≤15s);
+  # 超时仅对自有 PID 升级 SIGKILL 并再兜底 2s。
+  local waited=0 alive=1
+  while [ "$waited" -lt 15 ]; do
+    alive=0
+    for p in "${PIDS[@]:-}"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ "$alive" = "0" ] && break
+    sleep 1; waited=$((waited+1))
+  done
+  if [ "$alive" = "1" ]; then
+    for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null; done
+    sleep 2
+  fi
+  # 进程全退后,内核仍会保留服务端主动关闭连接的 TIME_WAIT pcb
+  # (控制口 18100 的 mux 长连接由服务端在优雅关停中先关,实测 2 条
+  # local TIME_WAIT 令裸 bind 探测 BUSY 约 13-30s = 2×MSL)。下一次
+  # 运行的预检用的正是同款裸 bind 探测,故此处以**完全相同的口径**
+  # 有界等待预检 TCP 端口集全部真正可绑再退出——不放宽任何断言,
+  # 只是不再把被自身残留污染的环境交给下一轮。仅在确实 spawn 过
+  # 进程时等待(预检失败路径 PIDS 为空,无需空等);超时即放弃,
+  # 让下一轮预检给出准确报错。
+  if [ "${#PIDS[@]}" != "0" ]; then
+    local w2=0 busy=1
+    while [ "$w2" -lt 35 ]; do
+      busy=0
+      for p in $TCP_PORTS; do port_free_tcp "$p" || busy=1; done
+      [ "$busy" = "0" ] && break
+      sleep 1; w2=$((w2+1))
+    done
+  fi
   # 归档目录唯一化:保留每次运行的历史快照,不覆盖其他会话证据
   if [ "$SKIP_ARCHIVE" != "1" ]; then
     local ARCHIVE="/tmp/rh-e2e-last-$(date +%Y%m%d-%H%M%S)-$$"
