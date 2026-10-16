@@ -1060,10 +1060,11 @@ impl<T> Active<T> {
 /// 的公平调度读探测与批量排空——读任务物理独立,无需写侧让位。
 ///
 /// 共享状态经 [`halves`::ConnShared]:锁只护数据结构,临界区内无 await、
-/// 无载体 IO;载体访问经 [`halves`::SplitSocket] 的 futures 原生互斥串行,
-/// 锁粒度 = 单次载体操作。错误双向传播(要点 1):任一半的 IO 错误/EOF
-/// 进入共享错误槽并唤醒对端 park 点;接收侧压来的 Pong/GoAway 帧与 rtt
-/// ping 的发送优先级不低于未拆分路径(要点 2)。
+/// 无载体 IO;载体访问经 [`halves`::SplitSocket] 的自研 BiLock(双句柄
+/// 共享 `Mutex<BiLockState>` + waker 槽,等待 waker 存于锁、不随临时
+/// future drop 丢失)串行,锁粒度 = 单次载体操作。错误双向传播(要点 1):
+/// 任一半的 IO 错误/EOF 进入共享错误槽并唤醒对端 park 点;接收侧压来的
+/// Pong/GoAway 帧与 rtt ping 的发送优先级不低于未拆分路径(要点 2)。
 mod halves {
     use super::*;
     use crate::{FrameDecodeError, Writev2};
@@ -1071,13 +1072,101 @@ mod halves {
     use futures::{AsyncRead, AsyncWrite};
     use std::{io, pin::Pin};
 
-    /// 载体拆分插座:单一 IO 经 futures 原生互斥(`futures::lock::Mutex`,
-    /// waker 传递正确)供收/发两个任务分别做读/写。BiLock 的语义等价物
-    /// (futures 的 `BiLock`/`WriteHalf` 需要未启用的 `bilock`+`unstable`
-    /// feature,Cargo.toml 不在本次改动范围)。`poll_write2` 在锁内委托
-    /// `T::poll_write2`,保持「帧头+帧体一次向量写」(要点 6)。
+    /// 自研 BiLock 共享状态(规格 Round-D2 要点 2:futures 的 `BiLock`
+    /// 需要未启用的 `bilock`+`unstable` feature,Cargo.toml 不在本次改动
+    /// 范围,按规格以「双句柄共享 `Mutex<BiLockState>` + waker 槽」等价
+    /// 自研)。`value` 为 `None` 表示锁被某一侧持有;锁等待者的 waker
+    /// 存于锁共享状态,**不随任何临时 future 的 drop 丢失**——这正是
+    /// `futures::lock::Mutex` 的缺陷:`lock()` 每次调用创建临时
+    /// `MutexLockFuture`,Pending 时把等待节点(内含已注册 waker)入队,
+    /// 该 future 随语句结束被 drop 时节点被移出队列,持锁对端释放时
+    /// 队列已空、无人被唤醒,等待侧永久挂起(Round-D2 根因)。
+    struct BiLockState<T> {
+        value: Option<T>,
+        waker: Option<Waker>,
+    }
+
+    /// `SplitSocket` 底层锁句柄:克隆即共享同一把锁(收/发两半恰好
+    /// 两个句柄、至多一个等待者,单一 waker 槽足够;等待者必为未持锁
+    /// 的那一半)。
+    struct SplitBiLock<T> {
+        shared: Arc<Mutex<BiLockState<T>>>,
+    }
+
+    impl<T> SplitBiLock<T> {
+        fn new(value: T) -> Self {
+            SplitBiLock {
+                shared: Arc::new(Mutex::new(BiLockState {
+                    value: Some(value),
+                    waker: None,
+                })),
+            }
+        }
+
+        /// 取锁(poll 语义):空闲即取(`value` 移入守卫,临界区开始);
+        /// 被对端持有则把当前 waker 存入锁共享状态并返回 Pending——
+        /// waker 在锁里,对端释放([`SplitBiLockGuard::drop`])时唤醒,
+        /// 最坏情形只是多余虚假唤醒,无丢失唤醒路径(BiLock 语义)。
+        fn poll_lock(&self, cx: &mut Context<'_>) -> Poll<SplitBiLockGuard<T>> {
+            let mut st = self.shared.lock();
+            match st.value.take() {
+                Some(value) => Poll::Ready(SplitBiLockGuard {
+                    shared: self.shared.clone(),
+                    value: Some(value),
+                }),
+                None => {
+                    st.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    // 手写 Clone:derive 会给 T 加 Clone 约束,这里只克隆 Arc。
+    impl<T> Clone for SplitBiLock<T> {
+        fn clone(&self) -> Self {
+            SplitBiLock {
+                shared: self.shared.clone(),
+            }
+        }
+    }
+
+    /// `SplitSocket` 底层锁守卫:Deref 到载体;drop 即释放(value 放回
+    /// + 唤醒等待者)。临界区内只做单次载体 IO,不做 IO 之外的等待。
+    struct SplitBiLockGuard<T> {
+        shared: Arc<Mutex<BiLockState<T>>>,
+        value: Option<T>,
+    }
+
+    impl<T> std::ops::Deref for SplitBiLockGuard<T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            self.value.as_ref().expect("bilock guard holds the carrier")
+        }
+    }
+
+    impl<T> std::ops::DerefMut for SplitBiLockGuard<T> {
+        fn deref_mut(&mut self) -> &mut T {
+            self.value.as_mut().expect("bilock guard holds the carrier")
+        }
+    }
+
+    impl<T> Drop for SplitBiLockGuard<T> {
+        fn drop(&mut self) {
+            let mut st = self.shared.lock();
+            debug_assert!(st.value.is_none(), "bilock invariant: one guard at a time");
+            st.value = self.value.take();
+            if let Some(w) = st.waker.take() {
+                w.wake();
+            }
+        }
+    }
+
+    /// 载体拆分插座:单一 IO 经自研 BiLock(锁等待 waker 存于锁共享
+    /// 状态)串行,供收/发两个任务分别做读/写。`poll_write2` 在锁内
+    /// 委托 `T::poll_write2`,保持「帧头+帧体一次向量写」(要点 6)。
     pub(crate) struct SplitSocket<T> {
-        io: Arc<futures::lock::Mutex<T>>,
+        io: SplitBiLock<T>,
     }
 
     // 手写 Clone:derive 会给 T 加 Clone 约束,这里只克隆 Arc。
@@ -1090,7 +1179,7 @@ mod halves {
     }
     pub(crate) fn split_socket<T>(io: T) -> SplitSocket<T> {
         SplitSocket {
-            io: Arc::new(futures::lock::Mutex::new(io)),
+            io: SplitBiLock::new(io),
         }
     }
 
@@ -1101,7 +1190,7 @@ mod halves {
             buf: &mut [u8],
         ) -> Poll<io::Result<usize>> {
             let this = self.get_mut();
-            let mut guard = ready!(this.io.lock().poll_unpin(cx));
+            let mut guard = ready!(this.io.poll_lock(cx));
             Pin::new(&mut *guard).poll_read(cx, buf)
         }
     }
@@ -1116,12 +1205,12 @@ mod halves {
         }
         fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             let this = self.get_mut();
-            let mut guard = ready!(this.io.lock().poll_unpin(cx));
+            let mut guard = ready!(this.io.poll_lock(cx));
             Pin::new(&mut *guard).poll_flush(cx)
         }
         fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             let this = self.get_mut();
-            let mut guard = ready!(this.io.lock().poll_unpin(cx));
+            let mut guard = ready!(this.io.poll_lock(cx));
             Pin::new(&mut *guard).poll_close(cx)
         }
     }
@@ -1134,7 +1223,7 @@ mod halves {
             b: &[u8],
         ) -> Poll<io::Result<usize>> {
             let this = self.get_mut();
-            let mut guard = ready!(this.io.lock().poll_unpin(cx));
+            let mut guard = ready!(this.io.poll_lock(cx));
             Pin::new(&mut *guard).poll_write2(cx, a, b)
         }
     }
@@ -3111,5 +3200,164 @@ mod tests {
             "receiver side must stay untouched"
         );
         drop(recv_half); // 收尾:接收半弃置不影响已完成观察
+    }
+
+    // ===== Round-D2 守卫:SplitSocket 锁丢失唤醒修复(先红后绿) =====
+
+    /// T6 专用载体:TestSocket 同款脚本行为 + 一次性重入钩子。首次
+    /// `poll_write2` 执行时写半已持有 `SplitSocket` 的底层锁(正处于载体
+    /// 临界区内),钩子先以读半的 waker 同步重入 poll 一次读半
+    /// `poll_read`(读侧空 → 必然 Pending 在取锁上),再执行本侧写——
+    /// 把真实场景中收/发双任务并行的临界区交错(竞态 ~50%)变成确定性
+    /// 必现,无需真实线程。
+    struct T6Socket {
+        base: TestSocket,
+        hook: Rc<RefCell<T6Hook>>,
+    }
+
+    struct T6Hook {
+        armed: bool,
+        reader: Option<halves::SplitSocket<T6Socket>>,
+        reader_waker: Option<Waker>,
+        nested_pending: Option<bool>,
+    }
+
+    impl crate::Writev2 for T6Socket {
+        fn poll_write2(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            a: &[u8],
+            b: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            {
+                let mut hook = this.hook.borrow_mut();
+                if hook.armed {
+                    hook.armed = false;
+                    let mut reader = hook.reader.take().expect("T6 reader half installed");
+                    let waker = hook.reader_waker.take().expect("T6 reader waker installed");
+                    drop(hook); // 重入 poll 期间不持有 hook 借用
+                    let mut cx1 = Context::from_waker(&waker);
+                    let mut buf = [0u8; 8];
+                    let nested = Pin::new(&mut reader).poll_read(&mut cx1, &mut buf);
+                    let mut hook = this.hook.borrow_mut();
+                    hook.nested_pending = Some(matches!(nested, Poll::Pending));
+                    hook.reader = Some(reader);
+                }
+            }
+            crate::Writev2::poll_write2(Pin::new(&mut this.base), cx, a, b)
+        }
+    }
+
+    impl futures::io::AsyncRead for T6Socket {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            futures::io::AsyncRead::poll_read(Pin::new(&mut this.base), cx, buf)
+        }
+    }
+
+    impl futures::io::AsyncWrite for T6Socket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            crate::Writev2::poll_write2(self, cx, &[], buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            futures::io::AsyncWrite::poll_flush(Pin::new(&mut this.base), cx)
+        }
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            futures::io::AsyncWrite::poll_close(Pin::new(&mut this.base), cx)
+        }
+    }
+
+    /// T6(红→绿,确定性):`SplitSocket` 底层锁的等待 waker 必须存于锁
+    /// 共享状态——读半在锁被写半持有期间(写半正处于载体临界区)
+    /// `poll_read` 返回 Pending 后,写半完成写并释放锁必须唤醒读半的
+    /// waker。修前(futures::lock::Mutex):`lock()` 临时 future 随
+    /// `poll_read` 返回被 drop,已入队的等待节点连同注册的 waker 一并被
+    /// 移出队列,释放时队列已空,w1 永不被唤醒(红;对应真实场景中
+    /// ~50% 概率的收侧永久挂起)。(d) 复 poll 读半(预置数据)→ Ready
+    /// 读到数据。CountWaker 计数断言,不需要真实线程。
+    #[test]
+    fn split_lock_pending_reader_woken_by_writer_release() {
+        let (base, st) = TestSocket::new();
+        let hook = Rc::new(RefCell::new(T6Hook {
+            armed: true,
+            reader: None,
+            reader_waker: None,
+            nested_pending: None,
+        }));
+        let sock = T6Socket {
+            base,
+            hook: hook.clone(),
+        };
+        let split = halves::split_socket(sock);
+        let mut writer = split.clone();
+        hook.borrow_mut().reader = Some(split);
+
+        #[derive(Default)]
+        struct CountWaker(AtomicUsize);
+        impl futures::task::ArcWake for CountWaker {
+            fn wake_by_ref(me: &Arc<Self>) {
+                me.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let w1 = Arc::new(CountWaker::default());
+        let w2 = Arc::new(CountWaker::default());
+        hook.borrow_mut().reader_waker = Some(futures::task::waker(w1.clone()));
+
+        // (b) 以 w2 poll 写半 poll_write2 小载荷 → Ready(取锁/写/释放)。
+        // (a) 嵌套于其临界区内:读侧空 → 读半 poll_read 必 Pending
+        //     (此时等待注册)。
+        let waker2 = futures::task::waker(w2.clone());
+        let mut cx2 = Context::from_waker(&waker2);
+        match crate::Writev2::poll_write2(Pin::new(&mut writer), &mut cx2, &[], b"x") {
+            Poll::Ready(Ok(n)) => assert_eq!(n, 1),
+            other => panic!("(b) writer poll_write2 must be ready, got {other:?}"),
+        }
+        assert_eq!(
+            w2.0.load(Ordering::SeqCst),
+            0,
+            "writer side is never parked"
+        );
+        assert_eq!(
+            hook.borrow().nested_pending,
+            Some(true),
+            "(a) reader must pend (on the lock) inside the writer critical section"
+        );
+
+        // (c) w1 已被唤醒:写半释放锁时必须唤醒等待中的读半 waker
+        //     (修前:Mutex 临时 future drop 丢节点,w1 永不被唤醒,红)。
+        assert!(
+            w1.0.load(Ordering::SeqCst) >= 1,
+            "(c) pending reader's waker must be woken by the writer's lock release"
+        );
+
+        // (d) 复 poll 读半(预置数据)→ Ready 读到数据。
+        st.borrow_mut()
+            .read_blocks
+            .lock()
+            .unwrap()
+            .push_back(b"y".to_vec());
+        let mut reader = hook
+            .borrow_mut()
+            .reader
+            .take()
+            .expect("reader half parked back in the hook");
+        let waker1 = futures::task::waker(w1.clone());
+        let mut cx1 = Context::from_waker(&waker1);
+        let mut buf = [0u8; 8];
+        match Pin::new(&mut reader).poll_read(&mut cx1, &mut buf) {
+            Poll::Ready(Ok(n)) => assert_eq!(&buf[..n], b"y"),
+            other => panic!("(d) reader must read preset data, got {other:?}"),
+        }
     }
 }
