@@ -31,6 +31,7 @@ use parking_lot::{Mutex, MutexGuard};
 use std::{
     fmt, io,
     pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
     task::{Context, Poll, Waker},
 };
@@ -320,6 +321,7 @@ impl Stream {
     /// * 成功消费 k 字节:整块消费时置 `None`(保持引用计数 1,帧写穿后
     ///   可归池);部分消费时置 `Some(剩余)`(slice 视图,本轮不归池);
     /// * `Poll::Pending`(窗口耗尽/通道满):`chunk` 原样保留。
+    ///
     /// 返回本次消费字节数(0 = 空块)。rabbithole vendor 转发路径专用。
     pub fn poll_write_chunk(
         mut self: Pin<&mut Self>,
@@ -909,6 +911,14 @@ pub(crate) struct Shared {
     /// "仅写半可发"即旧缺陷形态)。完整 Stream 不使用(其 flag
     /// 机制已覆盖全部外发路径)。
     pub(crate) ack_pending: bool,
+    /// halves 路径的未确认开流计数令牌(D4 精确性):Some ⟺ 该**出站**
+    /// 流已计入全局 ack_backlog_count 且尚未递减。基线 ack_backlog() 是
+    /// 全表实时扫描——流离开 Open{ack:false} 的**任何**迁移(对端 ACK
+    /// 确认 / 本地 poll_close 半关闭 / 对端 FIN、RST / 删除 / 连接排空)
+    /// 即刻不再计入;分片形态没有全局表可扫,由本令牌在 update_state
+    /// 的迁移点上恰递减一次(消费即置 None)。未拆分路径与非出站流恒
+    /// None,零行为影响。
+    pub(crate) ack_backlog_token: Option<Arc<AtomicUsize>>,
 }
 
 impl Shared {
@@ -922,6 +932,7 @@ impl Shared {
             reader: None,
             writer: None,
             ack_pending: false,
+            ack_backlog_token: None,
         }
     }
 
@@ -939,6 +950,26 @@ impl Shared {
         use self::State::*;
 
         let current = self.state;
+
+        // D4 令牌消费:离开 Open{ack:false} 的迁移点。基线靠全表实时扫描
+        // 自然"不再计入";分片形态在此恰递减一次全局未确认计数——所有
+        // 路径(对端 ACK 确认、本地 poll_close 半关闭、对端 FIN/RST、
+        // on_drop 删除、连接排空)都经本方法迁移状态,单点收口。
+        if matches!(
+            current,
+            Open {
+                acknowledged: false
+            }
+        ) && !matches!(
+            next,
+            Open {
+                acknowledged: false
+            }
+        ) {
+            if let Some(counter) = self.ack_backlog_token.take() {
+                counter.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
 
         match (current, next) {
             (Closed, _) => {}
@@ -993,6 +1024,18 @@ impl Shared {
 
     pub(crate) fn consume_receive_window(&mut self, i: u32) -> Result<(), ConnectionError> {
         self.flow_controller.consume_receive_window(i)
+    }
+}
+
+impl Drop for Shared {
+    /// D4 防御网:所有表内路径理论上都经 update_state(Closed) 收尾并
+    /// 消费令牌;若仍有令牌滞留到整体析构(未来新增路径漏迁移),在此
+    /// 补递减,保证"计入一次 ⟺ 递减一次"的不变量无泄漏。令牌消费即
+    /// 置 None,与 update_state 的消费互斥,不会双重递减。
+    fn drop(&mut self) {
+        if let Some(counter) = self.ack_backlog_token.take() {
+            counter.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 

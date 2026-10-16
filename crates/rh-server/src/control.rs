@@ -579,6 +579,9 @@ impl QuotaIo {
     }
 
     /// 内部流引用(splice 快路径:剥壳提取裸 TCP;限额语义随原对象生命周期)。
+    /// 唯一调用方是 data.rs 的 linux-only splice 分支,与
+    /// `CountedUserIo::inner_ref` 同款按平台裁剪,非 linux 平台不留死代码。
+    #[cfg(target_os = "linux")]
     pub(crate) fn inner_ref(&self) -> &rh_transport::BoxedIo {
         &self.inner
     }

@@ -3,8 +3,11 @@
 //! (Round-D:连接拆分 RecvHalf/SendHalf,对齐 Go yamux 的
 //! `go s.recv()` / `go s.send()` 双 goroutine 模型——收(解帧+派发)与
 //! 发(取命令+编帧+写出)物理并行;接收侧 accept 背压只停读侧任务,
-//! 不再拖死发送)。载体经 [`YamuxCarrier`] 适配:帧头+帧体由 writev
-//! 一次下发。
+//! 不再拖死发送)+ N 个分片 Worker 任务(Round-5:接收侧数据面按
+//! `sid % N` 拆到 N 个 Worker,流级解包/派发/流控记账/唤醒在各 Worker
+//! 内闭环,多核分摊——对齐 frp 多 goroutine;yamux 侧 futures-only,
+//! Worker 是裸 Future,spawn 在此完成)。载体经 [`YamuxCarrier`] 适配:
+//! 帧头+帧体由 writev 一次下发,发送半聚合的整批帧亦一次 writev。
 
 use crate::{BoxedIo, MultiplexerInner};
 use bytes::{BufMut as _, Bytes};
@@ -628,7 +631,8 @@ pub fn steal_mux_halves(io: &mut BoxedIo) -> Option<(RhMuxStreamRead, RhMuxStrea
 }
 
 /// yamux 连接载体:futures IO 视图的 BoxedIo + 向量写(writev)。
-/// poll_write2 把 [帧头, 帧体] 以 writev 单 syscall 下发;
+/// poll_write2 把 [帧头, 帧体] 以 writev 单 syscall 下发;poll_writev
+/// (round-5 §3 跨帧批量写)把发送半聚合的整批帧(≤33 段)一次下发;
 /// 不支持向量写的载体(tokio 默认实现)自动退化为顺序写。
 pub struct YamuxCarrier {
     inner: BoxedIo,
@@ -693,6 +697,18 @@ impl yamux::Writev2 for YamuxCarrier {
         }
         let bufs = [std::io::IoSlice::new(a), std::io::IoSlice::new(b)];
         Pin::new(&mut this.inner).poll_write_vectored(cx, &bufs)
+    }
+
+    /// round-5 §3.1:多段批量写直接走 tokio 的 `poll_write_vectored`
+    /// (writev 单 syscall 下发整批);不支持向量写的载体(tokio 默认
+    /// 实现)自动退化为顺序写,语义不变。
+    fn poll_writev(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
     }
 }
 
@@ -768,6 +784,10 @@ fn mux_config(max_streams: usize) -> yamux::Config {
     // 理由见上)。发送端初窗仍 256KiB——对端只见标准 WU,线路兼容。
     // 本改动只覆盖 yamux(mux 路径),不声称修复 nomux/QUIC/KCP。
     cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
+    // 分片 Worker 数(round-5 §2.7):**不覆盖**,消费 vendor 默认 4。
+    // 该值只作用于 halves 路径(本文件两路入口均走 halves),未拆分
+    // Active 路径忽略;三机验收 ×16 下行目标 ≥3100 Mbps / 数据面
+    // 2.0~3.5 核以默认 4 为准,调参须另立规格并回归三机。
     cfg
 }
 
@@ -787,9 +807,11 @@ impl YamuxMultiplexer {
             yamux::Connection::new(YamuxCarrier::new(io), mux_config(max_streams), mode);
         // Round-D:收/发双任务驱动(对齐 Go yamux recv/send 双 goroutine)。
         // 单一载体经 SplitSocket/BiLock 串行——TLS/WS/QUIC/KCP 等不可
-        // fd 复制的载体走此路径(泛型兜底)。
-        let (recv_half, send_half) = conn.into_halves();
-        Self::spawn_drivers(recv_half, send_half)
+        // fd 复制的载体走此路径(泛型兜底)。Round-5 起三元组:第三件
+        // 是 N 个分片 Worker(数量由 Config.shard_workers 决定,见
+        // [`mux_config`]),与两半一同 spawn。
+        let (recv_half, send_half, workers) = conn.into_halves();
+        Self::spawn_drivers(recv_half, send_half, workers)
     }
 
     /// 双载体入口(round-E2,裸 TCP fd-dup):read_io 归接收任务、write_io
@@ -808,21 +830,39 @@ impl YamuxMultiplexer {
     ) -> Self {
         let conn: MuxConn =
             yamux::Connection::new(YamuxCarrier::new(read_io), mux_config(max_streams), mode);
-        let (recv_half, send_half) = conn.into_halves_duplex(YamuxCarrier::new(write_io));
-        Self::spawn_drivers(recv_half, send_half)
+        let (recv_half, send_half, workers) = conn.into_halves_duplex(YamuxCarrier::new(write_io));
+        Self::spawn_drivers(recv_half, send_half, workers)
     }
 
-    /// 收/发双任务驱动(两路径共用):接收任务解帧+派发,新流入
-    /// accept_tx(容量 256 背压——接收阻塞只停读侧,不影响发送任务);
-    /// 发送任务处理开流请求 + 写路径。S: Send + 'static 供 tokio::spawn
-    ///(halves 的 Send/生命周期随 socket 类型)。
-    fn spawn_drivers<S>(recv_half: yamux::RecvHalf<S>, send_half: yamux::SendHalf<S>) -> Self
+    /// 收/发双任务 + N 个分片 Worker 任务驱动(两路径共用):接收任务
+    /// 解帧+路由,新流入 accept_tx(容量 256 背压——接收阻塞只停读侧,
+    /// 不影响发送任务);发送任务处理开流请求 + 写路径;Worker 任务独占
+    /// `sid % N` 的流集合,做流级派发/流控记账/唤醒(Round-5)。
+    /// S: Send + 'static 供 tokio::spawn(halves 的 Send/生命周期随
+    /// socket 类型);[`yamux::ShardWorker`] 不带 socket 泛型参数,其
+    /// `Send + 'static` 由 vendor 侧结构保证(Arc/Mutex/原子,无 Rc)。
+    ///
+    /// Worker 生命周期:JoinHandle 丢弃即分离(同两半的 driver);Worker
+    /// 在观察到共享错误槽(任一半 fatal / RecvHalf Drop 置 Closed)后自行
+    /// `Ready(())` 终结并排空本地流表,无需 abort——与 vendor §2.6 生命周期
+    /// 矩阵一致,不存在 Worker 永存泄漏面。
+    fn spawn_drivers<S>(
+        recv_half: yamux::RecvHalf<S>,
+        send_half: yamux::SendHalf<S>,
+        workers: Vec<yamux::ShardWorker>,
+    ) -> Self
     where
         S: futures::AsyncRead + futures::AsyncWrite + Unpin + yamux::Writev2 + Send + 'static,
     {
         let (open_tx, open_rx) = mpsc::channel::<oneshot::Sender<io::Result<yamux::Stream>>>(64);
         let (accept_tx, accept_rx) = mpsc::channel::<yamux::Stream>(256);
         let dead = Arc::new(AtomicBool::new(false));
+        // Worker 先于两半 spawn:接收任务路由的分片通道有界(cap 128),
+        // 消费侧未起即满 → 接收任务 park 停读;顺序不影响正确性(丢唤醒
+        // 防线保证消费侧起后必被唤醒),只是让首批帧少一次 park。
+        for w in workers {
+            tokio::spawn(w);
+        }
         tokio::spawn(send_driver(send_half, open_rx, dead.clone()));
         tokio::spawn(recv_driver(recv_half, accept_tx, dead.clone()));
         Self {
@@ -1074,6 +1114,26 @@ mod tests {
     #[test]
     fn chunk_cap_is_64kib() {
         assert_eq!(CHUNK_CAP, 64 * 1024, "读缓冲上限红线(64KiB)不得放宽");
+    }
+
+    // round-5 §2.7/§4.3 锁:mux_config 不覆盖 shard_workers,halves 三元组
+    // 的 Worker 数必须等于 vendor 默认 4(三机验收以此为准;调参须另立
+    // 规格)。经 into_halves 返回的 Vec 长度观测,不依赖 vendor 暴露
+    // getter;纯构造不 poll,无需运行时(两半/Worker 丢弃只走 Drop 收敛)。
+    #[test]
+    fn mux_config_consumes_default_four_shard_workers() {
+        let (a, _b) = tokio::io::duplex(64);
+        let conn: MuxConn = yamux::Connection::new(
+            YamuxCarrier::new(Box::new(a)),
+            mux_config(MUX_STREAMS_UNLIMITED),
+            yamux::Mode::Client,
+        );
+        let (_recv, _send, workers) = conn.into_halves();
+        assert_eq!(
+            workers.len(),
+            4,
+            "shard_workers 默认 4 不得被 mux_config 覆盖(round-5 §2.7)"
+        );
     }
 
     // A4 长期锁(read_chunk_from_cap_lock):注入超限缓冲(256KiB,镜像池

@@ -409,7 +409,7 @@ mod tests {
         // 手动驱动:同缓冲重试,直到 Ready(模拟 write_all 的上层契约)。
         // 整体放独立块:块结束 drop WsIo(含 duplex 半)→ reader 侧 EOF。
         let n = {
-            let mut c = WsIo::new(ws);
+            let c = WsIo::new(ws);
             let mut pinned = std::pin::pin!(c);
             tokio::time::timeout(
                 Duration::from_secs(5),

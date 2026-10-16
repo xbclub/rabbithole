@@ -35,7 +35,7 @@ pub(crate) mod connection;
 mod tagged_stream;
 
 pub use crate::connection::{
-    Connection, Mode, Packet, RecvHalf, SendHalf, SplitSocket, Stream, StreamReadHalf,
+    Connection, Mode, Packet, RecvHalf, SendHalf, ShardWorker, SplitSocket, Stream, StreamReadHalf,
     StreamWriteHalf,
 };
 pub use crate::error::ConnectionError;
@@ -81,6 +81,7 @@ const DEFAULT_SPLIT_SEND_SIZE: usize = 16 * KIB;
 /// - max. number of streams = 512
 /// - read after close = true
 /// - split send size = 16 KiB
+/// - shard workers = 4
 #[derive(Debug, Clone)]
 pub struct Config {
     max_connection_receive_window: Option<usize>,
@@ -91,6 +92,9 @@ pub struct Config {
     /// 见 [`Config::set_initial_stream_receive_window`])。默认
     /// [`DEFAULT_CREDIT`],即 upstream 原行为。
     initial_stream_receive_window: usize,
+    /// 分片 Worker 数(halves 路径,round-5 §2.7)。≥1;默认 4;
+    /// 未拆分路径(Active/Connection::poll_*)忽略该配置。
+    shard_workers: usize,
 }
 
 impl Default for Config {
@@ -101,6 +105,7 @@ impl Default for Config {
             read_after_close: true,
             split_send_size: DEFAULT_SPLIT_SEND_SIZE,
             initial_stream_receive_window: DEFAULT_CREDIT as usize,
+            shard_workers: 4,
         }
     }
 }
@@ -223,6 +228,18 @@ impl Config {
         self.initial_stream_receive_window = n;
         self
     }
+
+    /// Set the number of stream-shard workers for the split-halves path
+    /// (round-5 §2.7). Must be within `1..=64`; defaults to 4. The
+    /// unsplit path (`Active` / `Connection::poll_*`) ignores this.
+    pub fn set_shard_workers(&mut self, n: usize) -> &mut Self {
+        assert!(
+            (1..=64).contains(&n),
+            "`shard_workers` must be within 1..=64"
+        );
+        self.shard_workers = n;
+        self
+    }
 }
 
 // Check that we can safely cast a `usize` to a `u64`.
@@ -239,11 +256,11 @@ static_assertions::const_assert! {
 impl quickcheck::Arbitrary for Config {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
         // quickcheck 1 的 Gen 不暴露底层 rng:用 Arbitrary 取模近似 gen_range
+        // (impl 块体内被实现的 trait 已在作用域,无需再 use)
         fn gr_usize(g: &mut quickcheck::Gen, lo: usize, hi: usize) -> usize {
             if hi <= lo {
                 return lo;
             }
-            use quickcheck::Arbitrary;
             (u64::arbitrary(g) % ((hi - lo) as u64)) as usize + lo
         }
 
@@ -264,6 +281,8 @@ impl quickcheck::Arbitrary for Config {
             split_send_size: gr_usize(g, DEFAULT_SPLIT_SEND_SIZE, usize::MAX),
             // 随机配置保持 upstream 默认初窗(预授信行为由专项测试显式构造)
             initial_stream_receive_window: DEFAULT_CREDIT as usize,
+            // 分片数保持默认(分片行为由专项测试显式构造)
+            shard_workers: 4,
         }
     }
 }

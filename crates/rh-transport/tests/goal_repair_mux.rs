@@ -879,7 +879,7 @@ async fn mux_initial_window_pregrant_unlocks_single_stream() {
 
 /// 顺序延迟泵:读一块 → sleep(delay) → 写对端。两个方向各一条,
 /// 构成 RTT ≈ 2×delay 的合成载体(每向传播时延 delay)。
-async fn delay_pump<R, W>(mut from: R, mut to: W, delay: Duration)
+async fn delay_pump<R, W>(from: R, to: W, delay: Duration)
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,

@@ -2470,7 +2470,7 @@ mod kcp_regress {
                             x ^= x << 17;
                             assert_eq!(
                                 *b,
-                                (x >> 24) as u64 as u8,
+                                (x >> 24) as u8,
                                 "stream {stream_id} 偏移 {got} 数据损坏"
                             );
                         }
@@ -2486,7 +2486,7 @@ mod kcp_regress {
                         x ^= x << 13;
                         x ^= x >> 7;
                         x ^= x << 17;
-                        *b = (x >> 24) as u64 as u8;
+                        *b = (x >> 24) as u8;
                     }
                     w.write_all(&chunk[..n]).await.expect("write");
                     written += n as u64;
@@ -4534,12 +4534,6 @@ mod c84_closure_tests {
 
     const MSS: usize = MTU - KCP_OVERHEAD;
 
-    fn poll_w(io: &mut KcpIo, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        let w = noop_waker();
-        let mut cx = Context::from_waker(&w);
-        Pin::new(io).poll_write(&mut cx, buf)
-    }
-
     async fn yield16() {
         for _ in 0..16 {
             tokio::task::yield_now().await;
@@ -5017,7 +5011,7 @@ mod c84_closure_tests {
         sender.writable().await.expect("writable prime");
         let probe = vec![0xC1u8; 64];
         let backlog = Arc::new(UdpBacklog::new());
-        let mut out = PunchOutput {
+        let out = PunchOutput {
             sock: sender.clone(),
             peer: Arc::new(PunchPeer::new(peer_addr)),
             backlog: backlog.clone(),
@@ -5047,7 +5041,7 @@ mod c84_closure_tests {
             }
             match tokio::time::timeout(remaining, peer.recv_from(&mut buf)).await {
                 Ok(Ok((n, _))) => {
-                    if n == probe.len() && &buf[..n] == &probe[..] {
+                    if n == probe.len() && buf[..n] == probe[..] {
                         got_probe += 1;
                     }
                 }
@@ -5347,7 +5341,7 @@ mod c84_closure_tests {
         let (mut io, shared, rec, tx, task) = setup_ack_session(conv).await;
         let seg = vec![0xCDu8; MSS];
         io.write_all(&seg).await.unwrap();
-        spin_until(&shared, |_| rec.lock().unwrap().len() >= 1).await;
+        spin_until(&shared, |_| !rec.lock().unwrap().is_empty()).await;
         wait_stable(&shared, 300).await;
         let (sn, ts) = {
             let g = rec.lock().unwrap();

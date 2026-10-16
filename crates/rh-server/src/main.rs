@@ -80,7 +80,7 @@ fn check_fd_limit() {
                 if let Some(rest) = line.strip_prefix("Max open files") {
                     if let Some(soft) = rest.split_whitespace().next() {
                         let soft: i64 = soft.parse().unwrap_or(-1);
-                        if soft >= 0 && soft < 4096 {
+                        if (0..4096).contains(&soft) {
                             tracing::warn!(
                                 soft_limit = soft,
                                 "low open-files ulimit; high-concurrency forwarding will fail (raise with LimitNOFILE/ulimit -n)"

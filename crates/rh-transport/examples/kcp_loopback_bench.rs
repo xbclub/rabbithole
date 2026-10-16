@@ -7,7 +7,7 @@
 
 use rh_transport::kcp;
 use rh_transport::{ClientTransportConfig, Protocol, ServerTransportConfig};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

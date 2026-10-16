@@ -12,7 +12,9 @@
 //!
 //! * 写侧:帧头(12B)+帧体通过 [`Writev2::poll_write2`] 合并下发
 //!   (载体实现可用 `writev` 单 syscall);帧体来自 `crate::pool` 池化缓冲,
-//!   写穿后归还。
+//!   写穿后归还。round-5 §3 起 Sink 持批队列([`WriteState::Batch`]):
+//!   多帧聚合为一次 [`Writev2::poll_writev`] 多段写出,把"每帧一次
+//!   writev"降为"每批一次 syscall"。
 //! * 读侧:staging `BytesMut` 批量接收,一次 read 可含多帧;帧体以
 //!   `BytesMut::split_to(...).freeze()` 零拷贝切片交付,消除逐帧
 //!   `vec![0; body_len]` 的分配+清零。
@@ -25,7 +27,9 @@ use crate::connection::Id;
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{prelude::*, ready};
 use std::{
-    fmt, io,
+    collections::VecDeque,
+    fmt,
+    io::{self, IoSlice},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -47,6 +51,19 @@ const READ_RESERVE: usize = 64 * 1024;
 /// 大帧保留零拷贝切片(转发主力路径不受影响)。
 const SMALL_FRAME_COPY: usize = 4 * 1024;
 
+/// 跨帧批量写的聚合上限——帧数(round-5 §3.2)。一次 `poll_writev` 最多
+/// 聚合队列中的 16 帧;发送半按同一上限连续取帧入队(§3.3)。
+pub(crate) const MAX_BATCH_FRAMES: usize = 16;
+
+/// 跨帧批量写的聚合上限——字节(round-5 §3.2)。只约束聚合:队列为空时
+/// 单帧无条件入队,单帧可超此值。
+pub(crate) const MAX_BATCH_BYTES: usize = 256 * 1024;
+
+/// 一次 `poll_writev` 的段数上限(§3.2:≤33 段)。半写中的 current 至多
+/// 贡献 2 段(帧头余段 + 帧体),队列后续每帧 ≤2 段(帧头 + 非空帧体):
+/// current 1 段 + 16 帧 × 2 = 33;current 2 段时只容得下 15 帧。
+const MAX_WRITEV_SEGMENTS: usize = 33;
+
 /// 两段缓冲合并写出。
 ///
 /// 由载体侧实现:支持向量写出的 IO 用 `writev` 一次下发(a 为帧头、b 为帧体),
@@ -59,6 +76,28 @@ pub trait Writev2: AsyncWrite {
         a: &[u8],
         b: &[u8],
     ) -> Poll<io::Result<usize>>;
+
+    /// 多段批量写出(round-5 §3.1):返回针对 `bufs` 拼接视图本次写出的
+    /// 字节数,部分写出由调用方按返回值推进偏移后重拼剩余段。
+    ///
+    /// 默认实现:顺序退化——每次只写出前两个非空段,经 [`Self::poll_write2`]
+    /// 下发(a/b 契约是纯字节拼接视图,不假定帧边界,跨帧两段同样合法)。
+    /// 只实现了 `poll_write2` 的旧载体由此零改动即可编译,且保持原
+    /// "每帧一次两段写"的 syscall 形态不回退;真正的多段向量写由载体
+    /// 覆盖(`YamuxCarrier` → `poll_write_vectored`、`SplitSocket` 取锁后
+    /// 委托内层)。全空段 → `Ok(0)`,本模块 Sink 保证不以全空段调用。
+    fn poll_writev(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let mut it = bufs.iter().filter(|b| !b.is_empty());
+        match (it.next(), it.next()) {
+            (Some(a), Some(b)) => self.poll_write2(cx, &a[..], &b[..]),
+            (Some(a), None) => self.poll_write2(cx, &a[..], &[]),
+            (None, _) => Poll::Ready(Ok(0)),
+        }
+    }
 }
 
 /// 顺序写出适配器:把 [`Writev2`] 实现为「先 a 后 b」的两段顺序写。
@@ -220,15 +259,34 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
     }
 }
 
-/// The stages of writing a new `Frame`.
+/// 已编码待写帧:12B 帧头 + 帧体(所有权自 [`Frame`] 转入,写穿后归池)。
+struct PendingFrame {
+    header: [u8; header::HEADER_SIZE],
+    body: bytes::Bytes,
+}
+
+impl PendingFrame {
+    /// 线上总字节(帧头 + 帧体)。
+    fn wire_len(&self) -> usize {
+        header::HEADER_SIZE + self.body.len()
+    }
+}
+
+/// The stages of writing `Frame`s.
 ///
-/// `Combined` 把帧头与帧体视为一个拼接视图,单次 [`Writev2::poll_write2`]
-/// 尽可能一次写出;部分写出按 offset 推进。
+/// round-5 §3.2 批队列:`start_send` 只入队;`poll_ready` 把半写中的
+/// `current` 余段与队列后续帧拼成 IoSlice 数组一次 [`Writev2::poll_writev`]
+/// 写出,按返回字节跨帧推进 `offset`,写穿的帧体归池。`Ready(Ok)` 仅当
+/// 队列 + current 全部写穿(→ `Init`);载体 Pending 时半写状态原地保留;
+/// 写错误 → `Poisoned`(B4:此后拒绝新帧,原始 IO 错误向上传播)。
 enum WriteState {
+    /// 队列空且无半写。
     Init,
-    Combined {
-        header: [u8; header::HEADER_SIZE],
-        body: bytes::Bytes,
+    Batch {
+        queue: VecDeque<PendingFrame>,
+        /// 半写中的帧(`offset < wire_len`);`None` 时下一轮自队首取。
+        current: Option<PendingFrame>,
+        /// `current` 的已写偏移(跨帧头/帧体边界计)。
         offset: usize,
     },
     Poisoned,
@@ -238,61 +296,146 @@ impl fmt::Debug for WriteState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             WriteState::Init => f.write_str("(WriteState::Init)"),
-            WriteState::Combined { body, offset, .. } => write!(
+            WriteState::Batch {
+                queue,
+                current,
+                offset,
+            } => write!(
                 f,
-                "(WriteState::Combined (offset {offset}) (body-len {}))",
-                body.len()
+                "(WriteState::Batch (queued {}) (current offset {offset} body-len {:?}))",
+                queue.len(),
+                current.as_ref().map(|c| c.body.len())
             ),
             WriteState::Poisoned => f.write_str("(WriteState::Poisoned)"),
         }
     }
 }
 
+/// 帧写穿:池化帧体按值取回归还(引用计数不为 1 时自然释放)。
+fn recycle_body(body: bytes::Bytes) {
+    if let Ok(mut bm) = body.try_into_mut() {
+        bm.clear();
+        crate::pool::put(bm);
+    }
+}
+
 impl WriteState {
-    /// 写出剩余字节;返回 Ok(true) 表示本帧已写穿。
-    fn poll_write_frame<T: Writev2 + Unpin>(
+    /// 批量写出队列 + current,直至全部写穿(`Ready(Ok)`)/ 载体 Pending
+    /// (半写状态原地保留)/ 写错误(调用方置 Poisoned)。
+    ///
+    /// 每轮聚合:current 自 `offset` 起的余段 + 队列中后续 ≤
+    /// [`MAX_BATCH_FRAMES`] 帧,总段数 ≤ [`MAX_WRITEV_SEGMENTS`],一次
+    /// `poll_writev`;写出 n 字节后先烧穿 current 余段、再逐帧核销队列,
+    /// 落在帧中间的位置成为新的 current/offset。帧不会跨 writev 拆分
+    /// 核销——单帧(含超 [`MAX_BATCH_BYTES`] 的)整帧归属一个 current。
+    fn poll_write_batch<T: Writev2 + Unpin>(
         &mut self,
         io: &mut T,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<bool, io::Error>> {
-        let WriteState::Combined {
-            header,
-            body,
+    ) -> Poll<io::Result<()>> {
+        let WriteState::Batch {
+            queue,
+            current,
             offset,
         } = self
         else {
             // Init / Poisoned 由调用方处理,不该到达这里
-            return Poll::Ready(Ok(true));
+            return Poll::Ready(Ok(()));
         };
-        let total = header.len() + body.len();
         loop {
-            let (a, b) = if *offset < header.len() {
-                (&header[*offset..], &body[..])
-            } else {
-                (&header[..0], &body[*offset - header.len()..])
-            };
-            match Pin::new(&mut *io).poll_write2(cx, a, b) {
+            if current.is_none() {
+                match queue.pop_front() {
+                    Some(f) => {
+                        *current = Some(f);
+                        *offset = 0;
+                    }
+                    None => return Poll::Ready(Ok(())),
+                }
+            }
+            let cur = current.as_ref().expect("current set above");
+            let cur_total = cur.wire_len();
+            debug_assert!(*offset < cur_total, "current must have unwritten bytes");
+
+            // 拼段:current 余段(帧头余段 + 帧体 / 仅帧体余段)+ 队列后续帧
+            let mut slices = [IoSlice::new(&[]); MAX_WRITEV_SEGMENTS];
+            let mut nsegs = 0usize;
+            let mut total = 0usize;
+            {
+                let (a, b) = if *offset < header::HEADER_SIZE {
+                    (&cur.header[*offset..], &cur.body[..])
+                } else {
+                    (&cur.header[..0], &cur.body[*offset - header::HEADER_SIZE..])
+                };
+                for s in [a, b] {
+                    if !s.is_empty() {
+                        slices[nsegs] = IoSlice::new(s);
+                        nsegs += 1;
+                        total += s.len();
+                    }
+                }
+            }
+            for (appended, f) in queue.iter().enumerate() {
+                if appended >= MAX_BATCH_FRAMES {
+                    break;
+                }
+                let need = 1 + usize::from(!f.body.is_empty());
+                if nsegs + need > MAX_WRITEV_SEGMENTS {
+                    break;
+                }
+                slices[nsegs] = IoSlice::new(&f.header);
+                nsegs += 1;
+                if !f.body.is_empty() {
+                    slices[nsegs] = IoSlice::new(&f.body);
+                    nsegs += 1;
+                }
+                total += f.wire_len();
+            }
+
+            let n = match Pin::new(&mut *io).poll_writev(cx, &slices[..nsegs]) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                 }
-                Poll::Ready(Ok(n)) => {
-                    *offset += n;
-                    if *offset > total {
-                        let err = io::Error::other(format!(
-                            "Writer returned invalid write count n={n}: {offset} > {total}"
-                        ));
-                        return Poll::Ready(Err(err));
-                    }
-                    if *offset == total {
-                        return Poll::Ready(Ok(true));
-                    }
-                    // 部分写出:继续写剩余(就绪状态下立即返回)
+                Poll::Ready(Ok(n)) => n,
+            };
+            if n > total {
+                let err = io::Error::other(format!(
+                    "Writer returned invalid write count n={n}: exceeds offered {total}"
+                ));
+                return Poll::Ready(Err(err));
+            }
+
+            // 跨帧推进:先 current 余段,再逐帧核销队列
+            let cur_left = cur_total - *offset;
+            if n < cur_left {
+                *offset += n;
+                continue;
+            }
+            let mut rem = n - cur_left;
+            recycle_body(current.take().expect("current set above").body);
+            *offset = 0;
+            while rem > 0 {
+                let ft = queue
+                    .front()
+                    .expect("writev count is bounded by offered bytes")
+                    .wire_len();
+                if rem >= ft {
+                    recycle_body(queue.pop_front().expect("front checked").body);
+                    rem -= ft;
+                } else {
+                    *current = queue.pop_front();
+                    *offset = rem;
+                    rem = 0;
                 }
             }
+            // 就绪状态下继续写剩余批(队列空且无半写时下一轮返回 Ok)
         }
     }
+}
+
+fn poisoned_error() -> io::Error {
+    io::Error::other("Sink is in poisoned state due to previous write error")
 }
 
 impl<T> Sink<Frame<()>> for Io<T>
@@ -301,62 +444,60 @@ where
 {
     type Error = io::Error;
 
+    /// `Ready(Ok)` 仅当队列 + current 全部写穿(§3.2 Sink 契约):批量
+    /// 入队的调用方由此得到背压——载体阻塞时半写状态保留并返回
+    /// Pending(载体写 waker 已武装),不会再接受新帧。
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = Pin::into_inner(self);
-        loop {
-            log::trace!("{}: write: {:?}", this.id, this.write_state);
-            match this.write_state {
-                WriteState::Init => return Poll::Ready(Ok(())),
-                WriteState::Combined { .. } => {
-                    let mut state = std::mem::replace(&mut this.write_state, WriteState::Poisoned);
-                    match state.poll_write_frame(&mut this.io, cx) {
-                        Poll::Pending => {
-                            this.write_state = state;
-                            return Poll::Pending;
-                        }
-                        Poll::Ready(Err(e)) => {
-                            this.write_state = WriteState::Poisoned;
-                            return Poll::Ready(Err(e));
-                        }
-                        Poll::Ready(Ok(_done)) => {
-                            // 帧写穿:池化帧体按值取回归还(引用计数不为 1 时自然释放)
-                            if let WriteState::Combined { body, .. } = state {
-                                if let Ok(mut bm) = body.try_into_mut() {
-                                    bm.clear();
-                                    crate::pool::put(bm);
-                                }
-                            }
-                            this.write_state = WriteState::Init;
-                        }
-                    }
+        log::trace!("{}: write: {:?}", this.id, this.write_state);
+        match this.write_state {
+            WriteState::Init => Poll::Ready(Ok(())),
+            WriteState::Batch { .. } => match this.write_state.poll_write_batch(&mut this.io, cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    this.write_state = WriteState::Poisoned;
+                    Poll::Ready(Err(e))
                 }
-                WriteState::Poisoned => {
-                    return Poll::Ready(Err(io::Error::other(
-                        "Sink is in poisoned state due to previous write error",
-                    )))
+                Poll::Ready(Ok(())) => {
+                    this.write_state = WriteState::Init;
+                    Poll::Ready(Ok(()))
                 }
-            }
+            },
+            WriteState::Poisoned => Poll::Ready(Err(poisoned_error())),
         }
     }
 
+    /// 入队(编码 12B 帧头,帧体所有权转入);聚合上限由调用方按
+    /// [`MAX_BATCH_FRAMES`] / [`MAX_BATCH_BYTES`] 控制入队节奏,本方法
+    /// 不拒绝超限入队(Sink 契约下调用方每 `poll_ready` Ready 后的入队
+    /// 批自然有界)。
     fn start_send(self: Pin<&mut Self>, f: Frame<()>) -> Result<(), Self::Error> {
+        let this = Pin::into_inner(self);
         // B4:写错误已置 Poisoned 后必须拒绝新帧——无条件接受会覆盖
         // 半写状态,使帧边界错乱(前帧残段 + 新帧拼接破坏线协议)。
-        if matches!(self.write_state, WriteState::Poisoned) {
-            return Err(io::Error::other(
-                "Sink is in poisoned state due to previous write error",
-            ));
+        if matches!(this.write_state, WriteState::Poisoned) {
+            return Err(poisoned_error());
         }
-        let header = header::encode(&f.header);
-        let buffer = f.body;
-        self.get_mut().write_state = WriteState::Combined {
-            header,
-            body: buffer,
-            offset: 0,
+        let frame = PendingFrame {
+            header: header::encode(&f.header),
+            body: f.body,
         };
+        match &mut this.write_state {
+            WriteState::Batch { queue, .. } => queue.push_back(frame),
+            state => {
+                let mut queue = VecDeque::with_capacity(MAX_BATCH_FRAMES);
+                queue.push_back(frame);
+                *state = WriteState::Batch {
+                    queue,
+                    current: None,
+                    offset: 0,
+                };
+            }
+        }
         Ok(())
     }
 
+    /// 整队写穿后才 flush 载体(未排空前 Pending)。
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = Pin::into_inner(self);
         ready!(this.poll_ready_unpin(cx))?;
@@ -740,6 +881,327 @@ mod tests {
         assert!(
             max_small_cap > 0,
             "small bodies must be independently owned"
+        );
+    }
+
+    // ===== round-5 §5.4 跨帧批量写(Sink 级:WriteState::Batch 契约)=====
+
+    /// 批量写测试载体:`blocked` → 恒 Pending(载体阻塞);`chunk` → 每次
+    /// writev 至多写出 chunk 字节(0 = 不限);`pend_after_write` → 每次
+    /// 成功写后下一次调用 Pending 一次(半写状态跨 Pending 保留的驱动);
+    /// `fail_after = Some(k)` → 第 k 次成功写之后恒 Err。计 writev 成功
+    /// 次数与载体 flush 次数。读侧恒 Pending。
+    #[derive(Default)]
+    struct BatchState {
+        written: Vec<u8>,
+        blocked: bool,
+        chunk: usize,
+        pend_after_write: bool,
+        pend_next: bool,
+        fail_after: Option<usize>,
+        writev_calls: usize,
+        flush_calls: usize,
+    }
+
+    struct BatchIo(std::rc::Rc<std::cell::RefCell<BatchState>>);
+
+    impl BatchIo {
+        fn new(st: BatchState) -> (Self, std::rc::Rc<std::cell::RefCell<BatchState>>) {
+            let st = std::rc::Rc::new(std::cell::RefCell::new(st));
+            (BatchIo(st.clone()), st)
+        }
+    }
+
+    impl AsyncRead for BatchIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for BatchIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Writev2::poll_writev(self, cx, &[IoSlice::new(buf)])
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.0.borrow_mut().flush_calls += 1;
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Writev2 for BatchIo {
+        fn poll_write2(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            a: &[u8],
+            b: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Writev2::poll_writev(self, cx, &[IoSlice::new(a), IoSlice::new(b)])
+        }
+
+        fn poll_writev(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let mut st = self.0.borrow_mut();
+            if st.blocked {
+                return Poll::Pending; // noop waker 驱动:测试手动复 poll
+            }
+            if let Some(k) = st.fail_after {
+                if st.writev_calls >= k {
+                    return Poll::Ready(Err(io::Error::other("mock-batch-write-failure")));
+                }
+            }
+            if st.pend_next {
+                st.pend_next = false;
+                return Poll::Pending;
+            }
+            st.writev_calls += 1;
+            let mut budget = if st.chunk == 0 { usize::MAX } else { st.chunk };
+            let mut n = 0;
+            for b in bufs {
+                let take = b.len().min(budget);
+                st.written.extend_from_slice(&b[..take]);
+                n += take;
+                budget -= take;
+                if budget == 0 {
+                    break;
+                }
+            }
+            if st.pend_after_write {
+                st.pend_next = true;
+            }
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    fn data_frame(id: u32, body: Vec<u8>) -> Frame<()> {
+        Frame::data(StreamId::new(id), body.into()).unwrap().into()
+    }
+
+    /// 帧的线上编码(12B 帧头 + 帧体)。
+    fn encode_frame(f: &Frame<()>) -> Vec<u8> {
+        let mut v = header::encode(&f.header).to_vec();
+        v.extend_from_slice(&f.body);
+        v
+    }
+
+    fn batch_cx() -> Context<'static> {
+        Context::from_waker(Box::leak(Box::new(futures::task::noop_waker())))
+    }
+
+    /// T-B2:部分写推进——载体每次只收 10B 且每次成功后 Pending 一次,
+    /// 跨帧头/帧体边界与帧边界多轮推进后全帧写穿、字节零错(含空帧体
+    /// Data、非 Data 控制帧、4KiB 帧的混合批)。Pending 轮数 = 成功写
+    /// 次数 − 1:每轮 Pending 前恰有进展,半写状态跨 Pending 原地保留。
+    #[test]
+    fn batch_partial_write_advances_across_frames() {
+        let (carrier, st) = BatchIo::new(BatchState {
+            chunk: 10,
+            pend_after_write: true,
+            ..Default::default()
+        });
+        let mut io = Io::new(crate::connection::Id::next(), carrier);
+        let mut cx = batch_cx();
+
+        let frames: Vec<Frame<()>> = vec![
+            data_frame(1, Vec::new()),
+            data_frame(3, vec![0xA1; 100]),
+            Frame::window_update(StreamId::new(5), 7).into(),
+            data_frame(7, vec![0xB2; 4096]),
+        ];
+        let expected: Vec<u8> = frames.iter().flat_map(encode_frame).collect();
+
+        assert!(
+            Sink::poll_ready(Pin::new(&mut io), &mut cx).is_ready(),
+            "idle sink must be ready"
+        );
+        for f in frames {
+            Sink::start_send(Pin::new(&mut io), f).expect("enqueue");
+        }
+        let mut pending_rounds = 0usize;
+        loop {
+            match Sink::poll_flush(Pin::new(&mut io), &mut cx) {
+                Poll::Ready(Ok(())) => break,
+                Poll::Pending => {
+                    pending_rounds += 1;
+                    assert!(pending_rounds < 10_000, "flush must converge");
+                }
+                Poll::Ready(Err(e)) => panic!("unexpected write error: {e}"),
+            }
+        }
+        let st = st.borrow();
+        assert_eq!(
+            st.written, expected,
+            "bytes on the wire must equal frame order"
+        );
+        let calls = expected.len().div_ceil(10);
+        assert_eq!(
+            st.writev_calls, calls,
+            "every successful writev must take exactly the 10B chunk"
+        );
+        assert_eq!(
+            pending_rounds,
+            calls - 1,
+            "each Pending must be preceded by progress (state kept across Pending)"
+        );
+    }
+
+    /// T-B3:背压——压满 16 帧后载体阻塞 → poll_ready Pending(不接受
+    /// 新帧);写穿后 Ready。写穿时 16 帧聚合为**一次** writev(current
+    /// 2 段 + 15 帧 × 2 段 = 32 ≤ 33);第二阶段 17 帧 → 恰 2 次
+    /// writev(34 段越过 33 段上限,末帧落到下一次)。
+    #[test]
+    fn batch_backpressure_pending_until_drained() {
+        let (carrier, st) = BatchIo::new(BatchState {
+            blocked: true,
+            ..Default::default()
+        });
+        let mut io = Io::new(crate::connection::Id::next(), carrier);
+        let mut cx = batch_cx();
+
+        let frames: Vec<Frame<()>> = (0..16u8).map(|i| data_frame(1, vec![i; 4096])).collect();
+        let expected: Vec<u8> = frames.iter().flat_map(encode_frame).collect();
+        assert!(Sink::poll_ready(Pin::new(&mut io), &mut cx).is_ready());
+        for f in frames {
+            Sink::start_send(Pin::new(&mut io), f).expect("enqueue");
+        }
+        match Sink::poll_ready(Pin::new(&mut io), &mut cx) {
+            Poll::Pending => {}
+            other => panic!("full queue on a blocked carrier must be Pending, got {other:?}"),
+        }
+        assert!(
+            st.borrow().written.is_empty(),
+            "nothing leaves a blocked carrier"
+        );
+
+        st.borrow_mut().blocked = false;
+        match Sink::poll_ready(Pin::new(&mut io), &mut cx) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("drained queue must be Ready, got {other:?}"),
+        }
+        assert_eq!(
+            st.borrow().written,
+            expected,
+            "all 16 frames written in order"
+        );
+        assert_eq!(
+            st.borrow().writev_calls,
+            1,
+            "16 queued frames must coalesce into a single writev"
+        );
+
+        // 第二阶段:17 帧 → 2 次 writev(段数上限 33)
+        st.borrow_mut().written.clear();
+        st.borrow_mut().writev_calls = 0;
+        let frames: Vec<Frame<()>> = (0..17u8).map(|i| data_frame(3, vec![i; 1024])).collect();
+        let expected: Vec<u8> = frames.iter().flat_map(encode_frame).collect();
+        for f in frames {
+            Sink::start_send(Pin::new(&mut io), f).expect("enqueue");
+        }
+        match Sink::poll_ready(Pin::new(&mut io), &mut cx) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("drained queue must be Ready, got {other:?}"),
+        }
+        assert_eq!(st.borrow().written, expected);
+        assert_eq!(
+            st.borrow().writev_calls,
+            2,
+            "17 frames exceed the 33-segment bound: exactly two writevs"
+        );
+    }
+
+    /// T-B5:半批写失败——2 帧入队、载体写穿第一帧帧头(12B)后 Err →
+    /// poll_ready 以**原始 IO 错误**返回、sink Poisoned 持续 Err、
+    /// start_send 拒绝新帧(现行 B4 等价,半写不得被新帧覆盖)。
+    #[test]
+    fn batch_half_write_error_poisons_sink() {
+        let (carrier, st) = BatchIo::new(BatchState {
+            chunk: 12,
+            fail_after: Some(1),
+            ..Default::default()
+        });
+        let mut io = Io::new(crate::connection::Id::next(), carrier);
+        let mut cx = batch_cx();
+
+        assert!(Sink::poll_ready(Pin::new(&mut io), &mut cx).is_ready());
+        Sink::start_send(Pin::new(&mut io), data_frame(1, vec![1; 100])).expect("enqueue");
+        Sink::start_send(Pin::new(&mut io), data_frame(3, vec![2; 100])).expect("enqueue");
+        match Sink::poll_ready(Pin::new(&mut io), &mut cx) {
+            Poll::Ready(Err(e)) => assert!(
+                e.to_string().contains("mock-batch-write-failure"),
+                "original io error must propagate, got: {e}"
+            ),
+            other => panic!("write failure must surface as Ready(Err), got {other:?}"),
+        }
+        assert_eq!(
+            st.borrow().written.len(),
+            12,
+            "exactly the first header was written before the failure"
+        );
+        match Sink::poll_ready(Pin::new(&mut io), &mut cx) {
+            Poll::Ready(Err(_)) => {}
+            other => panic!("poisoned sink must stay Err, got {other:?}"),
+        }
+        assert!(
+            Sink::start_send(Pin::new(&mut io), data_frame(5, vec![3; 8])).is_err(),
+            "start_send must reject frames after a write error (B4)"
+        );
+        match Sink::poll_flush(Pin::new(&mut io), &mut cx) {
+            Poll::Ready(Err(_)) => {}
+            other => panic!("poisoned flush must be Err, got {other:?}"),
+        }
+    }
+
+    /// T-B6:flush 语义——未排空前 poll_flush Pending 且**不得**触碰载体
+    /// flush;排空(一次 writev)+ 载体 flush 后才 Ready。
+    #[test]
+    fn batch_flush_pending_until_drained_then_carrier_flush() {
+        let (carrier, st) = BatchIo::new(BatchState {
+            blocked: true,
+            ..Default::default()
+        });
+        let mut io = Io::new(crate::connection::Id::next(), carrier);
+        let mut cx = batch_cx();
+
+        let frames: Vec<Frame<()>> = (0..3u8).map(|i| data_frame(1, vec![i; 256])).collect();
+        let expected: Vec<u8> = frames.iter().flat_map(encode_frame).collect();
+        assert!(Sink::poll_ready(Pin::new(&mut io), &mut cx).is_ready());
+        for f in frames {
+            Sink::start_send(Pin::new(&mut io), f).expect("enqueue");
+        }
+        match Sink::poll_flush(Pin::new(&mut io), &mut cx) {
+            Poll::Pending => {}
+            other => panic!("flush before drain must be Pending, got {other:?}"),
+        }
+        assert_eq!(
+            st.borrow().flush_calls,
+            0,
+            "carrier flush must not run before the queue is drained"
+        );
+
+        st.borrow_mut().blocked = false;
+        match Sink::poll_flush(Pin::new(&mut io), &mut cx) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("flush after drain must be Ready, got {other:?}"),
+        }
+        let st = st.borrow();
+        assert_eq!(st.written, expected, "all frames written in order");
+        assert_eq!(st.writev_calls, 1, "3 frames coalesce into one writev");
+        assert_eq!(
+            st.flush_calls, 1,
+            "carrier flush runs exactly once after drain"
         );
     }
 }

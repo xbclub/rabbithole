@@ -218,8 +218,8 @@ async fn ws_mux_bulk_transfer_survives() {
     let mut sent: u64 = 0;
     let mut chunk = vec![0u8; 64 * 1024];
     while sent < TOTAL {
-        for i in 0..chunk.len() {
-            chunk[i] = ((sent + i as u64) & 0xff) as u8;
+        for (i, b) in chunk.iter_mut().enumerate() {
+            *b = ((sent + i as u64) & 0xff) as u8;
         }
         s.write_all(&chunk)
             .await

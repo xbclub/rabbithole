@@ -18,6 +18,7 @@ use std::{convert::TryInto, num::TryFromIntError};
 
 pub(crate) use io::Io;
 pub use io::{FrameDecodeError, Sequential, Writev2};
+pub(crate) use io::{MAX_BATCH_BYTES, MAX_BATCH_FRAMES};
 
 /// A Yamux message frame consisting of header and body.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +41,12 @@ impl<T> Frame<T> {
 
     pub fn header_mut(&mut self) -> &mut Header<T> {
         &mut self.header
+    }
+
+    /// 线上总字节(12B 帧头 + 帧体):round-5 §3.3 发送半批量取帧的
+    /// 字节上限计量。
+    pub(crate) fn wire_len(&self) -> usize {
+        header::HEADER_SIZE + self.body.len()
     }
 
     /// Introduce this frame to the right of a binary frame type.

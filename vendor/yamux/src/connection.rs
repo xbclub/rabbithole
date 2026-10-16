@@ -40,7 +40,9 @@ use std::{fmt, sync::Arc, task::Poll};
 // SplitSocket 需公开:round-E2 起 into_halves 的返回签名直指
 // RecvHalf<SplitSocket<T>>(锁路径的 halves socket 类型),类型名必须
 // 对外可见;字段/构造器(pub(crate) split_socket)仍不外露,行为不变。
-pub use halves::{RecvHalf, SendHalf, SplitSocket};
+// ShardWorker(round-5 分片)同理:halves 三元组的第三件,由调用方
+// (rh-transport)spawn。
+pub use halves::{RecvHalf, SendHalf, ShardWorker, SplitSocket};
 pub use stream::{Packet, State, Stream, StreamReadHalf, StreamWriteHalf};
 
 /// Next connection identifier, used for debug logging.
@@ -1048,10 +1050,18 @@ impl<T> Active<T> {
 /// Pong/GoAway 帧与 rtt ping 的发送优先级不低于未拆分路径(要点 2)。
 mod halves {
     use super::*;
+    use crate::frame::{MAX_BATCH_BYTES, MAX_BATCH_FRAMES};
     use crate::{FrameDecodeError, Writev2};
     use futures::ready;
     use futures::{AsyncRead, AsyncWrite};
-    use std::{io, pin::Pin};
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    // round-5 流级分片:通道/Worker/收编三联(§2);子模块可直接触达本
+    // 模块私有状态。
+    mod shard;
+    pub use shard::ShardWorker;
 
     /// 自研 BiLock 共享状态(规格 Round-D2 要点 2:futures 的 `BiLock`
     /// 需要未启用的 `bilock`+`unstable` feature,Cargo.toml 不在本次改动
@@ -1209,25 +1219,62 @@ mod halves {
             let mut guard = ready!(this.io.poll_lock(cx));
             Pin::new(&mut *guard).poll_write2(cx, a, b)
         }
+
+        /// round-5 §3.1:多段批量写与 `poll_write2` 同式——取锁后委托
+        /// 内层(锁粒度仍 = 单次载体操作,临界区内只做这一次 writev)。
+        fn poll_writev(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let mut guard = ready!(this.io.poll_lock(cx));
+            Pin::new(&mut *guard).poll_writev(cx, bufs)
+        }
     }
 
-    /// 双半共享的连接状态。
+    /// 双半共享的连接状态(round-5 分片改造:全局流表删除,换 opening
+    /// 预注册表 + 双全局计数器,§2.4)。
     ///
     /// 锁纪律(要点 3):所有 parking_lot Mutex 临界区内只操作数据结构,
     /// 无 await、无载体 IO、无跨锁回调;固定加锁顺序
-    /// `streams → stream::Shared / new_receivers → send_waker`,发送侧
+    /// `opening → stream::Shared / new_receivers → send_waker`,发送侧
     /// 只单独取叶锁,不构成环路。
     pub(crate) struct ConnShared {
         id: Id,
         mode: Mode,
         config: Arc<Config>,
-        /// 流表:收侧(入站建流/数据派发/RST)与发侧(开流/on_drop_stream/
-        /// ACK backlog)共同读写。
-        streams: Mutex<IntMap<StreamId, Arc<Mutex<stream::Shared>>>>,
-        /// recv → send 帧队列(Pong/GoAway):发送优先级最高(要点 2)。
+        /// D3 出站预注册表:SendHalf 开流即插入,Worker 首帧"按需收编"
+        /// (消除跨任务注册顺序竞态:对端任何帧只可能在我们 SYN 上线后
+        /// 到达);从未收到帧的出站流不占 Worker 表,由 on_drop 直接清。
+        opening: Mutex<IntMap<StreamId, Arc<Mutex<stream::Shared>>>>,
+        /// D4 存活流数(入站建流 + 出站开流各 +1;fetch_add 回滚保证
+        /// 跨分片上界精确)。
+        stream_count: AtomicUsize,
+        /// D4 未确认出站流数(§2.5-A 开流 fetch_add;递减由流 Shared 持有
+        /// 的计数令牌在离开 Open{ack:false} 的任何路径恰一次完成——对端
+        /// ACK 确认 / 本地 poll_close 半关闭 / 对端 FIN、RST / 删除 / 连接
+        /// 排空,与基线 ack_backlog() 实时表扫描语义等价)。Arc 形态供
+        /// 令牌跨 ConnShared 共享同一计数器。
+        ack_backlog_count: Arc<AtomicUsize>,
+        /// SendHalf Drop 信号(§2.6:不置错误;Worker 排空本地表后
+        /// 继续服务,对齐现行"发送半弃置后接收半仍可读/建流")。
+        send_dropped: AtomicBool,
+        /// Framer 路由终结宣告(复核修复,Worker fatal 排空的终结条件
+        /// 之一):RecvHalf 在冲洗完 pending_route(或 Drop 弃置)后
+        /// 置位,此后不再有新消息进入任何分片通道。若 Worker 凭错误
+        /// 标志即终结,RecvHalf 在对端错误唤醒后冲洗的 pending_route 帧
+        /// 会落入已终结 Worker 而丢失(§0.3-3 在途数据)。
+        framer_flushed: AtomicBool,
+        /// 错误粘性影子:set_error 即置位且永不清除。RecvHalf/SendHalf
+        /// take_error 会移除首错,Worker 被唤醒时若首错已被取走,凭本
+        /// 标志仍可观测"已致命"并终结(§2.6 Workers 收敛路径的竞态缝)。
+        workers_shutdown: AtomicBool,
+        /// recv → send 帧队列(Pong/GoAway/Worker 的 RST/FIN):发送
+        /// 优先级最高(要点 2)。
         to_send: Mutex<VecDeque<Frame<()>>>,
-        /// 接收侧(入站建流)注册的新流命令接收器:发送半 poll 时收编入
-        /// `SelectAll`。
+        /// 接收侧(Worker 入站建流)注册的新流命令接收器:发送半 poll
+        /// 时收编入 `SelectAll`。
         new_receivers: Mutex<VecDeque<(StreamId, mpsc::Receiver<StreamCommand>)>>,
         /// 错误槽:首个错误生效;存重建副本(原始错误由产生侧直接返回,
         /// 见 [`make_shadow`])。
@@ -1236,28 +1283,42 @@ mod halves {
         send_waker: Mutex<Option<Waker>>,
         /// 接收半 park 点:发送侧置错时唤醒(要点 1)。
         recv_waker: Mutex<Option<Waker>>,
-        /// ACK backlog 门控的 open_stream 等待者(发侧登记,收侧 ACK 唤醒)。
+        /// ACK backlog 门控的 open_stream 等待者(发侧登记,Worker ACK
+        /// 唤醒)。
         new_outbound_stream_waker: Mutex<Option<Waker>>,
+        /// N 槽 Worker park 点:set_error/排空信号广播(§2.4)。
+        worker_wakers: Mutex<Vec<Option<Waker>>>,
+        /// Framer/SendHalf 路由句柄:每 Worker 一对(帧通道 + ctrl 通道)
+        /// 生产者(§2.4 workers 字段)。
+        workers: Mutex<Vec<shard::ShardRoute>>,
     }
 
     impl ConnShared {
-        fn new(id: Id, mode: Mode, config: Config) -> Self {
+        fn new(id: Id, mode: Mode, config: Config, worker_count: usize) -> Self {
             ConnShared {
                 id,
                 mode,
                 config: Arc::new(config),
-                streams: Mutex::new(IntMap::default()),
+                opening: Mutex::new(IntMap::default()),
+                stream_count: AtomicUsize::new(0),
+                ack_backlog_count: Arc::new(AtomicUsize::new(0)),
+                send_dropped: AtomicBool::new(false),
+                framer_flushed: AtomicBool::new(false),
+                workers_shutdown: AtomicBool::new(false),
                 to_send: Mutex::new(VecDeque::new()),
                 new_receivers: Mutex::new(VecDeque::new()),
                 error: Mutex::new(None),
                 send_waker: Mutex::new(None),
                 recv_waker: Mutex::new(None),
                 new_outbound_stream_waker: Mutex::new(None),
+                worker_wakers: Mutex::new(vec![None; worker_count]),
+                workers: Mutex::new(Vec::new()),
             }
         }
 
-        /// 置共享错误(首错生效)并唤醒两个半的 park 点与 backlog 等待者
-        /// (要点 1:另一半个下次 poll 立即可见,不得死等)。
+        /// 置共享错误(首错生效)并唤醒两个半的 park 点、backlog 等待者
+        /// 与全部 Worker(要点 1:另一半个下次 poll 立即可见,不得死等;
+        /// §2.4:worker_wakers 广播 + 粘性影子置位)。
         fn set_error(&self, e: ConnectionError) {
             let mut slot = self.error.lock();
             if slot.is_some() {
@@ -1265,6 +1326,7 @@ mod halves {
             }
             *slot = Some(e);
             drop(slot);
+            self.workers_shutdown.store(true, Ordering::Release);
             if let Some(w) = self.send_waker.lock().take() {
                 w.wake()
             }
@@ -1274,15 +1336,27 @@ mod halves {
             if let Some(w) = self.new_outbound_stream_waker.lock().take() {
                 w.wake()
             }
+            self.wake_all_workers();
+        }
+
+        /// 唤醒全部 Worker park 点(take 语义,§2.4 排空信号广播)。
+        fn wake_all_workers(&self) {
+            for slot in self.worker_wakers.lock().iter_mut() {
+                if let Some(w) = slot.take() {
+                    w.wake()
+                }
+            }
         }
 
         /// 观察侧取错误(一次性)。错误产生侧自身直接返回原始错误、不经此
-        /// 槽;最多一个对端观察者,取走即空。
+        /// 槽;最多一个对端观察者,取走即空(Worker 侧凭 workers_shutdown
+        /// 粘性影子收敛,不依赖此槽)。
         fn take_error(&self) -> Option<ConnectionError> {
             self.error.lock().take()
         }
 
-        /// 接收侧压来的待发帧(Pong/GoAway):压入即唤醒发送半。
+        /// 接收侧压来的待发帧(Pong/GoAway/Worker 的 RST/FIN):压入即
+        /// 唤醒发送半。
         fn push_to_send(&self, f: Frame<()>) {
             self.to_send.lock().push_back(f);
             if let Some(w) = self.send_waker.lock().take() {
@@ -1294,7 +1368,7 @@ mod halves {
             self.to_send.lock().pop_front()
         }
 
-        /// 入站建流:注册命令接收器并唤醒发送半收编。
+        /// 入站建流(Worker 内):注册命令接收器并唤醒发送半收编。
         fn push_new_receiver(&self, id: StreamId, r: mpsc::Receiver<StreamCommand>) {
             self.new_receivers.lock().push_back((id, r));
             if let Some(w) = self.send_waker.lock().take() {
@@ -1322,12 +1396,24 @@ mod halves {
             *self.recv_waker.lock() = Some(w.clone());
         }
 
-        /// 等价 [`Active::drop_all_streams`](要点 4):Closed + 唤醒全部流
-        /// 的 reader/writer waker,使其见到错误而非死等。已缓冲数据仍可读
-        /// (读路径缓冲优先)。
-        fn drop_all_streams(&self) {
-            let streams: Vec<_> = self.streams.lock().drain().collect();
-            for (id, s) in streams {
+        /// 排空 `opening` 残留(逐流 Closed + 唤醒 + `stream_count` 按条数
+        /// 回收)。**仅作 RecvHalf 终结排空完成时的兜底**(Workers 消亡/
+        /// abort 防御路径,无人清的场景)。
+        ///
+        /// 复核修复(§0.3-2/§0.3-3):规格 §2.4 原把 opening 排空放在
+        /// drop_all_streams 里、由各 fatal 入口**同步**执行——但已路由进分片
+        /// 通道、其流尚未被 Worker 收编的出站流首帧(对端响应的 Data|ACK /
+        /// WU|ACK 与 EOF 同一读突发到达),会在 Worker 终结排空时因
+        /// opening 已空而按"unknown stream"丢弃,应用读该流得 EOF 却无
+        /// 响应数据(基线全局表命中 → buffer.push 后才 Closed)。红线优先:
+        /// opening 的正常排空移到各 Worker 终结排空之后、按分片子集执行
+        /// (收编权分片所有,§2.5-C),此处只兜底。
+        fn drain_opening_leftovers(&self) {
+            let drained: Vec<_> = self.opening.lock().drain().collect();
+            if !drained.is_empty() {
+                self.stream_count.fetch_sub(drained.len(), Ordering::SeqCst);
+            }
+            for (id, s) in drained {
                 let mut shared = s.lock();
                 shared.update_state(self.id, id, State::Closed);
                 if let Some(w) = shared.reader.take() {
@@ -1357,9 +1443,11 @@ mod halves {
     }
 
     impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Connection<T> {
-        /// 拆分收/发双半(rabbithole 专用;先例 [`Stream::into_halves`])。
-        /// 两个半可由不同任务独立 poll(收:解帧+派发;发:取命令+编帧+
-        /// 写出),对齐 Go yamux 的 `go s.recv()` / `go s.send()`。
+        /// 拆分收/发双半 + N 个分片 Worker(round-5 D8 三元组;rabbithole
+        /// 专用;先例 [`Stream::into_halves`])。收半是纯切帧的 Framer,
+        /// 发半取命令编帧写出,Worker 独占 `sid % N` 流集合——三者可由
+        /// 不同任务独立 poll,对齐 Go yamux 的 `go s.recv()` / `go s.send()`
+        /// + frp 多 goroutine 分摊。
         ///
         /// 仅支持未激活的连接(`Connection::new` 之后、任何 poll 之前):
         /// 激活后载体已并入未拆分路径的 fused socket,不可取回。
@@ -1367,7 +1455,16 @@ mod halves {
         /// 锁路径:单一载体经 [`SplitSocket`](自研 BiLock)串行,两个半
         /// 持同一 socket 的 clone——TLS/WS/QUIC/KCP 等不可 fd 复制的载体
         /// 走此路径(泛型兜底,行为与 Round-D 起完全一致)。
-        pub fn into_halves(mut self) -> (RecvHalf<SplitSocket<T>>, SendHalf<SplitSocket<T>>) {
+        ///
+        /// Worker 是裸 Future(futures-only 红线):yamux 不 spawn,由
+        /// 调用方(rh-transport)spawn。
+        pub fn into_halves(
+            mut self,
+        ) -> (
+            RecvHalf<SplitSocket<T>>,
+            SendHalf<SplitSocket<T>>,
+            Vec<ShardWorker>,
+        ) {
             let inner = std::mem::replace(&mut self.inner, ConnectionState::Poisoned);
             drop(self); // Poisoned 分支无 drop_all_streams 副作用
             match inner {
@@ -1399,7 +1496,10 @@ mod halves {
         /// 释放需两侧 fd 同时 drop(与锁路径 halves 的持有语义一致)。
         ///
         /// 仅支持未激活的连接(同 [`Connection::into_halves`])。
-        pub fn into_halves_duplex(mut self, write_io: T) -> (RecvHalf<T>, SendHalf<T>) {
+        pub fn into_halves_duplex(
+            mut self,
+            write_io: T,
+        ) -> (RecvHalf<T>, SendHalf<T>, Vec<ShardWorker>) {
             let inner = std::mem::replace(&mut self.inner, ConnectionState::Poisoned);
             drop(self); // Poisoned 分支无 drop_all_streams 副作用
             match inner {
@@ -1415,27 +1515,54 @@ mod halves {
 
         /// halves 组装公共体:读/写载体各自归半。锁路径两侧为同一
         /// [`SplitSocket`] 的 clone(共享 BiLock);duplex 路径为两个
-        /// 独立 fd,零共享。
+        /// 独立 fd,零共享。round-5 起 N 个分片 Worker 与两半同时构造
+        /// (§2.4:通道/ctrl/建流通道三件套 + 路由表挂入 ConnShared)。
         fn halves_from_sockets<R, W>(
             mode: Mode,
             cfg: Config,
             read_socket: R,
             write_socket: W,
             tag: &str,
-        ) -> (RecvHalf<R>, SendHalf<W>)
+        ) -> (RecvHalf<R>, SendHalf<W>, Vec<ShardWorker>)
         where
             R: AsyncRead + AsyncWrite + Unpin + crate::Writev2,
             W: AsyncRead + AsyncWrite + Unpin + crate::Writev2,
         {
             let id = Id::next();
             log::debug!("new connection: {id} ({mode:?}) [{tag}]");
-            let shared = Arc::new(ConnShared::new(id, mode, cfg));
+            let shard_n = cfg.shard_workers;
+            let shared = Arc::new(ConnShared::new(id, mode, cfg, shard_n));
             let rtt = rtt::Rtt::new();
+            let mut workers = Vec::with_capacity(shard_n);
+            let mut new_streams_rxs = Vec::with_capacity(shard_n);
+            let mut routes = Vec::with_capacity(shard_n);
+            for index in 0..shard_n {
+                let (msg_producer, msg_consumer) =
+                    shard::ShardChannel::with_capacity(shard::SHARD_CHANNEL_CAP);
+                let (ctrl_producer, ctrl_consumer) =
+                    shard::ShardChannel::with_capacity(shard::SHARD_CHANNEL_CAP);
+                let (new_streams_tx, new_streams_rx) = mpsc::channel(shard::NEW_STREAMS_CAP);
+                new_streams_rxs.push(new_streams_rx);
+                routes.push((msg_producer, ctrl_producer));
+                workers.push(ShardWorker::new(
+                    index,
+                    shard_n,
+                    shared.clone(),
+                    msg_consumer,
+                    ctrl_consumer,
+                    new_streams_tx,
+                ));
+            }
+            *shared.workers.lock() = routes;
             (
                 RecvHalf {
                     socket: frame::Io::new(id, read_socket).fuse(),
                     shared: shared.clone(),
                     rtt: rtt.clone(),
+                    new_streams_rxs,
+                    pending_route: None,
+                    teardown: None,
+                    flush_signaled: false,
                     finished: false,
                 },
                 SendHalf {
@@ -1446,17 +1573,22 @@ mod halves {
                         Mode::Client => 1,
                         Mode::Server => 2,
                     },
-                    pending_write_frame: None,
+                    ctrl_pending: VecDeque::new(),
                     rtt,
                     finished: false,
                 },
+                workers,
             )
         }
     }
 
-    /// Connection 的接收半:载体读侧。解帧、`on_frame` 派发入各流 staging、
-    /// 交付新入站流;Ping → 向发送队列压 Pong;Terminate → 压 GoAway;
-    /// EOF/错误 → 记共享错误并唤醒发送侧。
+    /// Connection 的接收半:纯切帧的 Framer(round-5 重写,§2.4)。
+    /// 只做 12B header 解析 + 按 `sid % N` 路由:连接级帧(GoAway、
+    /// sid=0 Ping、Ping|ACK 的 rtt 处理)本地处理;Data/WU/Ping(sid≠0)
+    /// 路由进对应 Worker 的分片通道(带 SYN → ShardMsg::Syn)。新流经
+    /// 各 Worker 的 new_streams 通道回流交付;路由遇满 → 登记生产者
+    /// waker 后 park(背压:TCP 停读)。EOF/错误 → 记共享错误并唤醒
+    /// 发送侧与全部 Worker。
     ///
     /// 泛型参数直指 socket 类型(round-E2):锁路径 `S = SplitSocket<T>`
     /// (单一载体 + BiLock),duplex 路径 `S = T`(读侧独占 fd;
@@ -1465,52 +1597,181 @@ mod halves {
         socket: Fuse<frame::Io<S>>,
         shared: Arc<ConnShared>,
         rtt: rtt::Rtt,
+        /// 各 Worker 的建流通道接收器(D6/§2.4:实施者定由 RecvHalf 直接
+        /// 持有;空闲时各接收器登记本任务 waker,futures mpsc 自带唤醒)。
+        new_streams_rxs: Vec<mpsc::Receiver<Stream>>,
+        /// 路由背压暂存:分片通道满时持有未路由帧,唤醒后最先重试
+        /// (不丢帧,§2.1 防线)。
+        pending_route: Option<(usize, shard::ShardMsg)>,
+        /// 终结排空态(§0.3-2/§0.3-3,复核修复):fatal 已决但尚未返回
+        /// ——先冲洗 pending_route、交付 Workers 的全部建流产出(含
+        /// fatal 排空新建的),全部落地后才返回终结结果。基线单任务逐帧
+        /// 同步处理完才见 EOF,分片后的等价语义。
+        teardown: Option<TearDown>,
+        /// 本侧已宣告"路由终结"(framer_flushed 已置位)的本地镜像,
+        /// 防重复广播。
+        flush_signaled: bool,
         finished: bool,
     }
 
+    /// RecvHalf 的终结结果(§2.4 终结分支):Err = 对外一次性报告错误;
+    /// Eof = 对端正常关闭,收敛为 Ready(None)。
+    enum TearDown {
+        Err(ConnectionError),
+        Eof,
+    }
+
+    /// on_frame 的路由结果:Done = 已路由/已本地处理;Backpressured =
+    /// 分片通道满(生产者 waker 已登记 + 复查),消息暂存由调用方 park。
+    enum Routed {
+        Done,
+        Backpressured { index: usize, msg: shard::ShardMsg },
+    }
+
     impl<S: AsyncRead + AsyncWrite + Unpin + crate::Writev2> RecvHalf<S> {
-        /// 驱动接收:交付新入站流;`Ready(None)` = EOF;`Ready(Some(Err))`
-        /// = IO/协议错误。错误只交付一次,此后收敛为 `Ready(None)`
-        /// (对齐未拆分 `Connection::poll_next_inbound` 的状态机语义)。
+        /// 驱动接收:交付新入站流(经 Worker 建流通道回流);`Ready(None)`
+        /// = EOF;`Ready(Some(Err))` = IO/协议错误。错误只交付一次,此后
+        /// 收敛为 `Ready(None)`(对齐未拆分 `Connection::poll_next_inbound`
+        /// 的状态机语义)。
+        ///
+        /// 终结排空(§0.3-2/§0.3-3):fatal 决定后不立即返回——基线单任务
+        /// 逐帧同步处理完才见 EOF,分片后的等价语义是先冲洗 pending_route
+        /// (该帧已从载体读出)、交付 Workers 的全部建流产出(含其 fatal
+        /// 排空新建的),全部落地后才返回终结结果。
         pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Stream>>> {
             loop {
                 if self.finished {
                     return Poll::Ready(None);
                 }
-                if let Some(e) = self.shared.take_error() {
-                    self.shared.drop_all_streams();
-                    self.finished = true;
-                    return Poll::Ready(Some(Err(e)));
+                if self.teardown.is_some() {
+                    // 排空①:pending_route 冲洗。fatal 态 Worker 无条件
+                    // 排空分片通道,空间必恢复;try_route 已登记生产者
+                    // waker 并复查(§2.1 防线),park 必被推进。
+                    if let Some((index, msg)) = self.pending_route.take() {
+                        match self.try_route(index, msg, cx) {
+                            Ok(()) => {}
+                            Err((index, msg)) => {
+                                self.pending_route = Some((index, msg));
+                                return Poll::Pending;
+                            }
+                        }
+                    }
+                    if !self.flush_signaled {
+                        self.flush_signaled = true;
+                        // 排空②:路由终结宣告——此后不再有新消息入通道
+                        // (Worker fatal 排空的终结条件,防"冲洗帧落入已
+                        // 终结 Worker"的竞态丢失),广播唤醒等待中的 Worker
+                        self.shared.framer_flushed.store(true, Ordering::Release);
+                        self.shared.wake_all_workers();
+                    }
+                    // 排空③:交付 Workers 的建流产出,直至全部接收器耗尽
+                    // (sender close_channel/drop = 对应 Worker 已终结)
+                    let mut exhausted = true;
+                    for rx in self.new_streams_rxs.iter_mut() {
+                        match rx.poll_next_unpin(cx) {
+                            Poll::Ready(Some(stream)) => {
+                                log::trace!("{}: new inbound {}", self.shared.id, stream);
+                                return Poll::Ready(Some(Ok(stream)));
+                            }
+                            Poll::Ready(None) => {}
+                            Poll::Pending => exhausted = false,
+                        }
+                    }
+                    if exhausted {
+                        self.finished = true;
+                        // 兜底清 opening 残留:全部 Worker 已终结时各自清过
+                        // 本分片子集(此处必空);Workers 消亡(abort)路径
+                        // 无人清,在此收口(状态 Closed + 计数回收)
+                        self.shared.drain_opening_leftovers();
+                        return match self.teardown.take().expect("teardown set") {
+                            TearDown::Err(e) => Poll::Ready(Some(Err(e))),
+                            TearDown::Eof => Poll::Ready(None),
+                        };
+                    }
+                    // 尚有 Worker 在 fatal 排空(建流暂存交付中):挂起
+                    // 等待——其 try_send 或终结(close_channel)都会唤醒
+                    // 本任务;Worker fatal 排空必达终结,无死锁
+                    return Poll::Pending;
                 }
+                if let Some(e) = self.shared.take_error() {
+                    // 消费对端产出的错误(错误槽一次性;RecvHalf Drop 兜底
+                    // 回填 Closed 供 SendHalf 收敛,现行不变量)。Workers 已
+                    // 由产出侧 set_error 唤醒进入终结排空;opening 不在此
+                    // 排空(待收编帧须能收编,见 drain_opening_leftovers)
+                    self.teardown = Some(TearDown::Err(e));
+                    continue;
+                }
+                // §2.6 防御路径:Worker 消亡(spawn 句柄被 abort)→
+                // 生产者侧 consumer_gone → fatal(Closed)
+                if self.workers_gone() {
+                    self.begin_fatal(ConnectionError::Closed, true);
+                    continue;
+                }
+                // 1) new_streams 交付:轮询 N 条接收器,有新流 → 立即交付
+                //    (空闲时各接收器登记本任务 waker,futures mpsc 自带)。
+                //    必须先于 pending_route 重试:D6 背压链——分片通道满
+                //    (路由受阻)时 Worker 因 new_streams 满而门控,唯有
+                //    本任务消费建流通道释放容量后 Worker 才继续排空分片
+                //    通道;若先重试路由,满通道 park 永远到不了这里 → 互锁。
+                for rx in self.new_streams_rxs.iter_mut() {
+                    if let Poll::Ready(Some(stream)) = rx.poll_next_unpin(cx) {
+                        log::trace!("{}: new inbound {}", self.shared.id, stream);
+                        return Poll::Ready(Some(Ok(stream)));
+                    }
+                }
+                // 2) 背压暂存重试(§2.4:唤醒后重试,不丢帧)
+                if let Some((index, msg)) = self.pending_route.take() {
+                    match self.try_route(index, msg, cx) {
+                        Ok(()) => continue, // 路由成功,回到常规循环
+                        Err((index, msg)) => {
+                            self.pending_route = Some((index, msg));
+                            self.shared.set_recv_waker(cx.waker());
+                            if self.shared.error.lock().is_some() || self.workers_gone() {
+                                continue;
+                            }
+                            return Poll::Pending; // 背压:TCP 停读
+                        }
+                    }
+                }
+                // 3) 载体读一帧(frame::Io 零拷贝路径不动):连接级帧本地
+                //    处理;流级帧按 sid % N 路由。注:连续路由不 yield
+                //    (规格 §2.4 注记:本轮 ≥ ROUTE_BATCH=64 条也继续,
+                //    tokio 任务内循环本就不抢占);帧循环自然受通道容量
+                //    节流(cap 128)。
                 match self.socket.poll_next_unpin(cx) {
-                    Poll::Ready(Some(Ok(frame))) => match self.on_frame(frame) {
-                        Ok(Action::None) => {}
-                        Ok(Action::New(stream)) => {
-                            log::trace!("{}: new inbound {}", self.shared.id, stream);
-                            return Poll::Ready(Some(Ok(stream)));
+                    Poll::Ready(Some(Ok(frame))) => match self.on_frame(frame, cx) {
+                        Ok(Routed::Done) => {}
+                        Ok(Routed::Backpressured { index, msg }) => {
+                            self.pending_route = Some((index, msg));
+                            self.shared.set_recv_waker(cx.waker());
+                            // 复查(要点 1 防线):错误槽/Worker 消亡不丢唤醒
+                            if self.shared.error.lock().is_some() || self.workers_gone() {
+                                continue;
+                            }
+                            return Poll::Pending; // 背压:TCP 停读
                         }
-                        Ok(Action::Ping(f)) => {
-                            log::trace!("{}/{}: pong", self.shared.id, f.header().stream_id());
-                            self.shared.push_to_send(f.into());
+                        Err(e) => {
+                            self.begin_fatal(e, true);
+                            continue;
                         }
-                        Ok(Action::Terminate(f)) => {
-                            log::trace!("{}: sending term", self.shared.id);
-                            self.shared.push_to_send(f.into());
-                        }
-                        Err(e) => return Poll::Ready(Some(Err(self.fatal(e)))),
                     },
                     Poll::Ready(Some(Err(e))) => {
                         let e: ConnectionError = e.into();
-                        return Poll::Ready(Some(Err(self.fatal(e))));
+                        self.begin_fatal(e, true);
+                        continue;
                     }
                     Poll::Ready(None) => {
-                        self.fatal(ConnectionError::Closed);
-                        return Poll::Ready(None);
+                        // EOF:错误槽置位(唤醒 Workers fatal 排空)但不
+                        // 对外报错,终结收敛为 Ready(None)(现行语义)
+                        self.begin_fatal(ConnectionError::Closed, false);
+                        continue;
                     }
                     Poll::Pending => {
-                        // park 前登记 waker 并复查:发送侧错误不丢唤醒(要点 1)
+                        // park 前登记 waker 并复查:发送侧错误/Worker 消亡
+                        // 不丢唤醒(要点 1 防线;new_streams 由 futures mpsc
+                        // 的登记原子性兜住,无复查缝)
                         self.shared.set_recv_waker(cx.waker());
-                        if self.shared.error.lock().is_some() {
+                        if self.shared.error.lock().is_some() || self.workers_gone() {
                             continue;
                         }
                         return Poll::Pending;
@@ -1519,303 +1780,146 @@ mod halves {
             }
         }
 
-        fn fatal(&mut self, e: ConnectionError) -> ConnectionError {
+        /// 进入终结排空(产出侧):置共享错误(shadow 供 SendHalf/Workers
+        /// 观察 + 粘性 shutdown 广播,Workers 由此唤醒进入终结排空),
+        /// 记录待返回的终结结果;返回前先完成终结排空(见 poll 顶部)。
+        /// opening **不在此排空**:已路由、待收编的出站流首帧须能在 Worker
+        /// 终结排空中收编落缓冲(§0.3-3),排空交各 Worker 终结后按分片
+        /// 执行 + [`ConnShared::drain_opening_leftovers`] 兜底。
+        fn begin_fatal(&mut self, e: ConnectionError, report_err: bool) {
             self.shared.set_error(make_shadow(&e));
-            self.shared.drop_all_streams();
-            self.finished = true;
-            e
+            self.teardown = Some(if report_err {
+                TearDown::Err(e)
+            } else {
+                TearDown::Eof
+            });
         }
 
-        /// 处理一帧:与未拆分 `Active::on_frame` 逐分支等价,操作对象换为
-        /// 共享流表/共享 waker 槽。
-        fn on_frame(&mut self, frame: Frame<()>) -> Result<Action> {
+        /// Workers 消亡探测(§2.6 防御):任一分片通道消费者已 drop。
+        fn workers_gone(&self) -> bool {
+            self.shared
+                .workers
+                .lock()
+                .iter()
+                .any(|(msg_producer, _)| msg_producer.consumer_gone())
+        }
+
+        /// 纯切帧分派(§2.4):GoAway → fatal;Ping|ACK → rtt;Ping
+        /// (sid=0)→ Pong;其余按 sid % N 路由(带 SYN → ShardMsg::Syn,
+        /// 由 Worker 执行建流全流程)。
+        fn on_frame(
+            &mut self,
+            frame: Frame<()>,
+            cx: &mut Context<'_>,
+        ) -> std::result::Result<Routed, ConnectionError> {
             log::trace!("{}: received: {}", self.shared.id, frame.header());
-
-            if frame.header().flags().contains(header::ACK)
-                && matches!(frame.header().tag(), Tag::Data | Tag::WindowUpdate)
-            {
-                let id = frame.header().stream_id();
-                {
-                    let streams = self.shared.streams.lock();
-                    if let Some(stream) = streams.get(&id) {
-                        stream.lock().update_state(
-                            self.shared.id,
-                            id,
-                            State::Open { acknowledged: true },
-                        );
-                    }
-                }
-                if let Some(waker) = self.shared.new_outbound_stream_waker.lock().take() {
-                    waker.wake();
-                }
-            }
-
-            let action = match frame.header().tag() {
-                Tag::Data => self.on_data(frame.into_data()),
-                Tag::WindowUpdate => self.on_window_update(&frame.into_window_update()),
-                Tag::Ping => self.on_ping(&frame.into_ping()),
-                Tag::GoAway => return Err(ConnectionError::Closed),
-            };
-            Ok(action)
-        }
-
-        fn on_data(&mut self, frame: Frame<Data>) -> Action {
-            let stream_id = frame.header().stream_id();
-
-            if frame.header().flags().contains(header::RST) {
-                // stream reset
-                let streams = self.shared.streams.lock();
-                if let Some(s) = streams.get(&stream_id) {
-                    let mut shared = s.lock();
-                    shared.update_state(self.shared.id, stream_id, State::Closed);
-                    if let Some(w) = shared.reader.take() {
-                        w.wake()
-                    }
-                    if let Some(w) = shared.writer.take() {
-                        w.wake()
-                    }
-                }
-                return Action::None;
-            }
-
-            let is_finish = frame.header().flags().contains(header::FIN); // half-close
-
-            if frame.header().flags().contains(header::SYN) {
-                // new stream
-                if !self.is_valid_remote_id(stream_id, Tag::Data) {
-                    log::error!("{}: invalid stream id {}", self.shared.id, stream_id);
-                    return Action::Terminate(Frame::protocol_error());
-                }
-                {
-                    // 存在性/上限校验(入站流 id 只由本任务插入,与发送侧
-                    // on_drop_stream 的 remove 无检查-插入竞态)
-                    let streams = self.shared.streams.lock();
-                    if streams.contains_key(&stream_id) {
-                        log::error!("{}/{}: stream already exists", self.shared.id, stream_id);
-                        return Action::Terminate(Frame::protocol_error());
-                    }
-                    if streams.len() == self.shared.config.max_num_streams {
-                        log::error!("{}: maximum number of streams reached", self.shared.id);
-                        return Action::Terminate(Frame::internal_error());
-                    }
-                }
-                if frame.body().len() > DEFAULT_CREDIT as usize {
-                    log::error!(
-                        "{}/{}: 1st body of stream exceeds default credit",
-                        self.shared.id,
-                        stream_id
-                    );
-                    return Action::Terminate(Frame::protocol_error());
-                }
-                let stream = self.make_new_inbound_stream(stream_id, DEFAULT_CREDIT);
-                {
-                    let mut shared = stream.shared();
-                    if is_finish {
-                        shared.update_state(self.shared.id, stream_id, State::RecvClosed);
-                    }
-                    if let Err(_err) = shared.consume_receive_window(frame.body_len()) {
-                        log::error!(
-                            "{}/{}: 1st body of stream exceeds default credit",
-                            self.shared.id,
-                            stream_id
-                        );
-                        return Action::Terminate(Frame::protocol_error());
-                    }
-                    shared.buffer.push(frame.into_body());
-                }
-                self.shared
-                    .streams
-                    .lock()
-                    .insert(stream_id, stream.clone_shared());
-                return Action::New(stream);
-            }
-
-            {
-                let streams = self.shared.streams.lock();
-                if let Some(s) = streams.get(&stream_id) {
-                    let mut shared = s.lock();
-
-                    if let Err(_err) = shared.consume_receive_window(frame.body_len()) {
-                        log::error!(
-                            "{}/{}: frame body larger than window of stream",
-                            self.shared.id,
-                            stream_id
-                        );
-                        return Action::Terminate(Frame::protocol_error());
-                    }
-
-                    if is_finish {
-                        shared.update_state(self.shared.id, stream_id, State::RecvClosed);
-                    }
-
-                    shared.buffer.push(frame.into_body());
-                    if let Some(w) = shared.reader.take() {
-                        w.wake()
-                    }
-                } else {
-                    log::trace!(
-                        "{}/{}: data frame for unknown stream, possibly dropped earlier: {:?}",
-                        self.shared.id,
-                        stream_id,
-                        frame
-                    );
-                    // 与未拆分路径一致:不视为协议违规、不回 RST(仍可能有
-                    // 该流在途命令,见 paritytech/yamux#110)。
-                }
-            }
-
-            Action::None
-        }
-
-        fn on_window_update(&mut self, frame: &Frame<WindowUpdate>) -> Action {
-            let stream_id = frame.header().stream_id();
-
-            if frame.header().flags().contains(header::RST) {
-                // stream reset
-                let streams = self.shared.streams.lock();
-                if let Some(s) = streams.get(&stream_id) {
-                    let mut shared = s.lock();
-                    shared.update_state(self.shared.id, stream_id, State::Closed);
-                    if let Some(w) = shared.reader.take() {
-                        w.wake()
-                    }
-                    if let Some(w) = shared.writer.take() {
-                        w.wake()
-                    }
-                }
-                return Action::None;
-            }
-
-            let is_finish = frame.header().flags().contains(header::FIN); // half-close
-
-            if frame.header().flags().contains(header::SYN) {
-                // new stream
-                if !self.is_valid_remote_id(stream_id, Tag::WindowUpdate) {
-                    log::error!("{}: invalid stream id {}", self.shared.id, stream_id);
-                    return Action::Terminate(Frame::protocol_error());
-                }
-                {
-                    let streams = self.shared.streams.lock();
-                    if streams.contains_key(&stream_id) {
-                        log::error!("{}/{}: stream already exists", self.shared.id, stream_id);
-                        return Action::Terminate(Frame::protocol_error());
-                    }
-                    if streams.len() == self.shared.config.max_num_streams {
-                        log::error!("{}: maximum number of streams reached", self.shared.id);
-                        return Action::Terminate(Frame::protocol_error());
-                    }
-                }
-
-                let Some(credit) = frame.header().credit().checked_add(DEFAULT_CREDIT) else {
-                    log::error!("{}: header contains invalid credit", self.shared.id);
-                    return Action::Terminate(Frame::protocol_error());
-                };
-                let stream = self.make_new_inbound_stream(stream_id, credit);
-
-                if is_finish {
-                    stream
-                        .shared()
-                        .update_state(self.shared.id, stream_id, State::RecvClosed);
-                }
-                self.shared
-                    .streams
-                    .lock()
-                    .insert(stream_id, stream.clone_shared());
-                return Action::New(stream);
-            }
-
-            {
-                let streams = self.shared.streams.lock();
-                if let Some(s) = streams.get(&stream_id) {
-                    let mut shared = s.lock();
-                    if let Err(err) = shared.increase_send_window_by(frame.header().credit()) {
-                        log::error!(
-                            "{}/{}: could not increase the send window, {err}",
-                            self.shared.id,
-                            stream_id
-                        );
-                        return Action::Terminate(Frame::protocol_error());
-                    }
-                    if is_finish {
-                        shared.update_state(self.shared.id, stream_id, State::RecvClosed);
-
-                        if let Some(w) = shared.reader.take() {
-                            w.wake()
+            match frame.header().tag() {
+                Tag::GoAway => Err(ConnectionError::Closed),
+                Tag::Ping => {
+                    let ping = frame.into_ping();
+                    if ping.header().flags().contains(header::ACK) {
+                        // Pong:本地 rtt 处理(意外 pong → Terminate 语义:
+                        // 只发 GoAway 帧不断连,现行行为)
+                        match self.rtt.handle_pong(ping.id()) {
+                            Action::None => {}
+                            Action::Terminate(f) => self.shared.push_to_send(f.into()),
+                            _ => unreachable!("rtt 只产生 None/Terminate"),
                         }
+                        return Ok(Routed::Done);
                     }
-                    if let Some(w) = shared.writer.take() {
-                        w.wake()
+                    if ping.header().stream_id() == CONNECTION_ID {
+                        let mut hdr = Header::ping(ping.header().id());
+                        hdr.ack();
+                        self.shared.push_to_send(Frame::new(hdr).into());
+                        return Ok(Routed::Done);
                     }
-                } else {
-                    log::trace!(
-                        "{}/{}: window update for unknown stream, possibly dropped earlier: {:?}",
-                        self.shared.id,
-                        stream_id,
-                        frame
-                    );
-                    // 与未拆分路径一致:不视为协议违规、不回 RST
-                    //(paritytech/yamux#110)。
+                    // 流级 Ping(sid≠0):路由(§2.3 Ping 行)
+                    let index = self.route_index(ping.header().stream_id());
+                    let msg = shard::ShardMsg::Frame(Frame::from(ping));
+                    self.route(index, msg, cx)
+                }
+                Tag::Data | Tag::WindowUpdate => {
+                    let index = self.route_index(frame.header().stream_id());
+                    let msg = if frame.header().flags().contains(header::SYN) {
+                        shard::ShardMsg::Syn(frame)
+                    } else {
+                        shard::ShardMsg::Frame(frame)
+                    };
+                    self.route(index, msg, cx)
                 }
             }
-
-            Action::None
         }
 
-        fn on_ping(&mut self, frame: &Frame<Ping>) -> Action {
-            let stream_id = frame.header().stream_id();
-            if frame.header().flags().contains(header::ACK) {
-                return self.rtt.handle_pong(frame.id());
-            }
-            if stream_id == CONNECTION_ID || self.shared.streams.lock().contains_key(&stream_id) {
-                let mut hdr = Header::ping(frame.header().id());
-                hdr.ack();
-                return Action::Ping(Frame::new(hdr));
-            }
-            log::debug!(
-                "{}/{}: ping for unknown stream, possibly dropped earlier: {:?}",
-                self.shared.id,
-                stream_id,
-                frame
-            );
-            // 与未拆分路径一致:不视为协议违规、不回 RST(paritytech/yamux#110)。
-            Action::None
+        fn route_index(&self, sid: StreamId) -> usize {
+            let workers = self.shared.workers.lock();
+            (sid.val() as usize) % workers.len()
         }
 
-        fn is_valid_remote_id(&self, id: StreamId, tag: Tag) -> bool {
-            if tag == Tag::Ping || tag == Tag::GoAway {
-                return id.is_session();
-            }
-            match self.shared.mode {
-                Mode::Client => id.is_server(),
-                Mode::Server => id.is_client(),
+        /// 路由一帧到 worker[index](§2.4):try_push 失败 → 登记生产者
+        /// waker + 复查(§2.1 防线)→ 仍满 → 返回消息由调用方 park 背压
+        /// (TCP 停读)。
+        fn try_route(
+            &self,
+            index: usize,
+            msg: shard::ShardMsg,
+            cx: &mut Context<'_>,
+        ) -> std::result::Result<(), (usize, shard::ShardMsg)> {
+            let producer = self.shared.workers.lock()[index].0.clone();
+            match producer.try_push(msg) {
+                Ok(()) => Ok(()),
+                Err(msg) => {
+                    producer.register_producer_waker(cx.waker());
+                    // 复查(丢唤醒防线):登记后让出空间即唤醒
+                    match producer.try_push(msg) {
+                        Ok(()) => Ok(()),
+                        Err(msg) => Err((index, msg)),
+                    }
+                }
             }
         }
 
-        fn make_new_inbound_stream(&self, id: StreamId, credit: u32) -> Stream {
-            let (sender, receiver) = mpsc::channel(10); // 10 is an arbitrary number.
-            self.shared.push_new_receiver(id, receiver);
-            Stream::new_inbound(
-                id,
-                self.shared.id,
-                self.shared.config.clone(),
-                credit,
-                sender,
-            )
+        fn route(
+            &mut self,
+            index: usize,
+            msg: shard::ShardMsg,
+            cx: &mut Context<'_>,
+        ) -> std::result::Result<Routed, ConnectionError> {
+            match self.try_route(index, msg, cx) {
+                Ok(()) => Ok(Routed::Done),
+                Err((index, msg)) => Ok(Routed::Backpressured { index, msg }),
+            }
+        }
+    }
+
+    /// Round-5 回归测试专用(不得用于生产):暴露共享状态句柄,供测试
+    /// 断言计数器/开流表(镜像 SendHalf::shared_for_test)。
+    #[cfg(test)]
+    impl<S> RecvHalf<S> {
+        pub(crate) fn shared_for_test(&self) -> Arc<ConnShared> {
+            self.shared.clone()
         }
     }
 
     impl<S> Drop for RecvHalf<S> {
         fn drop(&mut self) {
-            // 要点 4:接收半弃置 → 共享错误置 Closed,唤醒发送侧。
+            // 要点 4:接收半弃置 → 共享错误置 Closed,唤醒发送侧与 Worker
+            //(set_error 广播 worker_wakers + 粘性影子,Worker 收敛终结)。
+            // 未冲洗的 pending_route 随弃置丢弃(不再路由),路由终结宣告
+            // 必须补上——Worker fatal 排空的终结条件,否则 Worker 永挂。
             self.shared.set_error(ConnectionError::Closed);
+            self.shared.framer_flushed.store(true, Ordering::Release);
+            self.shared.wake_all_workers();
         }
     }
 
-    /// Connection 的发送半:载体写侧。`poll_new_outbound` 开流(分配 id、
-    /// 注册流,建流即授信照旧走流命令通道);`poll` 驱动写路径——接收侧
-    /// 压来的 Pong/GoAway、rtt ping、各流命令帧(`stream_receivers`)、
-    /// 部分写/flush;流通道关闭 → `on_drop_stream`(RST/FIN)。不含
-    /// Round-A/C 公平调度读探测(读任务物理独立,无需写侧让位)。
+    /// Connection 的发送半:载体写侧(round-5 分片改造,§2.5)。
+    /// `poll_new_outbound` 开流(分配 id、opening 预注册 + 双计数器,
+    /// 建流即授信照旧走流命令通道);`poll` 驱动写路径——接收侧压来的
+    /// Pong/GoAway、rtt ping、各流命令帧(`stream_receivers`)按优先级
+    /// 批量取帧入 Sink 批队列(§3.3:≤16 帧/≤256KiB 一次 writev 写出)、
+    /// 部分写/flush;流通道关闭 → `on_drop_stream` 双路径(opening 命中
+    /// 直接终结;已收编 → ctrl Remove 交 Worker)。不含 Round-A/C 公平
+    /// 调度读探测(读任务物理独立,无需写侧让位)。
     ///
     /// 泛型参数直指 socket 类型(round-E2):锁路径 `S = SplitSocket<T>`
     /// (单一载体 + BiLock),duplex 路径 `S = T`(写侧独占 fd;
@@ -1825,45 +1929,88 @@ mod halves {
         shared: Arc<ConnShared>,
         stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
         next_id: u32,
-        pending_write_frame: Option<Frame<()>>,
+        /// §2.5-D ②路径的未发出 Remove(ctrl 通道满时暂存,生产者 waker
+        /// 唤醒后重试;上界为存活流数。多流并发 drop 时通道可能满,单槽
+        /// 会相互覆盖丢 Remove——必须为队列)。
+        ctrl_pending: VecDeque<StreamId>,
         rtt: rtt::Rtt,
         finished: bool,
     }
 
     impl<S: AsyncRead + AsyncWrite + Unpin + crate::Writev2> SendHalf<S> {
-        /// 开新出站流(分配 id、注册流;ACK backlog 门控经共享 waker 由
-        /// 接收半的 ACK 处理唤醒——与未拆分路径同语义)。
+        /// 开新出站流(§2.5-A:opening 预注册 + 双计数器;ACK backlog
+        /// 门控经共享 waker 由 Worker 的 ACK 处理唤醒——与未拆分路径
+        /// 同语义)。
         pub fn poll_new_outbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
             if self.finished {
                 return Poll::Ready(Err(ConnectionError::Closed));
             }
             if let Some(e) = self.shared.take_error() {
-                self.shared.drop_all_streams();
+                // 产出侧 set_error 已唤醒 Workers 进入终结排空(opening 由其
+                // 终结后按分片排空,此处不得抢先清——待收编帧须能收编)
                 self.finished = true;
                 return Poll::Ready(Err(e));
             }
-            if self.shared.streams.lock().len() >= self.shared.config.max_num_streams {
+            // D4:全局计数器精确上界(fetch_add 回滚保证跨分片精确)
+            if self.shared.stream_count.fetch_add(1, Ordering::SeqCst) + 1
+                > self.shared.config.max_num_streams
+            {
+                self.shared.stream_count.fetch_sub(1, Ordering::SeqCst);
                 log::error!("{}: maximum number of streams reached", self.shared.id);
                 return Poll::Ready(Err(ConnectionError::TooManyStreams));
             }
             // 先登记 waker 再查 backlog:ACK 恰在登记与检查之间到达时由
-            // 复查兜住(至多多一次虚假唤醒,不丢唤醒)
+            // 复查兜住(至多多一次虚假唤醒,不丢唤醒)——现行顺序保留
             *self.shared.new_outbound_stream_waker.lock() = Some(cx.waker().clone());
-            if self.ack_backlog() >= MAX_ACK_BACKLOG {
+            if self.shared.ack_backlog_count.load(Ordering::SeqCst) >= MAX_ACK_BACKLOG {
                 log::debug!(
                     "{MAX_ACK_BACKLOG} streams waiting for ACK, registering task for wake-up \
                      until remote acknowledges at least one stream"
                 );
+                // 未建流:回滚计数(重试不得重复累计)
+                self.shared.stream_count.fetch_sub(1, Ordering::SeqCst);
                 return Poll::Pending;
             }
 
             log::trace!("{}: creating new outbound stream", self.shared.id);
 
-            let id = self.next_stream_id()?;
+            let id = match self.next_stream_id() {
+                Ok(id) => id,
+                Err(e) => {
+                    self.shared.stream_count.fetch_sub(1, Ordering::SeqCst);
+                    return Poll::Ready(Err(e));
+                }
+            };
             let stream = self.make_new_outbound_stream(id);
 
             log::debug!("{}: new outbound {}", self.shared.id, stream);
-            self.shared.streams.lock().insert(id, stream.clone_shared());
+            // D4:未确认计数 +1 并挂"递减令牌"(必须在 opening 插入前
+            // 完成——opening 一旦可见,Worker 即可能收编并发起状态迁移,
+            // 令牌须先就位)。令牌保证该流离开 Open{ack:false} 的**任何**
+            // 路径(对端 ACK 确认 / 本地 poll_close 半关闭 / 对端 FIN、
+            // RST / 删除 / 连接排空)恰递减一次——与基线 ack_backlog()
+            // 实时表扫描语义等价(复核修复:仅靠 ACK 分支与删除路径递减
+            // 会漏掉本地半关闭等常态路径,泄漏 256 条后开流永久 Pending)。
+            {
+                let mut ss = stream.shared();
+                ss.ack_backlog_token = Some(self.shared.ack_backlog_count.clone());
+                self.shared.ack_backlog_count.fetch_add(1, Ordering::SeqCst);
+                if !matches!(
+                    ss.state(),
+                    State::Open {
+                        acknowledged: false
+                    }
+                ) {
+                    // 防御(理论上不可达:SYN 尚未上线,对端无从发来该流
+                    // 任何帧):挂令牌前已被并发迁出未确认态 → 令牌无人
+                    // 消费,就地撤销
+                    ss.ack_backlog_token = None;
+                    self.shared.ack_backlog_count.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            // D3:出站预注册进 opening(不再插全局表);Worker 首帧按需
+            // 收编,从未收到帧的出站流不占 Worker 表
+            self.shared.opening.lock().insert(id, stream.clone_shared());
 
             Poll::Ready(Ok(stream))
         }
@@ -1878,9 +2025,17 @@ mod halves {
                     return Poll::Ready(Err(ConnectionError::Closed));
                 }
                 if let Some(e) = self.shared.take_error() {
-                    self.shared.drop_all_streams();
+                    // 同 poll_new_outbound:不抢先清 opening
                     self.finished = true;
                     return Poll::Ready(Err(e));
+                }
+                // ctrl Remove 重试(§2.5-D ②:通道满暂存,生产者 waker
+                // 唤醒后重试;队首阻塞即止——其余 Remove 在其后保序)
+                while let Some(&sid) = self.ctrl_pending.front() {
+                    if !self.try_push_ctrl(sid, cx) {
+                        break;
+                    }
+                    self.ctrl_pending.pop_front();
                 }
                 // 收编接收侧注册的新流命令接收器(入站流的命令通道)
                 {
@@ -1890,38 +2045,19 @@ mod halves {
                     }
                 }
                 // B4 同款三态:Ready(Err) 以原始 IO 错误传播并终结。
-                // Round-D3-2(复核修复):捕获本轮 poll_ready 是否未被阻塞
-                //(Ready(Ok) ⟙ sink 无在途半写帧、可立即接收新帧)——
-                // park 复查对 to_send 的保留以此为门,见下方 park 段注释。
+                // round-5 §3.3:Sink 的 poll_ready Ready(Ok) ⟺ 批队列 +
+                // 半写帧已全部写穿(§3.2 契约);随后按优先级连续取帧入队
+                // (`fill_batch`),有帧入队即 continue——下轮 poll_ready 把
+                // 整批一次 writev 写出;无帧可取 ⟹ 队列此刻为空。
+                // `sink_idle`(Round-D3-2 门控的重推导)= 本轮 poll_ready 曾
+                // Ready(Ok) 且当前队列 + current 为空;park 复查对 to_send 的
+                // 保留以此为门,见下方 park 段注释。
                 let sink_idle = match self.socket.poll_ready_unpin(cx) {
-                    Poll::Ready(Ok(())) => {
-                        // Note `next_ping` does not register a waker and thus if not called
-                        // regularly (idle connection) no ping is sent. This is deliberate
-                        // as an idle connection does not need RTT measurements.
-                        //
-                        // 帧优先级(要点 2):接收侧压来的 Pong/GoAway > rtt ping
-                        // > 流命令帧——不低于未拆分路径
-                        // (pending_read_frame > ping/pending_write_frame > 流命令)。
-                        if let Some(frame) = self.shared.pop_to_send() {
-                            if let Err(e) = self.socket.start_send_unpin(frame) {
-                                return Poll::Ready(Err(self.fatal(e.into())));
-                            }
-                            continue;
-                        }
-                        if let Some(frame) = self.rtt.next_ping() {
-                            if let Err(e) = self.socket.start_send_unpin(frame.into()) {
-                                return Poll::Ready(Err(self.fatal(e.into())));
-                            }
-                            continue;
-                        }
-                        if let Some(frame) = self.pending_write_frame.take() {
-                            if let Err(e) = self.socket.start_send_unpin(frame) {
-                                return Poll::Ready(Err(self.fatal(e.into())));
-                            }
-                            continue;
-                        }
-                        true
-                    }
+                    Poll::Ready(Ok(())) => match self.fill_batch(cx) {
+                        Ok(0) => true,
+                        Ok(_) => continue,
+                        Err(e) => return Poll::Ready(Err(e)),
+                    },
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(self.fatal(e.into()))),
                     Poll::Pending => false,
                 };
@@ -1931,61 +2067,29 @@ mod halves {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(self.fatal(e.into()))),
                 }
 
-                if self.pending_write_frame.is_none() {
-                    match self.stream_receivers.poll_next_unpin(cx) {
-                        Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
-                            log::trace!(
-                                "{}/{}: sending: {}",
-                                self.shared.id,
-                                frame.header().stream_id(),
-                                frame.header()
-                            );
-                            self.pending_write_frame.replace(frame.into());
-                            continue;
-                        }
-                        Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack, syn })))) => {
-                            log::trace!("{}/{}: sending close", self.shared.id, id);
-                            self.pending_write_frame
-                                .replace(Frame::close_stream(id, ack, syn).into());
-                            continue;
-                        }
-                        Poll::Ready(Some((id, None))) => {
-                            if let Some(frame) = self.on_drop_stream(id) {
-                                log::trace!(
-                                    "{}/{}: sending: {}",
-                                    self.shared.id,
-                                    id,
-                                    frame.header()
-                                );
-                                self.pending_write_frame.replace(frame);
-                            };
-                            continue;
-                        }
-                        // SelectAll 空:无接收器可挂 waker——新接收器到达时经
-                        // shared.send_waker 唤醒后收编(park 前已登记)
-                        Poll::Ready(None) => {}
-                        Poll::Pending => {}
-                    }
-                }
-
                 self.shared.set_send_waker(cx.waker());
                 // Round-D3(自旋修复)+ Round-D3-2(独立复核:丢唤醒修复):
                 // 复查项 = 无需载体即可推进的新接收器/错误,**加** to_send——
-                // 但 to_send 以「本轮 poll_ready 未被阻塞」(sink_idle)为门:
+                // 但 to_send 以 sink_idle 为门(round-5 §3.3 重推导,D3 论证
+                // 原样适用于批队列):
                 //
-                // - sink_idle == false(半写帧未写穿,poll_ready 恒 Pending):
-                //   to_send 帧无法出队,把它当作"有工作"会让 poll 永不返回
-                //   Pending(单核自旋,三机实测 260 万次迭代);此形态下 park
-                //   时 EPOLLOUT 必已武装(半写阻塞必经 poll_write 的
-                //   WouldBlock),可写即唤醒,不存在丢唤醒——to_send 不参与。
+                // - sink_idle == false(批队列/半写帧未写穿,poll_ready 恒
+                //   Pending):to_send 帧无法出队,把它当作"有工作"会让 poll
+                //   永不返回 Pending(单核自旋,三机实测 260 万次迭代);此
+                //   形态下 park 时 EPOLLOUT 必已武装(批 writev 阻塞必经载体
+                //   写的 WouldBlock),可写即唤醒,不存在丢唤醒——to_send 不
+                //   参与,**不得复活自旋**。
                 // - sink_idle == true(空 sink 型 park):本轮 poll_ready 曾
-                //   Ready(Ok),未武装任何载体写 waker;若当次 poll 由消耗
-                //   send_waker 槽的唤醒(push_to_send/push_new_receiver/
-                //   set_error)启动,则在 pop_to_send 与本 set_send_waker
-                //   之间压入的 Pong/GoAway 既不触发唤醒、也无人复查,滞留
-                //   to_send 直到下一个无关事件——to_send 必须复查;门保证了
-                //   continue 后下一轮真正出队写穿(poll_ready Ready(Ok) ⟹
-                //   pop_to_send 后可写),不复活自旋。
+                //   Ready(Ok) 且 fill_batch 取到 0 帧(队列为空),未武装任何
+                //   载体写 waker;若当次 poll 由消耗 send_waker 槽的唤醒
+                //   (push_to_send/push_new_receiver/set_error)启动,则在
+                //   pop_to_send 与本 set_send_waker 之间压入的 Pong/GoAway/
+                //   RST/FIN 既不触发唤醒、也无人复查,滞留 to_send 直到下一个
+                //   无关事件——to_send 必须复查;门保证了 continue 后下一轮
+                //   真正入队写穿。
+                //
+                // ctrl_pending 不参与复查:其唤醒由 ctrl 通道生产者
+                // waker(try_push_ctrl 登记时已注册)保证,纳入会复活自旋。
                 if (sink_idle && !self.shared.to_send.lock().is_empty())
                     || !self.shared.new_receivers.lock().is_empty()
                     || self.shared.error.lock().is_some()
@@ -1996,9 +2100,84 @@ mod halves {
             }
         }
 
+        /// §3.3.2 批量取帧:按优先级连续取帧 `start_send` 入 Sink 批队列,
+        /// 直至聚合上限([`MAX_BATCH_FRAMES`] 帧 / [`MAX_BATCH_BYTES`]
+        /// 字节)或帧源 Pending。返回本轮入队帧数;Err = 载体 start_send
+        /// 失败(已 fatal)。
+        ///
+        /// 字节上限按**已入队**字节判定:帧源不可窥探下一帧大小(rtt/
+        /// 命令通道取出即消费、不可退回),取出即入队,最后一帧可越过
+        /// 上限 < 1 帧——与 §3.2"队列为空时单帧无条件入队、上限只约束
+        /// 聚合"同理;帧数上限精确。调用方拿到 Ready(Ok) 时队列必为空
+        /// (§3.2),故本轮入队批即队列全量,批有界 ⟹ 队列有界。
+        fn fill_batch(&mut self, cx: &mut Context<'_>) -> Result<usize> {
+            let mut frames = 0usize;
+            let mut bytes = 0usize;
+            while frames < MAX_BATCH_FRAMES && bytes < MAX_BATCH_BYTES {
+                let Some(frame) = self.next_frame(cx) else {
+                    break;
+                };
+                bytes += frame.wire_len();
+                frames += 1;
+                if let Err(e) = self.socket.start_send_unpin(frame) {
+                    return Err(self.fatal(e.into()));
+                }
+            }
+            Ok(frames)
+        }
+
+        /// 取下一待发帧(帧优先级,要点 2 / §3.3.1,不变):接收侧压来的
+        /// Pong/GoAway(含 Worker 经 to_send 的 RST/FIN)> rtt ping > 流命令帧
+        /// ——不低于未拆分路径(pending_read_frame > ping/pending_write_frame
+        /// 再 > 流命令)。`None` = 帧源全部 Pending/空(流命令接收器的 waker
+        /// 已由 SelectAll 登记)。
+        fn next_frame(&mut self, cx: &mut Context<'_>) -> Option<Frame<()>> {
+            if let Some(frame) = self.shared.pop_to_send() {
+                return Some(frame);
+            }
+            // Note `next_ping` does not register a waker and thus if not called
+            // regularly (idle connection) no ping is sent. This is deliberate
+            // as an idle connection does not need RTT measurements.
+            if let Some(frame) = self.rtt.next_ping() {
+                return Some(frame.into());
+            }
+            loop {
+                match self.stream_receivers.poll_next_unpin(cx) {
+                    Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
+                        log::trace!(
+                            "{}/{}: sending: {}",
+                            self.shared.id,
+                            frame.header().stream_id(),
+                            frame.header()
+                        );
+                        return Some(frame.into());
+                    }
+                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack, syn })))) => {
+                        log::trace!("{}/{}: sending close", self.shared.id, id);
+                        return Some(Frame::close_stream(id, ack, syn).into());
+                    }
+                    Poll::Ready(Some((id, None))) => {
+                        if let Some(frame) = self.on_drop_stream(id, cx) {
+                            log::trace!("{}/{}: sending: {}", self.shared.id, id, frame.header());
+                            return Some(frame);
+                        }
+                        // 无帧(SendClosed/Closed 或已交 Worker 的 ctrl
+                        // Remove):继续取下一条命令
+                    }
+                    // SelectAll 空:无接收器可挂 waker——新接收器到达时经
+                    // shared.send_waker 唤醒后收编(park 前已登记)
+                    Poll::Ready(None) => return None,
+                    Poll::Pending => return None,
+                }
+            }
+        }
+
+        /// 发送半 fatal:置共享错误(shadow + 粘性 shutdown,Workers 由此
+        /// 唤醒进入终结排空——各自先处理完已路由帧、及时关闭流状态、再按
+        /// 分片排空 opening)+ 自身终结。不在此清 opening(待收编帧须能
+        /// 收编,§0.3-3)。
         fn fatal(&mut self, e: ConnectionError) -> ConnectionError {
             self.shared.set_error(make_shadow(&e));
-            self.shared.drop_all_streams();
             self.finished = true;
             e
         }
@@ -2023,63 +2202,55 @@ mod halves {
             Ok(proposed)
         }
 
-        /// The ACK backlog is defined as the number of outbound streams that
-        /// have not yet been acknowledged(流表共享,只读遍历)。
-        fn ack_backlog(&self) -> usize {
-            let streams = self.shared.streams.lock();
-            streams
-                .iter()
-                // Clients use odd IDs and servers use even IDs.
-                .filter(|(id, _)| match self.shared.mode {
-                    Mode::Client => id.is_client(),
-                    Mode::Server => id.is_server(),
-                })
-                .filter(|(_, s)| s.lock().is_pending_ack())
-                .count()
+        /// §2.5-D:命令通道关闭时的流删除双路径。
+        /// ① opening 命中 → 直接执行现行 on_drop_stream 全逻辑(选帧+
+        /// 唤醒 + 双计数器递减),返回待发帧;
+        /// ② 未命中(已被 Worker 收编)→ 向 worker[sid%N] 发
+        /// ShardCtrl::Remove(满则登记生产者 waker 暂存重试),Worker
+        /// 执行同一套逻辑(帧经 to_send 汇入,Pong 之后同优先级)。
+        fn on_drop_stream(
+            &mut self,
+            stream_id: StreamId,
+            cx: &mut Context<'_>,
+        ) -> Option<Frame<()>> {
+            if let Some(s) = self.shared.opening.lock().remove(&stream_id) {
+                log::trace!("{}: removing dropped stream {}", self.shared.id, stream_id);
+                return shard::finalize_dropped_stream(&self.shared, stream_id, &s);
+            }
+            self.ctrl_pending.push_back(stream_id);
+            // 立即尝试一次(通道有余量时免等下一轮)
+            while let Some(&sid) = self.ctrl_pending.front() {
+                if !self.try_push_ctrl(sid, cx) {
+                    log::trace!(
+                        "{}/{}: stream removal parked on full ctrl channel",
+                        self.shared.id,
+                        sid
+                    );
+                    break;
+                }
+                self.ctrl_pending.pop_front();
+            }
+            None
         }
 
-        fn on_drop_stream(&mut self, stream_id: StreamId) -> Option<Frame<()>> {
-            let s = self
-                .shared
-                .streams
-                .lock()
-                .remove(&stream_id)
-                .expect("stream not found");
-
-            log::trace!("{}: removing dropped stream {}", self.shared.id, stream_id);
-            let frame = {
-                let mut shared = s.lock();
-                let frame = match shared.update_state(self.shared.id, stream_id, State::Closed) {
-                    // The stream was dropped without calling `poll_close`.
-                    // We reset the stream to inform the remote of the closure.
-                    State::Open { .. } => {
-                        let mut hdr = Header::data(stream_id, 0);
-                        hdr.rst();
-                        Some(Frame::new(hdr))
-                    }
-                    // The stream was dropped without calling `poll_close`.
-                    // We have already received a FIN from remote and send one
-                    // back which closes the stream for good.
-                    State::RecvClosed => {
-                        let mut hdr = Header::data(stream_id, 0);
-                        hdr.fin();
-                        Some(Frame::new(hdr))
-                    }
-                    // The stream was properly closed. We already sent our FIN frame.
-                    State::SendClosed => None,
-                    // The stream was properly closed. We already have sent our FIN frame.
-                    // The remote end has already done so in the past.
-                    State::Closed => None,
-                };
-                if let Some(w) = shared.reader.take() {
-                    w.wake()
-                }
-                if let Some(w) = shared.writer.take() {
-                    w.wake()
-                }
-                frame
+        /// ctrl Remove 投递:成功 → true;满 → 登记生产者 waker + 复查
+        /// (§2.1 防线),仍满 → 由调用方暂存 ctrl_pending(park 后重试)。
+        fn try_push_ctrl(&self, stream_id: StreamId, cx: &mut Context<'_>) -> bool {
+            let producer = {
+                let workers = self.shared.workers.lock();
+                let index = (stream_id.val() as usize) % workers.len();
+                workers[index].1.clone()
             };
-            frame.map(Into::into)
+            match producer.try_push(shard::ShardCtrl::Remove(stream_id)) {
+                Ok(()) => true,
+                Err(_) => {
+                    producer.register_producer_waker(cx.waker());
+                    matches!(
+                        producer.try_push(shard::ShardCtrl::Remove(stream_id)),
+                        Ok(())
+                    )
+                }
+            }
         }
     }
 
@@ -2095,10 +2266,14 @@ mod halves {
 
     impl<S> Drop for SendHalf<S> {
         fn drop(&mut self) {
-            // 要点 4:发送半弃置 → 等价 drop_all_streams(唤醒全部流的
-            // reader/writer waker,使其见到错误而非死等);命令通道随
+            // 要点 4/§2.6:发送半弃置**不置错误**(现行)——置 send_dropped
+            // + 广播唤醒 Worker(Worker 先处理完已路由帧,再排空本地表与
+            // opening 本分片子集,但不 finished,继续服务新 SYN,语义对齐
+            // 现行"发送半弃置后接收半仍可读缓冲/建流");命令通道随
             // stream_receivers drop 断开,流侧 sender 由此报 WriteZero。
-            self.shared.drop_all_streams();
+            // opening 不在此清:已路由待收编帧须能收编(§0.3-3)。
+            self.shared.send_dropped.store(true, Ordering::SeqCst);
+            self.shared.wake_all_workers();
         }
     }
 }
@@ -2124,6 +2299,10 @@ mod tests {
         /// Arc 包装:公平调度 T3 的 waker 需跨 `Rc` 句柄快照「唤醒时刻的
         /// 载体写次数」;计数语义不变(经 Deref 照常 fetch_add/load)。
         write_calls: Arc<AtomicUsize>,
+        /// writev 调用计数(round-5 §5.4 T-B1:批量写 syscall 汇聚断言;
+        /// 每次 `poll_writev` +1,与单段/两段 `poll_write2` 的 write_calls
+        /// 分列)。
+        writev_calls: Arc<AtomicUsize>,
         /// T5 事件序列(测试基建):载体写成功记 'w',读返回 Ready(Ok(n>0))
         /// 记 'r'(0 字节 EOF 不记)——用于强制读探测批量排空的断言。
         events: Mutex<Vec<char>>,
@@ -2156,6 +2335,30 @@ mod tests {
             st.written.lock().unwrap().extend_from_slice(b);
             st.events.lock().unwrap().push('w');
             Poll::Ready(Ok(a.len() + b.len()))
+        }
+
+        /// 真·向量写(round-5 §3.1 测试侧覆盖):全部段一次写穿并计
+        /// writev 次数,一次调用同时计一次载体写('w' 事件/write_calls
+        /// 口径 = 载体写操作数,与 poll_write2 同级)。
+        fn poll_writev(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let st = self.0.borrow();
+            if st.fail_writes.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::other("mock-io-write-failure")));
+            }
+            st.write_calls.fetch_add(1, Ordering::SeqCst);
+            st.writev_calls.fetch_add(1, Ordering::SeqCst);
+            let mut written = st.written.lock().unwrap();
+            let mut n = 0;
+            for b in bufs {
+                written.extend_from_slice(b);
+                n += b.len();
+            }
+            st.events.lock().unwrap().push('w');
+            Poll::Ready(Ok(n))
         }
     }
 
@@ -2438,6 +2641,49 @@ mod tests {
     fn noop_cx() -> Context<'static> {
         // noop waker 测试专用:leak 一次,测试进程生命周期内使用
         Context::from_waker(Box::leak(Box::new(futures::task::noop_waker())))
+    }
+
+    // ===== round-5 分片 halves 驱动夹具(§5.3):单线程 noop waker 下手动
+    // 轮询推进,等价生产侧 tokio::spawn 的多任务并行 =====
+
+    /// 驱动 recv + workers 一轮收敛:recv 排空路由 → workers 全处理 →
+    /// recv 再探(new_streams 交付)。返回 recv 的最终 poll 结果。
+    fn drive_recv_workers<S>(
+        recv: &mut RecvHalf<S>,
+        workers: &mut [ShardWorker],
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Stream>>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + crate::Writev2,
+    {
+        match recv.poll(cx) {
+            Poll::Pending => {}
+            other => return other,
+        }
+        for w in workers.iter_mut() {
+            let _ = w.poll_unpin(cx);
+        }
+        recv.poll(cx)
+    }
+
+    /// 驱动 send + workers 一轮收敛:send 冲刷 → workers 全处理(建流
+    /// 授信命令等)→ send 终轮(把 to_send 新帧写上 wire)。
+    fn drive_send_workers<S>(
+        send: &mut SendHalf<S>,
+        workers: &mut [ShardWorker],
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<()>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + crate::Writev2,
+    {
+        match send.poll(cx) {
+            Poll::Pending => {}
+            other => return other,
+        }
+        for w in workers.iter_mut() {
+            let _ = w.poll_unpin(cx);
+        }
+        send.poll(cx)
     }
 
     /// (红→绿)unsplit API:lazy 流首写前 close,线上必须是 Data len0 的
@@ -2741,7 +2987,7 @@ mod tests {
             match Pin::new(&mut blocked).poll_write(&mut cx, &payload) {
                 Poll::Ready(Ok(4096)) => {
                     total += 4096;
-                    if total % (4096 * 8) == 0 {
+                    if total.is_multiple_of(4096 * 8) {
                         drive_to_pending(&mut conn, &mut cx);
                     }
                 }
@@ -2999,14 +3245,15 @@ mod tests {
     // `SendHalf::poll -> Poll<Result<()>>`、`SendHalf::poll_new_outbound`。
 
     /// S1(红→绿):16 流 ×8×4096B 写命令已入队 + 入站 SYN|DATA 预置时,
-    /// 仅驱动接收半即可交付入站流——读推进不依赖写侧让位(未拆分路径须
-    /// 等写预算耗尽后的强制读探测)。断言交付发生在载体尚未写完风暴帧
-    /// (written < 风暴总量)之时。
+    /// 仅驱动接收侧(recv+Worker)即可交付入站流——读推进不依赖写侧
+    /// 让位(未拆分路径须等写预算耗尽后的强制读探测)。断言交付发生在
+    /// 载体尚未写完风暴帧(written < 风暴总量)之时。round-5 起分片:
+    /// SYN 经 Framer 路由进 Worker 建流、经 new_streams 回流交付。
     #[test]
     fn split_recv_delivers_while_send_commands_pending() {
         let (socket, st) = TestSocket::new();
         let conn = Connection::new(socket, Config::default(), Mode::Client);
-        let (mut recv_half, mut send_half) = conn.into_halves();
+        let (mut recv_half, mut send_half, mut workers) = conn.into_halves();
 
         let mut cx = noop_cx();
         let payload = [7u8; 4096];
@@ -3031,7 +3278,7 @@ mod tests {
             .unwrap()
             .push_back(syn_data_block(2, b"x"));
 
-        let inbound = match poll_fn(|cx| recv_half.poll(cx)).poll_unpin(&mut cx) {
+        let inbound = match drive_recv_workers(&mut recv_half, &mut workers, &mut cx) {
             Poll::Ready(Some(Ok(s))) => s,
             other => {
                 panic!("recv half must deliver inbound without send-side progress, got {other:?}")
@@ -3055,14 +3302,14 @@ mod tests {
         let mut cfg = Config::default();
         cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
         let conn = Connection::new(socket, cfg, Mode::Client);
-        let (_recv_half, mut send_half) = conn.into_halves();
+        let (_recv_half, mut send_half, mut workers) = conn.into_halves();
 
         let mut cx = noop_cx();
         let _stream = match send_half.poll_new_outbound(&mut cx) {
             Poll::Ready(Ok(s)) => s,
             other => panic!("open outbound via send half, got {other:?}"),
         };
-        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+        match drive_send_workers(&mut send_half, &mut workers, &mut cx) {
             Poll::Pending => {}
             other => panic!("send half must park after flushing the grant, got {other:?}"),
         }
@@ -3099,7 +3346,7 @@ mod tests {
     fn split_recv_eof_stops_sender() {
         let (socket, st) = TestSocket::new();
         let conn = Connection::new(socket, Config::default(), Mode::Client);
-        let (mut recv_half, mut send_half) = conn.into_halves();
+        let (mut recv_half, mut send_half, mut workers) = conn.into_halves();
 
         let mut cx = noop_cx();
         let mut stream = match send_half.poll_new_outbound(&mut cx) {
@@ -3112,7 +3359,7 @@ mod tests {
         }
 
         st.borrow().eof.store(true, Ordering::SeqCst);
-        match poll_fn(|cx| recv_half.poll(cx)).poll_unpin(&mut cx) {
+        match drive_recv_workers(&mut recv_half, &mut workers, &mut cx) {
             Poll::Ready(None) => {}
             other => panic!("recv half must observe EOF, got {other:?}"),
         }
@@ -3134,14 +3381,15 @@ mod tests {
         );
     }
 
-    /// S4(红→绿):SendHalf 开流 → 写载荷 → 双半驱动 → 从该流读到载荷
-    /// (单连接自环,验证派发入 staging 全链)。自环回喂剥除 SYN 的流 1
-    /// Data 帧(带 SYN 会被 is_valid_remote_id 判非法——本端流 id)。
+    /// S4(红→绿):SendHalf 开流 → 写载荷 → 双半+Worker 驱动 → 从该流
+    /// 读到载荷(单连接自环,验证派发入 staging 全链)。自环回喂剥除
+    /// SYN 的流 1 Data 帧(带 SYN 会被 is_valid_remote_id 判非法——本端
+    /// 流 id);round-5 起该帧由 Worker 从 opening 收编后入缓冲。
     #[test]
     fn split_open_write_read_roundtrip() {
         let (socket, st) = TestSocket::new();
         let conn = Connection::new(socket, Config::default(), Mode::Client);
-        let (mut recv_half, mut send_half) = conn.into_halves();
+        let (mut recv_half, mut send_half, mut workers) = conn.into_halves();
 
         let mut cx = noop_cx();
         let mut stream = match send_half.poll_new_outbound(&mut cx) {
@@ -3152,7 +3400,7 @@ mod tests {
             Poll::Ready(Ok(9)) => {}
             other => panic!("queue data frame, got {other:?}"),
         }
-        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+        match drive_send_workers(&mut send_half, &mut workers, &mut cx) {
             Poll::Pending => {}
             other => panic!("send half must park, got {other:?}"),
         }
@@ -3178,7 +3426,7 @@ mod tests {
             }
         }
 
-        match poll_fn(|cx| recv_half.poll(cx)).poll_unpin(&mut cx) {
+        match drive_recv_workers(&mut recv_half, &mut workers, &mut cx) {
             Poll::Pending => {}
             other => panic!("recv half must park after dispatch, got {other:?}"),
         }
@@ -3191,14 +3439,14 @@ mod tests {
         assert_eq!(&buf[..n], b"roundtrip");
     }
 
-    /// S5(红→绿):接收半不 poll(模拟 accept 背压满),发送半仍能持续
-    /// 写出(载体 written 增长)——接收停摆不再拖死发送(旧单任务
-    /// driver 的结构问题)。
+    /// S5(红→绿):接收半不 poll(模拟 accept 背压满,Worker 也不建流),
+    /// 发送半仍能持续写出(载体 written 增长)——接收停摆不再拖死发送
+    /// (旧单任务 driver 的结构问题)。
     #[test]
     fn split_accept_backpressure_does_not_stall_sender() {
         let (socket, st) = TestSocket::new();
         let conn = Connection::new(socket, Config::default(), Mode::Client);
-        let (recv_half, mut send_half) = conn.into_halves();
+        let (recv_half, mut send_half, _workers) = conn.into_halves();
 
         let mut cx = noop_cx();
         let mut stream = match send_half.poll_new_outbound(&mut cx) {
@@ -3481,8 +3729,8 @@ mod tests {
         }
     }
 
-    /// T7(红→绿,工作线程 + 超时看门狗):半写帧(poll_ready 恒 Pending)
-    /// + to_send 非空(接收侧压入 Pong)时,SendHalf::poll 的 park 复查
+    /// T7(红→绿,工作线程 + 超时看门狗):半写帧(poll_ready 恒 Pending)+
+    /// to_send 非空(接收侧压入 Pong)时,SendHalf::poll 的 park 复查
     /// 不得把 to_send 当作"无需载体即可推进的工作"——修前
     /// `has_send_work` 命中 to_send 非空 → `continue` 无限自旋,poll 永不
     /// 返回 Pending(三机实测 260 万次迭代、烧 1 核)。看门狗:poll 在
@@ -3502,7 +3750,7 @@ mod tests {
         }));
         let sock = SpinSocket(state.clone());
         let conn = Connection::new(sock, Config::default(), Mode::Client);
-        let (mut recv_half, mut send_half) = conn.into_halves();
+        let (mut recv_half, mut send_half, _workers) = conn.into_halves();
 
         // (1) 首次驱动发送半:Rtt::new 的 next_ping 立即到期(Round-B 后
         //     next=now),8B 容量只写穿 12B 帧头的前 8B → 半写帧,
@@ -3691,7 +3939,7 @@ mod tests {
             inject,
         };
         let conn = Connection::new(sock, Config::default(), Mode::Client);
-        let (recv_half, mut send_half) = conn.into_halves();
+        let (recv_half, mut send_half, _workers) = conn.into_halves();
         *shared_slot.borrow_mut() = Some(send_half.shared_for_test());
 
         // 单次 poll:sink 空闲(写恒 Ready),rtt ping 立即到期发出并写穿,
@@ -3873,9 +4121,9 @@ mod tests {
         let (a_write, b_read) = duplex_pipe();
         let (b_write, a_read) = duplex_pipe();
         let conn_a = Connection::new(a_read, cfg.clone(), Mode::Client);
-        let (mut recv_a, mut send_a) = conn_a.into_halves_duplex(a_write);
+        let (mut recv_a, mut send_a, mut workers_a) = conn_a.into_halves_duplex(a_write);
         let conn_b = Connection::new(b_read, cfg, Mode::Server);
-        let (mut recv_b, mut send_b) = conn_b.into_halves_duplex(b_write);
+        let (mut recv_b, mut send_b, mut workers_b) = conn_b.into_halves_duplex(b_write);
 
         let mut cx = noop_cx();
 
@@ -3884,21 +4132,22 @@ mod tests {
             Poll::Ready(Ok(s)) => s,
             other => panic!("open outbound on duplex send half, got {other:?}"),
         };
-        match poll_fn(|cx| send_a.poll(cx)).poll_unpin(&mut cx) {
+        match drive_send_workers(&mut send_a, &mut workers_a, &mut cx) {
             Poll::Pending => {}
             other => panic!("duplex send half must park after flush, got {other:?}"),
         }
-        // B 收半解帧:交付入站流(其建流授信 ACK|WU 已排入命令通道)
-        let mut stream_b = match poll_fn(|cx| recv_b.poll(cx)).poll_unpin(&mut cx) {
+        // B 收半解帧:SYN|WU 经 Framer 路由进 Worker 建流、new_streams
+        // 回流交付(其建流授信 ACK|WU 已排入命令通道)
+        let mut stream_b = match drive_recv_workers(&mut recv_b, &mut workers_b, &mut cx) {
             Poll::Ready(Some(Ok(s))) => s,
             other => panic!("duplex recv half must deliver inbound stream, got {other:?}"),
         };
-        match poll_fn(|cx| send_b.poll(cx)).poll_unpin(&mut cx) {
+        match drive_send_workers(&mut send_b, &mut workers_b, &mut cx) {
             Poll::Pending => {}
             other => panic!("duplex peer send half must park after flushing ACK|WU, got {other:?}"),
         }
-        // A 收半处理 ACK(流 1 确认,无新流 → Pending)
-        match poll_fn(|cx| recv_a.poll(cx)).poll_unpin(&mut cx) {
+        // A 收半处理 ACK(Worker 收编 opening 流 1 并确认;无新流 → Pending)
+        match drive_recv_workers(&mut recv_a, &mut workers_a, &mut cx) {
             Poll::Pending => {}
             other => panic!("duplex recv half must park after ACK, got {other:?}"),
         }
@@ -3908,11 +4157,11 @@ mod tests {
             Poll::Ready(Ok(4)) => {}
             other => panic!("duplex stream write must be ready, got {other:?}"),
         }
-        match poll_fn(|cx| send_a.poll(cx)).poll_unpin(&mut cx) {
+        match drive_send_workers(&mut send_a, &mut workers_a, &mut cx) {
             Poll::Pending => {}
             other => panic!("send half must flush data frame, got {other:?}"),
         }
-        match poll_fn(|cx| recv_b.poll(cx)).poll_unpin(&mut cx) {
+        match drive_recv_workers(&mut recv_b, &mut workers_b, &mut cx) {
             Poll::Pending => {}
             other => panic!("recv half must dispatch data, got {other:?}"),
         }
@@ -3928,11 +4177,11 @@ mod tests {
             Poll::Ready(Ok(4)) => {}
             other => panic!("peer duplex stream write must be ready, got {other:?}"),
         }
-        match poll_fn(|cx| send_b.poll(cx)).poll_unpin(&mut cx) {
+        match drive_send_workers(&mut send_b, &mut workers_b, &mut cx) {
             Poll::Pending => {}
             other => panic!("peer send half must flush data frame, got {other:?}"),
         }
-        match poll_fn(|cx| recv_a.poll(cx)).poll_unpin(&mut cx) {
+        match drive_recv_workers(&mut recv_a, &mut workers_a, &mut cx) {
             Poll::Pending => {}
             other => panic!("recv half must dispatch peer data, got {other:?}"),
         }
@@ -3947,11 +4196,11 @@ mod tests {
             Poll::Ready(Ok(())) => {}
             other => panic!("duplex stream close must be ready, got {other:?}"),
         }
-        match poll_fn(|cx| send_a.poll(cx)).poll_unpin(&mut cx) {
+        match drive_send_workers(&mut send_a, &mut workers_a, &mut cx) {
             Poll::Pending => {}
             other => panic!("send half must flush FIN, got {other:?}"),
         }
-        match poll_fn(|cx| recv_b.poll(cx)).poll_unpin(&mut cx) {
+        match drive_recv_workers(&mut recv_b, &mut workers_b, &mut cx) {
             Poll::Pending => {}
             other => panic!("recv half must dispatch FIN, got {other:?}"),
         }
@@ -3964,11 +4213,11 @@ mod tests {
             Poll::Ready(Ok(())) => {}
             other => panic!("peer stream close must be ready, got {other:?}"),
         }
-        match poll_fn(|cx| send_b.poll(cx)).poll_unpin(&mut cx) {
+        match drive_send_workers(&mut send_b, &mut workers_b, &mut cx) {
             Poll::Pending => {}
             other => panic!("peer send half must flush FIN, got {other:?}"),
         }
-        match poll_fn(|cx| recv_a.poll(cx)).poll_unpin(&mut cx) {
+        match drive_recv_workers(&mut recv_a, &mut workers_a, &mut cx) {
             Poll::Pending => {}
             other => panic!("recv half must dispatch peer FIN, got {other:?}"),
         }
@@ -3980,7 +4229,7 @@ mod tests {
         // 连接级 EOF 传播:B 双半 drop → A 读侧 Ready(None) → 发半快速收敛
         drop(recv_b);
         drop(send_b);
-        match poll_fn(|cx| recv_a.poll(cx)).poll_unpin(&mut cx) {
+        match drive_recv_workers(&mut recv_a, &mut workers_a, &mut cx) {
             Poll::Ready(None) => {}
             other => panic!("recv half must observe peer EOF as Ready(None), got {other:?}"),
         }
@@ -4009,7 +4258,7 @@ mod tests {
         let (read_socket, read_st) = TestSocket::new();
         let (write_socket, write_st) = TestSocket::new();
         let conn = Connection::new(read_socket, cfg, Mode::Client);
-        let (mut recv_half, mut send_half) = conn.into_halves_duplex(write_socket);
+        let (mut recv_half, mut send_half, _workers) = conn.into_halves_duplex(write_socket);
 
         let mut cx = noop_cx();
         // 先挂起读侧(waker 登记在读载体上)
@@ -4068,6 +4317,146 @@ mod tests {
         assert!(
             read_st.borrow().read_blocks.lock().unwrap().is_empty(),
             "no scripted data consumed: the read side stays parked"
+        );
+    }
+
+    // ===== round-5 §5.4 跨帧批量写(发送半级:§3.3 集成)=====
+
+    /// 按帧走读线上字节(tag 感知:只有 Data 帧的 len 是帧体长度,控制帧
+    /// 的 len 字段是信用/opaque id、无帧体)。`written_headers` 对非 Data
+    /// 帧按 len 跳字节,Pong(len = ping id)会错位,此处不复用。
+    fn frames_on_wire(bytes: &[u8]) -> Vec<(header::Header<()>, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off + header::HEADER_SIZE <= bytes.len() {
+            let block: [u8; header::HEADER_SIZE] =
+                bytes[off..off + header::HEADER_SIZE].try_into().unwrap();
+            let hdr = header::decode(&block).expect("written bytes must be valid frames");
+            let body_len = if hdr.tag() == Tag::Data {
+                hdr.len().val() as usize
+            } else {
+                0
+            };
+            let body =
+                bytes[off + header::HEADER_SIZE..off + header::HEADER_SIZE + body_len].to_vec();
+            off += header::HEADER_SIZE + body_len;
+            out.push((hdr, body));
+        }
+        assert_eq!(off, bytes.len(), "wire must end on a frame boundary");
+        out
+    }
+
+    /// T-B1(红→绿):3 帧 × 4KiB 一次驱动 → TestSocket writev 调用数
+    /// == 1(修前每帧一次 writev = 3);线上字节序 = 帧序、逐字节一致。
+    /// 预驱动一次冲掉 `Rtt::new` 立即到期的 rtt ping(独立一批),使
+    /// 断言只计量 3 个数据帧。
+    #[test]
+    fn batch_three_frames_one_writev() {
+        let (socket, st) = TestSocket::new();
+        let conn = Connection::new(socket, Config::default(), Mode::Client);
+        let (_recv_half, mut send_half, _workers) = conn.into_halves();
+        let mut cx = noop_cx();
+
+        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("send half must park after the rtt ping, got {other:?}"),
+        }
+        st.borrow().writev_calls.store(0, Ordering::SeqCst);
+        let before = st.borrow().written.lock().unwrap().len();
+
+        let mut stream = match send_half.poll_new_outbound(&mut cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("open outbound via send half, got {other:?}"),
+        };
+        let payloads = [[1u8; 4096], [2u8; 4096], [3u8; 4096]];
+        for p in &payloads {
+            match Pin::new(&mut stream).poll_write(&mut cx, p) {
+                Poll::Ready(Ok(4096)) => {}
+                other => panic!("queue data frame, got {other:?}"),
+            }
+        }
+        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("send half must park after the batch, got {other:?}"),
+        }
+
+        assert_eq!(
+            st.borrow().writev_calls.load(Ordering::SeqCst),
+            1,
+            "3 frames must coalesce into exactly one writev (修前每帧一次 = 3)"
+        );
+        let bytes = st.borrow().written.lock().unwrap()[before..].to_vec();
+        assert_eq!(
+            bytes.len(),
+            3 * (header::HEADER_SIZE + 4096),
+            "exactly the three data frames reach the wire"
+        );
+        let frames = frames_on_wire(&bytes);
+        assert_eq!(frames.len(), 3);
+        for (i, (hdr, body)) in frames.iter().enumerate() {
+            assert_eq!(hdr.tag(), Tag::Data);
+            assert_eq!(hdr.stream_id(), StreamId::new(1));
+            assert_eq!(body, &payloads[i][..], "frame #{i} body must be in order");
+        }
+    }
+
+    /// T-B4:to_send 有 Pong + 流帧满队列(2 流 × 8 帧 = 16)→ Pong 字节
+    /// 先上线(帧优先级 to_send > rtt ping > 流命令);全部 16 个流帧随后
+    /// 上线,18 帧恰分两批 writev(批上限 16 帧)。
+    #[test]
+    fn batch_pong_precedes_full_batch_of_stream_frames() {
+        let (socket, st) = TestSocket::new();
+        let conn = Connection::new(socket, Config::default(), Mode::Client);
+        let (_recv_half, mut send_half, _workers) = conn.into_halves();
+        let mut cx = noop_cx();
+
+        let payload = [7u8; 4096];
+        let mut streams = Vec::new();
+        for _ in 0..2 {
+            let mut s = match send_half.poll_new_outbound(&mut cx) {
+                Poll::Ready(Ok(s)) => s,
+                other => panic!("open outbound via send half, got {other:?}"),
+            };
+            for _ in 0..8 {
+                match Pin::new(&mut s).poll_write(&mut cx, &payload) {
+                    Poll::Ready(Ok(4096)) => {}
+                    other => panic!("queue data frame, got {other:?}"),
+                }
+            }
+            streams.push(s);
+        }
+        // 接收侧压入 Pong(走生产 push_to_send 语义)
+        let mut hdr = header::Header::ping(9);
+        hdr.ack();
+        send_half
+            .shared_for_test()
+            .push_to_send_for_test(Frame::new(hdr).into());
+
+        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("send half must park after draining, got {other:?}"),
+        }
+
+        let bytes = st.borrow().written.lock().unwrap().clone();
+        let frames = frames_on_wire(&bytes);
+        let (h0, _) = &frames[0];
+        assert_eq!(
+            h0.tag(),
+            Tag::Ping,
+            "first frame on the wire must be the pong"
+        );
+        assert!(
+            h0.flags().contains(header::ACK),
+            "pong must carry ACK, got {:?}",
+            h0.flags()
+        );
+        assert_eq!(h0.len().val(), 9, "pong keeps its opaque id");
+        let data = frames.iter().filter(|(h, _)| h.tag() == Tag::Data).count();
+        assert_eq!(data, 16, "all 16 stream frames must follow the pong");
+        assert_eq!(
+            st.borrow().writev_calls.load(Ordering::SeqCst),
+            2,
+            "pong + rtt ping + 16 stream frames = 18 frames → two batches"
         );
     }
 }
