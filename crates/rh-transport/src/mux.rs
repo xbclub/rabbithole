@@ -807,11 +807,12 @@ impl YamuxMultiplexer {
             yamux::Connection::new(YamuxCarrier::new(io), mux_config(max_streams), mode);
         // Round-D:收/发双任务驱动(对齐 Go yamux recv/send 双 goroutine)。
         // 单一载体经 SplitSocket/BiLock 串行——TLS/WS/QUIC/KCP 等不可
-        // fd 复制的载体走此路径(泛型兜底)。Round-5 起三元组:第三件
-        // 是 N 个分片 Worker(数量由 Config.shard_workers 决定,见
-        // [`mux_config`]),与两半一同 spawn。
-        let (recv_half, send_half, workers) = conn.into_halves();
-        Self::spawn_drivers(recv_half, send_half, workers)
+        // fd 复制的载体走此路径(泛型兜底)。Round-5 起三元组扩为
+        // round-6 四元组:第三件是 N 个接收侧分片 Worker、第四件是 N 个
+        // 发送侧分片 Worker(命令消费/帧转换/on_drop 分摊,数量由
+        // Config.shard_workers 决定,见 [`mux_config`]),与两半一同 spawn。
+        let (recv_half, send_half, workers, send_workers) = conn.into_halves();
+        Self::spawn_drivers(recv_half, send_half, workers, send_workers)
     }
 
     /// 双载体入口(round-E2,裸 TCP fd-dup):read_io 归接收任务、write_io
@@ -830,26 +831,32 @@ impl YamuxMultiplexer {
     ) -> Self {
         let conn: MuxConn =
             yamux::Connection::new(YamuxCarrier::new(read_io), mux_config(max_streams), mode);
-        let (recv_half, send_half, workers) = conn.into_halves_duplex(YamuxCarrier::new(write_io));
-        Self::spawn_drivers(recv_half, send_half, workers)
+        let (recv_half, send_half, workers, send_workers) =
+            conn.into_halves_duplex(YamuxCarrier::new(write_io));
+        Self::spawn_drivers(recv_half, send_half, workers, send_workers)
     }
 
-    /// 收/发双任务 + N 个分片 Worker 任务驱动(两路径共用):接收任务
-    /// 解帧+路由,新流入 accept_tx(容量 256 背压——接收阻塞只停读侧,
-    /// 不影响发送任务);发送任务处理开流请求 + 写路径;Worker 任务独占
-    /// `sid % N` 的流集合,做流级派发/流控记账/唤醒(Round-5)。
-    /// S: Send + 'static 供 tokio::spawn(halves 的 Send/生命周期随
-    /// socket 类型);[`yamux::ShardWorker`] 不带 socket 泛型参数,其
-    /// `Send + 'static` 由 vendor 侧结构保证(Arc/Mutex/原子,无 Rc)。
+    /// 收/发双任务 + N 个接收侧分片 Worker + N 个发送侧分片 Worker 任务
+    /// 驱动(两路径共用):接收任务解帧+路由,新流入 accept_tx(容量 256
+    /// 背压——接收阻塞只停读侧,不影响发送任务);发送任务(FlushTask)
+    /// 处理开流请求 + 写路径(唯一 socket 写者:send_out 轮转取帧、批量
+    /// writev);RecvWorker 独占 `sid % N` 流集合的接收派发(Round-5),
+    /// SendWorker 独占同模数分片的流命令消费/帧转换/on_drop(round-6,
+    /// 发送面计算分摊)。S: Send + 'static 供 tokio::spawn(halves 的
+    /// Send/生命周期随 socket 类型);[`yamux::ShardWorker`] 与
+    /// [`yamux::SendWorker`] 均不带 socket 泛型参数,其 `Send + 'static`
+    /// 由 vendor 侧结构保证(Arc/Mutex/原子,无 Rc)。
     ///
     /// Worker 生命周期:JoinHandle 丢弃即分离(同两半的 driver);Worker
     /// 在观察到共享错误槽(任一半 fatal / RecvHalf Drop 置 Closed)后自行
-    /// `Ready(())` 终结并排空本地流表,无需 abort——与 vendor §2.6 生命周期
-    /// 矩阵一致,不存在 Worker 永存泄漏面。
+    /// `Ready(())` 终结并排空本地流表(SendWorker 另在 send_dropped 后
+    /// 终结),无需 abort——与 vendor §2.6 生命周期矩阵一致,不存在
+    /// Worker 永存泄漏面。
     fn spawn_drivers<S>(
         recv_half: yamux::RecvHalf<S>,
         send_half: yamux::SendHalf<S>,
         workers: Vec<yamux::ShardWorker>,
+        send_workers: Vec<yamux::SendWorker>,
     ) -> Self
     where
         S: futures::AsyncRead + futures::AsyncWrite + Unpin + yamux::Writev2 + Send + 'static,
@@ -857,10 +864,14 @@ impl YamuxMultiplexer {
         let (open_tx, open_rx) = mpsc::channel::<oneshot::Sender<io::Result<yamux::Stream>>>(64);
         let (accept_tx, accept_rx) = mpsc::channel::<yamux::Stream>(256);
         let dead = Arc::new(AtomicBool::new(false));
-        // Worker 先于两半 spawn:接收任务路由的分片通道有界(cap 128),
-        // 消费侧未起即满 → 接收任务 park 停读;顺序不影响正确性(丢唤醒
-        // 防线保证消费侧起后必被唤醒),只是让首批帧少一次 park。
+        // 双侧 Worker 先于两半 spawn(与 RecvWorker 同批):消费侧未起即
+        // 满 → 生产侧 park(RecvWorker 满 → Framer 停读;send_out 满 →
+        // SendWorker 停止消费命令),顺序不影响正确性(丢唤醒防线保证
+        // 消费侧起后必被唤醒),只是让首批帧少一次 park。
         for w in workers {
+            tokio::spawn(w);
+        }
+        for w in send_workers {
             tokio::spawn(w);
         }
         tokio::spawn(send_driver(send_half, open_rx, dead.clone()));
@@ -1116,10 +1127,74 @@ mod tests {
         assert_eq!(CHUNK_CAP, 64 * 1024, "读缓冲上限红线(64KiB)不得放宽");
     }
 
-    // round-5 §2.7/§4.3 锁:mux_config 不覆盖 shard_workers,halves 三元组
-    // 的 Worker 数必须等于 vendor 默认 4(三机验收以此为准;调参须另立
-    // 规格)。经 into_halves 返回的 Vec 长度观测,不依赖 vendor 暴露
-    // getter;纯构造不 poll,无需运行时(两半/Worker 丢弃只走 Drop 收敛)。
+    // round-6 复核修复回归(发送侧分片):停读-恢复 + 写完即 drop 的流,
+    // 其 on_drop RST(ctrl Remove → RecvWorker finalize → to_send 最高
+    // 优先级)不得插队到本流滞留在 send_out 的回显数据之前——分片前
+    // SendHalf 单任务先消费完流命令才处理 (id,None) 天然保序;分片后
+    // FlushTask 与 SendWorker 并发,若无顺序门控,客户端会在回显中途
+    // 收到 RST → Closed → read_exact "early eof"(数据丢失)。修复:
+    // SendWorker 的 ctrl Remove 投递受"本流末帧已出队"的水位门控
+    // (send_out[k] 出队计数 ≥ drop 时的推入序;不要求整队取空,持续
+    // 负载下不饥饿)+ FlushTask 取空通知唤醒。
+    #[tokio::test]
+    async fn mux_pause_resume_echo_stream_drop_rst_not_overtaking() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const TOTAL: usize = 2 * 1024 * 1024;
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = wrap_stream_as_server(Box::new(b), true, MUX_STREAMS_UNLIMITED);
+        let client = wrap_stream_as_client(Box::new(a), true, MUX_STREAMS_UNLIMITED);
+
+        let echo = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let mut ss = server.accept().await.expect("accept");
+                // 停读 2s:让客户端的发送数据积压在背压链上(打开插队
+                // 窗口),再读全部并回显;写完即 drop(Open 态 → RST)
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut got = 0usize;
+                while got < TOTAL {
+                    let want = buf.len().min(TOTAL - got);
+                    ss.read_exact(&mut buf[..want]).await.expect("srv read");
+                    ss.write_all(&buf[..want]).await.expect("echo");
+                    got += want;
+                }
+            })
+        };
+        let cs = client.open_stream().await.expect("open");
+        let (mut cr, mut cw) = tokio::io::split(cs);
+        let verifier = tokio::spawn(async move {
+            let mut got = 0usize;
+            let mut buf = vec![0u8; 64 * 1024];
+            while got < TOTAL {
+                let want = buf.len().min(TOTAL - got);
+                cr.read_exact(&mut buf[..want])
+                    .await
+                    .expect("echo read must not see EOF before all echoed data");
+                assert!(buf[..want].iter().all(|&b| b == 7));
+                got += want;
+            }
+        });
+        let mut pos = 0usize;
+        let chunk = vec![7u8; 64 * 1024];
+        while pos < TOTAL {
+            cw.write_all(&chunk).await.expect("write");
+            pos += chunk.len();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), verifier)
+            .await
+            .expect("verifier timeout: echo must complete")
+            .expect("verifier join");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), echo)
+            .await
+            .expect("echo join");
+    }
+
+    // round-5 §2.7/§4.3 + round-6 §4.4 锁:mux_config 不覆盖 shard_workers,
+    // halves 四元组的两个 Worker Vec 长度必须都等于 vendor 默认 4(三机
+    // 验收以此为准;调参须另立规格)。经 into_halves 返回的 Vec 长度观测,
+    // 不依赖 vendor 暴露 getter;纯构造不 poll,无需运行时(两半/Worker
+    // 丢弃只走 Drop 收敛)。
     #[test]
     fn mux_config_consumes_default_four_shard_workers() {
         let (a, _b) = tokio::io::duplex(64);
@@ -1128,11 +1203,16 @@ mod tests {
             mux_config(MUX_STREAMS_UNLIMITED),
             yamux::Mode::Client,
         );
-        let (_recv, _send, workers) = conn.into_halves();
+        let (_recv, _send, workers, send_workers) = conn.into_halves();
         assert_eq!(
             workers.len(),
             4,
             "shard_workers 默认 4 不得被 mux_config 覆盖(round-5 §2.7)"
+        );
+        assert_eq!(
+            send_workers.len(),
+            4,
+            "send workers 与 RecvWorker 同 N 同模数(round-6 §4.4)"
         );
     }
 

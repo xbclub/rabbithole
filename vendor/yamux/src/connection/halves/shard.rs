@@ -19,21 +19,23 @@
 //!
 //! 本模块是 halves 的子模块,可直接触达 [`super::ConnShared`] 的私有字段。
 
-use crate::connection::{Id, Mode, State};
+use crate::connection::{Id, Mode, State, StreamCommand};
 use crate::frame::header::{self, Header, StreamId, Tag};
 use crate::frame::Frame;
+use crate::tagged_stream::TaggedStream;
 use crate::{Config, ConnectionError, Stream, DEFAULT_CREDIT};
 use futures::channel::mpsc;
+use futures::stream::{SelectAll, StreamExt};
 use nohash_hasher::IntMap;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use super::ConnShared;
+use super::{make_shadow, ConnShared};
 
 /// Framer → Worker 的入站消息(§2.1,D2:经有界轻量通道)。
 pub(super) enum ShardMsg {
@@ -54,16 +56,32 @@ pub(super) type ShardRoute = (ShardProducer<ShardMsg>, ShardProducer<ShardCtrl>)
 /// 分片通道容量(D2:cap 128;临界区 ~50ns,当前帧率下无争用问题)。
 pub(super) const SHARD_CHANNEL_CAP: usize = 128;
 
+/// SendWorker → FlushTask 帧通道容量(round-6 §2.1:每 Worker 一条
+/// `ShardChannel<Frame<()>>`,cap 128 帧;帧体 ≤ 单帧最大 body,内存上界
+/// 有界)。满即停:SendWorker 停止消费命令(pending_frame 单槽滞留),
+/// FlushTask 写穿后逐帧让位唤醒。
+pub(super) const SEND_OUT_CAP: usize = 128;
+
+/// SendWorker 单轮 poll 的命令消费预算(round-6 §2.3:防单 Worker 独占
+/// 线程;命令已在通道内,break 后下轮继续,不丢)。
+const SEND_CMDS_PER_POLL: usize = 64;
+
 /// Worker→Framer 建流交付通道容量(D6:accept 背压链的一环)。
 pub(super) const NEW_STREAMS_CAP: usize = 16;
 
-/// 通道共享状态:有界队列 + 双 waker 槽 + 消费者存活标志。
+/// 通道共享状态:有界队列 + 双 waker 槽 + 消费者存活标志 + 出队水位。
 struct ChannelShared<T> {
     queue: Mutex<VecDeque<T>>,
     cap: usize,
     producer_waker: Mutex<Option<Waker>>,
     consumer_waker: Mutex<Option<Waker>>,
     consumer_gone: AtomicBool,
+    /// 累计出队条数(单调;消费侧 Release 递增、生产侧 Acquire 读取)。
+    /// SPSC 下生产者第 n 次成功 push 的条目恰在 `popped ≥ n` 时已出队,
+    /// 生产侧据此做"某条目已出队"的精确判定,不必观察队列是否为空——
+    /// send_out 的 ctrl Remove 顺序门控以此替代"整队取空"(复核修复:
+    /// FlushTask 瓶颈态下队列几乎永不为空,整队门控会无限期饥饿 Remove)。
+    popped: AtomicU64,
 }
 
 /// 有界轻量通道(§2.1,D2):`parking_lot::Mutex<VecDeque<T>>` + 双 waker
@@ -88,6 +106,7 @@ impl<T> ShardChannel<T> {
                 producer_waker: Mutex::new(None),
                 consumer_waker: Mutex::new(None),
                 consumer_gone: AtomicBool::new(false),
+                popped: AtomicU64::new(0),
             }),
         };
         (
@@ -145,6 +164,15 @@ impl<T> ShardProducer<T> {
     pub(super) fn consumer_gone(&self) -> bool {
         self.shared.consumer_gone.load(Ordering::Acquire)
     }
+
+    /// 消费侧累计出队条数(Acquire,与消费侧 Release 递增配对)。SPSC
+    /// 下生产者第 n 次成功 `try_push` 的条目在 `popped_count() ≥ n` 时
+    /// 必已出队——send_out 的 ctrl Remove 顺序门控据此做"本流末帧已
+    /// 出队"的精确判定(见 [`SendWorker::flush_ctrl_pending`]),不再
+    /// 要求整队取空。
+    pub(super) fn popped_count(&self) -> u64 {
+        self.shared.popped.load(Ordering::Acquire)
+    }
 }
 
 /// 通道消费者句柄(Worker 侧;drop 即向生产者宣告消亡)。
@@ -165,6 +193,10 @@ impl<T> ShardConsumer<T> {
         }
         let still = queue.len();
         drop(queue);
+        if n > 0 {
+            // 出队水位先于生产者唤醒推进:被唤醒的生产侧复查即见新水位
+            self.shared.popped.fetch_add(n as u64, Ordering::Release);
+        }
         if was_full && still < self.shared.cap {
             // 满变非满:生产侧已登记才唤醒(take 语义)
             if let Some(w) = self.shared.producer_waker.lock().take() {
@@ -174,14 +206,39 @@ impl<T> ShardConsumer<T> {
         n
     }
 
+    /// 弹出单条;从满变非满时唤醒生产者(elision 契约镜像;round-6 §2.1)。
+    /// FlushTask 的 next_frame 逐帧轮转取(不整段 drain_into——为 D3 严格
+    /// 轮转公平:每取一帧即切换游标,任一 Worker 持续满队列时后面的
+    /// Worker 每批仍分得份额)。
+    pub(super) fn try_pop(&self) -> Option<T> {
+        let mut queue = self.shared.queue.lock();
+        let was_full = queue.len() >= self.shared.cap;
+        let item = queue.pop_front();
+        let still = queue.len();
+        drop(queue);
+        if item.is_some() {
+            // 出队水位先于生产者唤醒推进(同 drain_into)
+            self.shared.popped.fetch_add(1, Ordering::Release);
+        }
+        if was_full && still < self.shared.cap {
+            // 满变非满:生产侧已登记才唤醒(take 语义)
+            if let Some(w) = self.shared.producer_waker.lock().take() {
+                w.wake();
+            }
+        }
+        item
+    }
+
     /// 空闲时登记消费者 waker(生产者压入时唤醒;登记后调用方必须复查
-    /// 队列非空,见 §2.1 防线)。
-    fn register_consumer_waker(&self, w: &Waker) {
+    /// 队列非空,见 §2.1 防线)。round-6 起 FlushTask(发送半)亦经
+    /// send_out 通道消费,提升至 halves 可见。
+    pub(super) fn register_consumer_waker(&self, w: &Waker) {
         *self.shared.consumer_waker.lock() = Some(w.clone());
     }
 
-    /// 复查探测(丢唤醒防线):队列当前非空。
-    fn has_pending(&self) -> bool {
+    /// 复查探测(丢唤醒防线):队列当前非空。FlushTask 的 park 复查用
+    /// (round-6 §3.2,受 sink_idle 门控)。
+    pub(super) fn has_pending(&self) -> bool {
         !self.shared.queue.lock().is_empty()
     }
 }
@@ -841,6 +898,344 @@ impl Future for ShardWorker {
     }
 }
 
+/// 发送侧分片 Worker(round-6 §2.3,规格 benchmark/runs/
+/// tcp-multiflow-frp-20261015/coding-spec-round6-send-sharding.md):
+/// 独占 `sid % N == index` 的流命令接收器,分摊原 send_driver 的计算
+/// 密集面——多流命令轮询、帧转换、on_drop 选帧、ctrl 投递;跨 Tokio
+/// 线程物理并行。产出完整 `Frame<()>` 压入本分片的 `send_out[k]` 有界
+/// 通道(cap [`SEND_OUT_CAP`]),由 FlushTask(发送半)轮转消费写出。
+/// 裸 Future(futures-only 红线),由 rh-transport 侧 spawn。
+///
+/// **顺序契约(红线 5 的机制保证)**:同一流全部事件(数据帧、
+/// CloseStream、on_drop 产出的 FIN/RST)只被本 Worker 按命令到达顺序
+/// 处理,产出帧按处理顺序 push 进同一条 `send_out[k]` FIFO ⟹ wire 上
+/// FIN/RST 必在该流全部已产出数据之后;`pending_frame` 单槽 + "满即停"
+/// (send_out[k] 满时不消费新命令)保证 on_drop 不越过滞留的数据命令。
+/// 例外(与现行语义一致,非本流):to_send 里的接收侧 RST/FIN/Pong/
+/// GoAway 优先级高于全部流帧——现行行为,不是回退。
+///
+/// Future 语义:`Ready(())` 仅出现在共享错误(含粘性影子
+/// workers_shutdown)或 `send_dropped` 之后(D8:发送面已死则命令通道
+/// 应断,流侧 sender 报错,与现行 flush 任务终结等效);`Pending` =
+/// 无命令可消费、无滞留帧/ctrl、注册队列空。
+pub struct SendWorker {
+    /// k = sid % N(与接收侧 RecvWorker 同 N 同模数,D1:on_drop 的 ctrl
+    /// Remove 恰路由到**同一个** RecvWorker,零额外路由表)。
+    index: usize,
+    shared: Arc<ConnShared>,
+    streams: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
+    /// send_out[k] 生产句柄(本分片流全部产出帧的唯一出口,顺序契约)。
+    out: ShardProducer<Frame<()>>,
+    /// ctrl Remove 投递句柄(构造时预存 workers[k].1,D1 保证 k 即目标
+    /// RecvWorker;clone 预存免每轮取锁,语义与现行 SendHalf 同款)。
+    ctrl_tx: ShardProducer<ShardCtrl>,
+    /// send_out[k] 满时的暂存帧(单槽:满即停止消费,顺序契约)。
+    pending_frame: Option<Frame<()>>,
+    /// 成功压入 send_out[k] 的累计帧数(推入序;SPSC 下与通道内部的
+    /// 出队水位同一计量)。ctrl Remove 的门控水位取自此:drop 命令被
+    /// 消费时本流全部数据帧已压入(命令通道 FIFO + 满即停),此刻的推入
+    /// 序即"本流末帧序"的上界。
+    out_pushed: u64,
+    /// ctrl Remove 未投递暂存:(流 id, 门控水位)。水位 = drop 时的
+    /// `out_pushed`,`popped_count() ≥ 水位` 即本流在途帧已全部出队,方可
+    /// 投递(复核修复:精确水位替代"整队取空"——FlushTask 瓶颈态下
+    /// 队列几乎永不为空,整队门控会无限期饥饿 Remove,对端收不到
+    /// RST/FIN、stream_count 不减)。上界 = 存活流数;队首阻塞即止,其余
+    /// Remove 在其后保序——多流并发 drop 时通道可能满,单槽会丢。
+    ctrl_pending: VecDeque<(StreamId, u64)>,
+    finished: bool,
+}
+
+impl SendWorker {
+    pub(super) fn new(
+        index: usize,
+        shared: Arc<ConnShared>,
+        out: ShardProducer<Frame<()>>,
+        ctrl_tx: ShardProducer<ShardCtrl>,
+    ) -> Self {
+        SendWorker {
+            index,
+            shared,
+            streams: SelectAll::default(),
+            out,
+            ctrl_tx,
+            pending_frame: None,
+            out_pushed: 0,
+            ctrl_pending: VecDeque::new(),
+            finished: false,
+        }
+    }
+
+    /// 产出帧压入 send_out[k](顺序契约唯一出口):满则登记生产者 waker
+    /// 并复查一次(§2.1 防线);仍满返回帧由调用方存 pending_frame。
+    /// 成功即推进推入序 `out_pushed`(ctrl Remove 门控水位的计量)。
+    fn push_out_frame(&mut self, frame: Frame<()>, cx: &mut Context<'_>) -> Result<(), Frame<()>> {
+        let pushed = match self.out.try_push(frame) {
+            Ok(()) => Ok(()),
+            Err(f) => {
+                self.out.register_producer_waker(cx.waker());
+                // 复查(丢唤醒防线):登记后让出空间即唤醒
+                self.out.try_push(f)
+            }
+        };
+        if pushed.is_ok() {
+            self.out_pushed += 1;
+        }
+        pushed
+    }
+
+    /// ctrl Remove 投递(§2.5-D ②:经 workers[k].1 路由,D1 保证 k 即
+    /// 目标 RecvWorker):成功 → true;满 → 登记生产者 waker + 复查
+    /// (§2.1 防线),仍满由调用方暂存 ctrl_pending(park 后重试)。
+    /// 与现行 SendHalf 同款语义,整体迁入。
+    fn try_push_ctrl(&self, stream_id: StreamId, cx: &mut Context<'_>) -> bool {
+        match self.ctrl_tx.try_push(ShardCtrl::Remove(stream_id)) {
+            Ok(()) => true,
+            Err(_) => {
+                self.ctrl_tx.register_producer_waker(cx.waker());
+                matches!(self.ctrl_tx.try_push(ShardCtrl::Remove(stream_id)), Ok(()))
+            }
+        }
+    }
+
+    /// ctrl_pending 排空重试(队首阻塞即止——其余 Remove 在其后保序)。
+    /// **顺序门控(红线 5,精确水位)**:Remove 只在 `popped_count() ≥
+    /// 本条水位`(drop 时的推入序)后投递——此前本流仍有数据帧滞留
+    /// send_out[k],RecvWorker finalize 的 RST/FIN 经 to_send(优先级
+    /// 最高)会越过它们插队上线(分片前单任务天然保序,分片后此门控
+    /// 恢复等价);出队水位追平即本流在途帧已全部弹出,且 FlushTask 的
+    /// 弹出与 start_send 在 fill_batch 内严格交替,后到的 to_send 帧只会
+    /// 排在其后。门控不要求整队取空:水位之后压入的他流帧不计,持续
+    /// 负载下迟到以 drop 时的队列占用(≤ cap)为界,不饥饿(复核修复)。
+    /// 唤醒来源:满变非满的生产者 waker(队列曾满)/ FlushTask 取空
+    /// 通知 send_worker_wakers[k](取空时水位必已追平)/ 任一命令到达。
+    fn flush_ctrl_pending(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut progress = false;
+        while let Some(&(sid, watermark)) = self.ctrl_pending.front() {
+            if self.out.popped_count() < watermark {
+                log::trace!(
+                    "{}/{}: stream removal parked on in-flight send_out frames",
+                    self.shared.id,
+                    sid
+                );
+                break;
+            }
+            if !self.try_push_ctrl(sid, cx) {
+                log::trace!(
+                    "{}/{}: stream removal parked on full ctrl channel",
+                    self.shared.id,
+                    sid
+                );
+                break;
+            }
+            self.ctrl_pending.pop_front();
+            progress = true;
+        }
+        progress
+    }
+
+    /// §2.5-D(on_drop 全量迁入):命令通道关闭 `(id, None)` 时的流删除
+    /// 双路径。① opening 命中 → `finalize_dropped_stream`(选帧、唤醒、
+    /// 双计数器递减三联),产出帧同样过 send_out[k] 与本流数据同 FIFO
+    /// (红线 5);② 未命中(已被 RecvWorker 收编)→ ctrl Remove 直送
+    /// RecvWorker k(帧经 to_send 汇入,现行 Round-5 行为;投递受本流
+    /// 在途帧出队水位门控,见 [`Self::flush_ctrl_pending`];Remove 迟到
+    /// 无害且有界)。返回 `Some(frame)` = send_out 满滞留帧(调用方存
+    /// pending_frame 并停止消费——on_drop 不得越过本流滞留数据)。
+    fn on_drop_stream(&mut self, stream_id: StreamId, cx: &mut Context<'_>) -> Option<Frame<()>> {
+        // 先释放 opening 锁再 finalize/压帧:不跨 stream::Shared 与通道锁持有
+        let opening_hit = self.shared.opening.lock().remove(&stream_id);
+        if let Some(s) = opening_hit {
+            log::trace!("{}: removing dropped stream {}", self.shared.id, stream_id);
+            if let Some(frame) = finalize_dropped_stream(&self.shared, stream_id, &s) {
+                if let Err(f) = self.push_out_frame(frame, cx) {
+                    return Some(f);
+                }
+            }
+            return None;
+        }
+        // 水位 = 此刻推入序:drop 命令在本流全部数据命令之后被消费(命令
+        // 通道 FIFO),且步骤 3 仅在 pending_frame 为空时运行(满即停),
+        // 故本流数据帧此刻已全部成功压入,推入序即其末帧序的上界
+        self.ctrl_pending.push_back((stream_id, self.out_pushed));
+        // 立即尝试一次(在途帧已出队且通道有余量时免等下一轮;否则仅
+        // 暂存,不阻塞数据命令消费——Remove 迟到无害)
+        self.flush_ctrl_pending(cx);
+        None
+    }
+}
+
+impl Future for SendWorker {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = &mut *self;
+        loop {
+            if this.finished {
+                return Poll::Ready(());
+            }
+            // D8 终结:共享错误(含粘性影子 workers_shutdown,防 take_error
+            // 先行移除后漏终结)或 send_dropped(§2.5:发送面弃置,命令
+            // 通道应断)→ drop 全部接收器(命令通道断,流侧 sender 报错)
+            // + 丢弃 pending 帧 + 清 ctrl 暂存 + Ready。错误槽非空时回填
+            // make_shadow(现行 take-error 观察方语义:SendHalf 只凭错误槽
+            // 观察错误,本 Worker 取走后必须回填,否则 FlushTask 看不到
+            // 已发生的中止)。
+            if this.shared.workers_shutdown.load(Ordering::Acquire)
+                || this.shared.error.lock().is_some()
+                || this.shared.send_dropped.load(Ordering::Acquire)
+            {
+                if let Some(e) = this.shared.take_error() {
+                    this.shared.set_error(make_shadow(&e));
+                }
+                this.streams.clear();
+                this.pending_frame = None;
+                this.ctrl_pending.clear();
+                this.finished = true;
+                return Poll::Ready(());
+            }
+            let mut progress = false;
+            // 1) 注册收编(D4:send_regs[k] 全量 drain——入站建流
+            //    (push_new_receiver)与出站开流(make_new_outbound_stream)
+            //    的命令接收器都按 sid%N 压入;条目上界 = max_num_streams)
+            {
+                let mut regs = this.shared.send_regs.lock();
+                if !regs[this.index].is_empty() {
+                    for (id, r) in regs[this.index].drain(..) {
+                        this.streams.push(TaggedStream::new(id, r));
+                    }
+                    progress = true;
+                }
+            }
+            // 2) pending_frame 重试:成功 → 清槽 + progress;失败经
+            //    push_out_frame 以**当前** waker 重新登记(register-then-
+            //    retry:跨 poll 场景下槽内可能是上一 poll 的旧 waker,
+            //    不刷新则消费侧会唤醒到失效上下文)+ 复查一次,仍满则
+            //    跳过 3——满即停,顺序契约:未消费命令保留在命令通道/
+            //    SelectAll 中不被消费,on_drop 不越过滞留的数据命令
+            if let Some(f) = this.pending_frame.take() {
+                match this.push_out_frame(f, cx) {
+                    Ok(()) => progress = true,
+                    Err(f) => this.pending_frame = Some(f),
+                }
+            }
+            // 3) 命令消费(单轮 poll ≤ SEND_CMDS_PER_POLL 条,超出保留
+            //    下次 poll;公平性:防单 Worker 独占线程——tokio 协作调度
+            //    只在 poll 返回时让出,预算必须是 poll 级的,内层 while
+            //    的 progress→continue 不重置它)
+            let mut budget_exhausted = false;
+            if this.pending_frame.is_none() {
+                let mut budget = SEND_CMDS_PER_POLL;
+                while budget > 0 {
+                    match this.streams.poll_next_unpin(cx) {
+                        Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
+                            budget -= 1;
+                            log::trace!(
+                                "{}/{}: sending: {}",
+                                this.shared.id,
+                                frame.header().stream_id(),
+                                frame.header()
+                            );
+                            let frame: Frame<()> = frame.into();
+                            match this.push_out_frame(frame, cx) {
+                                Ok(()) => progress = true,
+                                Err(f) => {
+                                    this.pending_frame = Some(f);
+                                    break; // send_out 满:停止消费(顺序契约)
+                                }
+                            }
+                        }
+                        Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack, syn })))) => {
+                            budget -= 1;
+                            log::trace!("{}: sending close {}", this.shared.id, id);
+                            let frame: Frame<()> = Frame::close_stream(id, ack, syn).into();
+                            match this.push_out_frame(frame, cx) {
+                                Ok(()) => progress = true,
+                                Err(f) => {
+                                    this.pending_frame = Some(f);
+                                    break; // send_out 满:停止消费(顺序契约)
+                                }
+                            }
+                        }
+                        Poll::Ready(Some((id, None))) => {
+                            budget -= 1;
+                            log::trace!("{}: consuming drop of stream {}", this.shared.id, id);
+                            match this.on_drop_stream(id, cx) {
+                                Some(f) => {
+                                    this.pending_frame = Some(f);
+                                    break; // opening 命中的 FIN/RST 滞留:停止消费
+                                }
+                                None => progress = true,
+                            }
+                        }
+                        // SelectAll 空(无接收器可挂 waker——新接收器到达
+                        // 经 send_worker_wakers[k] 唤醒,park 复查 a 捕获)
+                        // 或命令暂无就绪(mpsc 已登记 waker)
+                        Poll::Ready(None) | Poll::Pending => break,
+                    }
+                }
+                budget_exhausted = budget == 0;
+            }
+            // ctrl 暂存重试(不阻塞数据命令:Remove 迟到无害)
+            if this.flush_ctrl_pending(cx) {
+                progress = true;
+            }
+            // 4) progress → continue;预算耗尽的让出例外(§2.3 预算说明
+            //    的实现形态:此刻命令通道可能仍有剩余,mpsc waker 未必
+            //    登记过——直接 park 会滞留到无关事件。自唤醒 + 返回
+            //    Pending:任务重新排队、其他任务插队(防独占),剩余命令
+            //    下次 poll 继续,不丢)
+            if progress {
+                if budget_exhausted {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                continue;
+            }
+            // park(register-then-recheck 防线,§2.3;全部满足才 Pending)。
+            // a. 注册 send_worker_wakers[k](注册压入 / set_error /
+            //    send_dropped 唤醒)→ 复查 send_regs[k] 非空
+            this.shared.send_worker_wakers.lock()[this.index] = Some(cx.waker().clone());
+            let mut rerun = !this.shared.send_regs.lock()[this.index].is_empty();
+            // 终结条件复查:与 waker 登记的竞缝由 set_error 广播兜住
+            // (标志粘性,continue 即进终结分支返回,不自旋)
+            if !rerun
+                && (this.shared.workers_shutdown.load(Ordering::Acquire)
+                    || this.shared.error.lock().is_some()
+                    || this.shared.send_dropped.load(Ordering::Acquire))
+            {
+                rerun = true;
+            }
+            // b. pending_frame 非空 → 经 push_out_frame 以当前 waker 登记
+            //    + 复查 try_push 一次(登记跨 poll 刷新,消费侧 take 后
+            //    槽空,此处重登是唯一可靠的唤醒来源)
+            if !rerun {
+                if let Some(f) = this.pending_frame.take() {
+                    match this.push_out_frame(f, cx) {
+                        Ok(()) => rerun = true,
+                        Err(f) => this.pending_frame = Some(f),
+                    }
+                }
+            }
+            // c. ctrl_pending 非空 → 复查投递。两种阻塞各有已登记的唤醒:
+            //    ctrl 通道满 → ctrl producer waker 已在失败时登记;在途帧
+            //    水位未追平 → 队列曾满时 b 已登记 send_out producer waker
+            //    (满变非满即醒),队列未满时 FlushTask 取空通知经 a 登记
+            //    的 send_worker_wakers[k] 唤醒(取空 ⟹ 水位追平);a 在
+            //    本复查之前登记,登记后的取空由本复查捕获(防线同款)
+            if !rerun && this.flush_ctrl_pending(cx) {
+                rerun = true;
+            }
+            // d. streams 非空:SelectAll 的 poll_next 已登记 waker(命令
+            //    到达即唤醒);streams 空:新接收器靠 a 的注册唤醒
+            if rerun {
+                continue;
+            }
+            return Poll::Pending;
+        }
+    }
+}
+
 /// 关闭单条流的状态并唤醒两端 waker(数据保留在缓冲,read_after_close
 /// 仍可读;Closed 上重复调用无迁移,幂等)。Worker 排空/及时关闭面共用。
 fn close_stream(
@@ -923,6 +1318,58 @@ mod tests {
         fn wake_by_ref(me: &Arc<Self>) {
             me.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// 唤醒置位 waker(round-6 T-S/T-F 系:单次唤醒观察)。
+    #[derive(Default)]
+    struct WakeFlag(AtomicBool);
+    impl ArcWake for WakeFlag {
+        fn wake_by_ref(me: &Arc<Self>) {
+            me.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// 构造 Data 帧(测试 helper,round-6 T-S/T-F 系)。
+    fn data_frame(id: u32, body: Vec<u8>) -> Frame<()> {
+        Frame::data(StreamId::new(id), body.into()).unwrap().into()
+    }
+
+    /// 按帧走读线上字节(tag 感知:只有 Data 帧的 len 是帧体长度,控制帧
+    /// 的 len 字段是信用/opaque id、无帧体;round-6 T-S/T-F 系)。
+    fn frames_on_wire(st: &Rc<RefCell<ScriptState>>) -> Vec<(Header<()>, Vec<u8>)> {
+        let bytes = st.borrow().written.clone();
+        frames_from_bytes(&bytes)
+    }
+
+    /// [`frames_on_wire`] 的字节级入口(T-F3:ThrottleSocket 的 written
+    /// 不经 ScriptState)。
+    fn frames_from_bytes(bytes: &[u8]) -> Vec<(Header<()>, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off + header::HEADER_SIZE <= bytes.len() {
+            let block: [u8; header::HEADER_SIZE] =
+                bytes[off..off + header::HEADER_SIZE].try_into().unwrap();
+            let hdr = header::decode(&block).expect("written bytes must be valid frames");
+            let body_len = if hdr.tag() == Tag::Data {
+                hdr.len().val() as usize
+            } else {
+                0
+            };
+            let body =
+                bytes[off + header::HEADER_SIZE..off + header::HEADER_SIZE + body_len].to_vec();
+            off += header::HEADER_SIZE + body_len;
+            out.push((hdr, body));
+        }
+        assert_eq!(off, bytes.len(), "wire must end on a frame boundary");
+        out
+    }
+
+    /// 解析 written 字节为 header 序列(T-F3 反向断言用)。
+    fn written_headers_from_bytes(bytes: &[u8]) -> Vec<Header<()>> {
+        frames_from_bytes(bytes)
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect()
     }
 
     /// T-C1:cap=4 压 5 条 → 第 5 条 Err 原样返还;消费后可再压;FIFO。
@@ -1026,6 +1473,53 @@ mod tests {
         assert!(!prod.consumer_gone());
         drop(cons);
         assert!(prod.consumer_gone());
+    }
+
+    /// T-O1(round-6 §5.1,红→绿:try_pop 修前不存在):try_pop 语义——
+    /// FIFO;空 → None;满 → pop 后生产者被唤醒恰一次(elision 契约镜像:
+    /// 只发生在"从满变非满"且生产者已登记的时刻;非满期间 pop 不重复
+    /// 唤醒)。
+    #[test]
+    fn shard_channel_try_pop_fifo_and_producer_elision() {
+        let (prod, cons) = ShardChannel::<u8>::with_capacity(4);
+        // FIFO
+        for i in 0..4 {
+            assert_eq!(prod.try_push(i), Ok(()));
+        }
+        let pw = Arc::new(CountWaker::default());
+        let w = waker(pw.clone());
+        prod.register_producer_waker(&w);
+        assert_eq!(
+            cons.try_pop(),
+            Some(0),
+            "try_pop must be FIFO (front first)"
+        );
+        assert_eq!(
+            pw.0.load(Ordering::SeqCst),
+            1,
+            "full→non-full must wake the registered producer exactly once"
+        );
+        // 非满期间 pop:不重复唤醒(镜像 elision)
+        assert_eq!(cons.try_pop(), Some(1));
+        assert_eq!(
+            pw.0.load(Ordering::SeqCst),
+            1,
+            "pop while non-full must not re-wake the producer"
+        );
+        // 排空 → 空 → None;消费者侧镜像:登记后空变非空恰一次唤醒
+        assert_eq!(cons.try_pop(), Some(2));
+        assert_eq!(cons.try_pop(), Some(3));
+        assert_eq!(cons.try_pop(), None, "empty channel must pop None");
+        let cw = Arc::new(CountWaker::default());
+        let cw_waker = waker(cw.clone());
+        cons.register_consumer_waker(&cw_waker);
+        assert_eq!(prod.try_push(9), Ok(()));
+        assert_eq!(
+            cw.0.load(Ordering::SeqCst),
+            1,
+            "empty→non-empty must wake the registered consumer exactly once"
+        );
+        assert_eq!(cons.try_pop(), Some(9));
     }
 
     // ===== §5.2/§5.3 测试基建 =====
@@ -1196,12 +1690,13 @@ mod tests {
         out
     }
 
-    /// 分片 halves 测试夹具:N 个 Worker 的 halves 三件套 + 脚本载体 +
-    /// 共享状态句柄(计数器/开流表断言用)。
+    /// 分片 halves 测试夹具:N 个 RecvWorker + N 个 SendWorker 的 halves
+    /// 四元组 + 脚本载体 + 共享状态句柄(计数器/开流表断言用)。
     struct Fixture {
         recv: RecvHalfForTest,
         send: SendHalfForTest,
         workers: Vec<ShardWorker>,
+        send_workers: Vec<SendWorker>,
         st: Rc<RefCell<ScriptState>>,
         shared: Arc<ConnShared>,
         cx: Context<'static>,
@@ -1217,13 +1712,15 @@ mod tests {
             cfg.set_shard_workers(n);
             let (socket, st) = ScriptSocket::new();
             let conn = Connection::new(socket, cfg, Mode::Client);
-            let (recv, send, workers) = conn.into_halves();
+            let (recv, send, workers, send_workers) = conn.into_halves();
             let shared = recv.shared_for_test();
             debug_assert_eq!(workers.len(), n);
+            debug_assert_eq!(send_workers.len(), n);
             Fixture {
                 recv,
                 send,
                 workers,
+                send_workers,
                 st,
                 shared,
                 cx: noop_cx(),
@@ -1234,9 +1731,10 @@ mod tests {
             self.st.borrow_mut().read_blocks.push_back(block);
         }
 
-        /// 驱动 recv + workers 一轮收敛(单线程手动推进,等价生产侧
-        /// tokio::spawn 的并行):recv 排空路由 → workers 全处理 →
-        /// recv 再探(new_streams 交付)。
+        /// 驱动 recv + 双侧 Worker 一轮收敛(单线程手动推进,等价生产侧
+        /// tokio::spawn 的并行):recv 排空路由 → RecvWorker 全处理 →
+        /// SendWorker 同 poll(round-6 §5.4:驱动面覆盖)→ recv 再探
+        /// (new_streams 交付)。
         fn drive_recv(&mut self) -> Poll<Option<crate::Result<Stream>>> {
             let cx = &mut self.cx;
             match self.recv.poll(cx) {
@@ -1246,11 +1744,16 @@ mod tests {
             for w in self.workers.iter_mut() {
                 let _ = w.poll_unpin(cx);
             }
+            for w in self.send_workers.iter_mut() {
+                let _ = w.poll_unpin(cx);
+            }
             self.recv.poll(cx)
         }
 
-        /// 驱动 send + workers 一轮收敛(Worker 压入 to_send 的 RST/FIN
-        /// 由终轮 send poll 写上 wire)。
+        /// 驱动 send + 双侧 Worker 一轮收敛:send(FlushTask)冲刷 →
+        /// RecvWorker 全处理(建流授信命令等)→ SendWorker 消费流命令、
+        /// 产出帧压 send_out(round-6:发送面数据命令的唯一消费者)→
+        /// send 终轮把 send_out/to_send 新帧写上 wire。
         fn drive_send(&mut self) -> Poll<crate::Result<()>> {
             let cx = &mut self.cx;
             match self.send.poll(cx) {
@@ -1260,7 +1763,19 @@ mod tests {
             for w in self.workers.iter_mut() {
                 let _ = w.poll_unpin(cx);
             }
+            for w in self.send_workers.iter_mut() {
+                let _ = w.poll_unpin(cx);
+            }
             self.send.poll(cx)
+        }
+
+        /// 只驱动 SendWorker 一轮(不发车 FlushTask/RecvWorker):T-S 系
+        /// 对 SendWorker 自身行为(收编/消费/满停/park)的白盒驱动。
+        fn poll_send_workers(&mut self) {
+            let cx = &mut self.cx;
+            for w in self.send_workers.iter_mut() {
+                let _ = w.poll_unpin(cx);
+            }
         }
     }
 
@@ -1319,7 +1834,7 @@ mod tests {
         cfg.set_shard_workers(2);
         let (socket, st) = ScriptSocket::new();
         let conn = Connection::new(socket, cfg, Mode::Client);
-        let (mut recv, mut send, mut workers) = conn.into_halves();
+        let (mut recv, mut send, mut workers, mut send_workers) = conn.into_halves();
 
         st.borrow_mut()
             .read_blocks
@@ -1336,12 +1851,20 @@ mod tests {
             Poll::Ready(Some(Ok(s))) => s,
             other => panic!("worker-built stream must be delivered, got {other:?}"),
         };
+        // round-6:入站流的授信命令(ACK|WU)经 send_regs 路由 SendWorker
+        // 收编消费、压 send_out,再由 send(FlushTask)写上 wire
+        for w in send_workers.iter_mut() {
+            let _ = w.poll_unpin(&mut cx);
+        }
         match send.poll(&mut cx) {
             Poll::Pending => {} // flush 后 park
             other => panic!("send half must park, got {other:?}"),
         }
-        // 再驱动一轮 worker/send 确认无第二帧
+        // 再驱动一轮双侧 worker/send 确认无第二帧
         for w in workers.iter_mut() {
+            let _ = w.poll_unpin(&mut cx);
+        }
+        for w in send_workers.iter_mut() {
             let _ = w.poll_unpin(&mut cx);
         }
         match send.poll(&mut cx) {
@@ -2122,7 +2645,7 @@ mod tests {
         cfg.set_shard_workers(2);
         let (socket, st) = ScriptSocket::new();
         let conn = Connection::new(socket, cfg, Mode::Client);
-        let (mut recv, mut send, mut workers) = conn.into_halves();
+        let (mut recv, mut send, mut workers, _send_workers) = conn.into_halves();
         let shared = recv.shared_for_test();
         let mut cx = noop_cx();
 
@@ -2215,6 +2738,985 @@ mod tests {
         assert_eq!(shared.stream_count.load(Ordering::SeqCst), 0);
     }
 
+    // ===== round-6 §5.2 SendWorker(单测,N=2 构造跨分片)=====
+
+    /// T-S1:注册路由——8 条出站流 → 驱动 SendWorker → 各 Worker 的
+    /// SelectAll 恰含 sid%N==k 的接收器;命令不丢(收编后首条命令经
+    /// 通道 FIFO 消费、帧上线)。
+    #[test]
+    fn send_worker_registration_routes_by_sid_mod_n() {
+        let mut f = Fixture::client(2, Config::default());
+        let mut outbound = Vec::new();
+        for _ in 0..8 {
+            let s = match f.send.poll_new_outbound(&mut f.cx) {
+                Poll::Ready(Ok(s)) => s,
+                other => panic!("outbound open must succeed, got {other:?}"),
+            };
+            outbound.push(s);
+        }
+        // client 出站 sid 恒奇数:1,3,…,15 → % 2 == 1 全归 SendWorker 1
+        f.poll_send_workers();
+        assert_eq!(
+            f.send_workers[0].streams.len(),
+            0,
+            "even shard must adopt no receivers"
+        );
+        assert_eq!(
+            f.send_workers[1].streams.len(),
+            8,
+            "odd shard must adopt all 8 receivers"
+        );
+        // 命令不丢:收编后的首条写命令经通道 FIFO 消费、帧经 send_out 上线
+        match Pin::new(&mut outbound[0]).poll_write(&mut f.cx, b"cmd") {
+            Poll::Ready(Ok(3)) => {}
+            other => panic!("write after adoption must be ready, got {other:?}"),
+        }
+        match f.drive_send() {
+            Poll::Pending => {}
+            other => panic!("flush task must park after flushing, got {other:?}"),
+        }
+        let data: Vec<_> = written_headers(&f.st)
+            .into_iter()
+            .filter(|h| h.stream_id() == StreamId::new(1) && h.tag() == Tag::Data)
+            .collect();
+        assert_eq!(
+            data.len(),
+            1,
+            "the adopted stream's command must reach the wire via send_out"
+        );
+    }
+
+    /// T-S2(红→绿):流内顺序——同一流 8 个数据帧 + CloseStream,跨多轮
+    /// poll(FlushTask 先行空转穿插)→ wire 字节序:8 帧体逐字节一致且
+    /// FIN 在最后(顺序契约:同流事件只经 send_out[k] 单 FIFO,红线 5)。
+    #[test]
+    fn send_worker_stream_order_across_polls() {
+        let mut f = Fixture::client(2, Config::default());
+        let mut s = match f.send.poll_new_outbound(&mut f.cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("outbound open must succeed, got {other:?}"),
+        };
+        assert_eq!(s.id(), StreamId::new(1));
+        let payloads: Vec<Vec<u8>> = (0..8u8).map(|i| vec![0xA0 + i; 256]).collect();
+        for p in &payloads {
+            match Pin::new(&mut s).poll_write(&mut f.cx, &p[..]) {
+                Poll::Ready(Ok(256)) => {}
+                other => panic!("stream write must be ready, got {other:?}"),
+            }
+        }
+        match Pin::new(&mut s).poll_close(&mut f.cx) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("close must be ready, got {other:?}"),
+        }
+        // 多轮交替驱动(FlushTask 先行空转 → SendWorker 消费 → FlushTask
+        // 写穿),模拟跨轮 poll 的交错;每轮终态必须 park(不空转)
+        for _ in 0..4 {
+            match f.send.poll(&mut f.cx) {
+                Poll::Pending => {}
+                other => panic!("flush task must park between rounds, got {other:?}"),
+            }
+            f.poll_send_workers();
+            match f.send.poll(&mut f.cx) {
+                Poll::Pending => {}
+                other => panic!("flush task must park after draining, got {other:?}"),
+            }
+        }
+        let s1: Vec<_> = frames_on_wire(&f.st)
+            .into_iter()
+            .filter(|(h, _)| h.stream_id() == StreamId::new(1))
+            .collect();
+        assert_eq!(s1.len(), 9, "8 data frames + FIN expected, got {s1:?}");
+        for i in 0..8 {
+            assert_eq!(s1[i].0.tag(), Tag::Data, "frame #{i} must be data");
+            assert_eq!(
+                &s1[i].1,
+                &payloads[i][..],
+                "frame #{i} body must be byte-identical in order"
+            );
+        }
+        let (h_fin, b_fin) = &s1[8];
+        assert!(
+            h_fin.flags().contains(header::FIN),
+            "FIN must come last on the wire, got {h_fin:?}"
+        );
+        assert_eq!(b_fin.len(), 0);
+        assert!(
+            s1[0].0.flags().contains(header::SYN),
+            "lazy SYN must ride the first frame"
+        );
+    }
+
+    /// T-S3(红→绿):send_out 有界——FlushTask 不消费时 SendWorker 压满
+    /// cap(128)+ 单槽 pending 后 poll Pending(不丢帧);FlushTask 排空
+    /// 后生产者被唤醒(WakeFlag),滞留帧与命令最终全部上线且顺序一致。
+    #[test]
+    fn send_worker_send_out_bounded_and_recovery() {
+        let mut cfg = Config::default();
+        cfg.set_shard_workers(1);
+        let mut f = Fixture::client(1, cfg);
+        let mut s = match f.send.poll_new_outbound(&mut f.cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("outbound open must succeed, got {other:?}"),
+        };
+        let payload = [7u8; 64];
+        // 阶段 1(饱和):只驱动 SendWorker(FlushTask 全程不消费),应用
+        // 侧写至通道满,直至 pending_frame 单槽滞留
+        let mut queued = 0usize;
+        let mut rounds = 0usize;
+        loop {
+            rounds += 1;
+            assert!(rounds < 512, "must saturate send_out within bounded rounds");
+            loop {
+                match Pin::new(&mut s).poll_write(&mut f.cx, &payload) {
+                    Poll::Ready(Ok(64)) => queued += 1,
+                    Poll::Pending => break,
+                    other => panic!("unexpected stream write: {other:?}"),
+                }
+            }
+            match f.send_workers[0].poll_unpin(&mut f.cx) {
+                Poll::Pending => {}
+                other => panic!("worker must park once saturated, got {other:?}"),
+            }
+            if f.send_workers[0].pending_frame.is_some() {
+                break;
+            }
+        }
+        // 饱和证据:send_out 恰 cap + pending 单槽(≥ 129 条命令已产出)
+        assert!(
+            queued > SEND_OUT_CAP,
+            "saturation must cover a full channel plus the pending slot, queued {queued}"
+        );
+        let wire_before = frames_on_wire(&f.st)
+            .iter()
+            .filter(|(h, _)| h.tag() == Tag::Data)
+            .count();
+        assert_eq!(
+            wire_before, 0,
+            "flush task must not have consumed anything yet"
+        );
+        // 阶段 2(park 防线):以 WakeFlag 复 poll 登记 producer waker
+        let fw = Arc::new(WakeFlag::default());
+        let w = waker(fw.clone());
+        let mut cx2 = Context::from_waker(&w);
+        match f.send_workers[0].poll_unpin(&mut cx2) {
+            Poll::Pending => {}
+            other => panic!("worker must stay parked while send_out is full, got {other:?}"),
+        }
+        assert!(
+            !fw.0.load(Ordering::SeqCst),
+            "no spurious wake before the drain"
+        );
+        // FlushTask 排空 send_out:满变非满 → 生产者被唤醒(elision 镜像)
+        match f.send.poll(&mut f.cx) {
+            Poll::Pending => {}
+            other => panic!("flush task must park after draining send_out, got {other:?}"),
+        }
+        assert!(
+            fw.0.load(Ordering::SeqCst),
+            "producer waker must be woken when send_out drains (lost-wakeup defense)"
+        );
+        // 阶段 3(恢复):滞留帧与命令通道剩余全部上线,顺序逐字节一致
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            assert!(guard < 512, "recovery must converge");
+            f.poll_send_workers();
+            match f.send.poll(&mut f.cx) {
+                Poll::Pending => {}
+                other => panic!("flush task must park after draining, got {other:?}"),
+            }
+            let n = frames_on_wire(&f.st)
+                .iter()
+                .filter(|(h, _)| h.tag() == Tag::Data && h.stream_id() == StreamId::new(1))
+                .count();
+            if n == queued {
+                break;
+            }
+        }
+        let frames = frames_on_wire(&f.st);
+        let bodies: Vec<&Vec<u8>> = frames
+            .iter()
+            .filter(|(h, _)| h.tag() == Tag::Data && h.stream_id() == StreamId::new(1))
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(bodies.len(), queued);
+        assert!(
+            bodies.iter().all(|b| b.as_slice() == &payload[..]),
+            "every frame body must be intact and in order after recovery"
+        );
+    }
+
+    /// T-S4:on_drop 三态矩阵——opening 命中路径 Open→RST、SendClosed→
+    /// 无帧;ctrl Remove 路径(已被 RecvWorker 收编)RecvClosed→FIN 与
+    /// 现行行为一致;stream_count 递减、ack_backlog_count 由令牌递减。
+    #[test]
+    fn send_worker_on_drop_frame_matrix() {
+        let mut f = Fixture::client(2, Config::default());
+        // (a) opening 命中,Open{ack:false} → RST 经 send_out;令牌递减
+        let s1 = match f.send.poll_new_outbound(&mut f.cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("outbound open must succeed, got {other:?}"),
+        };
+        assert_eq!(f.shared.ack_backlog_count.load(Ordering::SeqCst), 1);
+        drop(s1);
+        for _ in 0..4 {
+            match f.drive_send() {
+                Poll::Pending => {}
+                other => panic!("flush task must park after the RST, got {other:?}"),
+            }
+        }
+        let rst: Vec<_> = written_headers(&f.st)
+            .into_iter()
+            .filter(|h| h.stream_id() == StreamId::new(1) && h.flags().contains(header::RST))
+            .collect();
+        assert_eq!(
+            rst.len(),
+            1,
+            "Open → exactly one RST via send_out, got {rst:?}"
+        );
+        assert_eq!(
+            f.shared.stream_count.load(Ordering::SeqCst),
+            0,
+            "opening hit must decrement stream_count"
+        );
+        assert_eq!(
+            f.shared.ack_backlog_count.load(Ordering::SeqCst),
+            0,
+            "the ack-backlog token must release the slot"
+        );
+
+        // (b) opening 命中,poll_close 半关闭(SendClosed)→ drop 无帧
+        let mut s3 = match f.send.poll_new_outbound(&mut f.cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("outbound open must succeed, got {other:?}"),
+        };
+        assert_eq!(s3.id(), StreamId::new(3));
+        match Pin::new(&mut s3).poll_close(&mut f.cx) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("close must be ready, got {other:?}"),
+        }
+        for _ in 0..4 {
+            match f.drive_send() {
+                Poll::Pending => {}
+                other => panic!("flush task must park after the FIN, got {other:?}"),
+            }
+        }
+        let before = written_headers(&f.st).len();
+        drop(s3);
+        for _ in 0..4 {
+            match f.drive_send() {
+                Poll::Pending => {}
+                other => panic!("flush task must park, got {other:?}"),
+            }
+        }
+        let after: Vec<_> = written_headers(&f.st)
+            .into_iter()
+            .skip(before)
+            .filter(|h| h.stream_id() == StreamId::new(3))
+            .collect();
+        assert!(
+            after.is_empty(),
+            "SendClosed → no extra frame on drop, got {after:?}"
+        );
+
+        // (c) ctrl 路径(RecvWorker 已收编):RecvClosed → FIN(现行行为)
+        f.feed(syn_data_block(2, b"a"));
+        let s2 = match f.drive_recv() {
+            Poll::Ready(Some(Ok(s))) => s,
+            other => panic!("inbound stream expected, got {other:?}"),
+        };
+        f.feed(data_fin_block(2, b""));
+        match f.drive_recv() {
+            Poll::Pending => {}
+            other => panic!("no new stream expected on FIN, got {other:?}"),
+        }
+        let baseline = f.shared.stream_count.load(Ordering::SeqCst);
+        let before = written_headers(&f.st).len();
+        drop(s2);
+        for _ in 0..6 {
+            match f.drive_send() {
+                Poll::Pending => {}
+                other => panic!("flush task must park after the FIN, got {other:?}"),
+            }
+        }
+        let fin: Vec<_> = written_headers(&f.st)
+            .into_iter()
+            .skip(before)
+            .filter(|h| h.stream_id() == StreamId::new(2) && h.flags().contains(header::FIN))
+            .collect();
+        assert_eq!(
+            fin.len(),
+            1,
+            "RecvClosed → exactly one FIN via the ctrl Remove path, got {fin:?}"
+        );
+        assert_eq!(
+            f.shared.stream_count.load(Ordering::SeqCst),
+            baseline - 1,
+            "ctrl Remove must decrement stream_count"
+        );
+    }
+
+    /// T-S5:错误收敛——set_error → SendWorker Ready 终结(粘性影子);
+    /// 其接收器消亡 → 流侧 sender 报错(命令通道断,现行等效)。
+    #[test]
+    fn send_worker_error_terminates_and_breaks_channels() {
+        let mut f = Fixture::client(2, Config::default());
+        let mut s = match f.send.poll_new_outbound(&mut f.cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("outbound open must succeed, got {other:?}"),
+        };
+        f.poll_send_workers(); // 收编(sid 1 → SendWorker 1)
+        f.shared.set_error(ConnectionError::Closed);
+        for w in f.send_workers.iter_mut() {
+            assert!(
+                w.poll_unpin(&mut f.cx).is_ready(),
+                "error must finish every SendWorker"
+            );
+        }
+        // 终结幂等
+        for w in f.send_workers.iter_mut() {
+            assert!(w.poll_unpin(&mut f.cx).is_ready());
+        }
+        // 命令通道断:流侧写报错(WriteZero)
+        match Pin::new(&mut s).poll_write(&mut f.cx, b"x") {
+            Poll::Ready(Err(e)) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::WriteZero,
+                "stream write must fail with WriteZero after receivers dropped"
+            ),
+            other => {
+                panic!("stream write must fail after the worker dropped receivers, got {other:?}")
+            }
+        }
+    }
+
+    /// T-S6:send_dropped——置位 → SendWorker Ready 终结;RecvWorker 不
+    /// 终结(现行 T-W10 语义不回归,§2.5 生命周期矩阵)。
+    #[test]
+    fn send_worker_send_dropped_terminates_but_recv_workers_serve() {
+        let mut f = Fixture::client(2, Config::default());
+        f.feed(syn_data_block(2, b"x"));
+        let stream = match f.drive_recv() {
+            Poll::Ready(Some(Ok(s))) => s,
+            other => panic!("inbound stream expected, got {other:?}"),
+        };
+        // 等价 SendHalf::drop 的信号面:置位 + 双侧广播(现行
+        // wake_all_workers + 新增 wake_all_send_workers)
+        f.shared.send_dropped.store(true, Ordering::SeqCst);
+        f.shared.wake_all_workers();
+        f.shared.wake_all_send_workers();
+        for w in f.send_workers.iter_mut() {
+            assert!(
+                w.poll_unpin(&mut f.cx).is_ready(),
+                "send_dropped must finish SendWorker (D8)"
+            );
+        }
+        for w in f.workers.iter_mut() {
+            match w.poll_unpin(&mut f.cx) {
+                Poll::Pending => {}
+                other => panic!("RecvWorker must NOT finish on send_dropped alone, got {other:?}"),
+            }
+        }
+        assert!(
+            stream.is_closed(),
+            "RecvWorker must still drain its local table (T-W10 semantics)"
+        );
+    }
+
+    /// T-S7(红→绿):命令预算——单轮 poll 70 条命令(7 流 × 10 帧)只
+    /// 消费 64(SEND_CMDS_PER_POLL 上界的直接证据),剩余保留下轮、
+    /// 零丢失;两轮后全部上线且顺序逐字节一致。
+    #[test]
+    fn send_worker_command_budget_splits_rounds() {
+        let mut cfg = Config::default();
+        cfg.set_shard_workers(1);
+        let mut f = Fixture::client(1, cfg);
+        // 7 流(client 出站 sid 1..13 奇数,N=1 全归 worker0)× 10 帧
+        // = 70 条命令 > 64;单流命令通道 cap 10 内全就绪
+        const STREAMS: usize = 7;
+        const FRAMES: usize = 10;
+        let mut streams = Vec::new();
+        let payload = [3u8; 64];
+        for _ in 0..STREAMS {
+            let mut s = match f.send.poll_new_outbound(&mut f.cx) {
+                Poll::Ready(Ok(s)) => s,
+                other => panic!("outbound open must succeed, got {other:?}"),
+            };
+            for _ in 0..FRAMES {
+                match Pin::new(&mut s).poll_write(&mut f.cx, &payload) {
+                    Poll::Ready(Ok(64)) => {}
+                    other => panic!("stream write must be ready, got {other:?}"),
+                }
+            }
+            streams.push(s);
+        }
+        // 第一轮:预算 64 恰耗尽(自唤醒 + Pending,noop 下手动续驱)
+        f.poll_send_workers();
+        match f.send.poll(&mut f.cx) {
+            Poll::Pending => {}
+            other => panic!("flush task must park after the first round, got {other:?}"),
+        }
+        let after_round1 = frames_on_wire(&f.st)
+            .iter()
+            .filter(|(h, _)| h.tag() == Tag::Data)
+            .count();
+        assert_eq!(
+            after_round1, SEND_CMDS_PER_POLL,
+            "a single SendWorker poll must consume exactly the 64-command budget"
+        );
+        // 第二轮:剩余 6 条消费,零丢失
+        f.poll_send_workers();
+        match f.send.poll(&mut f.cx) {
+            Poll::Pending => {}
+            other => panic!("flush task must park after the second round, got {other:?}"),
+        }
+        let frames = frames_on_wire(&f.st);
+        let total = frames.iter().filter(|(h, _)| h.tag() == Tag::Data).count();
+        assert_eq!(
+            total,
+            STREAMS * FRAMES,
+            "all commands must be consumed across rounds without loss"
+        );
+        // 每流恰 10 帧、体逐字节一致(顺序契约)
+        for k in 0..STREAMS {
+            let sid = (2 * k + 1) as u32;
+            let bodies: Vec<&Vec<u8>> = frames
+                .iter()
+                .filter(|(h, _)| h.tag() == Tag::Data && h.stream_id() == StreamId::new(sid))
+                .map(|(_, b)| b)
+                .collect();
+            assert_eq!(bodies.len(), FRAMES, "stream {sid} frame count");
+            assert!(
+                bodies.iter().all(|b| b.as_slice() == &payload[..]),
+                "stream {sid} bodies must be intact and in order"
+            );
+        }
+    }
+
+    /// T-S8(红→绿,复核修复 medium):ctrl Remove 在持续负载下不得
+    /// 饥饿——已收编入站流 sid2 写 K 帧后 drop;同分片出站流 sid1 每轮
+    /// 先灌一帧再驱动,使 SendWorker 的每个门控检查点(步骤 3 之后与
+    /// park 复查 c)看到的 send_out[0] 都非空(FlushTask 瓶颈态下队列
+    /// 几乎永不为空的确定性复现)。修前门控 =「整队取空」→ Remove 永不
+    /// 投递(RST 不上线、stream_count 不减,有限 max_num_streams 下最终
+    /// TooManyStreams / GoAway);修后门控 =「本流末帧已出队」的水位 →
+    /// 有界轮数内投递,且 RST 必在 sid2 全部在途数据之后上线(红线 5
+    /// 不回退)。
+    #[test]
+    fn send_worker_ctrl_remove_not_starved_under_sustained_load() {
+        let mut cfg = Config::default();
+        cfg.set_shard_workers(1);
+        let mut f = Fixture::client(1, cfg);
+        // 已收编入站流(on_drop 走 ctrl Remove → RecvWorker finalize 路径)
+        f.feed(syn_data_block(2, b"a"));
+        let mut inbound = match f.drive_recv() {
+            Poll::Ready(Some(Ok(s))) => s,
+            other => panic!("inbound stream expected, got {other:?}"),
+        };
+        // 同分片持续负载源(N=1:全部流归 SendWorker 0)
+        let mut load = match f.send.poll_new_outbound(&mut f.cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("outbound open must succeed, got {other:?}"),
+        };
+        // K 帧在途数据(命令通道 cap 10:授信 WU|ACK 已消费,8 帧全就绪)
+        const K: usize = 8;
+        let payload = [0x5Au8; 128];
+        for _ in 0..K {
+            match Pin::new(&mut inbound).poll_write(&mut f.cx, &payload) {
+                Poll::Ready(Ok(128)) => {}
+                other => panic!("inbound stream write must be ready, got {other:?}"),
+            }
+        }
+        let baseline = f.shared.stream_count.load(Ordering::SeqCst);
+        assert_eq!(baseline, 2, "one inbound + one outbound stream");
+        drop(inbound); // Open → RST(ctrl Remove → RecvWorker finalize → to_send)
+
+        let sid2 = StreamId::new(2);
+        let mut removed_at = None;
+        for round in 0..8 {
+            // 每轮先灌一帧负载:本轮 SendWorker 必有新帧压入 send_out,
+            // 其门控检查点看到的队列恒非空
+            match Pin::new(&mut load).poll_write(&mut f.cx, &[1u8; 32]) {
+                Poll::Ready(Ok(32)) => {}
+                other => panic!("load write must be ready, got {other:?}"),
+            }
+            match f.drive_send() {
+                Poll::Pending => {}
+                other => panic!("flush task must park each round, got {other:?}"),
+            }
+            if f.shared.stream_count.load(Ordering::SeqCst) == baseline - 1 {
+                removed_at = Some(round);
+                break;
+            }
+        }
+        let removed_at = removed_at.unwrap_or_else(|| {
+            panic!(
+                "ctrl Remove starved under sustained load: stream_count still {} after 8 rounds",
+                f.shared.stream_count.load(Ordering::SeqCst)
+            )
+        });
+        // 有界迟到:drop 时在途帧于首轮终态写穿 → 次轮投递 Remove → 第三轮
+        // RecvWorker finalize 递减计数(轮序确定,不因负载推迟)
+        assert!(
+            removed_at <= 3,
+            "Remove lateness must be bounded by the in-flight drain, got round {removed_at}"
+        );
+        match f.drive_send() {
+            Poll::Pending => {}
+            other => panic!("flush task must park, got {other:?}"),
+        }
+        let wire = frames_on_wire(&f.st);
+        let rst_pos: Vec<usize> = wire
+            .iter()
+            .enumerate()
+            .filter(|(_, (h, _))| h.stream_id() == sid2 && h.flags().contains(header::RST))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(rst_pos.len(), 1, "Open → exactly one RST, got {rst_pos:?}");
+        let data_pos: Vec<usize> = wire
+            .iter()
+            .enumerate()
+            .filter(|(_, (h, b))| {
+                h.stream_id() == sid2 && h.tag() == Tag::Data && b.len() == payload.len()
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(data_pos.len(), K, "all in-flight data must reach the wire");
+        assert!(
+            data_pos.iter().all(|&i| i < rst_pos[0]),
+            "RST must follow every in-flight data frame: data {data_pos:?}, RST {rst_pos:?}"
+        );
+    }
+
+    /// T-S9(复核修复,红线 5 守卫):水位门控不得回退保序——已收编入站
+    /// 流写 K 帧后 drop;以「SendWorker → RecvWorker → FlushTask」轮序
+    /// 驱动(RecvWorker 先于 FlushTask 看到 Remove:若 Remove 在本流数据
+    /// 尚滞留 send_out 时投递,finalize 的 RST 经 to_send 最高优先级会先于
+    /// 数据写穿——无门控即插队,数据丢失)。断言:RST 上线且 K 帧数据
+    /// 全部在其前。
+    #[test]
+    fn send_worker_ctrl_remove_waits_for_in_flight_frames() {
+        let mut cfg = Config::default();
+        cfg.set_shard_workers(1);
+        let mut f = Fixture::client(1, cfg);
+        f.feed(syn_data_block(2, b"a"));
+        let mut inbound = match f.drive_recv() {
+            Poll::Ready(Some(Ok(s))) => s,
+            other => panic!("inbound stream expected, got {other:?}"),
+        };
+        // 先把授信 WU|ACK 写穿:随后 send_out 内只剩本流数据帧
+        match f.drive_send() {
+            Poll::Pending => {}
+            other => panic!("flush task must park, got {other:?}"),
+        }
+        const K: usize = 8;
+        let payload = [0xC3u8; 96];
+        for _ in 0..K {
+            match Pin::new(&mut inbound).poll_write(&mut f.cx, &payload) {
+                Poll::Ready(Ok(96)) => {}
+                other => panic!("inbound stream write must be ready, got {other:?}"),
+            }
+        }
+        assert_eq!(f.shared.stream_count.load(Ordering::SeqCst), 1);
+        drop(inbound); // Open → RST
+
+        let sid2 = StreamId::new(2);
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            assert!(rounds <= 8, "RST must land within bounded rounds");
+            // 轮序:SendWorker(消费数据 + drop)→ RecvWorker(Remove 已
+            // 投递则 finalize → to_send)→ FlushTask 写穿(to_send 优先)
+            f.poll_send_workers();
+            for w in f.workers.iter_mut() {
+                let _ = w.poll_unpin(&mut f.cx);
+            }
+            match f.send.poll(&mut f.cx) {
+                Poll::Pending => {}
+                other => panic!("flush task must park, got {other:?}"),
+            }
+            if frames_on_wire(&f.st)
+                .iter()
+                .any(|(h, _)| h.stream_id() == sid2 && h.flags().contains(header::RST))
+            {
+                break;
+            }
+        }
+        let wire = frames_on_wire(&f.st);
+        let rst_pos = wire
+            .iter()
+            .position(|(h, _)| h.stream_id() == sid2 && h.flags().contains(header::RST))
+            .expect("RST present");
+        let data_pos: Vec<usize> = wire
+            .iter()
+            .enumerate()
+            .filter(|(_, (h, b))| {
+                h.stream_id() == sid2 && h.tag() == Tag::Data && b.len() == payload.len()
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(data_pos.len(), K, "all in-flight data must reach the wire");
+        assert!(
+            data_pos.iter().all(|&i| i < rst_pos),
+            "RST overtook in-flight data: data {data_pos:?}, RST {rst_pos}"
+        );
+        assert_eq!(
+            f.shared.stream_count.load(Ordering::SeqCst),
+            0,
+            "ctrl Remove must decrement stream_count"
+        );
+    }
+
+    // ===== round-6 §5.3 FlushTask(halves)=====
+
+    /// T-F1(红→绿):轮转公平——4 Worker 各灌 32 帧(白盒直压 send_out,
+    /// 真实 SPSC 生产路径)→ 全部上线且每流恰 32 ≥ 总量/N−2(无饿死);
+    /// wire 的 Data 序列按 worker 严格交错(out_cursor 推进的直接证据)。
+    #[test]
+    fn flush_task_round_robin_fairness() {
+        let mut f = Fixture::client(4, Config::default());
+        for (k, w) in f.send_workers.iter_mut().enumerate() {
+            for _ in 0..32 {
+                let sid = (2 * k + 1) as u32;
+                match w.out.try_push(data_frame(sid, vec![k as u8 + 0xA0; 16])) {
+                    Ok(()) => {}
+                    Err(_) => panic!("send_out has room (cap 128)"),
+                }
+            }
+        }
+        match f.send.poll(&mut f.cx) {
+            Poll::Pending => {}
+            other => panic!("flush task must park after draining, got {other:?}"),
+        }
+        let frames = frames_on_wire(&f.st);
+        let data: Vec<_> = frames
+            .iter()
+            .filter(|(h, _)| h.tag() == Tag::Data)
+            .collect();
+        assert_eq!(data.len(), 128, "all frames must reach the wire");
+        for k in 0..4usize {
+            let sid = (2 * k + 1) as u32;
+            let n = data
+                .iter()
+                .filter(|(h, _)| h.stream_id() == StreamId::new(sid))
+                .count();
+            assert!(
+                n >= 128 / 4 - 2,
+                "stream {sid} starved with {n} frames (round-robin broken)"
+            );
+            assert_eq!(n, 32, "strict round robin must give each shard exactly 32");
+        }
+        // 严格轮转序:Data 帧的 sid 序列周期 4(1,3,5,7,1,…;批间
+        // out_cursor 不复位,全局单周期)
+        let seq: Vec<u32> = data.iter().map(|(h, _)| h.stream_id().val()).collect();
+        for (i, &sid) in seq.iter().enumerate() {
+            assert_eq!(
+                sid,
+                (2 * (i % 4) + 1) as u32,
+                "wire order must follow the strict round-robin cursor at #{i}"
+            );
+        }
+    }
+
+    /// T-F2:优先级——to_send 有 Pong + send_out 有数据(真实命令链灌入)
+    /// → Pong 字节先上线(T-B4 同型,路径改 send_out)。
+    #[test]
+    fn flush_task_tosend_precedes_send_out() {
+        let mut f = Fixture::client(2, Config::default());
+        let payload = [7u8; 1024];
+        let mut streams = Vec::new();
+        for _ in 0..2 {
+            let mut s = match f.send.poll_new_outbound(&mut f.cx) {
+                Poll::Ready(Ok(s)) => s,
+                other => panic!("outbound open must succeed, got {other:?}"),
+            };
+            for _ in 0..8 {
+                match Pin::new(&mut s).poll_write(&mut f.cx, &payload) {
+                    Poll::Ready(Ok(1024)) => {}
+                    other => panic!("stream write must be ready, got {other:?}"),
+                }
+            }
+            streams.push(s);
+        }
+        // 16 个流帧先进 send_out(SendWorker 消费真实命令)
+        f.poll_send_workers();
+        // to_send 压入 Pong(生产 push_to_send 语义)
+        let mut hdr = Header::ping(9);
+        hdr.ack();
+        f.shared.push_to_send_for_test(Frame::new(hdr).into());
+
+        match f.send.poll(&mut f.cx) {
+            Poll::Pending => {}
+            other => panic!("flush task must park after draining, got {other:?}"),
+        }
+
+        let frames = frames_on_wire(&f.st);
+        let (h0, _) = &frames[0];
+        assert_eq!(
+            h0.tag(),
+            Tag::Ping,
+            "first frame on the wire must be the pong (to_send > send_out)"
+        );
+        assert!(h0.flags().contains(header::ACK), "pong must carry ACK");
+        assert_eq!(h0.len().val(), 9, "pong keeps its opaque id");
+        let data = frames.iter().filter(|(h, _)| h.tag() == Tag::Data).count();
+        assert_eq!(data, 16, "all 16 stream frames must follow the pong");
+    }
+
+    /// T-F3(红→绿,D3-2 镜像,T7 同型):载体 writev 阻塞(半写)+
+    /// send_out[k] 有帧 → SendHalf::poll 必须返回 Pending(修前把
+    /// send_out 当"有工作"复查 → continue 无限自旋,poll 永不返回)。
+    /// 看门狗:poll 在工作线程执行,主线程 3s 收不到返回即判自旋失败;
+    /// poison 让自旋线程有界退出。
+    #[test]
+    fn flush_task_park_returns_pending_when_send_out_blocked_by_partial_write() {
+        // T-F3 专用载体:写容量受 cap 限制(cap==0 → Pending 并登记写
+        // waker;每次成功写扣减容量),读侧恒 Pending;poison 后写 Err。
+        // 状态经 Arc<std::sync::Mutex>:Send 绑定,可移入工作线程。
+        struct ThrottleState {
+            cap: usize,
+            written: Vec<u8>,
+            write_waker: Option<Waker>,
+            poison: bool,
+        }
+        struct ThrottleSocket(Arc<std::sync::Mutex<ThrottleState>>);
+        impl crate::Writev2 for ThrottleSocket {
+            fn poll_write2(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                a: &[u8],
+                b: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                crate::Writev2::poll_writev(
+                    self,
+                    cx,
+                    &[std::io::IoSlice::new(a), std::io::IoSlice::new(b)],
+                )
+            }
+            fn poll_writev(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bufs: &[std::io::IoSlice<'_>],
+            ) -> Poll<std::io::Result<usize>> {
+                let mut st = self.0.lock().unwrap();
+                if st.poison {
+                    return Poll::Ready(Err(std::io::Error::other("throttle poison")));
+                }
+                if st.cap == 0 {
+                    st.write_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                let mut budget = st.cap;
+                let mut n = 0usize;
+                for b in bufs {
+                    let take = b.len().min(budget);
+                    if take == 0 {
+                        continue;
+                    }
+                    st.written.extend_from_slice(&b[..take]);
+                    n += take;
+                    budget -= take;
+                    if budget == 0 {
+                        break;
+                    }
+                }
+                st.cap -= n;
+                Poll::Ready(Ok(n))
+            }
+        }
+        impl futures::io::AsyncRead for ThrottleSocket {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut [u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Pending
+            }
+        }
+        impl futures::io::AsyncWrite for ThrottleSocket {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                crate::Writev2::poll_writev(self, cx, &[std::io::IoSlice::new(buf)])
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let state = Arc::new(std::sync::Mutex::new(ThrottleState {
+            cap: 8, // 首帧(12B 帧头)只写穿 8B → 半写
+            written: Vec::new(),
+            write_waker: None,
+            poison: false,
+        }));
+        let sock = ThrottleSocket(state.clone());
+        let mut cfg = Config::default();
+        cfg.set_shard_workers(2);
+        let conn = Connection::new(sock, cfg, Mode::Client);
+        let (_recv, mut send_half, _workers, mut send_workers) = conn.into_halves();
+
+        let mut cx = noop_cx();
+        let mut stream = match send_half.poll_new_outbound(&mut cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("open outbound via send half, got {other:?}"),
+        };
+        match Pin::new(&mut stream).poll_write(&mut cx, b"payload") {
+            Poll::Ready(Ok(7)) => {}
+            other => panic!("queue data frame, got {other:?}"),
+        }
+        // 数据帧进 send_out[1](FlushTask 尚未 poll,半写未发生)
+        for w in send_workers.iter_mut() {
+            let _ = w.poll_unpin(&mut cx);
+        }
+
+        // 工作线程 poll 发送半:修前 park 复查命中 send_out 非空 →
+        // 无限自旋(看门狗超时判失败);修后 send_out 复查受 sink_idle
+        // 门控(半写态 sink_idle=false),立即返回 Pending。
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let worker = std::thread::spawn(move || {
+            let w = futures::task::noop_waker();
+            let mut wcx = Context::from_waker(&w);
+            let outcome = send_half.poll(&mut wcx);
+            let _ = tx.send(format!("{outcome:?}"));
+            send_half
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(outcome) => {
+                assert_eq!(
+                    outcome, "Pending",
+                    "flush task must return Pending (not spin) while a partial write \
+                     blocks the carrier and send_out holds a frame"
+                );
+                let mut send_half = worker.join().expect("worker must finish cleanly");
+                assert_eq!(
+                    state.lock().unwrap().written.len(),
+                    8,
+                    "exactly 8B of the first frame header must be written"
+                );
+                // 反向断言:写侧恢复可写 → 半写帧写穿 + send_out 帧上线
+                {
+                    let mut st = state.lock().unwrap();
+                    st.cap = 4096;
+                    if let Some(w) = st.write_waker.take() {
+                        w.wake();
+                    }
+                }
+                match send_half.poll(&mut cx) {
+                    Poll::Pending => {}
+                    other => panic!("flush task must re-park after draining, got {other:?}"),
+                }
+                let written = state.lock().unwrap().written.clone();
+                let hdrs = written_headers_from_bytes(&written);
+                assert!(
+                    hdrs.iter()
+                        .any(|h| h.tag() == Tag::Data && h.stream_id() == StreamId::new(1)),
+                    "the send_out frame must reach the wire after the drain: {hdrs:?}"
+                );
+            }
+            Err(_) => {
+                // 看门狗超时:poison 让自旋中的 poll_writev 返回 Err,
+                // 工作线程有界退出,然后判失败
+                state.lock().unwrap().poison = true;
+                let _ = worker.join();
+                panic!(
+                    "spin detected: flush task did not return within 3s while send_out \
+                     holds a frame blocked by a partial write"
+                );
+            }
+        }
+    }
+
+    /// T-F4(红→绿):丢唤醒防线——FlushTask poll 至 Pending(已登记
+    /// send_out consumer waker)→ Worker push send_out[k](空变非空)→
+    /// FlushTask 被唤醒并写穿(WakeFlag 断言,§3.2 无条件登记的兑现)。
+    #[test]
+    fn flush_task_woken_by_send_out_push_after_park() {
+        let mut f = Fixture::client(2, Config::default());
+        // 预驱动冲掉 Rtt::new 立即到期的 ping,让 FlushTask 干净 park
+        match f.send.poll(&mut f.cx) {
+            Poll::Pending => {}
+            other => panic!("flush task must park after the rtt ping, got {other:?}"),
+        }
+        // 以 WakeFlag 复 poll:park 序列把 consumer waker 登记到 fw
+        let fw = Arc::new(WakeFlag::default());
+        let w = waker(fw.clone());
+        let mut cx2 = Context::from_waker(&w);
+        match f.send.poll(&mut cx2) {
+            Poll::Pending => {}
+            other => panic!("flush task must park, got {other:?}"),
+        }
+        assert!(
+            !fw.0.load(Ordering::SeqCst),
+            "no spurious wake before the push"
+        );
+        // Worker push(白盒直压 send_out[1],空变非空恰一次唤醒)
+        match f.send_workers[1].out.try_push(data_frame(3, vec![9u8; 32])) {
+            Ok(()) => {}
+            Err(_) => panic!("send_out has room"),
+        }
+        assert!(
+            fw.0.load(Ordering::SeqCst),
+            "consumer waker must be woken by the empty→non-empty push (lost-wakeup defense)"
+        );
+        // 复 poll 写穿
+        match f.send.poll(&mut f.cx) {
+            Poll::Pending => {}
+            other => panic!("flush task must park after draining, got {other:?}"),
+        }
+        assert!(
+            frames_on_wire(&f.st)
+                .iter()
+                .any(|(h, b)| h.stream_id() == StreamId::new(3) && b.as_slice() == &[9u8; 32][..]),
+            "the pushed frame must reach the wire after the wake"
+        );
+    }
+
+    /// T-F5(红→绿):开流路由——poll_new_outbound + 立即写 → 首帧带 SYN
+    /// 经 send_out 上线(对齐现行 G2/S 系断言;D4:出站流命令接收器经
+    /// push_new_receiver 路由 SendWorker 收编)。
+    #[test]
+    fn flush_task_first_write_carries_syn_via_send_out() {
+        let mut f = Fixture::client(2, Config::default());
+        let mut s = match f.send.poll_new_outbound(&mut f.cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("outbound open must succeed, got {other:?}"),
+        };
+        assert_eq!(s.id(), StreamId::new(1));
+        match Pin::new(&mut s).poll_write(&mut f.cx, b"first") {
+            Poll::Ready(Ok(5)) => {}
+            other => panic!("first write must be ready, got {other:?}"),
+        }
+        // 跨分片驱动:SendWorker 收编(注册路由)→ 消费 → FlushTask 写穿
+        match f.drive_send() {
+            Poll::Pending => {}
+            other => panic!("flush task must park after flushing, got {other:?}"),
+        }
+        let s1: Vec<_> = frames_on_wire(&f.st)
+            .into_iter()
+            .filter(|(h, _)| h.stream_id() == StreamId::new(1))
+            .collect();
+        assert_eq!(s1.len(), 1, "exactly one frame for stream 1");
+        assert_eq!(s1[0].0.tag(), Tag::Data);
+        assert!(
+            s1[0].0.flags().contains(header::SYN),
+            "lazy SYN must ride the first frame via send_out, got {:?}",
+            s1[0].0.flags()
+        );
+        assert_eq!(&s1[0].1, b"first");
+    }
+
     // ===== §5.3 halves 端到端 =====
 
     /// T-H1:双向并发——双连接对泳(手工 wire 同步)16 流双向打流,
@@ -2229,10 +3731,10 @@ mod tests {
 
         let (socket_a, st_a) = ScriptSocket::new();
         let conn_a = Connection::new(socket_a, cfg.clone(), Mode::Client);
-        let (mut recv_a, mut send_a, mut workers_a) = conn_a.into_halves();
+        let (mut recv_a, mut send_a, mut workers_a, mut send_workers_a) = conn_a.into_halves();
         let (socket_b, st_b) = ScriptSocket::new();
         let conn_b = Connection::new(socket_b, cfg, Mode::Server);
-        let (mut recv_b, mut send_b, mut workers_b) = conn_b.into_halves();
+        let (mut recv_b, mut send_b, mut workers_b, mut send_workers_b) = conn_b.into_halves();
         let mut cx = noop_cx();
 
         let payload_for = |sid: u32| -> Vec<u8> {
@@ -2349,7 +3851,8 @@ mod tests {
                 }
             }
 
-            // 驱动双侧:send flush → workers 全处理 → recv 交付(×2 轮
+            // 驱动双侧:send(FlushTask)flush → RecvWorker 全处理 →
+            // SendWorker 消费流命令(round-6 驱动面)→ recv 交付(×2 轮
             // 让 ctrl/交付链走穿)
             for r in 0..2 {
                 let _ = send_a.poll(&mut cx);
@@ -2360,6 +3863,15 @@ mod tests {
                 for w in workers_b.iter_mut() {
                     let _ = w.poll_unpin(&mut cx);
                 }
+                for w in send_workers_a.iter_mut() {
+                    let _ = w.poll_unpin(&mut cx);
+                }
+                for w in send_workers_b.iter_mut() {
+                    let _ = w.poll_unpin(&mut cx);
+                }
+                // send_out 里 Worker 刚压入的帧由再一轮 send poll 写穿
+                let _ = send_a.poll(&mut cx);
+                let _ = send_b.poll(&mut cx);
                 if r == 0 {
                     if let Poll::Ready(Some(Ok(s))) = recv_a.poll(&mut cx) {
                         accepted_a.push(s);
@@ -2403,7 +3915,7 @@ mod tests {
         cfg.set_shard_workers(2);
         let (socket, st) = ScriptSocket::new();
         let conn = Connection::new(socket, cfg, Mode::Client);
-        let (mut recv, mut send, mut workers) = conn.into_halves();
+        let (mut recv, mut send, mut workers, mut send_workers) = conn.into_halves();
         let shared = recv.shared_for_test();
         let mut cx = noop_cx();
 
@@ -2458,7 +3970,8 @@ mod tests {
             "stream_count must equal 256"
         );
 
-        // 全关 → (id,None) → ctrl Remove → 计数归零
+        // 全关 → (id,None) → SendWorker 消费 → ctrl Remove → RecvWorker
+        // finalize → 计数归零(round-6:命令消费与 on_drop 都在 SendWorker)
         drop(streams);
         let mut guard = 0;
         while shared.stream_count.load(Ordering::SeqCst) != 0 {
@@ -2469,6 +3982,14 @@ mod tests {
                 shared.stream_count.load(Ordering::SeqCst)
             );
             let _ = send.poll(&mut cx);
+            for w in workers.iter_mut() {
+                let _ = w.poll_unpin(&mut cx);
+            }
+            for w in send_workers.iter_mut() {
+                let _ = w.poll_unpin(&mut cx);
+            }
+            // ctrl Remove 经 RecvWorker finalize 入 to_send,终轮写穿并
+            // 释放计数;多轮驱动让 (id,None)→Remove→finalize 链走穿
             for w in workers.iter_mut() {
                 let _ = w.poll_unpin(&mut cx);
             }

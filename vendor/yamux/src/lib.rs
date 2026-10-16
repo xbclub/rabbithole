@@ -35,8 +35,8 @@ pub(crate) mod connection;
 mod tagged_stream;
 
 pub use crate::connection::{
-    Connection, Mode, Packet, RecvHalf, SendHalf, ShardWorker, SplitSocket, Stream, StreamReadHalf,
-    StreamWriteHalf,
+    Connection, Mode, Packet, RecvHalf, SendHalf, SendWorker, ShardWorker, SplitSocket, Stream,
+    StreamReadHalf, StreamWriteHalf,
 };
 pub use crate::error::ConnectionError;
 pub use crate::frame::{

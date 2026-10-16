@@ -568,9 +568,13 @@ async fn mux_relay_cancel_converges_when_close_queue_full() {
 
     // 逐块喂养直到写侧楔死:charge 停止增长 = write_chunk 已在
     // poll_ready 上 Pending(命令队列满、驱动卡在载体写)。
+    // round-6(发送侧分片):背压链容量 = 流命令通道(~11 帧)+ 每
+    // Worker send_out(cap 128,红线 6)+ pending 单槽 + FlushTask 批
+    // 队列(16)≈ 157 帧;喂养轮数须越过该容量才必然触发楔死
+    // (256 轮 × 100B = 25600B > 157 × 100B)。
     let mut fed = 0usize;
     let mut stalled = false;
-    for _ in 0..64 {
+    for _ in 0..256 {
         local.write_all(&[7u8; 100]).await.unwrap();
         fed += 100;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
@@ -585,7 +589,7 @@ async fn mux_relay_cancel_converges_when_close_queue_full() {
             break;
         }
     }
-    assert!(stalled, "64 轮喂养必须触发写侧楔死(命令队列有限)");
+    assert!(stalled, "256 轮喂养必须触发写侧楔死(命令队列有限)");
     let charged = limiter.charged.load(Ordering::SeqCst);
     assert!(
         charged >= 1000,
