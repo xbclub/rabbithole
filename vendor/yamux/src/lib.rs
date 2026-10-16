@@ -35,7 +35,8 @@ pub(crate) mod connection;
 mod tagged_stream;
 
 pub use crate::connection::{
-    Connection, Mode, Packet, RecvHalf, SendHalf, Stream, StreamReadHalf, StreamWriteHalf,
+    Connection, Mode, Packet, RecvHalf, SendHalf, SplitSocket, Stream, StreamReadHalf,
+    StreamWriteHalf,
 };
 pub use crate::error::ConnectionError;
 pub use crate::frame::{
@@ -86,8 +87,8 @@ pub struct Config {
     max_num_streams: usize,
     read_after_close: bool,
     split_send_size: usize,
-    /// 每流初始接收窗(接收侧授信上限的起步值;见
-    /// [`Config::set_initial_stream_receive_window`])。默认
+    /// 每流初始接收窗(round-E1 起为**恒定值**:窗口不自增、无预算钳制;
+    /// 见 [`Config::set_initial_stream_receive_window`])。默认
     /// [`DEFAULT_CREDIT`],即 upstream 原行为。
     initial_stream_receive_window: usize,
 }
@@ -133,6 +134,12 @@ impl Config {
     /// Despite the difficulty of the attack one should choose a reasonable
     /// `max_connection_receive_window` to protect against this attack, especially since an attacker
     /// might use more than one stream per connection.
+    ///
+    /// round-E1(rabbithole,2026-10-16):流控对齐 frp v0.2.0 后本字段无任何
+    /// 消费者——BDP 自增窗与连接级共享预算记账已删(恒定单流窗,见
+    /// `connection::stream::flow_control`);rabbithole 接线(mux.rs)设为
+    /// `None`(不限,对齐 frp"无连接级共享预算")。字段为上游 API 兼容
+    /// 保留;`None` 时下方 setter 相互断言对 `usize::MAX` 恒真。
     pub fn set_max_connection_receive_window(&mut self, n: Option<usize>) -> &mut Self {
         self.max_connection_receive_window = n;
 
@@ -183,13 +190,11 @@ impl Config {
     /// granted at stream creation via a window update frame carrying the
     /// initial flag (outbound SYN|WU / inbound ACK|WU, both upstream-legal
     /// combinations; round-4/B1, aligned with frp OpenStream/AcceptStream)
-    /// instead of waiting for the receiver's first read poll. From the first
-    /// read-driven window update on, BDP growth may engage. The pregrant is
-    /// charged against the connection budget
-    /// (`max_connection_receive_window - 256 KiB * max_num_streams`, shared
-    /// with auto-tuning) and clamped when the budget is exhausted, and the
-    /// creation grant never triggers BDP doubling (the pregrant is not
-    /// measured receive throughput).
+    /// instead of waiting for the receiver's first read poll. round-E1
+    /// (2026-10-16, frp v0.2.0 alignment) makes the window **constant**: it is
+    /// never auto-tuned (no BDP growth) and not charged against any connection
+    /// budget (the shared-budget accounting has been removed); read-driven
+    /// window updates only replenish consumed credit.
     ///
     /// Motivation (rabbithole round-1, measured on the 3-machine testbed,
     /// `benchmark/runs/goal-repair/round-1/single-stream-medians.txt`): every

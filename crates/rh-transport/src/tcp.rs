@@ -59,7 +59,12 @@ impl TcpListenerShim {
         // 交付即构造 mux:所有权与消费者同步建立。此前连接只是已验证裸 IO
         // (含 peek 前传字节),accept 之前客户端已发的帧仍缓冲在 IO 里,
         // 构造后由 driver 正常处理;未交付路径则从不存在 driver。
-        let mux = crate::mux::wrap_stream_as_server(v.io, v.yamux, v.max_streams);
+        // round-E2:yamux 连接且持有写侧 fd 副本 → 双载体 mux(零锁
+        // 读∥写);否则(try_clone 失败 / TLS/WS / 非 yamux)锁路径。
+        let mux = match (v.yamux, v.write_dup) {
+            (true, Some(dup)) => crate::mux::wrap_stream_as_server_duplex(v.io, dup, v.max_streams),
+            _ => crate::mux::wrap_stream_as_server(v.io, v.yamux, v.max_streams),
+        };
         Ok(Incoming {
             mux,
             remote: v.remote,
@@ -95,6 +100,11 @@ impl Drop for TcpListenerShim {
 /// 直接关闭;yamux driver 只随交付产生、归消费者所有。
 struct VerifiedConn {
     io: crate::BoxedIo,
+    /// 裸 TCP 分支的写侧 fd 副本(round-E2,verify 的 try_clone 产物):
+    /// accept 交付时若有则走 duplex mux(halves 零锁);无则锁路径。
+    /// 非 yamux 交付(RHTP 前缀/裸模式)不消费,随本结构析构关闭 fd
+    ///(socket 本体仍由 io 持有,不受影响)。
+    write_dup: Option<crate::BoxedIo>,
     remote: SocketAddr,
     protocol: crate::Protocol,
     /// peek 判定:按 yamux 处理(true)或裸 RHTP/非 multiplex 监听(false)。
@@ -103,16 +113,43 @@ struct VerifiedConn {
     max_streams: usize,
 }
 
+/// 裸 TCP fd 复制(round-E2,真·载体拆分的写侧载体):tokio TcpStream
+/// 无 try_clone(1.53 仅 fs::File 有),经 std fd 等价实现——
+/// F_DUPFD_CLOEXEC 复制 fd,与原 fd 共享同一打开文件描述(O_NONBLOCK
+/// 等 fd 状态同源),`from_std` 重新注册到当前 runtime 的 IO driver
+///(独立注册,与原 fd 无冲突)。任一步失败 → None → 调用方降级锁路径
+///(不报错、不失败建连)。
+fn try_dup_tcp(stream: &tokio::net::TcpStream) -> Option<crate::BoxedIo> {
+    use std::os::fd::AsFd as _;
+    let fd = stream.as_fd().try_clone_to_owned().ok()?;
+    let std_stream = std::net::TcpStream::from(fd);
+    let dup = tokio::net::TcpStream::from_std(std_stream).ok()?;
+    Some(Box::new(dup) as crate::BoxedIo)
+}
+
 /// 单连接验证管线:TLS → WS 升级 → 首字节窥探。
 /// 只做验证与分类,不构造 mux;验证流程/超时与原实现完全一致。
+/// 返回 (io, write_dup, yamux):write_dup 仅在裸 TCP 分支产生
+/// (round-E2;TLS/WS 会话层载体不可 fd 复制,恒 None)。
 async fn verify(
     stream: tokio::net::TcpStream,
     tls: Option<tokio_rustls::TlsAcceptor>,
     ws_upgrade: bool,
     multiplex: bool,
-) -> io::Result<(crate::BoxedIo, bool)> {
+) -> io::Result<(crate::BoxedIo, Option<crate::BoxedIo>, bool)> {
     stream.set_nodelay(true).ok();
     set_tcp_keepalive(&stream);
+    // round-E2:裸 TCP 分支(tls.is_none() && !ws_upgrade)在装箱前产生
+    // 写侧 fd 副本,供 accept 交付时走 duplex mux。peek_prefix 只从主
+    //(读)侧消费 4 字节——双 fd 共享同一内核收队列,但写侧绝不读
+    //(halves 方向纪律,见 vendor Connection::into_halves_duplex),无
+    // 消费冲突。try_clone 失败 → None → 锁路径。multiplex 监听才需要
+    // 副本(非 mux 监听永不消费,避免每连接白开一个 fd)。
+    let write_dup = if multiplex && tls.is_none() && !ws_upgrade {
+        try_dup_tcp(&stream)
+    } else {
+        None
+    };
     let io: crate::BoxedIo = match tls {
         Some(acceptor) => {
             let tls_stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
@@ -122,14 +159,15 @@ async fn verify(
         }
         None => Box::new(stream),
     };
-    post_tls(io, ws_upgrade, multiplex).await
+    post_tls(io, write_dup, ws_upgrade, multiplex).await
 }
 
 async fn post_tls(
     io: crate::BoxedIo,
+    write_dup: Option<crate::BoxedIo>,
     ws_upgrade: bool,
     multiplex: bool,
-) -> io::Result<(crate::BoxedIo, bool)> {
+) -> io::Result<(crate::BoxedIo, Option<crate::BoxedIo>, bool)> {
     let io = if ws_upgrade {
         let io = tokio::time::timeout(HANDSHAKE_TIMEOUT, ws::upgrade_server(io, ws::WS_PATH))
             .await
@@ -139,14 +177,19 @@ async fn post_tls(
         io
     };
     if !multiplex {
-        return Ok((io, false));
+        return Ok((io, write_dup, false));
     }
     // 混合接入:multiplex 监听允许裸模式客户端。
     // 窥探首 4 字节:RHTP 魔数 = 裸连接(每连接一流);否则按 yamux 处理。
-    // 窥探字节必须前传(两种包装都需要)。
+    // 窥探字节必须前传(两种包装都需要)。前传只挂在主(读)侧 IO 上,
+    // write_dup 不涉及(方向纪律,同上)。
     let (prefix, io) = peek_prefix(io).await?;
     let yamux = prefix != *b"RHTP";
-    Ok((crate::PrependedIo::wrap(io, prefix.to_vec()), yamux))
+    Ok((
+        crate::PrependedIo::wrap(io, prefix.to_vec()),
+        write_dup,
+        yamux,
+    ))
 }
 
 /// 窥探首 4 字节(带超时,防慢连接占资源);返回字节与可继续读取的流。
@@ -226,9 +269,10 @@ pub async fn listen_stream(
                     let max_streams = mux_limit.load(Ordering::Relaxed);
                     handshakes.spawn(async move {
                         match verify(stream, tls2, ws_upgrade, multiplex).await {
-                            Ok((io, yamux)) => {
+                            Ok((io, write_dup, yamux)) => {
                                 let vc = VerifiedConn {
                                     io,
+                                    write_dup,
                                     remote,
                                     protocol,
                                     yamux,
@@ -270,14 +314,15 @@ pub async fn listen_stream(
 /// 裸模式下连接本体即一条流(AcceptSingle),后续流由 DialPerStream 拨号。
 pub async fn connect_stream(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>> {
     if cfg.multiplex || cfg.protocol.always_muxed() {
-        let io = dial_io(cfg).await?;
+        let (io, write_dup) = dial_io(cfg).await?;
         // 客户端为开流方:超限是单流报错(不杀会话),取"不限制"即可,
-        // 真正的策略上限由服务端在 DATA_CHANNEL_HELLO 处执行
-        Ok(crate::mux::wrap_stream_as_client(
-            io,
-            true,
-            MUX_STREAMS_UNLIMITED,
-        ))
+        // 真正的策略上限由服务端在 DATA_CHANNEL_HELLO 处执行。
+        // round-E2:裸 TCP 持写侧 fd 副本 → 双载体 mux(零锁读∥写);
+        // None(非 Tcp 协议 / try_clone 失败)→ 锁路径。
+        Ok(match write_dup {
+            Some(dup) => crate::mux::wrap_stream_as_client_duplex(io, dup, MUX_STREAMS_UNLIMITED),
+            None => crate::mux::wrap_stream_as_client(io, true, MUX_STREAMS_UNLIMITED),
+        })
     } else {
         // 裸模式:开流即拨号
         Ok(Arc::new(Multiplexer {
@@ -287,16 +332,28 @@ pub async fn connect_stream(cfg: &ClientTransportConfig) -> io::Result<Arc<Multi
 }
 
 /// 客户端:为裸模式拨一条新的物理连接(= 一条新流)。
+/// 裸模式(AcceptSingle/DialPerStream)不涉及双载体:每连接一流,
+/// write_dup 不消费,随返回丢弃。
 pub async fn dial_stream(cfg: &ClientTransportConfig) -> io::Result<crate::BoxedIo> {
-    dial_io(cfg).await
+    let (io, _write_dup) = dial_io(cfg).await?;
+    Ok(io)
 }
 
-async fn dial_io(cfg: &ClientTransportConfig) -> io::Result<crate::BoxedIo> {
+/// 客户端拨号:返回 (主 IO, 写侧 fd 副本)。副本仅 Protocol::Tcp 裸分支
+/// 产生(round-E2,`try_dup_tcp`;失败 → None → 调用方锁路径),
+/// TLS/WS 会话层载体不可 fd 复制,恒 None。
+async fn dial_io(
+    cfg: &ClientTransportConfig,
+) -> io::Result<(crate::BoxedIo, Option<crate::BoxedIo>)> {
     let fut = async {
         let tcp = dial_tcp(cfg).await?;
         match cfg.protocol {
             crate::Protocol::Tcp => {
-                Ok::<crate::BoxedIo, io::Error>(Box::new(tcp) as crate::BoxedIo)
+                let write_dup = try_dup_tcp(&tcp);
+                Ok::<(crate::BoxedIo, Option<crate::BoxedIo>), io::Error>((
+                    Box::new(tcp) as crate::BoxedIo,
+                    write_dup,
+                ))
             }
             crate::Protocol::Tls | crate::Protocol::Wss => {
                 let (rust, verify) = crate::tls::client_config(&cfg.tls)?;
@@ -323,7 +380,7 @@ async fn dial_io(cfg: &ClientTransportConfig) -> io::Result<crate::BoxedIo> {
                     crate::tls::verify_pin(&expected, leaf.as_ref())?;
                 }
                 let io: crate::BoxedIo = Box::new(tls_stream);
-                if cfg.protocol == crate::Protocol::Wss {
+                let io = if cfg.protocol == crate::Protocol::Wss {
                     ws::client_handshake(
                         io,
                         &cfg.tls
@@ -332,13 +389,17 @@ async fn dial_io(cfg: &ClientTransportConfig) -> io::Result<crate::BoxedIo> {
                             .unwrap_or_else(|| cfg.server_addr.to_string()),
                         ws::WS_PATH,
                     )
-                    .await
+                    .await?
                 } else {
-                    Ok(io)
-                }
+                    io
+                };
+                Ok((io, None))
             }
             crate::Protocol::Ws => {
-                ws::client_handshake(Box::new(tcp), &cfg.server_addr.to_string(), ws::WS_PATH).await
+                let io =
+                    ws::client_handshake(Box::new(tcp), &cfg.server_addr.to_string(), ws::WS_PATH)
+                        .await?;
+                Ok((io, None))
             }
             crate::Protocol::Quic | crate::Protocol::Kcp => Err(other_err("use quic/kcp connect")),
         }

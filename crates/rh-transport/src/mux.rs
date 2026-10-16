@@ -701,6 +701,76 @@ impl yamux::Writev2 for YamuxCarrier {
 /// 此值只为让 0=不限 有一个有限的落点。64 位限定:256KiB×此值 = 4TiB。
 pub const MUX_STREAMS_UNLIMITED: usize = 1 << 24;
 
+/// yamux 连接配置(锁路径 [`YamuxMultiplexer::new`] 与双载体路径
+/// [`YamuxMultiplexer::new_duplex`] 共用,round-E2 起提取以免两路漂移)。
+fn mux_config(max_streams: usize) -> yamux::Config {
+    let mut cfg = yamux::Config::default();
+    let streams = if max_streams == 0 {
+        MUX_STREAMS_UNLIMITED
+    } else {
+        max_streams
+    };
+    // ---- 流控对齐 frp v0.2.0(round-E1,2026-10-16 源码级核对)----
+    // fatedier/yamux(frp 实际锁定 v0.2.0)三条事实:
+    // 1. OpenStream(session.go L200)/AcceptStream(L247)建流即
+    //    sendWindowUpdate——我方 Round-B1 已对齐(SYN|WU / ACK|WU
+    //    建流授信),保留;
+    // 2. MaxStreamWindowSize 恒定(stream.go L284
+    //    `max := config.MaxStreamWindowSize`),frp 两端 fmux 同设
+    //    6MiB,窗口永不自增——删除 paritytech 上游继承的 BDP 自增窗
+    //    (其与预算钳制/预授信守卫的相互作用是本 bug 类来源;我方
+    //    Round-3 +9.1% 单流增益只依赖 6MiB 初窗 + B1 建流授信,
+    //    不依赖自增);
+    // 3. 无连接级共享预算、无 BDP/auto-tune(全源码无此逻辑)——删除
+    //    自研 256MiB 共享预算(多流上已被证实"先到先得 + 耗尽冻结":
+    //    ≥45 并发流后新流被钳死在 256KiB,是整类记账 bug 的温床)。
+    // 每流接收窗恒等于初窗 6MiB,与流数无关(4096 流同窗,见
+    // flow_control.rs every_stream_gets_full_window_regardless_of_count)。
+    //
+    // 内存护栏:聚合在途敞口 = 并发流数 × 6MiB,唯一护栏是
+    // max_num_streams(rh-server 的 limits.mux_streams;0=不限时折算
+    // MUX_STREAMS_UNLIMITED,敞口无界,与 frp 行为一致,生产建议
+    // 显式配置流上限)。
+    //
+    // 连接级接收窗上限解除(None,对齐 frp"无连接级共享预算");
+    // 上游 API 兼容保留该字段(vendor lib.rs 注释)。setter 断言相互
+    // 校验当前值:必须先解除连接窗上限(None 对默认 512 流断言成立)
+    // 再提高流数(对 usize::MAX 恒成立;反序:默认 1GiB 总窗对
+    // 2^24 流保底乘积 4TiB 断言必炸)。断言语义零放宽。
+    cfg.set_max_connection_receive_window(None);
+    cfg.set_max_num_streams(streams);
+    // 分片帽对齐 frp(2026-10-15):frp 的 fmux 无分片发送概念,帧大小
+    // 上限即发送窗(见 benchmark/runs/tcp-multiflow-frp-20261015/
+    // FRP-YAMUX-ANALYSIS.md §2.1)。上游默认 16KiB 曾提到 64KiB,
+    // 现抬到 6MiB=单流窗口界,即"不再人为分片"。数据面经 CHUNK_CAP
+    // =64KiB 块写入(mux.rs 中继路径),实际上线帧大小不变,此改动
+    // 只移除人为帽,行为等价 frp 的"写多少发多少,上限受 sendWindow"。
+    cfg.set_split_send_size(6 * 1024 * 1024);
+    // 单流初始接收窗 = 恒定接收窗(round-2,goal-repair G2/G6;round-3
+    // 对齐 frp):
+    // 【实测】round-1 三机测试床(benchmark/runs/goal-repair/round-1/
+    // single-stream-medians.txt):tcp/tls/ws/wss mux 单流全部卡在
+    // 1051-1225 Mbps 上行 / 1468-1962 Mbps 下行,与是否 TLS 无关
+    // (tcp-mux 无 TLS 与 tls-mux 同卡);同路径 16 流 2160-2970 Mbps
+    // ——每字节成本解释不了,瓶颈随"流数"摊薄,指向每流独立约束
+    // (yamux 流控信用回路)。
+    // 【假设,未闭合】信用回路时延 > 2×ping RTT,RTT 门控的自增窗
+    // 不触发,单流被钳在 初窗/回路时延;本地合成 RTT 实验
+    // (goal_repair_mux.rs mux_single_stream_credit_stall_under_synthetic_rtt)
+    // 复现钳制机制,测试床 RTT/回路时延待下一轮实测。
+    // 【修复】round-2 接收端建流即从 2MiB 起步;round-3(2026-10-15)
+    // 抬到 6MiB,对齐 frp 两端同设的 fmux MaxStreamWindowSize=6MiB
+    // (FRP-YAMUX-ANALYSIS.md §2.1)。round-4/B1(2026-10-15)起差额
+    // 在建流时以带初始 flag 的窗口更新帧授出(outbound SYN|WU /
+    // inbound ACK|WU,upstream 合法组合,对齐 frp OpenStream/
+    // AcceptStream),不再等首个读 poll;round-E1(2026-10-16)起该
+    // 窗口恒定——不再受共享预算钳制、不再 BDP 自增(frp 对照与删除
+    // 理由见上)。发送端初窗仍 256KiB——对端只见标准 WU,线路兼容。
+    // 本改动只覆盖 yamux(mux 路径),不声称修复 nomux/QUIC/KCP。
+    cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
+    cfg
+}
+
 pub struct YamuxMultiplexer {
     open_tx: mpsc::Sender<oneshot::Sender<io::Result<yamux::Stream>>>,
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<yamux::Stream>>,
@@ -708,65 +778,48 @@ pub struct YamuxMultiplexer {
 }
 
 impl YamuxMultiplexer {
-    /// 在给定字节流上创建 yamux;mode:客户端(开流)/服务端(收流)。
-    /// max_streams:并发流硬顶,0 = 不限制(折算 MUX_STREAMS_UNLIMITED)。
+    /// 在给定字节流上创建 yamux(锁路径);mode:客户端(开流)/服务端
+    /// (收流)。max_streams:并发流硬顶,0 = 不限制(折算
+    /// MUX_STREAMS_UNLIMITED)。
     /// 注:yamux 0.14 无内建 keepalive,会话存活依赖协议层心跳(< 会话空闲超时)。
     pub fn new(io: BoxedIo, mode: yamux::Mode, max_streams: usize) -> Self {
-        let mut cfg = yamux::Config::default();
-        let streams = if max_streams == 0 {
-            MUX_STREAMS_UNLIMITED
-        } else {
-            max_streams
-        };
-        // 总接收窗 = 规约保底(256KiB×流数)+ 256MiB 共享预授/自增预算。
-        // 修前为 None(不限):预授信按配置初窗逐流入账,4096 流可累计
-        // ~7GiB 不受控信用额度。现在超出保底的额度有界(256MiB ≈ 4096 流
-        // 保底敞口 1GiB 的 1/4),预授信与既有 BDP 自增窗同池竞争,预算
-        // 耗尽时新流退回 256KiB 规约保底,流释放后额度回收复用。
-        // 64 位限定:2^24 流 × 256KiB = 4TiB,usize 放得下。
-        // 注:setter 断言相互校验当前值,必须先设窗口(对默认 512 流
-        // 断言成立)再提高流数(对刚设的窗口成立),反序必炸。
-        const MUX_PREGRANT_POOL: usize = 256 * 1024 * 1024;
-        let window = (streams as u64)
-            .saturating_mul(yamux::DEFAULT_CREDIT as u64)
-            .saturating_add(MUX_PREGRANT_POOL as u64)
-            .min(usize::MAX as u64) as usize;
-        cfg.set_max_connection_receive_window(Some(window));
-        cfg.set_max_num_streams(streams);
-        // 分片帽对齐 frp(2026-10-15):frp 的 fmux 无分片发送概念,帧大小
-        // 上限即发送窗(见 benchmark/runs/tcp-multiflow-frp-20261015/
-        // FRP-YAMUX-ANALYSIS.md §2.1)。上游默认 16KiB 曾提到 64KiB,
-        // 现抬到 6MiB=单流窗口界,即"不再人为分片"。数据面经 CHUNK_CAP
-        // =64KiB 块写入(mux.rs 中继路径),实际上线帧大小不变,此改动
-        // 只移除人为帽,行为等价 frp 的"写多少发多少,上限受 sendWindow"。
-        cfg.set_split_send_size(6 * 1024 * 1024);
-        // 单流初始接收窗预授信(round-2,goal-repair G2/G6;round-3 对齐 frp):
-        // 【实测】round-1 三机测试床(benchmark/runs/goal-repair/round-1/
-        // single-stream-medians.txt):tcp/tls/ws/wss mux 单流全部卡在
-        // 1051-1225 Mbps 上行 / 1468-1962 Mbps 下行,与是否 TLS 无关
-        // (tcp-mux 无 TLS 与 tls-mux 同卡);同路径 16 流 2160-2970 Mbps
-        // ——每字节成本解释不了,瓶颈随"流数"摊薄,指向每流独立约束
-        // (yamux 流控信用回路)。
-        // 【假设,未闭合】信用回路时延 > 2×ping RTT,RTT 门控的自增窗
-        // 不触发,单流被钳在 初窗/回路时延;本地合成 RTT 实验
-        // (goal_repair_mux.rs mux_single_stream_credit_stall_under_synthetic_rtt)
-        // 复现钳制机制,测试床 RTT/回路时延待下一轮实测。
-        // 【修复】round-2 接收端建流即从 2MiB 起步;round-3(2026-10-15)
-        // 抬到 6MiB,对齐 frp 两端同设的 fmux MaxStreamWindowSize=6MiB
-        // (FRP-YAMUX-ANALYSIS.md §2.1)。机制不变:仍受上面 256MiB 共享
-        // 预算钳制(16 流 × 6MiB = 96MiB 在预算内,额度不足仍退回 256KiB
-        // 规约保底);round-4/B1(2026-10-15)起差额在建流时以带初始
-        // flag 的窗口更新帧授出(outbound SYN|WU / inbound ACK|WU,upstream
-        // 合法组合,对齐 frp OpenStream/AcceptStream),不再等首个读 poll,
-        // 首个读 WU 起才可能进入 BDP 自增;发送端初窗仍 256KiB——对端
-        // 只见标准 WU,线路兼容。本改动只覆盖 yamux
-        // (mux 路径),不声称修复 nomux/QUIC/KCP。
-        cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
-        let conn: MuxConn = yamux::Connection::new(YamuxCarrier::new(io), cfg, mode);
+        let conn: MuxConn =
+            yamux::Connection::new(YamuxCarrier::new(io), mux_config(max_streams), mode);
         // Round-D:收/发双任务驱动(对齐 Go yamux recv/send 双 goroutine)。
-        // 接收任务:解帧+派发,新流入 accept_tx(容量 256 背压——接收
-        // 阻塞只停读侧,不影响发送任务);发送任务:开流请求 + 写路径。
+        // 单一载体经 SplitSocket/BiLock 串行——TLS/WS/QUIC/KCP 等不可
+        // fd 复制的载体走此路径(泛型兜底)。
         let (recv_half, send_half) = conn.into_halves();
+        Self::spawn_drivers(recv_half, send_half)
+    }
+
+    /// 双载体入口(round-E2,裸 TCP fd-dup):read_io 归接收任务、write_io
+    /// 归发送任务,halves 之间零锁,读∥写在载体层物理并行(对齐 frp/fmux
+    /// 收发双 goroutine 各持 conn 读写的事实形态)。driver 的 spawn、
+    /// open_tx(64)/accept_tx(256) 容量与背压、dead 语义与锁路径
+    /// 完全一致(共用 [`YamuxMultiplexer::spawn_drivers`])。
+    /// 调用契约:read_io/write_io 必须指向同一全双工 socket(如同一
+    /// TcpStream 的两次 try_clone;见 vendor `Connection::into_halves_duplex`
+    /// 的方向纪律与 shutdown 语义注释)。
+    pub fn new_duplex(
+        read_io: BoxedIo,
+        write_io: BoxedIo,
+        mode: yamux::Mode,
+        max_streams: usize,
+    ) -> Self {
+        let conn: MuxConn =
+            yamux::Connection::new(YamuxCarrier::new(read_io), mux_config(max_streams), mode);
+        let (recv_half, send_half) = conn.into_halves_duplex(YamuxCarrier::new(write_io));
+        Self::spawn_drivers(recv_half, send_half)
+    }
+
+    /// 收/发双任务驱动(两路径共用):接收任务解帧+派发,新流入
+    /// accept_tx(容量 256 背压——接收阻塞只停读侧,不影响发送任务);
+    /// 发送任务处理开流请求 + 写路径。S: Send + 'static 供 tokio::spawn
+    ///(halves 的 Send/生命周期随 socket 类型)。
+    fn spawn_drivers<S>(recv_half: yamux::RecvHalf<S>, send_half: yamux::SendHalf<S>) -> Self
+    where
+        S: futures::AsyncRead + futures::AsyncWrite + Unpin + yamux::Writev2 + Send + 'static,
+    {
         let (open_tx, open_rx) = mpsc::channel::<oneshot::Sender<io::Result<yamux::Stream>>>(64);
         let (accept_tx, accept_rx) = mpsc::channel::<yamux::Stream>(256);
         let dead = Arc::new(AtomicBool::new(false));
@@ -811,11 +864,15 @@ fn other(msg: &str) -> io::Error {
 /// 发送任务:开流请求 → `SendHalf::poll_new_outbound`;否则驱动写路径
 /// (`SendHalf::poll`:Pong/GoAway、rtt ping、流命令帧、部分写/flush)。
 /// 错误 → 置 `dead`(共享错误槽同时唤醒接收任务,双侧收敛)。
-async fn send_driver(
-    mut send_half: yamux::SendHalf<YamuxCarrier>,
+/// round-E2 起对 socket 泛型:锁路径 S=SplitSocket<YamuxCarrier>,
+/// duplex 路径 S=YamuxCarrier(写侧独占 fd),两路共用本实现。
+async fn send_driver<S>(
+    mut send_half: yamux::SendHalf<S>,
     mut open_rx: mpsc::Receiver<oneshot::Sender<io::Result<yamux::Stream>>>,
     dead: Arc<AtomicBool>,
-) {
+) where
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin + yamux::Writev2,
+{
     let mut pending_open: Option<oneshot::Sender<io::Result<yamux::Stream>>> = None;
     loop {
         // 返回 true = 终结(错误);false 不会出现,park 以 Pending 表达
@@ -895,11 +952,14 @@ async fn send_driver(
 
 /// 接收任务:解帧+派发;新流入 `accept_tx`(容量 256 背压——接收阻塞
 /// 只停读侧任务,不影响发送任务)。EOF/错误 → 置 `dead`。
-async fn recv_driver(
-    mut recv_half: yamux::RecvHalf<YamuxCarrier>,
+/// round-E2 起对 socket 泛型(同 [`send_driver`]:锁路径/duplex 共用)。
+async fn recv_driver<S>(
+    mut recv_half: yamux::RecvHalf<S>,
     accept_tx: mpsc::Sender<yamux::Stream>,
     dead: Arc<AtomicBool>,
-) {
+) where
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin + yamux::Writev2,
+{
     loop {
         let inbound = match std::future::poll_fn(|cx| recv_half.poll(cx)).await {
             Some(Ok(s)) => s,
@@ -918,6 +978,8 @@ async fn recv_driver(
 
 /// 服务端:把已建立的字节流包装为 Multiplexer(multiplex=true → yamux 服务端)。
 /// max_streams:并发流硬顶,0 = 不限制。
+/// 锁路径(单载体 + SplitSocket/BiLock);双载体裸 TCP 走
+/// [`wrap_stream_as_server_duplex`]。
 pub fn wrap_stream_as_server(
     io: BoxedIo,
     multiplex: bool,
@@ -940,7 +1002,26 @@ pub fn wrap_stream_as_server(
     }
 }
 
-/// 客户端:同上(yamux 客户端)。
+/// 服务端双载体变体(round-E2):read_io/write_io 为同一裸 TCP socket 的
+/// 两个 fd(tcp.rs verify 的 try_clone 产物),halves 零锁并行;
+/// 语义/背压与 [`wrap_stream_as_server`] 完全一致。
+pub fn wrap_stream_as_server_duplex(
+    read_io: BoxedIo,
+    write_io: BoxedIo,
+    max_streams: usize,
+) -> Arc<crate::Multiplexer> {
+    Arc::new(crate::Multiplexer {
+        inner: MultiplexerInner::Yamux(YamuxMultiplexer::new_duplex(
+            read_io,
+            write_io,
+            yamux::Mode::Server,
+            max_streams,
+        )),
+    })
+}
+
+/// 客户端:同上(yamux 客户端)。锁路径;双载体裸 TCP 走
+/// [`wrap_stream_as_client_duplex`]。
 pub fn wrap_stream_as_client(
     io: BoxedIo,
     multiplex: bool,
@@ -961,6 +1042,23 @@ pub fn wrap_stream_as_client(
             },
         })
     }
+}
+
+/// 客户端双载体变体(round-E2):同 [`wrap_stream_as_client`],载体为
+/// 同一裸 TCP socket 的两个 fd(tcp.rs dial_io 的 try_clone 产物)。
+pub fn wrap_stream_as_client_duplex(
+    read_io: BoxedIo,
+    write_io: BoxedIo,
+    max_streams: usize,
+) -> Arc<crate::Multiplexer> {
+    Arc::new(crate::Multiplexer {
+        inner: MultiplexerInner::Yamux(YamuxMultiplexer::new_duplex(
+            read_io,
+            write_io,
+            yamux::Mode::Client,
+            max_streams,
+        )),
+    })
 }
 
 /// tcpmux 服务端终结:yamux 服务端接受多路流(供 vhost/tcpmux 使用)。
@@ -1301,5 +1399,61 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
+    }
+
+    // round-E2 duplex 冒烟:tokio 内存 TcpListener 对拨,server/client
+    // 两侧均 new_duplex(裸 TCP 双 fd,镜像 tcp.rs try_dup_tcp 的
+    // AsFd/try_clone_to_owned + from_std 路径),open_stream/accept/echo
+    // 全链往返——真实 TCP socket 上验证读∥写零锁路径的组网。
+    #[tokio::test]
+    async fn duplex_mux_tcp_smoke_roundtrip() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::{TcpListener, TcpStream};
+
+        fn try_dup_tcp(stream: &TcpStream) -> TcpStream {
+            use std::os::fd::AsFd as _;
+            let fd = stream.as_fd().try_clone_to_owned().expect("dup fd");
+            TcpStream::from_std(std::net::TcpStream::from(fd)).expect("register dup with runtime")
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("server accept");
+            let write_dup = try_dup_tcp(&stream);
+            let mux = YamuxMultiplexer::new_duplex(
+                Box::new(stream),
+                Box::new(write_dup),
+                yamux::Mode::Server,
+                MUX_STREAMS_UNLIMITED,
+            );
+            // echo:收 5 字节回 5 字节
+            let mut s = mux.accept_stream().await.expect("server accept stream");
+            let mut buf = [0u8; 5];
+            s.read_exact(&mut buf).await.expect("server read");
+            s.write_all(&buf).await.expect("server echo");
+        });
+
+        let client_stream = TcpStream::connect(addr).await.expect("client connect");
+        let write_dup = try_dup_tcp(&client_stream);
+        let mux = YamuxMultiplexer::new_duplex(
+            Box::new(client_stream),
+            Box::new(write_dup),
+            yamux::Mode::Client,
+            MUX_STREAMS_UNLIMITED,
+        );
+        let mut c = mux.open_stream().await.expect("client open stream");
+        c.write_all(b"hello").await.expect("client write");
+        let mut buf = [0u8; 5];
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.read_exact(&mut buf))
+            .await
+            .expect("echo must return within 5s")
+            .expect("client read");
+        assert_eq!(&buf, b"hello");
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server task must finish")
+            .unwrap();
     }
 }

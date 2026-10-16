@@ -91,6 +91,10 @@ impl Rtt {
         Action::None
     }
 
+    /// round-E1(2026-10-16):BDP 自增窗删除后本方法无产品代码消费者
+    ///(唯一调用方 flow_control 已随预算/自增机制一并删除);ping/pong
+    /// 测量与存储仍在,保留读取入口供诊断/后续复用。
+    #[allow(dead_code)]
     pub(crate) fn get(&self) -> Option<Duration> {
         self.inner.lock().rtt
     }

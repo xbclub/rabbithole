@@ -8,12 +8,11 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-use crate::connection::rtt::Rtt;
 use crate::frame::header::ACK;
 use crate::ConnectionError;
 use crate::{
     chunks::Chunks,
-    connection::{self, rtt, StreamCommand},
+    connection::{self, StreamCommand},
     frame::{
         header::{Data, Header, StreamId, WindowUpdate},
         Frame,
@@ -132,8 +131,6 @@ impl Stream {
         config: Arc<Config>,
         send_window: u32,
         sender: mpsc::Sender<StreamCommand>,
-        rtt: rtt::Rtt,
-        accumulated_max_stream_windows: Arc<Mutex<usize>>,
     ) -> Self {
         let mut stream = Self {
             id,
@@ -142,13 +139,7 @@ impl Stream {
             window_update_sender: sender.clone(),
             sender,
             flag: Flag::Ack,
-            shared: Arc::new(Mutex::new(Shared::new(
-                DEFAULT_CREDIT,
-                send_window,
-                accumulated_max_stream_windows,
-                rtt,
-                config,
-            ))),
+            shared: Arc::new(Mutex::new(Shared::new(DEFAULT_CREDIT, send_window, config))),
         };
         stream.queue_creation_grant();
         stream
@@ -159,8 +150,6 @@ impl Stream {
         conn: connection::Id,
         config: Arc<Config>,
         sender: mpsc::Sender<StreamCommand>,
-        rtt: rtt::Rtt,
-        accumulated_max_stream_windows: Arc<Mutex<usize>>,
     ) -> Self {
         let mut stream = Self {
             id,
@@ -172,8 +161,6 @@ impl Stream {
             shared: Arc::new(Mutex::new(Shared::new(
                 DEFAULT_CREDIT,
                 DEFAULT_CREDIT,
-                accumulated_max_stream_windows,
-                rtt,
                 config,
             ))),
         };
@@ -925,24 +912,12 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    fn new(
-        receive_window: u32,
-        send_window: u32,
-        accumulated_max_stream_windows: Arc<Mutex<usize>>,
-        rtt: Rtt,
-        config: Arc<Config>,
-    ) -> Self {
+    fn new(receive_window: u32, send_window: u32, config: Arc<Config>) -> Self {
         Shared {
             state: State::Open {
                 acknowledged: false,
             },
-            flow_controller: FlowController::new(
-                receive_window,
-                send_window,
-                accumulated_max_stream_windows,
-                rtt,
-                config,
-            ),
+            flow_controller: FlowController::new(receive_window, send_window, config),
             buffer: Chunks::new(),
             reader: None,
             writer: None,
@@ -1059,8 +1034,6 @@ mod tests {
             connection::Id::next(),
             Arc::new(Config::default()),
             sender,
-            Rtt::new(),
-            Default::default(),
         );
 
         let write_waker = Arc::new(FlagWaker::default());
@@ -1109,8 +1082,6 @@ mod tests {
             Arc::new(Config::default()),
             DEFAULT_CREDIT,
             sender,
-            Rtt::new(),
-            Default::default(),
         );
 
         let (_read_half, mut write_half) = stream.into_halves();
@@ -1174,8 +1145,6 @@ mod tests {
             Arc::new(Config::default()),
             DEFAULT_CREDIT,
             sender,
-            Rtt::new(),
-            Default::default(),
         );
         let (r, w) = stream.into_halves();
         (r, w, receiver)
@@ -1238,8 +1207,6 @@ mod tests {
             Arc::new(Config::default()),
             DEFAULT_CREDIT,
             sender,
-            Rtt::new(),
-            Default::default(),
         );
         let (mut read_half, _write_half) = stream.into_halves();
         // 拆半 ACK 已排队(干净 handle try_send 成功),且该 handle 因
