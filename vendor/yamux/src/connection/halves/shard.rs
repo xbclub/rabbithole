@@ -165,13 +165,24 @@ impl<T> ShardProducer<T> {
         self.shared.consumer_gone.load(Ordering::Acquire)
     }
 
-    /// 消费侧累计出队条数(Acquire,与消费侧 Release 递增配对)。SPSC
+    /// 消费侧累计出队条数(SeqCst,与消费侧 SeqCst 递增配对)。SPSC
     /// 下生产者第 n 次成功 `try_push` 的条目在 `popped_count() ≥ n` 时
     /// 必已出队——send_out 的 ctrl Remove 顺序门控据此做"本流末帧已
     /// 出队"的精确判定(见 [`SendWorker::flush_ctrl_pending`]),不再
     /// 要求整队取空。
+    ///
+    /// SeqCst 约束(round-6.1 复核修复):本读点(SendWorker park 复查)
+    /// 与 ctrl_wait 门读(connection.rs next_frame)构成跨线程
+    /// store-buffering 对——Release/Acquire 下"Worker 复查未见取空
+    /// 推进 && FlushTask 门读未见置位"的双陈旧交织无任何同步边禁止,
+    /// 抽象机允许(aarch64 等非 TSO 机器上真实可达),空闲连接的 Remove
+    /// 将无限期滞留;四点(本读 / 取空 fetch_add / flag store / flag
+    /// load)全 SeqCst 后,SC 全序下"双陈旧"成环被禁——要么复查已见
+    /// 取空(水位追平,立即投递不 park),要么门读到 true(走 take+
+    /// wake),防线可见性与机器无关。x86 上 load/fetch_add 与
+    /// Acquire/Release 同指令,aarch64 上 ldar/stlr 同指令,零额外开销。
     pub(super) fn popped_count(&self) -> u64 {
-        self.shared.popped.load(Ordering::Acquire)
+        self.shared.popped.load(Ordering::SeqCst)
     }
 }
 
@@ -194,8 +205,11 @@ impl<T> ShardConsumer<T> {
         let still = queue.len();
         drop(queue);
         if n > 0 {
-            // 出队水位先于生产者唤醒推进:被唤醒的生产侧复查即见新水位
-            self.shared.popped.fetch_add(n as u64, Ordering::Release);
+            // 出队水位先于生产者唤醒推进:被唤醒的生产侧复查即见新水位。
+            // SeqCst:与 popped_count 的 SC 对约束(见其文档)统一本计数
+            // 器全部读写的序——send_out 消费路径(try_pop)是 SC 对的
+            // 写侧,此处的 msg/ctrl 通道虽无人读 popped,同协议免混序。
+            self.shared.popped.fetch_add(n as u64, Ordering::SeqCst);
         }
         if was_full && still < self.shared.cap {
             // 满变非满:生产侧已登记才唤醒(take 语义)
@@ -217,8 +231,13 @@ impl<T> ShardConsumer<T> {
         let still = queue.len();
         drop(queue);
         if item.is_some() {
-            // 出队水位先于生产者唤醒推进(同 drain_into)
-            self.shared.popped.fetch_add(1, Ordering::Release);
+            // 出队水位先于生产者唤醒推进(同 drain_into)。SeqCst:本路径
+            // 是 send_out 取空通知门控 SC 对的写侧——FlushTask 取空
+            // (本 fetch_add)与门读 ctrl_wait 之间须与 Worker 侧
+            // (store ctrl_wait + 复查读 popped)共同服从 SC 全序,
+            // 双陈旧(store-buffering)交织才被抽象机禁止(见
+            // popped_count 文档)
+            self.shared.popped.fetch_add(1, Ordering::SeqCst);
         }
         if was_full && still < self.shared.cap {
             // 满变非满:生产侧已登记才唤醒(take 语义)
@@ -1031,6 +1050,15 @@ impl SendWorker {
             self.ctrl_pending.pop_front();
             progress = true;
         }
+        // round-6.1 F2:暂存清空(全部投递成功)即无滞留,清零取空通知
+        // 前置门——FlushTask 恢复"一次原子读即跳过两把锁"的廉价路径。
+        // 置位与清零同在本 Worker 线程,Read 时序竞缝至多一次伪唤醒
+        // (FlushTask 读到 true 而唤已无滞留者),park 复查后重 Pending,
+        // 无害(规格 §1.2/§1.3)。SeqCst:与置位/门读构成 SC 对写侧
+        // (约束见 popped_count 文档),此处清零同理入对。
+        if self.ctrl_pending.is_empty() {
+            self.shared.ctrl_wait[self.index].store(false, Ordering::SeqCst);
+        }
         progress
     }
 
@@ -1054,6 +1082,16 @@ impl SendWorker {
             }
             return None;
         }
+        // round-6.1 F2:置位取空通知前置门(先于 push:紧随的
+        // flush_ctrl_pending 与对端观察都看到一致"非空"状态;置位
+        // 先后于 push 均不漏唤醒,见规格 round-6.1 §1.3——flag 咨询性,
+        // Worker 未 park 时通知本就多余)。SeqCst(复核修复):本 store
+        // 与紧随 park 复查的 popped 读同线程程序序,对端(FlushTask)
+        // 则以取空 fetch_add → 门读 flag 的顺序观察——双侧任一读到
+        // 陈旧值在 Release/Acquire 下可同时成立(store-buffering 形态,
+        // 空闲连接 Remove 滞留);四点全 SeqCst 后 SC 全序禁"双陈旧",
+        // 约束详见 popped_count 文档
+        self.shared.ctrl_wait[self.index].store(true, Ordering::SeqCst);
         // 水位 = 此刻推入序:drop 命令在本流全部数据命令之后被消费(命令
         // 通道 FIFO),且步骤 3 仅在 pending_frame 为空时运行(满即停),
         // 故本流数据帧此刻已全部成功压入,推入序即其末帧序的上界
@@ -1070,6 +1108,13 @@ impl Future for SendWorker {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = &mut *self;
+        // round-6.1 F1:命令预算是 poll 级的(单次 poll 全程共用)——在
+        // loop 外声明,`progress → continue` 不再重建,并发补货下单次
+        // poll 消费量有上界(公平性,round-6 §2.3「单轮 poll ≤64」的
+        // 字面兑现)。耗尽即让出(budget_exhausted → wake_by_ref +
+        // Pending);park 复查(pending_frame/flush_ctrl/注册)不是命令
+        // 消费,不受预算约束。
+        let mut budget = SEND_CMDS_PER_POLL;
         loop {
             if this.finished {
                 return Poll::Ready(());
@@ -1119,13 +1164,13 @@ impl Future for SendWorker {
                     Err(f) => this.pending_frame = Some(f),
                 }
             }
-            // 3) 命令消费(单轮 poll ≤ SEND_CMDS_PER_POLL 条,超出保留
+            // 3) 命令消费(单次 poll ≤ SEND_CMDS_PER_POLL 条,超出保留
             //    下次 poll;公平性:防单 Worker 独占线程——tokio 协作调度
-            //    只在 poll 返回时让出,预算必须是 poll 级的,内层 while
-            //    的 progress→continue 不重置它)
+            //    只在 poll 返回时让出,预算是 poll 级的(见 poll 入口),
+            //    loop 的 progress → continue 不重置;预算耗尽后本轮 poll
+            //    不得再消费命令,pending_frame 满滞留时同样跳过)
             let mut budget_exhausted = false;
-            if this.pending_frame.is_none() {
-                let mut budget = SEND_CMDS_PER_POLL;
+            if this.pending_frame.is_none() && budget > 0 {
                 while budget > 0 {
                     match this.streams.poll_next_unpin(cx) {
                         Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
@@ -3365,6 +3410,163 @@ mod tests {
             0,
             "ctrl Remove must decrement stream_count"
         );
+    }
+
+    // ===== round-6.1 §3(F2 取空通知门控 / F1 命令预算 poll 级)=====
+
+    /// T-G1(round-6.1 F2,红→绿):取空通知门控——ctrl_wait[k] 为假
+    /// (SendWorker k 无滞留 ctrl Remove)时,FlushTask 取空 send_out[k]
+    /// 不得触碰 send_worker_wakers[k](一次原子读跳过 has_pending/
+    /// wakers 两把锁与唤醒;通知唯一服务对象是"因水位门控滞留 ctrl
+    /// Remove 的 SendWorker",无滞留即纯开销);置位后取空恰一次唤醒
+    /// (take 语义,槽清空);清零后恢复跳过(§1.2 清零路径的效果面)。
+    #[test]
+    fn flush_task_empty_notification_gated_by_ctrl_wait() {
+        let mut f = Fixture::client(1, Config::default());
+        // 模拟 SendWorker 0 park:计数 waker 登记进 waker 槽(真实形态
+        // 为 park 复查 a 的登记点,此处白盒直置)
+        let wf = Arc::new(CountWaker::default());
+        let w = waker(wf.clone());
+        f.shared.send_worker_wakers.lock()[0] = Some(w.clone());
+        // Worker 未驱动:无 ctrl_pending,ctrl_wait[0] 初始为假——反复
+        // 取空 send_out[0],waker 槽必须保持已登记、计数零唤醒
+        for i in 0..3u8 {
+            f.send_workers[0]
+                .out
+                .try_push(data_frame(1, vec![i; 8]))
+                .expect("send_out has room (cap 128)");
+            match f.send.poll(&mut f.cx) {
+                Poll::Pending => {}
+                other => panic!("flush task must park after draining, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            wf.0.load(Ordering::SeqCst),
+            0,
+            "ctrl_wait 为假时取空通知必须被前置门跳过(零唤醒)"
+        );
+        assert!(
+            f.shared.send_worker_wakers.lock()[0].is_some(),
+            "waker 槽必须保持已登记(未被 take)"
+        );
+        // 置位(模拟 Worker 滞留 ctrl Remove)→ 取空恰一次唤醒、槽被 take
+        f.shared.ctrl_wait[0].store(true, Ordering::SeqCst);
+        f.send_workers[0]
+            .out
+            .try_push(data_frame(1, vec![9u8; 8]))
+            .expect("send_out has room (cap 128)");
+        match f.send.poll(&mut f.cx) {
+            Poll::Pending => {}
+            other => panic!("flush task must park, got {other:?}"),
+        }
+        assert_eq!(
+            wf.0.load(Ordering::SeqCst),
+            1,
+            "ctrl_wait 置位后取空必须恰一次唤醒"
+        );
+        assert!(
+            f.shared.send_worker_wakers.lock()[0].is_none(),
+            "唤醒后 waker 槽已清空(take 语义)"
+        );
+        // 清零(模拟 flush_ctrl_pending 排空后清门)→ 再取空恢复跳过
+        f.shared.ctrl_wait[0].store(false, Ordering::SeqCst);
+        f.shared.send_worker_wakers.lock()[0] = Some(w);
+        f.send_workers[0]
+            .out
+            .try_push(data_frame(1, vec![0xAu8; 8]))
+            .expect("send_out has room (cap 128)");
+        match f.send.poll(&mut f.cx) {
+            Poll::Pending => {}
+            other => panic!("flush task must park, got {other:?}"),
+        }
+        assert_eq!(
+            wf.0.load(Ordering::SeqCst),
+            1,
+            "ctrl_wait 清零后取空通知必须再次被门跳过"
+        );
+    }
+
+    /// T-G2(round-6.1 F1):命令预算 poll 级——通道内预置 >64 条全就绪
+    /// 命令(20 流 × 10 帧 = 200),单次 poll 消费恰 SEND_CMDS_PER_POLL
+    /// 的量级;预算耗尽的 wake_by_ref 自唤醒(noop waker 下无效)由驱动
+    /// 循环显式再 poll;每轮 wire 增量 ≤64、总消费对齐 200、零丢失、
+    /// 流内顺序逐字节一致。
+    ///
+    /// 说明(规格 §3 预留的退化形态):"单次 poll 消费 >64"的红形态需
+    /// 同一 poll 内迭代间并发补货——单线程手动驱动下预置命令全就绪,
+    /// 迭代要么耗尽预算让出(budget_exhausted → wake_by_ref + Pending)、
+    /// 要么无命令可消费,迭代间预算重置无法被观察;故本测与 T-S7 一起
+    /// 作为 poll 级上界的直接守卫(预算若回退为迭代级,任何迭代间
+    /// progress → continue 的补货窗口都会令单轮消费突破 64)。
+    #[test]
+    fn send_worker_command_budget_poll_level() {
+        let mut cfg = Config::default();
+        cfg.set_shard_workers(1);
+        let mut f = Fixture::client(1, cfg);
+        // 20 流(client 出站 sid 1..40 奇数,N=1 全归 worker0)× 10 帧
+        // = 200 条命令 > 3×64;单流命令通道 cap 10 内全就绪
+        const STREAMS: usize = 20;
+        const FRAMES: usize = 10;
+        let mut streams = Vec::new();
+        let payload = [0x7Bu8; 32];
+        for _ in 0..STREAMS {
+            let mut s = match f.send.poll_new_outbound(&mut f.cx) {
+                Poll::Ready(Ok(s)) => s,
+                other => panic!("outbound open must succeed, got {other:?}"),
+            };
+            for _ in 0..FRAMES {
+                match Pin::new(&mut s).poll_write(&mut f.cx, &payload) {
+                    Poll::Ready(Ok(32)) => {}
+                    other => panic!("stream write must be ready, got {other:?}"),
+                }
+            }
+            streams.push(s);
+        }
+        // 驱动循环:每轮一次 SendWorker poll + FlushTask 写穿;每轮 wire
+        // 的 Data 帧增量 ≤ SEND_CMDS_PER_POLL(单 poll 命令消费上界),
+        // 直至 200 条全部上线(预算耗尽即让出,轮数 > 200/64)
+        let mut on_wire = 0usize;
+        let mut rounds = 0usize;
+        while on_wire < STREAMS * FRAMES {
+            rounds += 1;
+            assert!(rounds <= 8, "all commands must land within bounded rounds");
+            f.poll_send_workers();
+            match f.send.poll(&mut f.cx) {
+                Poll::Pending => {}
+                other => panic!("flush task must park each round, got {other:?}"),
+            }
+            let now = frames_on_wire(&f.st)
+                .iter()
+                .filter(|(h, _)| h.tag() == Tag::Data)
+                .count();
+            let delta = now - on_wire;
+            assert!(
+                delta <= SEND_CMDS_PER_POLL,
+                "round {rounds}: single poll must consume at most \
+                 {SEND_CMDS_PER_POLL} commands, got {delta}"
+            );
+            on_wire = now;
+        }
+        assert_eq!(
+            on_wire,
+            STREAMS * FRAMES,
+            "all commands must reach the wire across poll rounds without loss"
+        );
+        // 每流恰 10 帧、体逐字节一致(顺序契约)
+        let frames = frames_on_wire(&f.st);
+        for k in 0..STREAMS {
+            let sid = (2 * k + 1) as u32;
+            let bodies: Vec<&Vec<u8>> = frames
+                .iter()
+                .filter(|(h, _)| h.tag() == Tag::Data && h.stream_id() == StreamId::new(sid))
+                .map(|(_, b)| b)
+                .collect();
+            assert_eq!(bodies.len(), FRAMES, "stream {sid} frame count");
+            assert!(
+                bodies.iter().all(|b| b.as_slice() == &payload[..]),
+                "stream {sid} bodies must be intact and in order"
+            );
+        }
     }
 
     // ===== round-6 §5.3 FlushTask(halves)=====

@@ -1305,6 +1305,16 @@ mod halves {
         /// N 槽 SendWorker park 点(round-6 §2.2:注册压入 / set_error /
         /// send_dropped 唤醒;take 语义)。
         send_worker_wakers: Mutex<Vec<Option<Waker>>>,
+        /// 每分片"SendWorker k 有滞留 ctrl Remove"咨询标志(round-6.1
+        /// F2):FlushTask 取空通知的廉价前置门——为假即一次原子读跳过
+        /// has_pending/wakers 两把锁与唤醒(该通知唯一的服务对象是"因
+        /// 水位门控滞留 ctrl Remove 的 SendWorker",无滞留即纯开销)。
+        /// 置位/清零仅 SendWorker k 自己(同一线程),FlushTask 只读;
+        /// flag 不承担正确性,任何时序下至多多一次伪唤醒,不丢唤醒。
+        /// 全部读写 SeqCst:与 popped 计数器构成跨线程 SC 对,机器无关
+        /// 地封死"门读陈旧 false + Worker 复查读陈旧水位"的双陈旧
+        /// 交织(复核修复,详述见 halves/shard.rs popped_count 文档)。
+        ctrl_wait: Vec<AtomicBool>,
         /// Framer/SendHalf 路由句柄:每 Worker 一对(帧通道 + ctrl 通道)
         /// 生产者(§2.4 workers 字段)。
         workers: Mutex<Vec<shard::ShardRoute>>,
@@ -1330,6 +1340,7 @@ mod halves {
                 new_outbound_stream_waker: Mutex::new(None),
                 worker_wakers: Mutex::new(vec![None; worker_count]),
                 send_worker_wakers: Mutex::new(vec![None; worker_count]),
+                ctrl_wait: (0..worker_count).map(|_| AtomicBool::new(false)).collect(),
                 workers: Mutex::new(Vec::new()),
             }
         }
@@ -2205,7 +2216,25 @@ mod halves {
                     // 取锁),配合 Worker 自身被命令到达/满变非满唤醒时的
                     // 逐轮复查,水位追平后有界时间内必投递。take 语义,未
                     // 登记则其 park 复查兜住,不丢唤醒。
-                    if !self.send_out_consumers[k].has_pending() {
+                    // round-6.1 F2 前置门:ctrl_wait[k] 为假 ⟹ Worker k 无
+                    // 滞留 Remove(置位/清零仅其自身,见 ConnShared 字段
+                    // 注释),一次原子读即跳过 has_pending/wakers 两把锁与
+                    // 唤醒——受限/环回工况下几乎每帧出队即取空,无门则
+                    // 每帧两把锁 + 伪唤醒。flag 仅咨询性,不漏唤醒的时序
+                    // 枚举见规格 round-6.1 §1.3。
+                    // SeqCst(复核修复):本读与上方 try_pop 的取空推进
+                    // (popped fetch_add)须同 Worker 侧(store ctrl_wait
+                    // + park 复查读 popped)服从 SC 全序——否则"门读到
+                    // 陈旧 false 跳过唤醒 && Worker 复查读到陈旧水位而
+                    // park"的双陈旧 store-buffering 交织在抽象机上成立
+                    // (x86 锁指令偶然封死,aarch64 不保证),空闲连接的
+                    // Remove 无限期滞留;SC 下两者互斥,要么复查已见取空
+                    // 立即投递、要么本门读到 true 走 take+wake,与机器
+                    // 无关。x86 上 SeqCst load 与 Acquire 同为 mov,热路径
+                    // 零额外开销(约束详述见 shard.rs popped_count 文档)。
+                    if self.shared.ctrl_wait[k].load(Ordering::SeqCst)
+                        && !self.send_out_consumers[k].has_pending()
+                    {
                         if let Some(w) = self.shared.send_worker_wakers.lock()[k].take() {
                             w.wake();
                         }
