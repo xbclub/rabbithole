@@ -51,18 +51,26 @@ const READ_RESERVE: usize = 64 * 1024;
 /// 大帧保留零拷贝切片(转发主力路径不受影响)。
 const SMALL_FRAME_COPY: usize = 4 * 1024;
 
-/// 跨帧批量写的聚合上限——帧数(round-5 §3.2)。一次 `poll_writev` 最多
-/// 聚合队列中的 16 帧;发送半按同一上限连续取帧入队(§3.3)。
-pub(crate) const MAX_BATCH_FRAMES: usize = 16;
+/// 跨帧批量写的聚合上限——帧数(round-5 §3.2;round-7 扩至 64)。一次
+/// `poll_writev` 最多聚合队列中的 [`MAX_BATCH_FRAMES`] 帧;发送半按同一
+/// 上限连续取帧入队(§3.3)。64 = 1MiB/64KiB 的 16 满帧留足余量:64KiB
+/// 主力帧由字节上限先封顶,小帧(4KiB 控制交错)场景才由本上限封顶,
+/// 得以更深聚合。
+pub(crate) const MAX_BATCH_FRAMES: usize = 64;
 
-/// 跨帧批量写的聚合上限——字节(round-5 §3.2)。只约束聚合:队列为空时
-/// 单帧无条件入队,单帧可超此值。
-pub(crate) const MAX_BATCH_BYTES: usize = 256 * 1024;
+/// 跨帧批量写的聚合上限——字节(round-5 §3.2;round-7 扩至 1MiB)。只约束
+/// 聚合:队列为空时单帧无条件入队,单帧可超此值。1MiB 在 64KiB 帧
+/// (应用层 CHUNK_CAP 步进,转发主力形态)下完整容纳 16 满帧——单批覆盖
+/// 16 流;256KiB 上限下同形态 4 帧即止(帧数利用率 25%),16 流需 4 次
+/// writev。
+pub(crate) const MAX_BATCH_BYTES: usize = 1024 * 1024;
 
-/// 一次 `poll_writev` 的段数上限(§3.2:≤33 段)。半写中的 current 至多
-/// 贡献 2 段(帧头余段 + 帧体),队列后续每帧 ≤2 段(帧头 + 非空帧体):
-/// current 1 段 + 16 帧 × 2 = 33;current 2 段时只容得下 15 帧。
-const MAX_WRITEV_SEGMENTS: usize = 33;
+/// 一次 `poll_writev` 的段数上限(§3.2;round-7 随帧数上限扩至 129)。
+/// 半写中的 current 至多贡献 2 段(帧头余段 + 帧体),队列后续每帧 ≤2 段
+/// (帧头 + 非空帧体):current 1 段 + 64 帧 × 2 = 129;current 2 段时只
+/// 容得下 63 帧。栈上 IoSlice 数组 129 × 16B ≈ 2KB,远低于 Linux
+/// IOV_MAX=1024。
+const MAX_WRITEV_SEGMENTS: usize = 129;
 
 /// 两段缓冲合并写出。
 ///
@@ -1058,10 +1066,12 @@ mod tests {
         );
     }
 
-    /// T-B3:背压——压满 16 帧后载体阻塞 → poll_ready Pending(不接受
-    /// 新帧);写穿后 Ready。写穿时 16 帧聚合为**一次** writev(current
-    /// 2 段 + 15 帧 × 2 段 = 32 ≤ 33);第二阶段 17 帧 → 恰 2 次
-    /// writev(34 段越过 33 段上限,末帧落到下一次)。
+    /// T-B3:背压——16 帧入队后载体阻塞 → poll_ready Pending(不接受
+    /// 新帧);写穿后 Ready。写穿时 16 帧聚合为**一次** writev(帧数、段数
+    /// 均在 [`MAX_BATCH_FRAMES`] / `MAX_WRITEV_SEGMENTS` 内);第二阶段
+    /// `MAX_BATCH_FRAMES + 1` 帧 → 恰 2 次 writev:段数上限 = 1 + 2 ×
+    /// MAX_BATCH_FRAMES,current 占 2 段时一次只容 MAX_BATCH_FRAMES 帧,
+    /// 末帧落到下一次。
     #[test]
     fn batch_backpressure_pending_until_drained() {
         let (carrier, st) = BatchIo::new(BatchState {
@@ -1102,10 +1112,13 @@ mod tests {
             "16 queued frames must coalesce into a single writev"
         );
 
-        // 第二阶段:17 帧 → 2 次 writev(段数上限 33)
+        // 第二阶段:MAX_BATCH_FRAMES + 1 帧 → 2 次 writev(帧数/段数上限
+        // 把前 MAX_BATCH_FRAMES 帧封进第一次,末帧独立成批)
         st.borrow_mut().written.clear();
         st.borrow_mut().writev_calls = 0;
-        let frames: Vec<Frame<()>> = (0..17u8).map(|i| data_frame(3, vec![i; 1024])).collect();
+        let frames: Vec<Frame<()>> = (0..MAX_BATCH_FRAMES + 1)
+            .map(|i| data_frame(3, vec![(i & 0xFF) as u8; 1024]))
+            .collect();
         let expected: Vec<u8> = frames.iter().flat_map(encode_frame).collect();
         for f in frames {
             Sink::start_send(Pin::new(&mut io), f).expect("enqueue");
@@ -1118,7 +1131,8 @@ mod tests {
         assert_eq!(
             st.borrow().writev_calls,
             2,
-            "17 frames exceed the 33-segment bound: exactly two writevs"
+            "{} frames exceed the per-writev frame bound of {MAX_BATCH_FRAMES}: exactly two writevs",
+            MAX_BATCH_FRAMES + 1
         );
     }
 

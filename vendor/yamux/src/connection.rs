@@ -361,6 +361,11 @@ pub(crate) enum StreamCommand {
     CloseStream { ack: bool, syn: bool },
 }
 
+/// 流命令通道容量(round-7):入站/出站建流点统一引用。
+/// 64 ≈ 单流 4MiB(64 × 64KiB 帧)在途命令缓冲,对齐 frp 会话级
+/// 缓冲深度;通道打满是本地调度背压,不是流控(流控见 Round-E1 窗口)。
+pub(crate) const STREAM_COMMAND_CAP: usize = 64;
+
 /// Possible actions as a result of incoming frame handling.
 #[derive(Debug)]
 pub(crate) enum Action {
@@ -953,7 +958,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
     fn make_new_inbound_stream(&mut self, id: StreamId, credit: u32) -> Stream {
         let config = self.config.clone();
 
-        let (sender, receiver) = mpsc::channel(10); // 10 is an arbitrary number.
+        let (sender, receiver) = mpsc::channel(STREAM_COMMAND_CAP);
         self.stream_receivers.push(TaggedStream::new(id, receiver));
         if let Some(waker) = self.no_streams_waker.take() {
             waker.wake();
@@ -965,7 +970,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
     fn make_new_outbound_stream(&mut self, id: StreamId) -> Stream {
         let config = self.config.clone();
 
-        let (sender, receiver) = mpsc::channel(10); // 10 is an arbitrary number.
+        let (sender, receiver) = mpsc::channel(STREAM_COMMAND_CAP);
         self.stream_receivers.push(TaggedStream::new(id, receiver));
         if let Some(waker) = self.no_streams_waker.take() {
             waker.wake();
@@ -1414,8 +1419,9 @@ mod halves {
         /// 唤醒发送半"——flush 侧已不消费注册)。入站建流(Worker 内)与
         /// 出站开流(SendHalf)都按 `sid % N` 压入 `send_regs[k]` 并唤醒
         /// SendWorker k(take 语义);**不再唤醒 send_waker**。
-        /// D4 正确性:出站流首命令缓冲在通道 cap 10 内,Worker 收编早晚
-        /// 不影响——命令不丢、SYN 在首帧自带 flag,顺序由通道 FIFO 保证。
+        /// D4 正确性:出站流首命令缓冲在通道 cap `STREAM_COMMAND_CAP` 内,
+        /// Worker 收编早晚不影响——命令不丢、SYN 在首帧自带 flag,顺序由
+        /// 通道 FIFO 保证。
         fn push_new_receiver(&self, id: StreamId, r: mpsc::Receiver<StreamCommand>) {
             let index = (id.val() as usize) % self.send_regs.lock().len();
             self.send_regs.lock()[index].push_back((id, r));
@@ -2256,11 +2262,11 @@ mod halves {
         }
 
         fn make_new_outbound_stream(&mut self, id: StreamId) -> Stream {
-            let (sender, receiver) = mpsc::channel(10); // 10 is an arbitrary number.
-                                                        // round-6 D4:注册路由改经 push_new_receiver(压 send_regs[k] +
-                                                        // 唤醒 SendWorker k;出站流首命令缓冲在通道 cap 10 内,Worker
-                                                        // 收编早晚不影响正确性——命令不丢、SYN 在首帧自带 flag,
-                                                        // 顺序由通道 FIFO 保证)
+            let (sender, receiver) = mpsc::channel(STREAM_COMMAND_CAP);
+            // round-6 D4:注册路由改经 push_new_receiver(压 send_regs[k] +
+            // 唤醒 SendWorker k;出站流首命令缓冲在通道 cap
+            // `STREAM_COMMAND_CAP` 内,Worker 收编早晚不影响正确性——命令
+            // 不丢、SYN 在首帧自带 flag,顺序由通道 FIFO 保证)
             self.shared.push_new_receiver(id, receiver);
 
             Stream::new_outbound(id, self.shared.id, self.shared.config.clone(), sender)
@@ -2311,6 +2317,7 @@ mod halves {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::{MAX_BATCH_BYTES, MAX_BATCH_FRAMES};
     use futures::future::poll_fn;
     use std::cell::RefCell;
     use std::pin::Pin;
@@ -3020,8 +3027,8 @@ mod tests {
         let mut blocked = streams.remove(0); // 流 1
 
         // 流 1 写到信用耗尽:256KiB / 4KiB = 64 次。通道容量为
-        // buffer(10)+2 发送句柄,每 8 次驱动一次连接清空队列,保证
-        // 后续 Pending 只可能因信用耗尽(而非通道满)。
+        // buffer(`STREAM_COMMAND_CAP`)+2 发送句柄,每 8 次驱动一次连接清空
+        // 队列,保证后续 Pending 只可能因信用耗尽(而非通道满)。
         let mut cx = noop_cx();
         let payload = [7u8; 4096];
         let mut total = 0usize;
@@ -4463,9 +4470,11 @@ mod tests {
         }
     }
 
-    /// T-B4:to_send 有 Pong + 流帧满队列(2 流 × 8 帧 = 16)→ Pong 字节
-    /// 先上线(帧优先级 to_send > rtt ping > 流命令);全部 16 个流帧随后
-    /// 上线,18 帧恰分两批 writev(批上限 16 帧)。
+    /// T-B4:to_send 有 Pong + 流帧(2 流 × 8 帧 = 16)→ Pong 字节先上线
+    /// (帧优先级 to_send > rtt ping > 流命令);全部 16 个流帧随后上线。
+    /// round-7:pong + rtt ping + 16 流帧 = 18 帧 ≤ [`MAX_BATCH_FRAMES`] 且
+    /// 总字节 < [`MAX_BATCH_BYTES`] → 合成**单批** writev(round-5 的 16 帧
+    /// 上限下恰分两批)。
     #[test]
     fn batch_pong_precedes_full_batch_of_stream_frames() {
         let (socket, st) = TestSocket::new();
@@ -4520,10 +4529,161 @@ mod tests {
         assert_eq!(h0.len().val(), 9, "pong keeps its opaque id");
         let data = frames.iter().filter(|(h, _)| h.tag() == Tag::Data).count();
         assert_eq!(data, 16, "all 16 stream frames must follow the pong");
+        // 18 帧落入单批的前提(fill_batch 口径:取帧前检查帧数 < 上限、
+        // 累计字节 < 上限;pong/ping 仅帧头),引用常量使下一轮扩容不炸
+        let total_frames = 2 + 16;
+        let total_bytes = 2 * header::HEADER_SIZE + 16 * (header::HEADER_SIZE + 4096);
+        assert!(
+            total_frames <= MAX_BATCH_FRAMES && total_bytes < MAX_BATCH_BYTES,
+            "caps must admit pong + rtt ping + 16 stream frames in one batch"
+        );
+        assert_eq!(
+            st.borrow().writev_calls.load(Ordering::SeqCst),
+            1,
+            "pong + rtt ping + 16 stream frames = 18 frames → one batch under round-7 caps"
+        );
+    }
+
+    /// T-B7(round-7,红→绿):生产帧形态下的批聚合——`set_split_send_size`
+    /// 对齐应用层 64KiB 步进(rh-transport mux.rs `CHUNK_CAP`),单流连写
+    /// 16 个 64KiB 帧(round-7 目标工况"16 流 × 64KiB 帧单次 writev 覆盖
+    /// 全部 16 流"的单流同型)→ 驱动 SendWorker + 发送半 → 恰 **1 次**
+    /// writev、线上恰 16 帧、帧序与字节逐一相符。修前双红:256KiB 字节
+    /// 上限下 fill_batch 4 帧即止 → 4 次 writev;流命令通道 cap 10(+2
+    /// 发送句柄)在第 13 次 poll_write 即满 → Pending。第二阶段再补写
+    /// 1 帧(共 17):前 16 帧已成批上线,末帧独立成批 → 总 2 次 writev。
+    ///
+    /// 工况帧数固定为 16——它是扩容的**目标**,不从上限反推(反推会在旧
+    /// 上限下自适应为 4 帧而失去红→绿判别力);上限与工况的联动以常量
+    /// 推导断言(§1.6),下一轮扩容不炸、缩容则明确报出。
+    ///
+    /// 写侧授信:出站流本地 send_window 初值为 [`DEFAULT_CREDIT`](256KiB,
+    /// stream.rs `new_outbound`),17 个 64KiB 帧需 1088KiB,故先经**生产
+    /// 入站路径**(RecvHalf → ShardWorker::on_window_update)注入对端窗口
+    /// 更新补齐差额——等价对端建流授信(S2:对端初窗 6MiB 时 SYN|WU 授
+    /// 6MiB−256KiB),不触碰流内部状态。
+    #[test]
+    fn batch_64k_frames_fill_byte_cap_one_writev() {
+        /// round-7 目标工况的帧数(16 流 × 64KiB 帧)。
+        const SCENARIO_FRAMES: usize = 16;
+        const FRAME_BODY: usize = 64 * 1024;
+        const WIRE: usize = header::HEADER_SIZE + FRAME_BODY;
+        // 上限一批可容纳的 64KiB 帧数(fill_batch 口径:取帧前检查累计
+        // 线上字节 < 字节上限,故取满 n 帧 ⟺ 前 n−1 帧累计 < 上限,即
+        // n = ceil(上限 / 单帧线上长);再受帧数上限封顶)。
+        let per_batch = MAX_BATCH_FRAMES.min(MAX_BATCH_BYTES.div_ceil(WIRE));
+
+        let (socket, st) = TestSocket::new();
+        let mut cfg = Config::default();
+        cfg.set_split_send_size(FRAME_BODY);
+        let conn = Connection::new(socket, cfg, Mode::Client);
+        let (mut recv_half, mut send_half, mut workers, mut send_workers) = conn.into_halves();
+        let mut cx = noop_cx();
+
+        // 预驱动冲掉 Rtt::new 立即到期的 rtt ping(独立一批,不计入断言)
+        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("send half must park after the rtt ping, got {other:?}"),
+        }
+
+        let mut stream = match send_half.poll_new_outbound(&mut cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("open outbound via send half, got {other:?}"),
+        };
+        // 对端授信:补齐 17 帧所需 send_window 与初始 DEFAULT_CREDIT 的
+        // 差额,经入站路径处理(WU 不交付新流 → Pending)
+        let need = ((SCENARIO_FRAMES + 1) * FRAME_BODY) as u32;
+        assert!(
+            need > DEFAULT_CREDIT,
+            "test premise: the write volume must exceed the initial credit"
+        );
+        st.borrow_mut()
+            .read_blocks
+            .lock()
+            .unwrap()
+            .push_back(wu_credit_block(1, need - DEFAULT_CREDIT));
+        match drive_recv_workers(&mut recv_half, &mut workers, &mut send_workers, &mut cx) {
+            Poll::Pending => {}
+            other => panic!("a window update must not deliver a stream, got {other:?}"),
+        }
+
+        st.borrow().writev_calls.store(0, Ordering::SeqCst);
+        let before = st.borrow().written.lock().unwrap().len();
+
+        // 第一阶段:16 个 64KiB 帧 → 恰 1 次 writev
+        let payloads: Vec<Vec<u8>> = (0..SCENARIO_FRAMES)
+            .map(|i| vec![(i + 1) as u8; FRAME_BODY])
+            .collect();
+        for p in &payloads {
+            match Pin::new(&mut stream).poll_write(&mut cx, p) {
+                Poll::Ready(Ok(n)) if n == FRAME_BODY => {}
+                other => panic!("queue 64KiB data frame, got {other:?}"),
+            }
+        }
+        // round-6:流命令由 SendWorker 消费进 send_out,再由 FlushTask
+        // 一次批量写出(与 T-B1 同型)
+        for w in send_workers.iter_mut() {
+            let _ = w.poll_unpin(&mut cx);
+        }
+        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("send half must park after the batch, got {other:?}"),
+        }
+        assert_eq!(
+            st.borrow().writev_calls.load(Ordering::SeqCst),
+            1,
+            "{SCENARIO_FRAMES} × 64KiB frames must coalesce into exactly one writev \
+             (caps admit {per_batch} such frames per batch; 修前 256KiB 上限 → 4 帧/批 = 4 次)"
+        );
+        // §1.6 常量联动:单批成立 ⟺ 上限容纳整个工况
+        assert!(
+            SCENARIO_FRAMES <= per_batch,
+            "caps must admit the whole scenario in one batch, admit {per_batch}"
+        );
+        let bytes = st.borrow().written.lock().unwrap()[before..].to_vec();
+        assert_eq!(
+            bytes.len(),
+            SCENARIO_FRAMES * WIRE,
+            "exactly the {SCENARIO_FRAMES} data frames reach the wire"
+        );
+        let frames = frames_on_wire(&bytes);
+        assert_eq!(frames.len(), SCENARIO_FRAMES);
+        for (i, (hdr, body)) in frames.iter().enumerate() {
+            assert_eq!(hdr.tag(), Tag::Data);
+            assert_eq!(hdr.stream_id(), StreamId::new(1));
+            assert_eq!(body, &payloads[i], "frame #{i} body must be in order");
+        }
+
+        // 第二阶段:补写第 17 帧 → 独立成批,总 2 次 writev
+        let tail = vec![0xEEu8; FRAME_BODY];
+        match Pin::new(&mut stream).poll_write(&mut cx, &tail) {
+            Poll::Ready(Ok(n)) if n == FRAME_BODY => {}
+            other => panic!("queue the tail 64KiB data frame, got {other:?}"),
+        }
+        for w in send_workers.iter_mut() {
+            let _ = w.poll_unpin(&mut cx);
+        }
+        match poll_fn(|cx| send_half.poll(cx)).poll_unpin(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("send half must park after the tail batch, got {other:?}"),
+        }
         assert_eq!(
             st.borrow().writev_calls.load(Ordering::SeqCst),
             2,
-            "pong + rtt ping + 16 stream frames = 18 frames → two batches"
+            "frame #{} lands in its own batch: exactly one more writev",
+            SCENARIO_FRAMES + 1
         );
+        let bytes = st.borrow().written.lock().unwrap()[before..].to_vec();
+        let frames = frames_on_wire(&bytes);
+        assert_eq!(
+            frames.len(),
+            SCENARIO_FRAMES + 1,
+            "all {} frames reach the wire",
+            SCENARIO_FRAMES + 1
+        );
+        let (hdr, body) = &frames[SCENARIO_FRAMES];
+        assert_eq!(hdr.tag(), Tag::Data);
+        assert_eq!(hdr.stream_id(), StreamId::new(1));
+        assert_eq!(body, &tail, "tail frame body must be intact");
     }
 }

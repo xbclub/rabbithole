@@ -19,7 +19,7 @@
 //!
 //! 本模块是 halves 的子模块,可直接触达 [`super::ConnShared`] 的私有字段。
 
-use crate::connection::{Id, Mode, State, StreamCommand};
+use crate::connection::{Id, Mode, State, StreamCommand, STREAM_COMMAND_CAP};
 use crate::frame::header::{self, Header, StreamId, Tag};
 use crate::frame::Frame;
 use crate::tagged_stream::TaggedStream;
@@ -442,7 +442,7 @@ impl ShardWorker {
     }
 
     fn make_new_inbound_stream(&self, id: StreamId, credit: u32) -> Stream {
-        let (sender, receiver) = mpsc::channel(10); // 10 is an arbitrary number.
+        let (sender, receiver) = mpsc::channel(STREAM_COMMAND_CAP);
         self.shared.push_new_receiver(id, receiver);
         Stream::new_inbound(id, self.id, self.config.clone(), credit, sender)
     }
@@ -3177,7 +3177,7 @@ mod tests {
         cfg.set_shard_workers(1);
         let mut f = Fixture::client(1, cfg);
         // 7 流(client 出站 sid 1..13 奇数,N=1 全归 worker0)× 10 帧
-        // = 70 条命令 > 64;单流命令通道 cap 10 内全就绪
+        // = 70 条命令 > 64;单流命令通道 cap `STREAM_COMMAND_CAP` 内全就绪
         const STREAMS: usize = 7;
         const FRAMES: usize = 10;
         let mut streams = Vec::new();
@@ -3263,7 +3263,8 @@ mod tests {
             Poll::Ready(Ok(s)) => s,
             other => panic!("outbound open must succeed, got {other:?}"),
         };
-        // K 帧在途数据(命令通道 cap 10:授信 WU|ACK 已消费,8 帧全就绪)
+        // K 帧在途数据(命令通道 cap `STREAM_COMMAND_CAP`:授信 WU|ACK 已
+        // 消费,8 帧全就绪)
         const K: usize = 8;
         let payload = [0x5Au8; 128];
         for _ in 0..K {
@@ -3504,7 +3505,7 @@ mod tests {
         cfg.set_shard_workers(1);
         let mut f = Fixture::client(1, cfg);
         // 20 流(client 出站 sid 1..40 奇数,N=1 全归 worker0)× 10 帧
-        // = 200 条命令 > 3×64;单流命令通道 cap 10 内全就绪
+        // = 200 条命令 > 3×64;单流命令通道 cap `STREAM_COMMAND_CAP` 内全就绪
         const STREAMS: usize = 20;
         const FRAMES: usize = 10;
         let mut streams = Vec::new();

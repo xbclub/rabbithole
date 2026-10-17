@@ -174,11 +174,11 @@ impl Stream {
     /// 初始 flag 的窗口更新帧排队授出——outbound SYN|WU 合帧(hashicorp
     /// OpenStream 的 initialStreamFlags 行为)、inbound ACK|WU(镜像
     /// `into_halves` 的 ACK 副作用记账),均为 upstream 合法组合,不再等
-    /// 读路径首个窗口更新 poll。通道在 make_new_*_stream 皆为容量 10 的
-    /// 全新通道,建流时必空,try_send 必成;失败兜底(测试以容量 0 通道
-    /// 直接构造流的用法)不得丢授信——flag 恢复原值(Syn/Ack)、
-    /// pregrant_pending 恢复 true,行为退回旧路径(读 poll 授信 /
-    /// into_halves 补 ACK)。
+    /// 读路径首个窗口更新 poll。通道在 make_new_*_stream 皆为容量
+    /// `STREAM_COMMAND_CAP` 的全新通道,建流时必空,try_send 必成;失败兜底
+    /// (测试以容量 0 通道直接构造流的用法)不得丢授信——flag 恢复原值
+    /// (Syn/Ack)、pregrant_pending 恢复 true,行为退回旧路径(读 poll
+    /// 授信 / into_halves 补 ACK)。
     fn queue_creation_grant(&mut self) {
         let delta = self.shared.lock().flow_controller.take_creation_grant();
         if delta == 0 {
