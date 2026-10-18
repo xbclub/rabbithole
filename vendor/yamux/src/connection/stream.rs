@@ -485,8 +485,10 @@ pub struct StreamReadHalf {
 impl StreamReadHalf {
     /// 同 [`Stream::poll_read_chunk`]。
     pub fn poll_read_chunk(&mut self, cx: &mut Context) -> Poll<io::Result<Option<bytes::Bytes>>> {
-        if crate::sched_diag::enabled() { crate::sched_diag::on_poll(); }
+        let __sd = crate::sched_diag::enabled();
+        if __sd { crate::sched_diag::on_poll(); crate::sched_diag::begin_poll(); }
         if !self.config.read_after_close && self.sender.is_closed() {
+            if __sd { crate::sched_diag::end_poll(); }
             return Poll::Ready(Ok(None));
         }
         match self.send_window_update(cx) {
@@ -494,6 +496,7 @@ impl StreamReadHalf {
             // C3:同 Stream::poll_read_chunk——缓冲优先于通道错误交付。
             Poll::Ready(Err(e)) => {
                 if self.shared.lock().buffer.is_empty() {
+                    if __sd { crate::sched_diag::end_poll(); }
                     return Poll::Ready(Err(e));
                 }
             }
@@ -501,10 +504,12 @@ impl StreamReadHalf {
         }
         let mut shared = self.shared();
         if let Some(bytes) = shared.buffer.pop() {
+            if __sd { crate::sched_diag::end_poll(); }
             return Poll::Ready(Ok(Some(bytes)));
         }
         if !shared.state().can_read() {
             log::debug!("{}/{}: eof", self.conn, self.id);
+            if __sd { crate::sched_diag::end_poll(); }
             return Poll::Ready(Ok(None));
         }
         // round-11:park 前在**同一把锁内**完成"注册 waker + 复查 buffer"。
@@ -516,9 +521,11 @@ impl StreamReadHalf {
         shared.reader = Some(cx.waker().clone());
         if let Some(bytes) = shared.buffer.pop() {
             shared.reader = None; // 撤销注册:本 poll 已直接交付
+            if __sd { crate::sched_diag::end_poll(); }
             return Poll::Ready(Ok(Some(bytes)));
         }
         if crate::sched_diag::enabled() { crate::sched_diag::on_park(); }
+        if __sd { crate::sched_diag::end_poll(); }
         Poll::Pending
     }
 

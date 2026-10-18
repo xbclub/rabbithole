@@ -40,6 +40,25 @@ pub fn on_park() {
     LAST_PARK.with(|c| c.set(Some(std::time::Instant::now())));
 }
 
+pub static IN_POLL_NS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static POLL_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// 记录一次"进入 poll → 返回 Ready/Pending"的耗时(即 poll 内部工作耗时)。
+pub fn begin_poll() {
+    POLL_START.with(|c| c.set(Some(std::time::Instant::now())));
+}
+
+pub fn end_poll() {
+    POLL_START.with(|c| {
+        if let Some(t) = c.take() {
+            IN_POLL_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    });
+}
+
 pub fn on_poll() {
     LAST_PARK.with(|c| {
         if let Some(t) = c.take() {
@@ -72,7 +91,8 @@ pub fn dump(tag: &str) {
     }
     let avg = SUM_US.load(Ordering::Relaxed) as f64 / p as f64;
     eprintln!(
-        "SCHED {tag} polls={p} avg_us={avg:.0} <=10us={} <=100us={} <=1ms={} <=10ms={} >10ms={}",
+        "SCHED {tag} polls={p} avg_us={avg:.0} in_poll_avg_us={:.1} <=10us={} <=100us={} <=1ms={} <=10ms={} >10ms={}",
+        IN_POLL_NS.load(Ordering::Relaxed) as f64 / p as f64 / 1000.0,
         HIT_LE_10US.load(Ordering::Relaxed),
         HIT_LE_100US.load(Ordering::Relaxed),
         HIT_LE_1MS.load(Ordering::Relaxed),
