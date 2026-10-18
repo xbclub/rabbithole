@@ -1821,3 +1821,66 @@ rh 用 tokio task + **`parking_lot::Mutex` 保护流状态**:
    内部仍有 `parking_lot::Mutex`(shard.rs 的 ShardChannel)。
 
 **这是本轮首次拿到"时间到底花在哪"的系统级证据,不再依赖代码猜测。**
+
+### 27.6 ⚠️ 关键修正:futex 52% 不是锁竞争,是 tokio worker park
+
+逐条 `strace -f -T -e trace=futex` 的结果:
+
+```
+futex(0x7f10fe4094d8, FUTEX_WAIT_PRIVATE, 1, NULL <unfinished ...>   ← 9 个线程都在这
+futex(0x7f10ff01b4d8, FUTEX_WAKE_PRIVATE, 1) = 1 <0.000097>          ← 唤醒 97μs
+futex(0x..., ... ) = 0 <0.027330>                                     ← 被唤醒,等了 27ms
+```
+
+**全部是 `FUTEX_WAIT_PRIVATE`**(条件变量等待,不是 mutex 争用),
+地址集中在 `0x7f10fe40xxxx` 附近,**这是 tokio runtime 的 worker park 结构**。
+
+**⇒ 52% 的 futex 时间 = tokio worker 空闲等待被唤醒,不是锁竞争。**
+
+`FUTEX_WAKE_PRIVATE` 单次仅 97μs,**唤醒本身很快**。
+
+### 27.7 `SO_SNDBUF` 假设也不成立
+
+发现 `net.core.wmem_max` 只有 **212,992(208KB)**,
+而 `net.ipv4.tcp_wmem` 上限 4MiB —— **显式设置大 SO_SNDBUF 会被截断**,
+这解释了 §16.3"设 8MiB 无效"的部分原因。
+
+**验证:把 `wmem_max` 提到 16MiB 后重测单流:**
+
+| 配置 | 单流 |
+|---|---:|
+| wmem_max=208KB(默认) | 1.05~1.06 G |
+| wmem_max=16MiB | 1.04~1.07 G |
+
+**无变化。⇒ 发送缓冲不是瓶颈。**
+
+### 27.8 当前确定与已排除的完整图景
+
+**已确定(有系统级证据):**
+- 单流 1.05 G,裸链路 7.7 G,利用率 15%
+- `RecvHalf` 每 poll 70.9 帧、内部 24.8ms(每帧 350μs)
+- 1.2% 的读 park,每次 34ms,贡献 100% 读延迟
+- park 时 `send_window` 全部充裕(205/205)
+- poll→poll 间隔 66ms,但 poll 内部占 24.8ms
+
+**已排除:**
+- CPU(0.55 核)、软中断、窗口(6~128MiB)、分片、(HARDWARE)载体、
+  分片通道容量(128/1024)、读批量(64K/256K/512K)、SO_SNDBUF、
+  futex 锁竞争(实为 tokio park)
+
+### 27.9 剩下的唯一解释
+
+**每帧 350μs 的解帧成本,加上 poll 之间 66ms 的空窗,意味着数据
+"来一批、停一段"。**
+
+`sendto` 每次 113μs(正常 5~10μs)说明**服务端把数据写进它到客户端的
+socket 时,内核在限速**。虽然提高了 `wmem_max` 没变,但 113μs 仍然异常。
+
+**下一个要测的:** 这个 `sendto` 的目标是**到客户端的那条物理连接**。
+若这条连接的接收方(rh-client)消费慢,发送端就会在 `sendto` 上等。
+
+**验证方法**:用 `ss -tinm` 看这条连接的 `Send-Q` 是否长期 >0。
+§22 曾记录 `f1392640`(约 1.4MB 未发送)——**这就是直接证据**。
+
+**⇒ 瓶颈在 rh-client 的消费速度,不在 rh-server。**
+下一轮应从**客户端侧**调查(`pump_up` / `RecvHalf`),而不是继续查服务端。
