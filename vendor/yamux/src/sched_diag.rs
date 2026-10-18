@@ -100,3 +100,9 @@ pub fn dump(tag: &str) {
         HIT_GT_10MS.load(Ordering::Relaxed),
     );
 }
+
+/// round-11 诊断专用:跳过 `send_window_update`(会破坏长流流控,禁止生产)。
+pub fn skip_wu() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("RH_SKIP_WU").map(|v| v == "1").unwrap_or(false))
+}

@@ -486,12 +486,13 @@ impl StreamReadHalf {
     /// 同 [`Stream::poll_read_chunk`]。
     pub fn poll_read_chunk(&mut self, cx: &mut Context) -> Poll<io::Result<Option<bytes::Bytes>>> {
         let __sd = crate::sched_diag::enabled();
+        let skip_wu = crate::sched_diag::skip_wu();
         if __sd { crate::sched_diag::on_poll(); crate::sched_diag::begin_poll(); }
         if !self.config.read_after_close && self.sender.is_closed() {
             if __sd { crate::sched_diag::end_poll(); }
             return Poll::Ready(Ok(None));
         }
-        match self.send_window_update(cx) {
+        match if skip_wu { Poll::Ready(Ok(())) } else { self.send_window_update(cx) } {
             Poll::Ready(Ok(())) => {}
             // C3:同 Stream::poll_read_chunk——缓冲优先于通道错误交付。
             Poll::Ready(Err(e)) => {
