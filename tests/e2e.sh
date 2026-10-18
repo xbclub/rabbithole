@@ -220,8 +220,22 @@ import socket, threading, sys
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(16)
 def h(c):
-    try: open(sys.argv[2] + "/hdr.log", "wb").write(c.recv(65536))
-    except OSError: pass
+    # PROXY 头与首段数据可能分两次到达(客户端 relay 分段写):累积读到
+    # "data\n" 或 EOF/超时,避免单次 recv 截断造成假失败。断言口径不变。
+    c.settimeout(2)
+    buf = b""
+    try:
+        while not buf.endswith(b"data\n"):
+            d = c.recv(65536)
+            if not d:
+                break
+            buf += d
+    except OSError:
+        pass
+    try:
+        open(sys.argv[2] + "/hdr.log", "wb").write(buf)
+    except OSError:
+        pass
     c.close()
 while True:
     c, _ = s.accept()
@@ -985,6 +999,509 @@ RT=$(curl -s -X POST "http://127.0.0.1:19196/api/auth/login" -H 'Content-Type: a
   -d "{\"username\":\"admin\",\"password\":\"Boot-New-456\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["accessToken"])' 2>/dev/null)
 [ -n "$RT" ]; check $? "重启后修改过的密码持久有效"
 kill $BOOT_PID2 2>/dev/null
+
+# ---------- Round-9.1(F2):多载体池化端到端 ----------
+# 覆盖服务端聚合路径(Round-9):客户端以 mux_pool_size=3 拨 3 条物理
+# 连接,首条控制 + 2 条附加载体报到;服务端把附加载体聚合进会话池,
+# 数据流经池合流路由。断言四件事:
+#   1) 服务端日志出现 2 条 "pool carrier attached"(真实聚合,非手工原语);
+#   2) 经代理规则端口 P_TCP 的随机字节 echo 全通(真实数据面);
+#   3) 会话替换(杀池化客户端→重启单载体)后,服务端控制端口上旧池化
+#      载体的 ESTAB 连接收敛(计数回落到重启后的预期);
+#   4) 收敛后数据面恢复(再次 echo)。
+# 连接计数在 ss 不可用时退化到 netstat;两者皆无则标注 SKIP(只用
+# 可达性与日志断言),不伪造通过。
+
+# 服务端进程在控制端口上**仍持有**的连接数(pid 过滤到 rh-server)。
+# 计 ESTABLISHED + CLOSE_WAIT:客户端进程被 kill 后,若服务端不收敛,
+# 该连接会永久停在 CLOSE_WAIT;收敛后服务端主动 close,连接转入
+# TIME_WAIT 并很快消失——TIME_WAIT 不计入,避免把"已收敛的残留 pcb"
+# 误判为泄漏。输出整数;ss/lsof/netstat 均不可用时输出 NA。
+ctl_estab() {  # $1=本地端口 $2=服务端 pid
+  python3 - "$1" "$2" <<'PYEOF'
+import shutil, subprocess, sys
+port, srv_pid = sys.argv[1], sys.argv[2]
+suffix = ":" + port
+def run(cmd, ok_codes=(0,)):
+    # 命令失败(无权限/内核不支持)返回 None,让调用方退化到下一工具;
+    # 成功但无匹配连接必须返回空串/计数 0,不能与"工具不可用"混淆
+    # (否则 SKIP 条件永真)。lsof 无匹配时退出码为 1,调用方显式放行。
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return r.stdout if r.returncode in ok_codes else None
+
+def count_ss():
+    out = run(["ss", "-tnp"])
+    if out is None:
+        return None
+    # 无任何进程信息(非特权环境内核不给 users:):按 pid 过滤不可用,
+    # 返回 None 交给下一工具,而不是把"看不见"当成"没有连接"(假 0)。
+    if "users:(" not in out:
+        return None
+    n = 0
+    for line in out.splitlines():
+        f = line.split()
+        # ss -tnp 默认列序:State Recv-Q Send-Q Local Peer [Process]
+        # 状态在第 1 列、本地地址在第 4 列(第 3 列是 Send-Q,不是地址)。
+        # 进程信息形如 users:(("rh-server",pid=123,fd=7))
+        if len(f) < 5 or f[0] not in ("ESTAB", "ESTABLISHED", "CLOSE-WAIT", "CLOSE_WAIT"):
+            continue
+        if f[3].endswith(suffix):
+            if ("pid=%s," % srv_pid) in line or ("pid=%s)" % srv_pid) in line:
+                n += 1
+    return n
+
+def count_lsof():
+    # lsof 无匹配连接时退出码 1(不是错误):放行,计 0。
+    out = run(["lsof", "-nP", "-a", "-p", srv_pid, "-iTCP:" + port], ok_codes=(0, 1))
+    if out is None:
+        return None
+    n = 0
+    for line in out.splitlines():
+        if "ESTABLISHED" not in line and "CLOSE_WAIT" not in line:
+            continue
+        for tok in line.split():
+            if "->" in tok:
+                lhs = tok.split("->", 1)[0]
+                if lhs.endswith(suffix):
+                    n += 1
+                break
+    return n
+
+def count_netstat():
+    # 退化路径(无法按 pid 过滤):只计 ESTABLISHED/CLOSE_WAIT +
+    # 本地端口匹配;其他进程同端口连接会抬高计数,故仅在无 ss/lsof 时使用。
+    out = run(["netstat", "-an", "-p", "tcp"])
+    if out is None:
+        return None
+    n = 0
+    for line in out.splitlines():
+        f = line.split()
+        # 列序:Proto Recv-Q Send-Q Local Foreign State [PID/Program]。
+        # macOS 无 -p 列(状态为末列);Linux 带 -p 时末列是 PID/Program,
+        # 故状态在 f[4:] 中查找而不绑定固定下标。本地地址:macOS 形如
+        # 192.168.50.23.52334(`.` 分隔),Linux 形如 127.0.0.1:18100;
+        # 取最后一段端口比较,两种分隔符下都成立。
+        if len(f) < 6 or not ({"ESTABLISHED", "CLOSE_WAIT"} & set(f[4:])):
+            continue
+        local_port = f[3].rsplit(":", 1)[-1].rsplit(".", 1)[-1]
+        if local_port == port:
+            n += 1
+    return n
+
+for fn, tool in (
+    (count_ss, "ss"),
+    (count_lsof, "lsof"),
+    (count_netstat, "netstat"),
+):
+    if not shutil.which(tool):
+        continue
+    n = fn()
+    if n is not None:
+        print(n)
+        sys.exit(0)
+print("NA")
+PYEOF
+}
+
+# 等待主客户端(CID)重新上线:最多 10s
+wait_client_online() {  # $1=client_id
+  local i on
+  for i in $(seq 1 20); do
+    on=$(curl -s "http://127.0.0.1:$API_PORT/api/clients" -H "Authorization: Bearer $TOKEN" \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([c["online"] for c in d if c["id"]==sys.argv[1]][0])' "$1" 2>/dev/null || true)
+    [ "$on" = "True" ] && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+CTL_BASE=$(ctl_estab "$CTL_PORT" "$SRV_PID")
+
+# 独立硬件上限(round-10.1 §2.5):与客户端 detect_hardware_cap 同口径,但
+# **不读被测日志**——CPU 亲和数(及 cgroup 配额)/2 与
+# /sys/class/net/*/queues/rx-* 的最大值,钳制 [1,8];非 Linux/无队列信息
+# 时仅由 CPU 决定。期望值的唯一来源是「显式 mux_pool_size=3」与本函数。
+indep_hw_cap() {
+  python3 - <<'PYEOF'
+import glob, os
+
+def cgroup_quota():
+    # cgroup v2
+    try:
+        with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as fh:
+            q, p = fh.read().split()[:2]
+            if q != "max" and int(p) > 0:
+                return max(1, int(q) // int(p))
+    except Exception:
+        pass
+    # cgroup v1
+    try:
+        q = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8").read())
+        p = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8").read())
+        if q > 0 and p > 0:
+            return max(1, q // p)
+    except Exception:
+        pass
+    return None
+
+try:
+    cpus = len(os.sched_getaffinity(0))
+except AttributeError:
+    cpus = os.cpu_count() or 1
+q = cgroup_quota()
+if q:
+    cpus = min(cpus, q)
+cap = max(cpus // 2, 1)
+queues = []
+for iface in glob.glob("/sys/class/net/*"):
+    n = len(glob.glob(os.path.join(iface, "queues", "rx-*")))
+    if n:
+        queues.append(n)
+if queues:
+    cap = min(cap, max(max(queues), 1))
+print(max(1, min(cap, 8)))
+PYEOF
+}
+
+# 按源端口归因(round-10.1 §2.5):记录客户端进程到控制端口的 ESTAB 连接
+# 本地源端口。拆除后按这些端口在服务端侧精确计数,避免全局 ESTAB 噪声。
+client_ctl_sports() {  # $1=控制端口 $2=客户端 pid → 空格分隔源端口
+  python3 - "$1" "$2" <<'PYEOF'
+import shutil, subprocess, sys
+port, pid = sys.argv[1], sys.argv[2]
+
+def run(cmd, ok=(0,)):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return r.stdout if r.returncode in ok else None
+
+def from_ss():
+    out = run(["ss", "-tnp"])
+    if out is None or "users:(" not in out:
+        return None
+    sports = set()
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) < 5 or f[0] != "ESTAB" or not f[4].endswith(":" + port):
+            continue
+        if ("pid=%s," % pid) in line or ("pid=%s)" % pid) in line:
+            sports.add(f[3].rsplit(":", 1)[-1])
+    return sports
+
+def from_lsof():
+    out = run(["lsof", "-nP", "-a", "-p", pid, "-iTCP:" + port], ok=(0, 1))
+    if out is None:
+        return None
+    sports = set()
+    for line in out.splitlines():
+        if "ESTABLISHED" not in line:
+            continue
+        for tok in line.split():
+            if "->" not in tok:
+                continue
+            lhs, rhs = tok.split("->", 1)
+            if rhs.rsplit(":", 1)[-1] == port:
+                sports.add(lhs.rsplit(":", 1)[-1])
+            break
+    return sports
+
+for fn, tool in ((from_ss, "ss"), (from_lsof, "lsof")):
+    if not shutil.which(tool):
+        continue
+    s = fn()
+    if s is not None:
+        print(" ".join(sorted(s)))
+        sys.exit(0)
+print("")
+PYEOF
+}
+
+# 服务端侧:本地端口 = 控制端口、对端源端口 ∈ 给定集合的连接数
+# (ESTABLISHED + CLOSE_WAIT,同 ctl_estab 口径)。NA = 工具不可用。
+ctl_estab_peer_ports() {  # $1=控制端口 $2=服务端 pid $3..=客户端源端口
+  python3 - "$@" <<'PYEOF'
+import shutil, subprocess, sys
+port, srv_pid = sys.argv[1], sys.argv[2]
+peers = set(p for p in sys.argv[3:] if p)
+
+def run(cmd, ok=(0,)):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return r.stdout if r.returncode in ok else None
+
+def count_ss():
+    out = run(["ss", "-tnp"])
+    if out is None or "users:(" not in out:
+        return None
+    n = 0
+    for line in out.splitlines():
+        f = line.split()
+        # State Recv-Q Send-Q Local Peer [Process]
+        if len(f) < 5 or f[0] not in ("ESTAB", "ESTABLISHED", "CLOSE-WAIT", "CLOSE_WAIT"):
+            continue
+        if not f[3].endswith(":" + port) or f[4].rsplit(":", 1)[-1] not in peers:
+            continue
+        if ("pid=%s," % srv_pid) in line or ("pid=%s)" % srv_pid) in line:
+            n += 1
+    return n
+
+def count_lsof():
+    out = run(["lsof", "-nP", "-a", "-p", srv_pid, "-iTCP:" + port], ok=(0, 1))
+    if out is None:
+        return None
+    n = 0
+    for line in out.splitlines():
+        if "ESTABLISHED" not in line and "CLOSE_WAIT" not in line:
+            continue
+        for tok in line.split():
+            if "->" not in tok:
+                continue
+            lhs, rhs = tok.split("->", 1)
+            if lhs.rsplit(":", 1)[-1] == port and rhs.rsplit(":", 1)[-1] in peers:
+                n += 1
+            break
+    return n
+
+def count_netstat():
+    # 无法按 pid 过滤:本地端口 + 对端源端口双重匹配后,同端口的其他
+    # 客户端不会落入(源端口集合只来自被测进程)。
+    out = run(["netstat", "-an", "-p", "tcp"])
+    if out is None:
+        return None
+    n = 0
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) < 6 or not ({"ESTABLISHED", "CLOSE_WAIT"} & set(f[4:])):
+            continue
+        local_port = f[3].rsplit(":", 1)[-1].rsplit(".", 1)[-1]
+        peer_port = f[4].rsplit(":", 1)[-1].rsplit(".", 1)[-1]
+        if local_port == port and peer_port in peers:
+            n += 1
+    return n
+
+for fn, tool in ((count_ss, "ss"), (count_lsof, "lsof"), (count_netstat, "netstat")):
+    if not shutil.which(tool):
+        continue
+    n = fn()
+    if n is not None:
+        print(n)
+        sys.exit(0)
+print("NA")
+PYEOF
+}
+
+# 按 PID 轮换主客户端为池化形态(3 载体):旧单载体连接收尾后再起新进程,
+# 池化阶段的连接增量只归因于新进程。
+cp "$WORK/client.toml" "$WORK/client-pool.toml"
+printf '\nmux_pool_size = 3\n' >> "$WORK/client-pool.toml"
+kill "$CLIENT_PID" 2>/dev/null
+sleep 2
+"$CLIENT" --config "$WORK/client-pool.toml" >"$WORK/client-pool.log" 2>&1 &
+CLIENT_PID=$!; PIDS+=($CLIENT_PID)
+wait_client_online "$CID"; check $? "池化客户端上线(mux_pool_size=3)"
+
+# 服务端聚合生效:1 首条 + (K-1) 条附加。K 不取自被测客户端日志:
+# 显式 mux_pool_size=3 按独立硬件上限钳制(§2.5)。initial_k 缺失或与
+# 独立期望不符 → FAIL;只有「显式 3 被硬件上限合法钳制到 1」才 SKIP
+# (钳制本身由 indep_hw_cap 独立证明)。
+POOL_HW_CAP=$(indep_hw_cap)
+POOL_EXPECT_K=3
+[ "$POOL_EXPECT_K" -gt "$POOL_HW_CAP" ] && POOL_EXPECT_K=$POOL_HW_CAP
+POOL_SIZING=""
+for _ in $(seq 1 20); do
+  POOL_SIZING=$(sed -E 's/\x1b\[[0-9;]*m//g' "$WORK/client-pool.log" 2>/dev/null \
+    | grep "pool sizing" | tail -1)
+  [ -n "$POOL_SIZING" ] && break
+  sleep 0.5
+done
+POOL_K=$(printf '%s' "$POOL_SIZING" | sed -nE 's/.*initial_k=([0-9]+).*/\1/p')
+if [ -z "$POOL_K" ]; then
+  bad "池化客户端定容日志缺失(实际: $POOL_SIZING)"
+elif [ "$POOL_K" -ne "$POOL_EXPECT_K" ]; then
+  bad "池化客户端 initial_k=$POOL_K,独立期望 $POOL_EXPECT_K(显式 3,硬件上限 $POOL_HW_CAP)"
+elif [ "$POOL_EXPECT_K" -lt 2 ]; then
+  echo "SKIP: 池化载体聚合断言(独立硬件上限 $POOL_HW_CAP 合法钳制显式 3 → initial_k=$POOL_K)"
+else
+  want_attached=$((POOL_EXPECT_K - 1))
+  attached=0
+  for _ in $(seq 1 20); do
+    attached=$(grep -c "pool carrier attached" "$WORK/server.log" 2>/dev/null || true)
+    [ "$attached" -ge "$want_attached" ] && break
+    sleep 0.5
+  done
+  if [ "$attached" -ge "$want_attached" ]; then
+    ok "池化客户端 $want_attached 条附加载体聚合(expect_k=$POOL_EXPECT_K, attached=$attached)"
+  else
+    bad "池化客户端附加载体聚合(attached=$attached,期望>= $want_attached)"
+  fi
+fi
+# 环回上附加必须全成:失败/被拒/缺 ACK 只允许出现在非环回/受限环境。
+if grep -qE "pool carrier attach (failed|rejected)|carrier attach ack (missing|timeout)|bad carrier attach ack" "$WORK/client-pool.log"; then
+  bad "池化客户端附加载体无失败(日志出现失败/拒绝/缺 ACK)"
+else
+  ok "池化客户端附加载体无失败"
+fi
+
+# 数据面:经真实代理端口 P_TCP 写随机字节并从同连接读回(非端口探测)。
+python3 - "$P_TCP" <<'EOF' && ok "池化会话 TCP 随机字节 echo" || bad "池化会话 TCP 随机字节 echo"
+import os, socket, sys
+p = os.urandom(100 * 1024) + b"-POOL-"
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+s.sendall(p); s.settimeout(10)
+g = b""
+while len(g) < len(p):
+    d = s.recv(65536)
+    if not d: break
+    g += d
+sys.exit(0 if g == p else 1)
+EOF
+
+# 会话替换后的载体收敛:池化运行期按**客户端源端口**记录载体连接集合,
+# 杀池化客户端并重启单载体客户端后,按同一组源端口在服务端侧计数
+# (round-10.1 §2.5:不再用全局 ESTAB —— 其中含无关连接)。全局计数
+# delta 仅作辅助信息。源端口集合不可得时退化为 after <= base + 1。
+sleep 1
+CTL_POOL=$(ctl_estab "$CTL_PORT" "$SRV_PID")
+POOL_SPORTS=$(client_ctl_sports "$CTL_PORT" "$CLIENT_PID")
+kill "$CLIENT_PID" 2>/dev/null
+sleep 3   # 服务端会话拆除 + driver 中止 → 载体 socket 关闭
+"$CLIENT" --config "$WORK/client.toml" >>"$WORK/client.log" 2>&1 &
+CLIENT_PID=$!; PIDS+=($CLIENT_PID)
+wait_client_online "$CID"; check $? "单载体客户端重启上线(会话替换)"
+sleep 2
+CTL_AFTER=$(ctl_estab "$CTL_PORT" "$SRV_PID")
+PORTS_AFTER="NA"
+if [ -n "$POOL_SPORTS" ]; then
+  # shellcheck disable=SC2086  # 源端口按空格分隔展开为独立参数
+  PORTS_AFTER=$(ctl_estab_peer_ports "$CTL_PORT" "$SRV_PID" $POOL_SPORTS)
+fi
+# T-E2(round-10):tcp 默认(无 mux_pool_size)= 协议基线 1 → 只应有一条
+# 物理载体;定容日志同样要给出 initial_k=final_k=1。日志带 ANSI 颜色,
+# 先剥转义再匹配。上线判定早于客户端写定容日志(服务端先记账),轮询等它。
+SIZING_DEFAULT=""
+for _ in $(seq 1 20); do
+  SIZING_DEFAULT=$(sed -E 's/\x1b\[[0-9;]*m//g' "$WORK/client.log" 2>/dev/null \
+    | grep "pool sizing" | grep "protocol=tcp" | tail -1)
+  [ -n "$SIZING_DEFAULT" ] && break
+  sleep 0.5
+done
+if printf '%s' "$SIZING_DEFAULT" | grep -qE "initial_k=1 .*final_k=1|final_k=1 .*initial_k=1"; then
+  ok "T-E2: tcp 默认定容 initial_k=final_k=1"
+else
+  bad "T-E2: tcp 默认定容日志缺失或 K≠1(实际: $SIZING_DEFAULT)"
+fi
+# 按客户端 PID 计数:控制端口上还有 env-only 客户端,服务端侧聚合计数
+# 无法归因到本进程。ss/lsof 按 pid 过滤;netstat 无法按 pid,直接 NA。
+CLI_CONNS=$(python3 - "$CTL_PORT" "$CLIENT_PID" <<'PYEOF'
+import shutil, subprocess, sys
+port, pid = sys.argv[1], sys.argv[2]
+
+def run(cmd, ok=(0,)):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return r.stdout if r.returncode in ok else None
+
+def count_ss():
+    out = run(["ss", "-tnp"])
+    if out is None or "users:(" not in out:
+        return None
+    n = 0
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) < 5 or not f[0].startswith("ESTAB"):
+            continue
+        if f[4].endswith(":" + port) or f[3].endswith(":" + port):
+            if ("pid=%s," % pid) in line or ("pid=%s)" % pid) in line:
+                n += 1
+    return n
+
+def count_lsof():
+    out = run(["lsof", "-nP", "-a", "-p", pid, "-iTCP:" + port], ok=(0, 1))
+    if out is None:
+        return None
+    # 同一 socket 的 fd 副本会出现多行:按四元组去重
+    seen = set()
+    for line in out.splitlines():
+        if "ESTABLISHED" not in line:
+            continue
+        for tok in line.split():
+            if "->" in tok:
+                seen.add(tok)
+                break
+    return len(seen)
+
+for fn, tool in ((count_ss, "ss"), (count_lsof, "lsof")):
+    if not shutil.which(tool):
+        continue
+    n = fn()
+    if n is not None:
+        print(n)
+        sys.exit(0)
+print("NA")
+PYEOF
+)
+if [ "$CLI_CONNS" = "NA" ]; then
+  echo "SKIP: T-E2 物理载体数断言(ss/lsof 均不可用)"
+elif [ "$CLI_CONNS" = "1" ]; then
+  ok "T-E2: tcp 默认 K=1,客户端控制口物理连接数 = 1"
+else
+  bad "T-E2: tcp 默认 K=1,实际物理连接数 = $CLI_CONNS"
+fi
+if [ "$CTL_BASE" = "NA" ] || [ "$CTL_POOL" = "NA" ] || [ "$CTL_AFTER" = "NA" ]; then
+  echo "SKIP: 会话替换后旧载体连接收敛计数(ss/netstat 均不可用)"
+  # 退化断言:数据面确认新会话可用(旧载体是否泄漏由 F1 单测覆盖)
+  python3 - "$P_TCP" <<'EOF' && ok "会话替换后数据面恢复(连接计数 SKIP 退化断言)" || bad "会话替换后数据面恢复(连接计数 SKIP 退化断言)"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+s.sendall(b"after-pool\n"); s.shutdown(socket.SHUT_WR); s.settimeout(10)
+g = b""
+while True:
+    d = s.recv(256)
+    if not d: break
+    g += d
+sys.exit(0 if g == b"after-pool\n" else 1)
+EOF
+else
+  delta=$((CTL_POOL - CTL_AFTER))
+  if [ "$POOL_EXPECT_K" -le 1 ]; then
+    echo "SKIP: 会话替换后旧载体收敛计数(独立硬件上限 $POOL_HW_CAP 使池化阶段不建池)"
+  elif [ "$PORTS_AFTER" != "NA" ]; then
+    # 精确定位:池化期该客户端用过的全部源端口,拆除后在服务端侧必须归零
+    # (留 1 条容忍握手/关闭窗口)。delta 只作辅助信息。
+    if [ "$PORTS_AFTER" -le 1 ]; then
+      ok "会话替换后旧池化载体收敛(源端口归属残留=$PORTS_AFTER,期望<=1;base=$CTL_BASE pool=$CTL_POOL after=$CTL_AFTER delta=$delta)"
+    else
+      bad "会话替换后旧池化载体收敛(源端口归属残留=$PORTS_AFTER,期望<=1;base=$CTL_BASE pool=$CTL_POOL after=$CTL_AFTER delta=$delta)"
+    fi
+  elif [ "$CTL_AFTER" -le $((CTL_BASE + 1)) ]; then
+    # 源端口集合不可得(工具限制):退化为 after <= base + 1(拆除后只
+    # 应剩新单载体会话;+1 容忍 TIME_WAIT/关闭窗口)。delta 仅参考。
+    ok "会话替换后旧池化载体收敛(after=$CTL_AFTER <= base+1=$((CTL_BASE + 1));base=$CTL_BASE pool=$CTL_POOL delta=$delta)"
+  else
+    bad "会话替换后旧池化载体收敛(after=$CTL_AFTER 超过 base+1=$((CTL_BASE + 1));base=$CTL_BASE pool=$CTL_POOL delta=$delta)"
+  fi
+  # 数据面恢复(单载体路径,零漂移验证)
+  python3 - "$P_TCP" <<'EOF' && ok "会话替换后数据面恢复" || bad "会话替换后数据面恢复"
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+s.sendall(b"after-pool\n"); s.shutdown(socket.SHUT_WR); s.settimeout(10)
+g = b""
+while True:
+    d = s.recv(256)
+    if not d: break
+    g += d
+sys.exit(0 if g == b"after-pool\n" else 1)
+EOF
+fi
 
 echo
 echo "== 结果: PASS=$PASS FAIL=$FAIL =="

@@ -4,6 +4,16 @@ bind_protocol = "tcp"
 bind_port = 7100
 multiplex = true
 
+# 多载体池允许的最大载体数(含首载体,round-10;钳制 1..=8,默认 8)。
+# 客户端报到时经 CARRIER_ATTACH_ACK 读取该值,并按
+# min(期望, 硬件上限, 该值) 定容;0 视为 1(不允许附加载体)。
+# round-10.1 起该上限**强制**:池内现有载体 + 首载体 + 本次附加 > 该值时,
+# 服务端回 CarrierAttachAck{ok:false, error_code:"POOL_FULL"} 且不聚合;
+# 重拨补位路径(首流即数据通道)同样检查。检查与聚合之间非原子,并发
+# 报到下可能短暂超出 1 条。
+# 运行中不补拨:客户端只在报到阶段收敛一次。
+# max_carriers = 8
+
 [web]
 bind_addr = "127.0.0.1"
 port = 8080

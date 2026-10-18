@@ -10,8 +10,15 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
+
+/// 服务端数据流聚合源(round-9 多载体池):首条物理连接由
+/// [`crate::control::run_session_loop`] 的数据接受循环直读;同会话的
+/// 附加载体(HELLO 携带 session_id 报到的后续连接)聚合进池。None =
+/// 单载体(旧行为);Some = 已有附加载体(自附加连接合流接收)。
+/// 随 Session 移除/替换整体释放,池内附加载体连接随之关闭(不泄漏)。
+pub type SessionMuxPool = Mutex<Option<Arc<rh_transport::Multiplexer>>>;
 
 pub struct PendingRequest {
     pub expires: Instant,
@@ -53,6 +60,15 @@ pub struct Session {
     pub started_at: Instant,
     /// 本会话数据连接计数(限额)。
     pub data_conn_count: AtomicU64,
+    /// 多载体聚合池(round-9):见 [`SessionMuxPool`]。建会话时 None;
+    /// 首个附加载体报到时升级为 Some(池);Session 被替换(epoch 变化)
+    /// 或移除时随之 drop,附加载体连接关闭,不得泄漏到新会话。
+    pub mux_pool: SessionMuxPool,
+    /// mux_pool None→Some 升级通知(round-9):数据接受循环可能仍 park
+    /// 在单源分支(首载体 accept)——池自身的 changed 只唤醒其订阅者,
+    /// 唤不醒尚未观察到池的任务,须由升级方在此补一发通知。仅在升级
+    /// 时触发;单载体会话永不通知。
+    pub mux_pool_changed: Notify,
 }
 
 impl Session {
@@ -75,6 +91,8 @@ impl Session {
             pending_requests: Mutex::new(BTreeMap::new()),
             started_at: Instant::now(),
             data_conn_count: AtomicU64::new(0),
+            mux_pool: Mutex::new(None),
+            mux_pool_changed: Notify::new(),
         })
     }
 

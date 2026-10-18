@@ -42,6 +42,13 @@ use std::{
 const MAX_FRAME_BODY_LEN: usize = crate::MIB;
 
 /// staging 一次读入的最小预留(批量接收窗口;一次 read 可解出多帧)。
+///
+/// round-8 三机消融实测(2026-10-17,benchmark/runs/tcp-multiflow-frp-20261015/
+/// ab/REPORT-round8.md):提升至 256KiB 在 ×16 上行(臂间噪声 ±0.1% 的
+/// 稳定方向)造成 -4.0% 确凿回退——单轮 poll 的读窗口拉长 4 倍,每流
+/// WU 窗口更新回程被推迟,流控信用回路时延增大(Round-7 批时序回退同类
+/// 机制)。READ_RESERVE 保持 64KiB;接收侧 syscall 削减的探索须另寻
+/// 不阻塞 WU 回程节奏的形态。
 const READ_RESERVE: usize = 64 * 1024;
 
 /// 小帧 copy-out 阈值(≤ READ_RESERVE)。goal-repair C1:帧体不完整时

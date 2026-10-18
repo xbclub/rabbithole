@@ -339,6 +339,57 @@ pub async fn dial_stream(cfg: &ClientTransportConfig) -> io::Result<crate::Boxed
     Ok(io)
 }
 
+/// 客户端:建立 K 条独立物理连接组成多载体池(round-8 优化项 5)。
+/// `carriers <= 1` 或非 mux 配置 → 等价 [`connect_stream`](单载体,
+/// 行为零漂移)。K 条连接并行拨号,任一失败即整体失败(已建连接随 drop
+/// 关闭,不残留 driver);池持有按同一 cfg 的重拨配方,载体故障时自动
+/// 补位。每条连接各自独立的本地源端口 → 不同四元组 → 网卡 RSS 散列到
+/// 不同 CPU 核;TLS 下 K 组并行加解密流水线。
+pub async fn connect_stream_pool(
+    cfg: &ClientTransportConfig,
+    carriers: usize,
+) -> io::Result<Arc<Multiplexer>> {
+    if carriers <= 1 || !(cfg.multiplex || cfg.protocol.always_muxed()) {
+        return connect_stream(cfg).await;
+    }
+    // round-10:每载体 shard 数按 K 缩减(总预算 ≈ 4),避免 K 条连接各自
+    // 4 个收发 Worker 使数据面线程总量随 K 线性膨胀。
+    let shards = crate::mux::shard_workers_for_k(carriers);
+    let members =
+        futures::future::try_join_all((0..carriers).map(|_| dial_client_mux(cfg, shards))).await?;
+    let redial_cfg = cfg.clone();
+    let redial: crate::mux::PoolRedial = Arc::new(move || {
+        let cfg = redial_cfg.clone();
+        Box::pin(async move { dial_client_mux(&cfg, shards).await })
+    });
+    Ok(Multiplexer::yamux_pool_client(members, Some(redial)))
+}
+
+/// 拨一条物理连接并包装为客户端 yamux(双载体优先,与 [`connect_stream`]
+/// 同构:裸 TCP 持写侧 fd 副本 → duplex 零锁;否则锁路径)。shards 为
+/// 该载体的收发分片 Worker 数(round-10 由池规模推导)。
+async fn dial_client_mux(
+    cfg: &ClientTransportConfig,
+    shards: usize,
+) -> io::Result<crate::mux::YamuxMultiplexer> {
+    let (io, write_dup) = dial_io(cfg).await?;
+    Ok(match write_dup {
+        Some(dup) => crate::mux::YamuxMultiplexer::new_duplex(
+            io,
+            dup,
+            yamux::Mode::Client,
+            MUX_STREAMS_UNLIMITED,
+            shards,
+        ),
+        None => crate::mux::YamuxMultiplexer::new(
+            io,
+            yamux::Mode::Client,
+            MUX_STREAMS_UNLIMITED,
+            shards,
+        ),
+    })
+}
+
 /// 客户端拨号:返回 (主 IO, 写侧 fd 副本)。副本仅 Protocol::Tcp 裸分支
 /// 产生(round-E2,`try_dup_tcp`;失败 → None → 调用方锁路径),
 /// TLS/WS 会话层载体不可 fd 复制,恒 None。

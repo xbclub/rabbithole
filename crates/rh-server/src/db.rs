@@ -175,6 +175,13 @@ impl Db {
         Ok(rows.iter().map(ClientRow::from_row).collect())
     }
 
+    /// 测试缝:关闭连接池,使后续查询返回错误(round-10.2 §2.4 覆盖
+    /// `attach_additional_carrier` 的 DB 错误 → INTERNAL 回包路径)。
+    #[cfg(test)]
+    pub async fn close_for_test(&self) {
+        self.pool.close().await;
+    }
+
     pub async fn update_client_meta(
         &self,
         id: &str,

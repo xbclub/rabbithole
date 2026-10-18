@@ -444,7 +444,15 @@ impl ShardWorker {
     fn make_new_inbound_stream(&self, id: StreamId, credit: u32) -> Stream {
         let (sender, receiver) = mpsc::channel(STREAM_COMMAND_CAP);
         self.shared.push_new_receiver(id, receiver);
-        Stream::new_inbound(id, self.id, self.config.clone(), credit, sender)
+        // round-9:halves 路径传入 ConnShared,纯 WU 帧走 to_send 快车道
+        Stream::new_inbound(
+            id,
+            self.id,
+            self.config.clone(),
+            credit,
+            sender,
+            Some(self.shared.clone()),
+        )
     }
 
     /// 建流计数回滚(§2.3 ②③④失败路径:未建成流不得占用全局上界)。

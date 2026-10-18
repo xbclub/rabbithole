@@ -122,6 +122,56 @@ docker run -d --name rh-client --restart unless-stopped \
 裸机同理:`RH_SERVER=host:7100 RH_CLIENT_ID=... RH_SECRET=... rh-client` 直接接入
 (优先级:CLI `--server/--id/--secret` > 环境变量 > 配置文件)。
 
+### 多载体池自动定容(round-10)
+
+启用 `multiplex = true` 的 tcp/tls/ws/wss 客户端会按三段式决定拨几条物理载体
+(K),控制流占第 0 条,其余用于数据面轮转分派:
+
+1. **协议基线**:tls/wss = 2(单连接串行加解密易成瓶颈);tcp/ws = 1;
+   QUIC/KCP 自带多路复用,恒 1。
+2. **硬件上限**:`min(CPU 核数/2, 网卡 RX 队列数)`,钳制 [1,8];非 Linux
+   或读不到队列数时仅由 CPU 决定("读不到"不等于"单队列")。
+3. **服务端上限**:报到应答回写 `max_carriers`(默认 8,钳制 [1,8]);
+   客户端取 `min(基线/期望, 硬件, 服务端)`。
+
+显式配置优先级:配置文件 `mux_pool_size = N` > 环境变量 `RH_MUX_POOL_SIZE`
+> 自动。`mux_pool_size = 1` 表示强制单载体(严格等价旧路径);K=1 时每条
+载体的 yamux 分片 Worker 仍为 4,不会被缩减。K>1 时每载体分片 Worker 按
+`max(1, 4/K)` 缩减,避免线程总量随 K 线性膨胀。
+
+报表中的 shard 数是**拨号时固化**的:收敛保留控制载体 + (`final_k` - 1) 个
+成功载体、摘除失败身份与其余成员,不重建,因此 `initial_k == 1` 时 shard = 4;
+从 `initial_k > 1` 收敛到 1 时沿用初始值 `max(1, 4/initial_k)`(例如
+initial_k=2 → 2、initial_k≥4 → 1)。
+不回收重建的理由:载体在拨号时已 spawn 分片 Worker,收敛后重建会拆掉
+控制流所在的载体 0,代价远超收益;"K=1 零回退"只针对 `initial_k == 1`
+路径(不建池、shard=4),该路径已满足。
+
+报到结束后 K 即固定:运行中不因服务端上限变大而补拨。收敛按**成员身份**
+(池内单调递增 id,不随成员表压缩漂移)摘除:保留控制载体 + 成员表中
+`final_k - 1` 条报到成功的载体,失败身份与其余成员逆序摘除(先清重拨
+配方再关闭物理连接)。报到被拒/超时/坏报文/写失败的载体同样按身份摘除,
+不再参与后续轮转。保留额按"当前表内成功数"计——不能按表尾位置取,
+否则前缀内失败(如 initial_k=3、final_k=2、第 1 条失败第 2 条成功)会把
+成功的第 2 条一并摘掉。收敛前 `reap` 可能已 spawn 重拨,而拨号受
+`connect_timeout`(默认 10s)约束;`set_active_prefix` 同时登记补位目标数,
+`redial_loop` 在入表前丢弃使成员数超过目标的多余补位并关闭其物理连接,
+因此迟到的重拨不会让物理载体数永久多出 1 条。之后的正常故障重拨不受
+影响(成员数低于目标时照常补位)。收敛后另有最多 3 轮"重读成员表 + 按
+同一保留规则再摘"的终态校验。
+报到窗口内死亡的载体由池健康监视剔除。
+启动日志单行给出定容依据:`pool sizing protocol=… protocol_baseline=…
+hardware_cap=… server_cap=… initial_k=… final_k=… shard_workers=…`;
+收敛日志追加 `failed=… detached=…`(实际成功摘除数)。
+
+服务端侧在 `deploy/rh-server.toml`/`server.example.toml` 用顶层
+`max_carriers = N` 控制上限(0 视为 1)。**该上限是强制的**:cap 含首
+载体,附加载体报到时若 `池内现有载体 + 首载体 + 本次 > cap`,服务端回
+`CarrierAttachAck{ok:false, error_code:"POOL_FULL"}` 并**不聚合**;
+重拨补位路径(首流为数据通道)同样检查,超限的连接不入池但仍可服务
+其首条数据流。检查与聚合之间存在并发窗口:多个附加连接同时报到时可能
+各自通过检查而短暂超出 1 条(拒绝路径无害,严格串行化会引入额外耦合)。
+
 转发端口段(默认 20000-21000)按需追加 `-p` 映射;生产请置于反向代理 + HTTPS 之后。
 也可自行构建:`deploy/Dockerfile`(server)与 `deploy/Dockerfile.client`(client)
 (打包 musl 静态二进制,无 RUN 步骤,本地构建方式见文件头注释)。

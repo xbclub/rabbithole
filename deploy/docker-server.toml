@@ -6,6 +6,9 @@ bind_addr = "0.0.0.0"
 bind_protocol = "tls"          # 容器内自动生成自签证书;公网生产建议替换为正式证书
 bind_port = 7100
 multiplex = true
+# 多载体池允许的最大载体数(含首载体,round-10;钳制 1..=8,默认 8)。
+# 客户端报到时经 CARRIER_ATTACH_ACK 读取并按 min(期望, 硬件, 该值) 定容。
+# max_carriers = 8
 
 [web]
 bind_addr = "0.0.0.0"          # 容器内必须 0.0.0.0 才能端口映射;生产请置反代 + HTTPS

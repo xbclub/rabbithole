@@ -11,7 +11,10 @@
 pub mod compress;
 pub mod kcp;
 pub mod mux;
-pub use mux::{wrap_stream_as_client, wrap_stream_as_server, MUX_STREAMS_UNLIMITED};
+pub use mux::{
+    wrap_stream_as_client, wrap_stream_as_server, PoolRedial, YamuxMultiplexer,
+    YamuxMultiplexerPool, MUX_STREAMS_UNLIMITED, YAMUX_POOL_DEFAULT_CARRIERS,
+};
 pub mod proxy_dial;
 pub mod quic;
 #[cfg(target_os = "linux")]
@@ -302,6 +305,19 @@ impl fmt::Display for Protocol {
     }
 }
 
+/// 多载体池协议基线(round-10):tls/wss 受单核串行加解密限制,默认多载体;
+/// tcp/ws 单载体已接近路径上限(实测 t/d 0.973~1.077),保持 1;
+/// QUIC/KCP 自带多路复用,恒 1。
+///
+/// 该值只是**期望值**,最终 K 还要经硬件探测与服务端 `max_carriers` 收敛
+/// (见 rh-client 的 pool sizing);此处不读环境/配置。
+pub fn default_carriers(protocol: Protocol) -> usize {
+    match protocol {
+        Protocol::Tls | Protocol::Wss => 2,
+        _ => 1,
+    }
+}
+
 /// TLS 客户端选项。
 #[derive(Debug, Clone, Default)]
 pub struct TlsClientOptions {
@@ -337,6 +353,14 @@ pub struct ClientTransportConfig {
     pub alpn: Vec<String>,
     /// 拨号总超时。
     pub connect_timeout: std::time::Duration,
+    /// 多载体池规模(round-9):TCP/TLS/WS/WSS 多路复用路径的物理连接数
+    /// (经 [`connect_pool`])。1 = 单载体(默认,严格等价旧路径);QUIC/KCP
+    /// 自带多路复用,忽略本参数。
+    ///
+    /// 0 只表示"未显式指定"的**期望值**(round-10.1:仅诊断/传递用,无
+    /// 生产读取点)——实际定容在会话层(`rh-client` 的三段式公式)计算,
+    /// 再以显式参数传入 [`connect_pool`]。本字段不参与自动定容。
+    pub carriers: usize,
 }
 
 impl Default for ClientTransportConfig {
@@ -349,6 +373,7 @@ impl Default for ClientTransportConfig {
             proxy_url: None,
             alpn: vec!["rhtp".to_string()],
             connect_timeout: std::time::Duration::from_secs(10),
+            carriers: 1,
         }
     }
 }
@@ -411,10 +436,147 @@ pub(crate) enum MultiplexerInner {
         stream: tokio::sync::Mutex<Option<BoxedIo>>,
     },
     Yamux(mux::YamuxMultiplexer),
+    /// 多物理载体连接池(round-8 优化项 5):K 条独立 TCP/TLS 连接各跑
+    /// 一套 yamux,开流按全局原子计数轮转分派,载体故障自动剔除+重拨。
+    YamuxPool(mux::YamuxMultiplexerPool),
     Quic(quic::QuicConnection),
 }
 
 impl Multiplexer {
+    /// 多载体客户端池(round-8 优化项 5):members 为 K 条已建立连接的
+    /// 客户端 yamux(≥1),redial 为载体故障时的重拨配方。
+    pub fn yamux_pool_client(
+        members: Vec<mux::YamuxMultiplexer>,
+        redial: Option<mux::PoolRedial>,
+    ) -> Arc<Multiplexer> {
+        Arc::new(Multiplexer {
+            inner: MultiplexerInner::YamuxPool(mux::YamuxMultiplexerPool::new_client(
+                members, redial,
+            )),
+        })
+    }
+
+    /// 多载体服务端池(round-8 优化项 5):members 为同一客户端会话的 K
+    /// 条已 accept 连接的服务端 yamux;accept 自全部成员合流。
+    pub fn yamux_pool_server(members: Vec<mux::YamuxMultiplexer>) -> Arc<Multiplexer> {
+        Arc::new(Multiplexer {
+            inner: MultiplexerInner::YamuxPool(mux::YamuxMultiplexerPool::new_server(members)),
+        })
+    }
+
+    /// 取出单载体 yamux(供上层把多条独立 accept 的连接聚合进服务端池)。
+    /// 非 yamux 单载体(裸模式/QUIC/已是池)返回 None,连接随 self 析构关闭
+    /// ——聚合调用方只应对 yamux 连接调用。
+    pub fn into_yamux(self) -> Option<mux::YamuxMultiplexer> {
+        match self.inner {
+            MultiplexerInner::Yamux(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// 运行中把一条已 accept 的服务端 yamux 载体附加进本多路复用器
+    /// (round-9 服务端会话聚合)。仅 [`MultiplexerInner::YamuxPool`] 变体
+    /// 支持(返回 true);其余变体返回 false,载体由调用方处置。
+    pub async fn attach_yamux_carrier(&self, mux: mux::YamuxMultiplexer) -> bool {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => {
+                p.attach_carrier(mux).await;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 显式关停多载体池(round-9.1):中止全部载体 driver 与 accept 转发
+    /// 任务,物理连接随之关闭。仅 [`MultiplexerInner::YamuxPool`] 有动作,
+    /// 其余变体 no-op(单载体路径关停由 Session 拆除/连接释放负责,语义
+    /// 零漂移)。幂等且可在同步上下文调用(池 Drop 兜底亦走同一路径)。
+    ///
+    /// 命名区别于 stream 的 `shutdown`:本方法关的是池/连接,不是某条流。
+    pub fn shutdown_pool(&self) {
+        if let MultiplexerInner::YamuxPool(p) = &self.inner {
+            p.shutdown();
+        }
+    }
+
+    /// 现有载体数(诊断/日志;非池变体返回 None)。只读,不改变池语义。
+    pub async fn pool_live_carriers(&self) -> Option<usize> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => Some(p.live_carriers().await),
+            _ => None,
+        }
+    }
+
+    /// 收缩多载体池的轮转分派前缀(round-10 自动定容)。仅
+    /// [`MultiplexerInner::YamuxPool`] 有动作,其余变体 no-op——单载体
+    /// 路径本就只有一个载体,收缩无意义且不得报错(调用方无条件收敛)。
+    pub async fn set_active_prefix(&self, n: usize) {
+        if let MultiplexerInner::YamuxPool(p) = &self.inner {
+            p.set_active_prefix(n).await;
+        }
+    }
+
+    /// 移除多载体池中的一个成员(round-10 报到收敛)。仅
+    /// [`MultiplexerInner::YamuxPool`] 有动作,其余变体 no-op(单载体
+    /// 路径没有可摘除的成员)。index 语义见
+    /// [`mux::YamuxMultiplexerPool::detach_carrier`]:先清重拨配方再
+    /// 关停物理连接,幂等。
+    pub async fn detach_carrier(&self, index: usize) {
+        if let MultiplexerInner::YamuxPool(p) = &self.inner {
+            p.detach_carrier(index).await;
+        }
+    }
+
+    /// 客户端:打开一个新流并返回落点载体身份(round-10.1)。池变体转发
+    /// 到 [`mux::YamuxMultiplexerPool::open_stream_tagged`];其余变体语义与
+    /// [`Self::open_stream`] 完全一致,id 恒 0(0 = 非池,不可按 id 摘除)。
+    pub async fn open_stream_tagged(&self) -> std::io::Result<(BoxedIo, u64)> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => p.open_stream_tagged().await,
+            _ => self.open_stream().await.map(|s| (s, 0)),
+        }
+    }
+
+    /// 按身份摘除池成员(round-10.1)。仅 [`MultiplexerInner::YamuxPool`]
+    /// 有动作;其余变体返回 false(无池可摘)。语义见
+    /// [`mux::YamuxMultiplexerPool::detach_carrier_by_id`]:先清重拨配方
+    /// 再关停物理连接,幂等。
+    pub async fn detach_carrier_by_id(&self, id: u64) -> bool {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => p.detach_carrier_by_id(id).await,
+            _ => false,
+        }
+    }
+
+    /// 池成员身份快照(round-10.1,成员表顺序)。非池变体返回空表——
+    /// 调用方(报到收敛)只在池路径使用;单载体路径无成员可摘。
+    pub async fn member_ids(&self) -> Vec<u64> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => p.member_ids().await,
+            _ => Vec::new(),
+        }
+    }
+
+    /// 池内**存活**成员身份快照(round-10.2,成员表顺序)。终态收敛按此
+    /// 计数保留额,避免把额度算给 dead-but-unreaped 成员后误摘健康成员。
+    /// 非池变体返回空表(同 [`Self::member_ids`])。
+    pub async fn live_member_ids(&self) -> Vec<u64> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => p.live_member_ids().await,
+            _ => Vec::new(),
+        }
+    }
+
+    /// 池成员表长度(含 dead-but-unreaped 成员,round-10.2)。服务端 cap
+    /// 检查用它而非存活数:dead 未 reap 的成员仍占物理连接与池内名额。
+    /// 非池变体返回 None。
+    pub async fn pool_member_count(&self) -> Option<usize> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => Some(p.pool_member_count().await),
+            _ => None,
+        }
+    }
+
     /// 客户端:打开一个新流(多路复用或新连接)。
     pub async fn open_stream(&self) -> std::io::Result<BoxedIo> {
         match &self.inner {
@@ -423,6 +585,7 @@ impl Multiplexer {
                 Err(other_err("open_stream on server-side single multiplexer"))
             }
             MultiplexerInner::Yamux(m) => m.open_stream().await,
+            MultiplexerInner::YamuxPool(p) => p.open_stream().await,
             MultiplexerInner::Quic(q) => q.open_stream().await,
         }
     }
@@ -443,6 +606,7 @@ impl Multiplexer {
                 })
             }
             MultiplexerInner::Yamux(m) => m.accept_stream().await,
+            MultiplexerInner::YamuxPool(p) => p.accept_stream().await,
             MultiplexerInner::Quic(q) => q.accept_stream().await,
         }
     }
@@ -451,6 +615,7 @@ impl Multiplexer {
     pub async fn is_dead(&self) -> bool {
         match &self.inner {
             MultiplexerInner::Yamux(m) => m.is_dead(),
+            MultiplexerInner::YamuxPool(p) => p.is_dead(),
             MultiplexerInner::Quic(q) => q.is_dead(),
             _ => false,
         }
@@ -550,6 +715,44 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
         }
         Protocol::Quic => quic::connect(cfg).await,
         Protocol::Kcp => kcp::connect(cfg).await,
+    }
+}
+
+/// 客户端:建立 K 条物理连接组成多载体池(round-8 优化项 5)。TCP/TLS/
+/// WS/WSS 多路复用路径走池(`carriers <= 1` 时等价 [`connect`]);QUIC/KCP
+/// 自带多路复用,忽略 carriers 走单连接。推荐 K = [`YAMUX_POOL_DEFAULT_CARRIERS`]。
+pub async fn connect_pool(
+    cfg: &ClientTransportConfig,
+    carriers: usize,
+) -> std::io::Result<Arc<Multiplexer>> {
+    match cfg.protocol {
+        Protocol::Tcp | Protocol::Tls | Protocol::Ws | Protocol::Wss => {
+            tcp::connect_stream_pool(cfg, carriers).await
+        }
+        Protocol::Quic => quic::connect(cfg).await,
+        Protocol::Kcp => kcp::connect(cfg).await,
+    }
+}
+
+#[cfg(test)]
+mod carrier_baseline_tests {
+    use super::*;
+
+    // T-C1(round-10):协议基线六变体全覆盖。tcp/ws = 1(单载体已接近
+    // 路径上限),tls/wss = 2(单核串行加解密),quic/kcp = 1(自带复用)。
+    #[test]
+    fn default_carriers_covers_all_protocols() {
+        assert_eq!(default_carriers(Protocol::Tcp), 1);
+        assert_eq!(default_carriers(Protocol::Tls), 2);
+        assert_eq!(default_carriers(Protocol::Ws), 1);
+        assert_eq!(default_carriers(Protocol::Wss), 2);
+        assert_eq!(default_carriers(Protocol::Quic), 1);
+        assert_eq!(default_carriers(Protocol::Kcp), 1);
+        // 红线 1 的形式化:非 tcp-based 恒 1。
+        for p in [Protocol::Quic, Protocol::Kcp] {
+            assert!(!p.is_tcp_based());
+            assert_eq!(default_carriers(p), 1);
+        }
     }
 }
 

@@ -5,6 +5,10 @@ bind_addr = "0.0.0.0"
 bind_protocol = "tls"          # 公网建议 tls;本机调试可用 tcp
 bind_port = 7100
 multiplex = true
+# 多载体池允许的最大载体数(含首载体,round-10;钳制 1..=8,默认 8)。
+# 客户端报到时经 CARRIER_ATTACH_ACK 读取并按 min(期望, 硬件, 该值) 定容;
+# 0 视为 1。运行中不补拨:客户端只在报到阶段收敛一次。
+# max_carriers = 8
 # 数据面中继模式:splice(Linux 零拷贝,默认)| copy(用户态拷贝)。
 # splice 仅在两端均为裸 TCP(裸模式明文载体、无压缩包装)时启用,
 # 其余场景自动回落 copy;对吞吐无损,显著降低大流量 CPU(实测约减半)。

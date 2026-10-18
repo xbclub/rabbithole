@@ -964,7 +964,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
             waker.wake();
         }
 
-        Stream::new_inbound(id, self.id, config, credit, sender)
+        // 未拆分路径无 ConnShared:conn_shared = None,WU 恒走流级 mpsc。
+        Stream::new_inbound(id, self.id, config, credit, sender, None)
     }
 
     fn make_new_outbound_stream(&mut self, id: StreamId) -> Stream {
@@ -976,7 +977,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
             waker.wake();
         }
 
-        Stream::new_outbound(id, self.id, config, sender)
+        // 同上:未拆分路径无 ConnShared。
+        Stream::new_outbound(id, self.id, config, sender, None)
     }
 
     fn next_stream_id(&mut self) -> Result<StreamId> {
@@ -1402,9 +1404,11 @@ mod halves {
             self.error.lock().take()
         }
 
-        /// 接收侧压来的待发帧(Pong/GoAway/Worker 的 RST/FIN):压入即
-        /// 唤醒发送半。
-        fn push_to_send(&self, f: Frame<()>) {
+        /// 接收侧压来的待发帧(Pong/GoAway/Worker 的 RST/FIN;round-9 起
+        /// 另含流读半快车道压入的纯 WU 帧):压入即唤醒发送半。
+        /// pub(crate)(round-9):WU 快车道由 stream.rs(connection 的后代
+        /// 模块)调用,仅可见性提升,行为不变。
+        pub(crate) fn push_to_send(&self, f: Frame<()>) {
             self.to_send.lock().push_back(f);
             if let Some(w) = self.send_waker.lock().take() {
                 w.wake()
@@ -1436,6 +1440,31 @@ mod halves {
         #[cfg(test)]
         pub(crate) fn push_to_send_for_test(&self, f: Frame<()>) {
             self.push_to_send(f)
+        }
+
+        /// round-9 WU 快车道测试缝(不得用于生产):独立构造一份连接级
+        /// 共享状态——快车道只触达 to_send/send_waker,无 Worker 参与,
+        /// 单 worker_count 即可支撑断言。
+        #[cfg(test)]
+        pub(crate) fn new_for_test(
+            id: Id,
+            mode: Mode,
+            config: Config,
+            worker_count: usize,
+        ) -> Self {
+            Self::new(id, mode, config, worker_count)
+        }
+
+        /// round-9 WU 快车道测试缝:观察 to_send 深度(帧是否入队)。
+        #[cfg(test)]
+        pub(crate) fn to_send_len_for_test(&self) -> usize {
+            self.to_send.lock().len()
+        }
+
+        /// round-9 WU 快车道测试缝:弹出 to_send 队首帧(校验线格式)。
+        #[cfg(test)]
+        pub(crate) fn pop_to_send_for_test(&self) -> Option<Frame<()>> {
+            self.pop_to_send()
         }
 
         /// 登记发送半 park 点 waker。唤醒方(唤醒语义,勿丢):
@@ -1617,11 +1646,15 @@ mod halves {
                     new_streams_tx,
                 ));
             }
+            // round-8 优化项 2:RecvHalf 本地缓存各 Worker 帧通道生产者,
+            // 解包热路径免锁免克隆(shared.workers 仅供测试断言回看)
+            let route_producers: Vec<_> = routes.iter().map(|(p, _)| p.clone()).collect();
             *shared.workers.lock() = routes;
             (
                 RecvHalf {
                     socket: frame::Io::new(id, read_socket).fuse(),
                     shared: shared.clone(),
+                    route_producers,
                     rtt: rtt.clone(),
                     new_streams_rxs,
                     pending_route: None,
@@ -1661,6 +1694,13 @@ mod halves {
     pub struct RecvHalf<S> {
         socket: Fuse<frame::Io<S>>,
         shared: Arc<ConnShared>,
+        /// 分片 Worker 路由句柄本地缓存(round-8 优化项 2):每 Worker 的
+        /// 帧通道生产者克隆,构造时一次性填充。解包热路径(`route_index` /
+        /// `try_route` / `workers_gone`)原本每帧对 `shared.workers` 互斥锁
+        /// 加锁 2 次 + 1 次 `Arc::clone`;Worker 集合在 halves 构造后
+        /// 永不变更(生产者句柄克隆共享同一队列),缓存后热路径零锁零
+        /// 分配。`shared.workers` 字段保留供 halves 构造与测试断言。
+        route_producers: Vec<shard::ShardProducer<shard::ShardMsg>>,
         rtt: rtt::Rtt,
         /// 各 Worker 的建流通道接收器(D6/§2.4:实施者定由 RecvHalf 直接
         /// 持有;空闲时各接收器登记本任务 waker,futures mpsc 自带唤醒)。
@@ -1861,12 +1901,9 @@ mod halves {
         }
 
         /// Workers 消亡探测(§2.6 防御):任一分片通道消费者已 drop。
+        /// round-8 优化项 2:经本地缓存句柄探测,免取 `shared.workers` 锁。
         fn workers_gone(&self) -> bool {
-            self.shared
-                .workers
-                .lock()
-                .iter()
-                .any(|(msg_producer, _)| msg_producer.consumer_gone())
+            self.route_producers.iter().any(|p| p.consumer_gone())
         }
 
         /// 纯切帧分派(§2.4):GoAway → fatal;Ping|ACK → rtt;Ping
@@ -1915,21 +1952,24 @@ mod halves {
             }
         }
 
+        /// round-8 优化项 2:直接按缓存句柄数取模,免 `shared.workers`
+        /// 互斥锁——每帧数据路由的原热路径。
         fn route_index(&self, sid: StreamId) -> usize {
-            let workers = self.shared.workers.lock();
-            (sid.val() as usize) % workers.len()
+            (sid.val() as usize) % self.route_producers.len()
         }
 
         /// 路由一帧到 worker[index](§2.4):try_push 失败 → 登记生产者
         /// waker + 复查(§2.1 防线)→ 仍满 → 返回消息由调用方 park 背压
         /// (TCP 停读)。
+        /// round-8 优化项 2:直接借用本地缓存句柄(免锁 + 免 `Arc::clone`,
+        /// 原实现每帧 2 次取锁 + 1 次克隆)。
         fn try_route(
             &self,
             index: usize,
             msg: shard::ShardMsg,
             cx: &mut Context<'_>,
         ) -> std::result::Result<(), (usize, shard::ShardMsg)> {
-            let producer = self.shared.workers.lock()[index].0.clone();
+            let producer = &self.route_producers[index];
             match producer.try_push(msg) {
                 Ok(()) => Ok(()),
                 Err(msg) => {
@@ -2269,7 +2309,14 @@ mod halves {
             // 不丢、SYN 在首帧自带 flag,顺序由通道 FIFO 保证)
             self.shared.push_new_receiver(id, receiver);
 
-            Stream::new_outbound(id, self.shared.id, self.shared.config.clone(), sender)
+            // round-9:halves 路径传入 ConnShared,纯 WU 帧走 to_send 快车道
+            Stream::new_outbound(
+                id,
+                self.shared.id,
+                self.shared.config.clone(),
+                sender,
+                Some(self.shared.clone()),
+            )
         }
 
         fn next_stream_id(&mut self) -> Result<StreamId> {

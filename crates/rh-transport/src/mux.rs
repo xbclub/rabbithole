@@ -13,7 +13,7 @@ use crate::{BoxedIo, MultiplexerInner};
 use bytes::{BufMut as _, Bytes};
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 use tokio::io::ReadBuf;
@@ -207,10 +207,6 @@ impl RhMuxStreamWrite {
 
 fn pool_get(cap: usize) -> bytes::BytesMut {
     yamux::pool::get(cap)
-}
-
-fn pool_put(b: bytes::BytesMut) {
-    yamux::pool::put(b)
 }
 
 /// 初始相本地缓冲容量(goal-repair C4):< vendor 池 MIN_RECYCLE(16KiB),
@@ -479,13 +475,22 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// down 侧小块聚合的段数上限(round-8 优化项 4):一次冲刷的 writev
+/// 至多聚合这么多小块。128 段栈上 IoSlice ≈ 2KB,远低于 Linux
+/// IOV_MAX=1024;小块极端碎片化(每块 <512B)时由本上限先于字节上限
+/// 触发冲刷,保证 writev 段数组有界。
+const SMALL_CHUNK_SEGS: usize = 128;
+
 /// down 侧搬运:mux 块 → a 写。满块(≥64KiB)直写(零拷贝单次 syscall);
-/// 小块聚合到 64KiB 再写——帧不满时恢复旧 copy 路径「多帧合并一次写」
-/// 的节奏(降低 syscall/唤醒频率),无后续就绪块即冲刷保延迟。
-/// 聚合缓冲取自/归还 vendor 池。
+/// 小块聚合(round-8 优化项 4:改向量写——小块以 `Bytes` 引用计数暂存
+/// `Vec<Bytes>` 收集数组,0 次内存拷贝;冲刷时构造 IoSlice 段数组经
+/// `write_vectored` 一次下发,彻底消除旧 `BytesMut::extend_from_slice`
+/// 聚合槽的用户态二次 memcpy),聚合上限 64KiB / 128 段先到先冲,
+/// 无后续就绪块即冲刷保延迟(节奏与旧 copy 路径一致:降低 syscall/
+/// 唤醒频率)。
 ///
-/// 限速=送达计费(A3/A5):字节入聚合槽不扣费;冲刷/直写前按写出量预留,
-/// 按实际写出逐步消费——取消/部分写时未消费预留自动退还,
+/// 限速=送达计费(A3/A5):字节入收集数组不扣费;冲刷/直写前按写出量
+/// 预留,按实际写出逐步消费——取消/部分写时未消费预留自动退还,
 /// 总扣费恒等于已送达字节(修前:聚合块先按 len 扣费,push_front 回退
 /// 余量后被再次扣费,×3 复现多扣 32768B)。
 ///
@@ -496,6 +501,8 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     b_read: &mut RhMuxStreamRead,
     limiter: &Option<std::sync::Arc<dyn crate::ChunkLimiter>>,
 ) -> bool {
+    use std::io::IoSlice;
+
     /// 预留 n 字节并写出 b,按实际写出消费;取消/写失败退款未消费部分。
     /// 返回 false = 写侧不可用(本轮结束)。
     async fn write_metered<W: tokio::io::AsyncWrite + Unpin>(
@@ -525,28 +532,81 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         // res(若有未消费余量)在返回时 drop → 自动退还
     }
 
-    async fn flush<W: tokio::io::AsyncWrite + Unpin>(
+    /// 多段向量写(优化项 4 核心):预留剩余总量,跨段推进部分写,按实际
+    /// 写出逐步消费;取消/写失败退款未消费部分。返回 false = 写侧不可用。
+    async fn write_metered_vectored<W: tokio::io::AsyncWrite + Unpin>(
         w: &mut W,
-        acc: &mut Option<bytes::BytesMut>,
+        chunks: &[Bytes],
         limiter: &Option<std::sync::Arc<dyn crate::ChunkLimiter>>,
     ) -> bool {
-        let Some(bm) = acc.take() else {
-            return true;
+        use tokio::io::AsyncWriteExt as _;
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        debug_assert!(total > 0, "caller flushes only non-empty batches");
+        let mut res = match limiter {
+            Some(l) => Some(l.reserve(total).await),
+            None => None,
         };
-        if bm.is_empty() {
-            pool_put(bm);
+        // (seg, off):当前未写起点(段索引 + 段内偏移);每轮从该点拼段
+        // 一次 writev,写出 k 后跨段烧穿推进。段数组栈上构造,零堆分配。
+        let mut seg = 0usize;
+        let mut off = 0usize;
+        let mut written = 0usize;
+        while written < total {
+            let mut slices = [IoSlice::new(&[]); SMALL_CHUNK_SEGS];
+            let mut nsegs = 0usize;
+            for (i, c) in chunks[seg..].iter().enumerate() {
+                if nsegs == SMALL_CHUNK_SEGS {
+                    break;
+                }
+                let s = if i == 0 { &c[off..] } else { &c[..] };
+                slices[nsegs] = IoSlice::new(s);
+                nsegs += 1;
+            }
+            match w.write_vectored(&slices[..nsegs]).await {
+                Ok(0) => return false, // WriteZero:写侧不可用
+                Ok(k) => {
+                    written += k;
+                    if let Some(r) = res.as_mut() {
+                        r.consume(k);
+                    }
+                    let mut rem = k;
+                    while rem > 0 {
+                        let left = chunks[seg].len() - off;
+                        if rem >= left {
+                            seg += 1;
+                            off = 0;
+                            rem -= left;
+                        } else {
+                            off += rem;
+                            rem = 0;
+                        }
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+        true
+        // res(若有未消费余量)在返回时 drop → 自动退还
+    }
+
+    /// 冲刷小块收集数组(空数组为 no-op;Vec capacity 跨轮复用)。
+    async fn flush<W: tokio::io::AsyncWrite + Unpin>(
+        w: &mut W,
+        smalls: &mut Vec<Bytes>,
+        smalls_bytes: &mut usize,
+        limiter: &Option<std::sync::Arc<dyn crate::ChunkLimiter>>,
+    ) -> bool {
+        if smalls.is_empty() {
             return true;
         }
-        let b = bm.freeze();
-        let ok = write_metered(w, &b, limiter).await;
-        if let Ok(mut m) = b.try_into_mut() {
-            m.clear();
-            pool_put(m);
-        }
+        let ok = write_metered_vectored(w, smalls, limiter).await;
+        smalls.clear();
+        *smalls_bytes = 0;
         ok
     }
 
-    let mut acc: Option<bytes::BytesMut> = None;
+    let mut smalls: Vec<Bytes> = Vec::new();
+    let mut smalls_bytes = 0usize;
     let clean = 'outer: loop {
         let chunk = match b_read.read_chunk().await {
             Ok(Some(c)) => c,
@@ -554,7 +614,7 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             Err(_) => break 'outer false,
         };
         if chunk.len() >= CHUNK_CAP {
-            if !flush(a_w, &mut acc, limiter).await {
+            if !flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await {
                 break 'outer false;
             }
             if !write_metered(a_w, &chunk, limiter).await {
@@ -562,41 +622,26 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             }
             continue;
         }
-        let slot = acc.get_or_insert_with(|| pool_get(CHUNK_CAP));
-        let room = CHUNK_CAP - slot.len();
-        let take = chunk.len().min(room);
-        slot.extend_from_slice(&chunk[..take]);
-        if take < chunk.len() {
-            // 余量回退(未入槽、未扣费;下一轮作为新块处理)
-            b_read.push_front(chunk.slice(take..));
-            if !flush(a_w, &mut acc, limiter).await {
+        if chunk.is_empty() {
+            continue;
+        }
+        // 小块:仅增加 Bytes 引用计数暂存(0 拷贝)
+        smalls_bytes += chunk.len();
+        smalls.push(chunk);
+        if smalls_bytes >= CHUNK_CAP || smalls.len() >= SMALL_CHUNK_SEGS {
+            if !flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await {
                 break 'outer false;
             }
             continue;
         }
-        if acc.as_ref().is_some_and(|b| b.len() >= CHUNK_CAP) {
-            if !flush(a_w, &mut acc, limiter).await {
-                break 'outer false;
-            }
-            continue;
-        }
-        // 聚合后续立即就绪的块(入槽字节下一轮冲刷时统一预留/消费)
+        // 聚合后续立即就绪的块(入收集数组的字节冲刷时统一预留/消费)
         loop {
             match b_read.try_read_chunk().await {
                 Ok(Some(c)) if !c.is_empty() => {
-                    let slot = acc.get_or_insert_with(|| pool_get(CHUNK_CAP));
-                    let room = CHUNK_CAP - slot.len();
-                    let take = c.len().min(room);
-                    slot.extend_from_slice(&c[..take]);
-                    if take < c.len() {
-                        b_read.push_front(c.slice(take..));
-                        if !flush(a_w, &mut acc, limiter).await {
-                            break 'outer false;
-                        }
-                        break;
-                    }
-                    if slot.len() >= CHUNK_CAP {
-                        if !flush(a_w, &mut acc, limiter).await {
+                    smalls_bytes += c.len();
+                    smalls.push(c);
+                    if smalls_bytes >= CHUNK_CAP || smalls.len() >= SMALL_CHUNK_SEGS {
+                        if !flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await {
                             break 'outer false;
                         }
                         break;
@@ -604,7 +649,7 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                 }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => {
-                    if !flush(a_w, &mut acc, limiter).await {
+                    if !flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await {
                         break 'outer false;
                     }
                     break;
@@ -612,7 +657,7 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             }
         }
     };
-    let _ = flush(a_w, &mut acc, limiter).await;
+    let _ = flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await;
     clean
 }
 
@@ -717,9 +762,27 @@ impl yamux::Writev2 for YamuxCarrier {
 /// 此值只为让 0=不限 有一个有限的落点。64 位限定:256KiB×此值 = 4TiB。
 pub const MUX_STREAMS_UNLIMITED: usize = 1 << 24;
 
-/// yamux 连接配置(锁路径 [`YamuxMultiplexer::new`] 与双载体路径
-/// [`YamuxMultiplexer::new_duplex`] 共用,round-E2 起提取以免两路漂移)。
+/// 默认 shard 数的配置入口(仅测试/既有断言使用)。
+///
+/// round-10 起生产调用点一律显式传 shard 数,本函数只保留"默认 4"的
+/// 既有语义供 [`mux_config_consumes_default_four_shard_workers`] 使用;
+/// `#[cfg(test)]` 避免 -D warnings 下成为死代码(生产等价路径为
+/// `mux_config_with_shards(max, DEFAULT_SHARD_WORKERS)`)。
+#[cfg(test)]
 fn mux_config(max_streams: usize) -> yamux::Config {
+    mux_config_with_shards(max_streams, DEFAULT_SHARD_WORKERS)
+}
+
+/// 分片 Worker 默认数(vendor 默认,round-5 起被三机验收锁定)。
+pub const DEFAULT_SHARD_WORKERS: usize = 4;
+
+/// 池规模 → 每载体 shard 数(round-10):总 Worker 预算按 4 计,
+/// K 越大每载体分得越少;下限 1。K=1 必须仍为 4(红线:K=1 零回退)。
+pub fn shard_workers_for_k(k: usize) -> usize {
+    (DEFAULT_SHARD_WORKERS / k.max(1)).max(1)
+}
+
+fn mux_config_with_shards(max_streams: usize, shard_workers: usize) -> yamux::Config {
     let mut cfg = yamux::Config::default();
     let streams = if max_streams == 0 {
         MUX_STREAMS_UNLIMITED
@@ -784,10 +847,12 @@ fn mux_config(max_streams: usize) -> yamux::Config {
     // 理由见上)。发送端初窗仍 256KiB——对端只见标准 WU,线路兼容。
     // 本改动只覆盖 yamux(mux 路径),不声称修复 nomux/QUIC/KCP。
     cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
-    // 分片 Worker 数(round-5 §2.7):**不覆盖**,消费 vendor 默认 4。
-    // 该值只作用于 halves 路径(本文件两路入口均走 halves),未拆分
-    // Active 路径忽略;三机验收 ×16 下行目标 ≥3100 Mbps / 数据面
-    // 2.0~3.5 核以默认 4 为准,调参须另立规格并回归三机。
+    // 分片 Worker 数(round-5 §2.7 锁默认 4;round-10 起由调用方按池规模
+    // 传入)。该值只作用于 halves 路径(本文件两路入口均走 halves),未
+    // 拆分 Active 路径忽略。`shard_workers == DEFAULT_SHARD_WORKERS` 时与
+    // round-5 行为逐字节等价(既有验收断言原样绿);K>1 客户端经
+    // [`shard_workers_for_k`] 缩减,使总 Worker 数 ≈ 4 而非 4K。
+    cfg.set_shard_workers(shard_workers.clamp(1, 64));
     cfg
 }
 
@@ -795,16 +860,25 @@ pub struct YamuxMultiplexer {
     open_tx: mpsc::Sender<oneshot::Sender<io::Result<yamux::Stream>>>,
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<yamux::Stream>>,
     dead: Arc<AtomicBool>,
+    /// 收发 driver 的句柄(round-9.1):仅 [`YamuxMultiplexer::shutdown`]
+    /// 消费——Drop 仍保持"句柄丢弃即分离、driver 继续服务存量流"的既有
+    /// 语义,不在此 abort(红线:正常路径零漂移)。
+    drivers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl YamuxMultiplexer {
     /// 在给定字节流上创建 yamux(锁路径);mode:客户端(开流)/服务端
     /// (收流)。max_streams:并发流硬顶,0 = 不限制(折算
-    /// MUX_STREAMS_UNLIMITED)。
+    /// MUX_STREAMS_UNLIMITED)。shard_workers:收发两侧分片 Worker 数
+    /// (round-10 参数化;单载体传 [`DEFAULT_SHARD_WORKERS`] 保持 round-5
+    /// 行为)。
     /// 注:yamux 0.14 无内建 keepalive,会话存活依赖协议层心跳(< 会话空闲超时)。
-    pub fn new(io: BoxedIo, mode: yamux::Mode, max_streams: usize) -> Self {
-        let conn: MuxConn =
-            yamux::Connection::new(YamuxCarrier::new(io), mux_config(max_streams), mode);
+    pub fn new(io: BoxedIo, mode: yamux::Mode, max_streams: usize, shard_workers: usize) -> Self {
+        let conn: MuxConn = yamux::Connection::new(
+            YamuxCarrier::new(io),
+            mux_config_with_shards(max_streams, shard_workers),
+            mode,
+        );
         // Round-D:收/发双任务驱动(对齐 Go yamux recv/send 双 goroutine)。
         // 单一载体经 SplitSocket/BiLock 串行——TLS/WS/QUIC/KCP 等不可
         // fd 复制的载体走此路径(泛型兜底)。Round-5 起三元组扩为
@@ -828,9 +902,13 @@ impl YamuxMultiplexer {
         write_io: BoxedIo,
         mode: yamux::Mode,
         max_streams: usize,
+        shard_workers: usize,
     ) -> Self {
-        let conn: MuxConn =
-            yamux::Connection::new(YamuxCarrier::new(read_io), mux_config(max_streams), mode);
+        let conn: MuxConn = yamux::Connection::new(
+            YamuxCarrier::new(read_io),
+            mux_config_with_shards(max_streams, shard_workers),
+            mode,
+        );
         let (recv_half, send_half, workers, send_workers) =
             conn.into_halves_duplex(YamuxCarrier::new(write_io));
         Self::spawn_drivers(recv_half, send_half, workers, send_workers)
@@ -852,6 +930,10 @@ impl YamuxMultiplexer {
     /// `Ready(())` 终结并排空本地流表(SendWorker 另在 send_dropped 后
     /// 终结),无需 abort——与 vendor §2.6 生命周期矩阵一致,不存在
     /// Worker 永存泄漏面。
+    ///
+    /// round-9.1 起两个 driver 的 JoinHandle 存入
+    /// [`YamuxMultiplexer::drivers`]:正常路径语义不变(Drop 不 abort),
+    /// 池关停/会话拆除经 [`YamuxMultiplexer::shutdown`] 显式消费。
     fn spawn_drivers<S>(
         recv_half: yamux::RecvHalf<S>,
         send_half: yamux::SendHalf<S>,
@@ -874,12 +956,13 @@ impl YamuxMultiplexer {
         for w in send_workers {
             tokio::spawn(w);
         }
-        tokio::spawn(send_driver(send_half, open_rx, dead.clone()));
-        tokio::spawn(recv_driver(recv_half, accept_tx, dead.clone()));
+        let send = tokio::spawn(send_driver(send_half, open_rx, dead.clone()));
+        let recv = tokio::spawn(recv_driver(recv_half, accept_tx, dead.clone()));
         Self {
             open_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
             dead,
+            drivers: std::sync::Mutex::new(vec![send, recv]),
         }
     }
 
@@ -906,6 +989,919 @@ impl YamuxMultiplexer {
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
     }
+
+    /// 显式关停(round-9.1):中止收发 driver——物理连接随 socket drop
+    /// 关闭,`recv_driver` 中止后 `accept_rx` 生产端消失,`accept_stream`
+    /// 立即返回错误,转发任务据此自然收敛。
+    ///
+    /// 幂等:`std::mem::take` 消费句柄,重复/并发调用只会 abort 一次。
+    /// **只由池关停 / 会话拆除调用**;Drop 不调用(既有语义是"mux 句柄
+    /// 丢弃后 driver 继续服务存量流",见 `drivers` 字段注释)。
+    pub fn shutdown(&self) {
+        self.dead.store(true, Ordering::Release);
+        let handles: Vec<_> = std::mem::take(&mut *self.drivers.lock().unwrap());
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    /// 取出 driver 句柄但不 abort(round-9.1 池 Drop 延迟收尾专用):
+    /// 置 dead 阻止新开流,句柄交由调用方在宽限期后 abort。与
+    /// [`YamuxMultiplexer::shutdown`] 共享"take 后为空"的幂等性。
+    fn take_drivers(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.dead.store(true, Ordering::Release);
+        std::mem::take(&mut *self.drivers.lock().unwrap())
+    }
+}
+
+// ===== 多物理载体连接池聚合(round-8 优化项 5) =====
+//
+// 架构:池持有 K 个独立物理载体(每载体一套完整 YamuxMultiplexer——独立
+// 收发 driver、独立分片 Worker、独立 TCP/TLS 会话)。业务流按全局原子
+// 计数轮转分派(i = stream_seq mod K):K 条连接具有不同本地源端口
+// (不同四元组),网卡 RSS 硬件自动散列到不同 CPU 核处理软中断;TLS
+// 模式下 K 条连接 = K 组完全并行的 Record 加解密流水线,突破单连接
+// 串行加解密上限。某载体异常断开时从活跃池剔除并自动重拨,其余载体
+// 上的存量流不受影响(消除单 TCP 物理拥塞丢包的全局队头阻塞)。
+
+/// 池推荐默认载体数(任务规格:K=4)。
+pub const YAMUX_POOL_DEFAULT_CARRIERS: usize = 4;
+
+/// 重拨配方:重新建立一条物理载体并包装为 YamuxMultiplexer(客户端侧;
+/// 服务端成员不可主动拨号,死亡即永久剔除)。
+pub type PoolRedial = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, io::Result<YamuxMultiplexer>> + Send + Sync,
+>;
+
+/// 重拨连续失败上限:退避 200ms 起步 ×2 封顶 5s,累计约 2 分钟后放弃
+/// (池成员表空则置死——open_stream 的等待因此有界,不永挂)。
+const REDIAL_MAX_ATTEMPTS: u32 = 16;
+const REDIAL_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(200);
+const REDIAL_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 服务端 accept 合流通道容量(对齐单 mux accept_rx 的 256 背压)。
+const POOL_ACCEPT_CAP: usize = 256;
+
+/// detach 的两种定位方式(round-10.1):Round-10 的下标入口保留原语义,
+/// 新增的身份入口不受成员表压缩影响。
+#[derive(Clone, Copy)]
+enum DetachBy {
+    Index(usize),
+    Id(u64),
+}
+
+/// 单个物理载体成员。
+struct PoolMember {
+    /// 池内稳定身份(round-10.1):成员创建时分配,单调递增;重拨补位的
+    /// 新成员拿新 id。用于在成员表压缩/重拨并发下精确定位载体(下标会
+    /// 漂移)。
+    id: u64,
+    mux: YamuxMultiplexer,
+    /// 重拨配方(None = 服务端成员/已 detach:不可重拨,死亡即永久剔除)。
+    ///
+    /// round-10 起为 `Mutex`:detach 必须在成员表写锁内先清配方再
+    /// shutdown——`reap_member` 在另一个任务里读同一字段,顺序颠倒会被
+    /// 视为载体死亡并触发重拨(5s 重拨环)。锁内只做 Option 读写,无 await。
+    redial: std::sync::Mutex<Option<PoolRedial>>,
+}
+
+impl PoolMember {
+    fn new(id: u64, mux: YamuxMultiplexer, redial: Option<PoolRedial>) -> Self {
+        Self {
+            id,
+            mux,
+            redial: std::sync::Mutex::new(redial),
+        }
+    }
+
+    /// 取重拨配方的克隆(shutdown 后仍可能被已在途的 redial_loop 观察)。
+    fn redial(&self) -> Option<PoolRedial> {
+        self.redial.lock().unwrap().clone()
+    }
+
+    /// 永久关闭该成员的重拨(幂等);返回是否此前存在配方。
+    fn clear_redial(&self) -> bool {
+        self.redial.lock().unwrap().take().is_some()
+    }
+}
+
+struct PoolInner {
+    /// 活跃成员表(死亡即剔除、重拨成功即追加)。open_stream 只取读锁
+    /// 快照;剔除/追加走写锁。
+    members: tokio::sync::RwLock<Vec<Arc<PoolMember>>>,
+    /// 全局流分派轮转计数(open_stream 热路径原子自增,无锁)。
+    rr: AtomicUsize,
+    /// 池死:成员表空且无在途重拨。
+    dead: AtomicBool,
+    /// 成员表变更通知(剔除/追加后唤醒等待中的 open_stream/accept)。
+    changed: tokio::sync::Notify,
+    /// 池关停(终止重拨循环;不再接受新成员)。
+    shutdown: AtomicBool,
+    /// 在途重拨任务数(全灭时的死亡判定依据)。
+    redialing: AtomicUsize,
+    /// 成员身份分配器(round-10.1):初始 1,单调递增;重拨/追加补位
+    /// 不复用旧 id(摘除按 id 定位,复用会把新成员误认成旧成员)。
+    next_member_id: AtomicU64,
+    /// 轮转分派前缀(round-10 自动定容):open_stream 只在成员表前
+    /// `active_prefix` 个成员中分派;`usize::MAX` = 不限(默认,零漂移)。
+    /// 只影响客户端 open_stream;服务端 accept 合流不受影响。
+    active_prefix: AtomicUsize,
+    /// 重拨补位目标数(round-10.1):成员表长度已达到该值时,`redial_loop`
+    /// 在入表前丢弃本次拨号。`set_active_prefix` 同步设置(取未按当前表长
+    /// 钳制的请求值);`usize::MAX` = 不限(默认,既有语义零漂移)。
+    ///
+    /// 存在理由:收敛前的 `reap_member` 可能已经 spawn 了重拨,而拨号受
+    /// `connect_timeout`(默认 10s)约束。仅在 detach 时清配方无法失效这条
+    /// 已克隆的重拨;在入表处按目标数拦截,才能在任意慢拨下都不把物理
+    /// 载体数补回 `final_k + 1`。
+    redial_target: AtomicUsize,
+    /// 服务端合流通道的生产端(round-9 attach_carrier:新成员的 accept
+    /// 转发任务复用同一合流通道;None = 客户端池,无 accept 语义,
+    /// attach_carrier 不适用)。原本是 new_server 的局部 tx,提升到
+    /// inner 以支持运行中追加成员。
+    accept_tx: Option<mpsc::Sender<BoxedIo>>,
+    /// accept 转发任务句柄(round-9.1):shutdown 时全部 abort,并随池
+    /// 释放兜底。追加成员时在成员表写锁内同步登记(临界区无 await),
+    /// 消除"已 spawn 未登记"窗口。
+    ///
+    /// 用 `std::sync::Mutex` 而非 tokio Mutex:池 `shutdown()` 是同步方法
+    /// (Drop 路径必须可调用),锁内只做 Vec push/take,无 await。
+    forward_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// 转发任务已退出条数(round-9.1 测试缝,T-L1):退出守卫在任务正常
+    /// 结束或 abort 丢弃 future 时自增。生产构建无此字段,零成本。
+    #[cfg(test)]
+    forward_exited: AtomicUsize,
+}
+
+impl PoolInner {
+    /// 成员表(快照 ms)空且无在途重拨 → 置死。
+    fn mark_dead_if_exhausted(&self, ms: &[Arc<PoolMember>]) {
+        if ms.is_empty() && self.redialing.load(Ordering::Acquire) == 0 {
+            self.dead.store(true, Ordering::Release);
+        }
+    }
+
+    /// 关停竞态兜底(round-9.1 复核):**写锁路径释放锁后**复查 shutdown
+    /// 标志并补做收敛。`YamuxMultiplexerPool::shutdown` 的成员快照走
+    /// `try_read`,撞上写锁持有者(attach/redial/reap)时只能拿到空表;
+    /// 若该写路径不再复查,显式拆除的立即收敛会退化为等 [`PoolInner`]
+    /// 最后一次 `Arc` 释放(可能被在途流的 QuotaIo 长期续持)。
+    ///
+    /// 幂等:重复关停/abort 无害。自身也拿不到读锁时留给下一个写路径
+    /// 或 [`PoolInner::Drop`]——写锁临界区均无 await,窗口极短且有界。
+    fn shutdown_sweep(&self) {
+        if !self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(ms) = self.members.try_read() else {
+            return;
+        };
+        for m in ms.iter() {
+            m.mux.shutdown();
+        }
+        // 二次保险同 shutdown():转发任务可能停在合流发送或 accept 上。
+        let tasks: Vec<_> = std::mem::take(&mut *self.forward_tasks.lock().unwrap());
+        for t in tasks {
+            t.abort();
+        }
+    }
+}
+
+/// 池本体释放兜底(round-9.1):转发任务被 abort 后它们持有的
+/// `Arc<PoolInner>` 随任务结束释放,此时才可能走到这里。若
+/// [`YamuxMultiplexerPool::shutdown`] 因成员表写锁被占而没能拿到快照
+/// (`try_read` 失败分支),成员表里残留的载体 driver 由本 Drop 关停
+/// ——保证"池已释放但物理连接仍活着"不成立。重复 shutdown 幂等
+/// (句柄 take 后为空)。
+impl Drop for PoolInner {
+    fn drop(&mut self) {
+        let members = self.members.get_mut();
+        for m in members.iter() {
+            m.mux.shutdown();
+        }
+    }
+}
+
+/// 池 Drop 的收尾宽限期(round-9.1):Drop 不能 await,若立即 abort 收发
+/// driver,已进入 yamux 发送队列但未写穿 socket 的最后一帧会被丢弃(实测:
+/// 对端 write_all 后紧随池释放会读到 early eof)。宽限期让发送侧把在途帧
+/// 冲刷到内核;超时后无条件 abort,保证 driver 不滞留。取值远小于 T-L3
+/// 的 1s EOF 断言,且只在"池整体释放"路径生效(显式 shutdown 立即中止)。
+const POOL_DROP_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// 多物理载体连接池:open_stream 按全局原子计数轮转分派到第
+/// `seq mod K` 个载体;accept(服务端池)自合流通道交付;载体故障自动
+/// 剔除 + 退避重拨,其余载体存量流不受影响。
+pub struct YamuxMultiplexerPool {
+    inner: Arc<PoolInner>,
+    /// 服务端合流接收器(None = 客户端池,accept 返回错误)。
+    accept_rx: Option<tokio::sync::Mutex<mpsc::Receiver<BoxedIo>>>,
+}
+
+/// 转发任务退出探针(round-9.1 测试缝,T-L1/T-L3):Drop 即计数——
+/// 无论任务是自然收敛还是被 abort(future 被丢弃),都恰好记一次。
+#[cfg(test)]
+struct ForwardExitProbe(Arc<PoolInner>);
+
+#[cfg(test)]
+impl Drop for ForwardExitProbe {
+    fn drop(&mut self) {
+        self.0.forward_exited.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl YamuxMultiplexerPool {
+    /// 客户端池:members 为 K 个已建立连接的客户端 YamuxMultiplexer
+    /// (≥1);redial 为重拨配方(任一载体死亡时按此重建,新成员继承)。
+    pub fn new_client(members: Vec<YamuxMultiplexer>, redial: Option<PoolRedial>) -> Self {
+        assert!(!members.is_empty(), "pool needs at least one carrier");
+        let next_member_id = AtomicU64::new(1);
+        let members: Vec<_> = members
+            .into_iter()
+            .map(|mux| {
+                let id = next_member_id.fetch_add(1, Ordering::Relaxed);
+                Arc::new(PoolMember::new(id, mux, redial.clone()))
+            })
+            .collect();
+        let inner = Arc::new(PoolInner {
+            members: tokio::sync::RwLock::new(members),
+            rr: AtomicUsize::new(0),
+            dead: AtomicBool::new(false),
+            changed: tokio::sync::Notify::new(),
+            shutdown: AtomicBool::new(false),
+            redialing: AtomicUsize::new(0),
+            next_member_id,
+            active_prefix: AtomicUsize::new(usize::MAX),
+            redial_target: AtomicUsize::new(usize::MAX),
+            accept_tx: None,
+            forward_tasks: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            forward_exited: AtomicUsize::new(0),
+        });
+        spawn_health_watch(&inner);
+        Self {
+            inner,
+            accept_rx: None,
+        }
+    }
+
+    /// 服务端池:members 为 K 个已 accept 连接的服务端 YamuxMultiplexer;
+    /// accept_stream 自全部成员合流交付(FIFO)。成员死亡(该物理连接
+    /// 断开)即剔除,不影响其余成员上的存量流。
+    pub fn new_server(members: Vec<YamuxMultiplexer>) -> Self {
+        assert!(!members.is_empty(), "pool needs at least one carrier");
+        let (tx, rx) = mpsc::channel::<BoxedIo>(POOL_ACCEPT_CAP);
+        let next_member_id = AtomicU64::new(1);
+        let members: Vec<_> = members
+            .into_iter()
+            .map(|mux| {
+                let id = next_member_id.fetch_add(1, Ordering::Relaxed);
+                Arc::new(PoolMember::new(id, mux, None))
+            })
+            .collect();
+        let inner = Arc::new(PoolInner {
+            members: tokio::sync::RwLock::new(members.clone()),
+            rr: AtomicUsize::new(0),
+            dead: AtomicBool::new(false),
+            changed: tokio::sync::Notify::new(),
+            shutdown: AtomicBool::new(false),
+            redialing: AtomicUsize::new(0),
+            next_member_id,
+            active_prefix: AtomicUsize::new(usize::MAX),
+            redial_target: AtomicUsize::new(usize::MAX),
+            // round-9:tx 提升入 inner(attach_carrier 复用同一合流通道)
+            accept_tx: Some(tx.clone()),
+            forward_tasks: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            forward_exited: AtomicUsize::new(0),
+        });
+        for m in members {
+            // 句柄登记与成员表构造同属 new_server 的初始化临界区:池尚未
+            // 返回,无并发观察者,直接 push 即消除"已 spawn 未登记"窗口。
+            let h = Self::spawn_accept_forward(&inner, m, tx.clone());
+            inner.forward_tasks.lock().unwrap().push(h);
+        }
+        spawn_health_watch(&inner);
+        Self {
+            inner,
+            accept_rx: Some(tokio::sync::Mutex::new(rx)),
+        }
+    }
+
+    /// 运行中追加一个载体成员(round-9 服务端会话聚合):追加 + 接管该
+    /// 成员 accept 转发 + 唤醒等待方,三步全部在成员表写锁内完成——
+    /// 与 open_stream 的读锁快照互斥,追加后的轮转/合流立即对后续调用
+    /// 可见,不出现"已报到但分派不到"的窗口。仅服务端池(有合流通道);
+    /// 成员表空转导致的 dead 标志随非空表一并清除(镜像 redial_loop 补位
+    /// 语义)。客户端池无 accept 语义,不适用(附加载体由服务端聚合)。
+    pub async fn attach_carrier(&self, mux: YamuxMultiplexer) {
+        let Some(tx) = self.inner.accept_tx.clone() else {
+            return;
+        };
+        let id = self.inner.next_member_id.fetch_add(1, Ordering::Relaxed);
+        let member = Arc::new(PoolMember::new(id, mux, None));
+        let mut ms = self.inner.members.write().await;
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            // 池已关停:新载体直接关停(不能只靠 drop——mux 的 Drop 保持
+            // "driver 继续服务存量流"语义,不 abort;见 YamuxMultiplexer
+            // 字段注释)。释放写锁后补扫:本次持锁可能正是池 shutdown 的
+            // try_read 快照落空的原因(round-9.1 复核)。
+            drop(ms);
+            member.mux.shutdown();
+            self.inner.shutdown_sweep();
+            return;
+        }
+        ms.push(member.clone());
+        // 表已非空:清除"表空置死"标志(镜像 redial_loop 补位语义)
+        self.inner.dead.store(false, Ordering::Release);
+        // spawn 与登记同处成员表写锁临界区内(临界区无 await),消除
+        // "已 spawn 未登记"窗口;关停路径必然能看到该句柄。
+        let h = Self::spawn_accept_forward(&self.inner, member, tx);
+        self.inner.forward_tasks.lock().unwrap().push(h);
+        self.inner.changed.notify_waiters();
+        drop(ms);
+        // 关停竞态复查(round-9.1 复核):上面的标志检查与池 shutdown 的
+        // try_read 快照可能交错——shutdown 在检查之后置位、快照又撞上本
+        // 写锁时,刚追加的成员不在其快照里。释放写锁后补做一次:shutdown
+        // 已置位则关停全部成员(含刚追加者)并 abort 已登记转发任务。
+        self.inner.shutdown_sweep();
+    }
+
+    /// 池关停:终止重拨循环;进行中的存量流随各自 mux 自然终结(不在池
+    /// 层强杀)。关停后新拨载体直接丢弃。
+    ///
+    /// round-9.1(F1):除置标志外必须把**载体 driver 与 accept 转发任务**
+    /// 一并收敛——否则 Session 移除/替换后,空闲载体的物理连接、driver、
+    /// 转发任务与 PoolInner 会永久滞留(转发任务强持 PoolInner 与成员)。
+    /// 顺序:先关各载体 driver(物理连接随 socket drop 关闭,accept_rx
+    /// 随之关闭,转发任务本会自然退出),再 abort 转发任务作二次保险。
+    ///
+    /// 幂等且并发安全:标志重复置位无害;成员快照取不到与句柄集合都用
+    /// `take`/快照语义,重复调用不 panic。
+    ///
+    /// 成员快照失败(`try_read` 撞上写锁持有者,如 attach_carrier 的追加
+    /// 临界区)时的兜底收敛路径:本次只置标志 + abort 已登记转发任务;
+    /// 该写锁持有者在释放锁前经 [`PoolInner::shutdown_sweep`] 复查标志并
+    /// 补做载体关停(attach_carrier / redial_loop / reap_member 三处),
+    /// 且 [`PoolInner`] 最终释放时的 Drop 会关停成员表中残留的全部 driver
+    /// ——三条路径保证不出现"标志已置但连接仍活着"的永久泄漏。
+    pub fn shutdown(&self) {
+        self.inner.shutdown.store(true, Ordering::Release);
+        self.inner.changed.notify_waiters();
+        let members: Vec<_> = match self.inner.members.try_read() {
+            Ok(ms) => ms.clone(),
+            Err(_) => Vec::new(),
+        };
+        for m in members {
+            m.mux.shutdown();
+        }
+        // 二次保险:被 abort 的任务不会再执行成员剔除,但成员 mux 已置 dead,
+        // live_carriers 归零;残留的合流接收端随池释放关闭。
+        let tasks: Vec<_> = std::mem::take(&mut *self.inner.forward_tasks.lock().unwrap());
+        for t in tasks {
+            t.abort();
+        }
+        // try_read 落败:写锁持有者与本次调用并发,它释放锁前后各自会
+        // 复查/收敛;此处再试一次把常见的短临界区窗口直接补上。
+        self.inner.shutdown_sweep();
+    }
+
+    /// 服务端成员 accept 转发:该成员的每个新流入合流通道;载体终结
+    /// (accept 返回错误 = 连接断开)时从成员表剔除并通知等待方。
+    ///
+    /// 返回 JoinHandle 供调用方在成员表写锁内登记(round-9.1 红线:
+    /// 不得 spawn 后丢弃句柄又声称能停止)。循环双重收敛:池 shutdown
+    /// 标志置位即退出;driver 被中止后 accept_stream 必然返回错误。
+    fn spawn_accept_forward(
+        inner: &Arc<PoolInner>,
+        member: Arc<PoolMember>,
+        tx: mpsc::Sender<BoxedIo>,
+    ) -> tokio::task::JoinHandle<()> {
+        let inner = inner.clone();
+        tokio::spawn(async move {
+            // 退出守卫(round-9.1 测试缝):正常退出与被 abort 都计数,
+            // T-L1 据此断言转发任务已收敛(不需要 await 句柄)。
+            #[cfg(test)]
+            let _exit_probe = ForwardExitProbe(inner.clone());
+            loop {
+                if inner.shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                match member.mux.accept_stream().await {
+                    Ok(s) => {
+                        if tx.send(s).await.is_err() {
+                            break; // 池侧已释放
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // 本任务因池关停而退出时必须亲自关停载体 driver(round-9.1):
+            // 本任务可能是关停瞬间才登记进来的(attach_carrier 窗口),
+            // 池 shutdown 的成员快照里没有它;不在此关停则 driver 随成员
+            // 表剔除而失去唯一可关停的引用(mux 的 Drop 不 abort)。
+            if inner.shutdown.load(Ordering::Acquire) {
+                member.mux.shutdown();
+            }
+            // 该物理载体终结:从成员表剔除并通知等待方
+            let mut ms = inner.members.write().await;
+            ms.retain(|x| !Arc::ptr_eq(x, &member));
+            inner.mark_dead_if_exhausted(&ms);
+            drop(ms);
+            inner.changed.notify_waiters();
+            // 关停竞态复查(round-9.1 复核):本路径也是写锁持有者,池
+            // shutdown 的 try_read 可能在此期间落空;释放锁后补做一次
+            // (非关停路径为空操作)。sweep 可能 abort 本任务,但此后已
+            // 无 await,abort 不改变语义。
+            inner.shutdown_sweep();
+        })
+    }
+
+    /// 剔除死亡成员并(若可)触发重拨;唤醒等待中的 open_stream。
+    async fn reap(&self, member: Arc<PoolMember>) {
+        reap_member(&self.inner, member).await
+    }
+
+    /// 客户端:打开一个新流——按全局原子计数轮转分派到活跃载体
+    /// (i = stream_seq mod K)。选中载体死亡 → 剔除并自动重试其余载体;
+    /// 全部载体同时死亡时等待重拨落地(全部不可重拨/重拨放弃 → 池死报错)。
+    ///
+    /// round-10:分派集合先按 [`Self::set_active_prefix`] 收缩到成员表前 n 个
+    /// (默认 usize::MAX = 全表,零漂移)。成员被剔除后表会压缩,后续成员
+    /// 因此前移进入前缀——这是"前缀"而非"载体身份"的既有语义。
+    pub async fn open_stream(&self) -> io::Result<BoxedIo> {
+        self.open_stream_inner().await.map(|(s, _id)| s)
+    }
+
+    /// 打开一个流并返回其落点成员身份(round-10.1):报到循环据此精确摘除
+    /// 失败的载体,不依赖易漂移的下标。语义与 open_stream 完全一致(同轮转/
+    /// 同死亡重试),仅在成功返回时附带成员 id(非池/无成员时不可能出现)。
+    pub async fn open_stream_tagged(&self) -> io::Result<(BoxedIo, u64)> {
+        self.open_stream_inner().await
+    }
+
+    /// open_stream 的实现本体:成功返回时附带落点成员 id。
+    async fn open_stream_inner(&self) -> io::Result<(BoxedIo, u64)> {
+        loop {
+            let (alive, prefix_pending) = {
+                let ms = self.inner.members.read().await;
+                let limit = self
+                    .inner
+                    .active_prefix
+                    .load(Ordering::Acquire)
+                    .min(ms.len());
+                let prefix = &ms[..limit];
+                (
+                    prefix
+                        .iter()
+                        .filter(|m| !m.mux.is_dead())
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    prefix.iter().any(|m| m.mux.is_dead()),
+                )
+            };
+            match alive.len() {
+                0 => {
+                    if self.inner.dead.load(Ordering::Acquire) {
+                        return Err(other("yamux pool: no live carrier"));
+                    }
+                    // 前缀内全死但尚未剔除:等健康监视/开流收敛路径 reap 后
+                    // 重读(表压缩可能把前缀外成员前移进来)。不得查看前缀外
+                    // 的存活成员——那会让本循环在"前缀全死"时空转。
+                    if prefix_pending {
+                        self.inner.changed.notified().await;
+                        continue;
+                    }
+                    // 有成员待收敛或重拨在途:等成员表变更(notified 先
+                    // 创建再复查,防通知落入创建前的间隙)。
+                    let notified = self.inner.changed.notified();
+                    if self.inner.dead.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    {
+                        let ms = self.inner.members.read().await;
+                        let limit = self
+                            .inner
+                            .active_prefix
+                            .load(Ordering::Acquire)
+                            .min(ms.len());
+                        if ms[..limit].iter().any(|m| !m.mux.is_dead()) {
+                            continue;
+                        }
+                    }
+                    notified.await;
+                    continue;
+                }
+                n => {
+                    let seq = self.inner.rr.fetch_add(1, Ordering::Relaxed);
+                    let m = alive[seq % n].clone();
+                    // 先取身份再移动成员:成功即死的分支会在返回前消费 m。
+                    let member_id = m.id;
+                    match m.mux.open_stream().await {
+                        Ok(s) => {
+                            if m.mux.is_dead() {
+                                // 成功即死(连接在开流瞬间终结):顺手收敛,
+                                // 流本身随错误语义由上层处理
+                                self.reap(m).await;
+                            }
+                            return Ok((s, member_id));
+                        }
+                        Err(e) => {
+                            if m.mux.is_dead() {
+                                self.reap(m).await;
+                                continue; // 换下一个活跃载体
+                            }
+                            // 非死亡性错误(如服务端流上限):原样上抛
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 收缩轮转分派前缀(round-10 自动定容):仅前 n 个成员参与 open_stream
+    /// 轮转;accept(服务端)不受影响。幂等;n 按目标数存储(下界 1),
+    /// 读取侧统一按当前表长钳制。
+    /// 只收缩分派集合,不摘除成员——需要真正回收多余载体时用
+    /// [`Self::detach_carrier`]。
+    ///
+    /// 语义是"前缀计数"而非固定成员集合:成员因死亡被剔除后成员表压缩,
+    /// 原前缀外成员前移进入前缀;若表长小于 n,全部剩余成员参与分派。
+    ///
+    /// round-10.1:同时把 n(未按当前表长钳制)登记为重拨补位目标数。收敛
+    /// 前已 spawn 的在途重拨可能因拨号超时(默认 10s)晚于收敛落地;
+    /// [`redial_loop`] 入表前按该目标数丢弃多余补位,因此无论如何都不会
+    /// 把物理载体数补回 `final_k + 1`。
+    pub async fn set_active_prefix(&self, n: usize) {
+        // 持成员表读锁完成两次原子写:redial_loop 在写锁内读取补位目标并
+        // 入表,二者互斥——不存在"重拨读到旧目标后入表"的窗口。
+        //
+        // round-10.2:两次 store 必须同口径——都存目标数,不按当前表长
+        // 钳制。若此处把 active_prefix 钳到当时的 len,重拨补位后表变长而
+        // 前缀不扩,会出现"物理数 = final_k 但只有前 len 个参与分派"的
+        // 冻结(读取侧已统一 min(表长),无需在此收缩)。
+        let ms = self.inner.members.read().await;
+        let want = n.max(1);
+        self.inner.redial_target.store(want, Ordering::Release);
+        self.inner.active_prefix.store(want, Ordering::Release);
+        drop(ms);
+    }
+
+    /// 当前生效的分派前缀上限(诊断/测试缝:与成员数取较小值)。
+    pub async fn active_prefix(&self) -> usize {
+        let len = self.inner.members.read().await.len();
+        self.inner
+            .active_prefix
+            .load(Ordering::Acquire)
+            .min(len.max(1))
+    }
+
+    /// 移除一个成员(round-10,任务书 §2.4 语义):**先清 redial 配方**,
+    /// 再 shutdown 该成员 driver(物理连接随 socket drop 关闭),最后从
+    /// 成员表移除。顺序不可颠倒——先 shutdown 会让 `reap_member` /
+    /// 健康监视把该成员当作故障载体并触发重拨,形成 5s 周期重拨环。
+    ///
+    /// index 为成员表下标(报到顺序)。幂等:越界或成员已被并发收敛即
+    /// 返回。若移除后只剩 1 个成员,同时关闭该剩余成员的重拨配方——
+    /// `final_k == 1` 时池退化为单载体,重拨不再需要(任务书 §2.4)。
+    ///
+    /// accept 转发任务:`forward_tasks` 未按成员索引登记,按规格允许的
+    /// 简化实现 abort 全部后为剩余成员重新 spawn(仅服务端池有该语义)。
+    pub async fn detach_carrier(&self, index: usize) {
+        let _ = self.detach_inner(DetachBy::Index(index)).await;
+    }
+
+    /// 按身份摘除成员(round-10.1):先失效 redial(防 5s 重拨环),再
+    /// shutdown 其 driver,最后出表并 abort 其转发任务。幂等(id 不存在
+    /// 即返回 false)。身份定位不受成员表压缩影响,因此报到失败的载体
+    /// 可以在重拨补位/并发剔除之后仍被精确摘除。
+    pub async fn detach_carrier_by_id(&self, id: u64) -> bool {
+        self.detach_inner(DetachBy::Id(id)).await
+    }
+
+    /// detach 两入口的共享实现;锁内只做查找/移除/清配方/shutdown,
+    /// 无 await(与 Round-10 的临界区形状一致)。
+    async fn detach_inner(&self, by: DetachBy) -> bool {
+        let (target, remain, tx) = {
+            let mut ms = self.inner.members.write().await;
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                return false;
+            }
+            let target = match by {
+                DetachBy::Index(index) => {
+                    if index >= ms.len() {
+                        return false;
+                    }
+                    ms.remove(index)
+                }
+                DetachBy::Id(id) => {
+                    let Some(pos) = ms.iter().position(|m| m.id == id) else {
+                        return false;
+                    };
+                    ms.remove(pos)
+                }
+            };
+            // 先清配方再 shutdown(见方法注释;顺序是正确性的一部分)
+            target.clear_redial();
+            target.mux.shutdown();
+            if ms.len() == 1 {
+                ms[0].clear_redial();
+            }
+            self.inner.mark_dead_if_exhausted(&ms);
+            let remain: Vec<Arc<PoolMember>> = ms.clone();
+            (target, remain, self.inner.accept_tx.clone())
+        };
+        self.inner.changed.notify_waiters();
+        // 服务端池:转发任务重建。abort 全部 → 为剩余成员重新 spawn;
+        // 新任务在成员表读锁前创建并登记,不存在"已 spawn 未登记"窗口
+        // (登记在同步闭包内完成,期间无 await 让出成员表增删)。
+        if let Some(tx) = tx {
+            let old: Vec<_> = std::mem::take(&mut *self.inner.forward_tasks.lock().unwrap());
+            for t in old {
+                t.abort();
+            }
+            if !self.inner.shutdown.load(Ordering::Acquire) {
+                let mut handles = Vec::with_capacity(remain.len());
+                for m in remain {
+                    handles.push(Self::spawn_accept_forward(&self.inner, m, tx.clone()));
+                }
+                self.inner.forward_tasks.lock().unwrap().extend(handles);
+            }
+        }
+        // 该成员可能正是池 shutdown 的 try_read 快照落空的原因:释放
+        // 锁后补扫一次(非关停路径为空操作)。
+        self.inner.shutdown_sweep();
+        drop(target);
+        true
+    }
+
+    /// 成员身份快照(round-10.1,成员表顺序)。只读;调用方据此计算
+    /// 超出分派前缀的尾部成员,再按 id 逆序摘除(下标会随表压缩漂移)。
+    pub async fn member_ids(&self) -> Vec<u64> {
+        self.inner
+            .members
+            .read()
+            .await
+            .iter()
+            .map(|m| m.id)
+            .collect()
+    }
+
+    /// 当前成员表中**存活**成员的 id(按表序,round-10.2)。终态收敛按此
+    /// 计数保留额,避免把额度算给 dead-but-unreaped 成员后误摘健康成员
+    /// (健康监视 500ms 窗口内 `member_ids` 仍含已死未剔除的成员)。
+    pub async fn live_member_ids(&self) -> Vec<u64> {
+        self.inner
+            .members
+            .read()
+            .await
+            .iter()
+            .filter(|m| !m.mux.is_dead())
+            .map(|m| m.id)
+            .collect()
+    }
+
+    /// 成员表长度(**含 dead-but-unreaped 成员**,round-10.2)。服务端 cap
+    /// 检查用它而非 [`Self::live_carriers`]:已死未 reap 的成员仍占用物理
+    /// 连接与池内名额,按其计数才能覆盖"dead 未 reap 占位"的窗口(该窗口
+    /// 内按存活数计会多放行 1 条)。已披露的"检查→聚合非原子"窗口仍在。
+    pub async fn pool_member_count(&self) -> usize {
+        self.inner.members.read().await.len()
+    }
+
+    /// 服务端:接受一个新流(自全部成员合流)。
+    pub async fn accept_stream(&self) -> io::Result<BoxedIo> {
+        let Some(rx) = self.accept_rx.as_ref() else {
+            return Err(other("yamux pool: accept on client-side pool"));
+        };
+        let mut guard = rx.lock().await;
+        match guard.recv().await {
+            Some(s) => Ok(s),
+            None => Err(other("yamux pool closed")),
+        }
+    }
+
+    /// 池是否已死(无法再产生新流:成员表空且无在途重拨)。
+    pub fn is_dead(&self) -> bool {
+        self.inner.dead.load(Ordering::Acquire)
+    }
+
+    /// 活跃载体数(诊断/测试缝:观察故障收敛与重拨补位进度)。
+    pub async fn live_carriers(&self) -> usize {
+        self.inner
+            .members
+            .read()
+            .await
+            .iter()
+            .filter(|m| !m.mux.is_dead())
+            .count()
+    }
+}
+
+/// 池整体释放(round-9.1 F1):转发任务与载体连接不得滞留——Session
+/// 被替换/移除时 `Arc<Multiplexer>` 的最后一个引用可能在任何任务上下文
+/// 里 drop,显式收敛让 driver 与转发任务立即开始收尾,而不是等健康监视
+/// 或对端超时。
+///
+/// 与显式 [`YamuxMultiplexerPool::shutdown`] 的唯一差别:Drop 对**载体
+/// driver** 有 [`POOL_DROP_GRACE`] 的有界宽限(先置 shutdown/dead、停
+/// 转发任务,再延迟 abort driver),让已排入 yamux 发送队列的在途帧写穿
+/// socket。立即 abort 会截断最后一帧(round-9 既有集成测试
+/// pool_wiring:对端 write 后紧随池释放即读到 early eof)。宽限有界且由
+/// 一个持有句柄的看门任务完成 abort,不存在"spawn 后丢弃句柄又声称能
+/// 停止";无运行时时退化为立即 abort。幂等:标志重复置位无害,句柄
+/// take 后为空。
+impl Drop for YamuxMultiplexerPool {
+    fn drop(&mut self) {
+        self.inner.shutdown.store(true, Ordering::Release);
+        self.inner.changed.notify_waiters();
+        // 转发任务立即 abort:它们只停在 accept_stream 上,不承载在途数据。
+        let tasks: Vec<_> = std::mem::take(&mut *self.inner.forward_tasks.lock().unwrap());
+        for t in tasks {
+            t.abort();
+        }
+        // 成员快照拿到则消费其 driver 句柄;拿不到(写锁被占)由
+        // PoolInner 的 Drop 兜底。
+        let mut drivers = Vec::new();
+        if let Ok(ms) = self.inner.members.try_read() {
+            for m in ms.iter() {
+                drivers.extend(m.mux.take_drivers());
+            }
+        }
+        if drivers.is_empty() {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // 看门任务持有全部句柄并在宽限期后 abort;即使它自身被取消,
+            // 句柄随 future drop 分离——与直接 abort 相比不会更差。
+            tokio::spawn(async move {
+                tokio::time::sleep(POOL_DROP_GRACE).await;
+                for d in drivers {
+                    d.abort();
+                }
+            });
+        } else {
+            // 无运行时上下文:driver 已无法被调度,直接 abort 无副作用。
+            for d in drivers {
+                d.abort();
+            }
+        }
+    }
+}
+
+/// 测试缝(round-9.1):观测转发任务退出与 PoolInner 是否仍被任务持有。
+#[cfg(test)]
+impl YamuxMultiplexerPool {
+    /// 已退出的 accept 转发任务数。
+    fn forward_tasks_exited(&self) -> usize {
+        self.inner.forward_exited.load(Ordering::Acquire)
+    }
+
+    /// PoolInner 的弱引用(断言任务/成员释放后强计数归零)。
+    fn inner_weak(&self) -> std::sync::Weak<PoolInner> {
+        Arc::downgrade(&self.inner)
+    }
+
+    /// 在途重拨任务数(复核回归:关停分支必须归还该计数)。
+    fn redialing(&self) -> usize {
+        self.inner.redialing.load(Ordering::Acquire)
+    }
+}
+
+/// 剔除死亡成员并(若可)触发重拨;唤醒等待中的 open_stream。
+/// 幂等:并发收敛(open_stream 撞死/健康监视/accept 转发退出)下按
+/// 指针复查,至多剔除一次、至多重拨一次。
+async fn reap_member(inner: &Arc<PoolInner>, member: Arc<PoolMember>) {
+    let mut ms = inner.members.write().await;
+    if !ms.iter().any(|x| Arc::ptr_eq(x, &member)) {
+        // 已被并发路径收敛:仍需复查关停标志——shutdown() 的成员快照
+        // 可能恰在本写锁被持有时两次 try_read 落空,本次是最后一条会
+        // 释放该锁的路径(round-9.2)。必须先释放写锁再 sweep:其内部
+        // try_read 在持锁时必然失败,成为无效调用。
+        drop(ms);
+        inner.shutdown_sweep();
+        return;
+    }
+    // round-10:redial 必须在写锁内读取。detach_carrier 在写锁内先清
+    // 配方再 shutdown;若在锁外提前读,可能读到刚被清掉的旧值并把
+    // 已 detach 的载体重拨回来。
+    let redial = member.redial();
+    ms.retain(|x| !Arc::ptr_eq(x, &member));
+    inner.mark_dead_if_exhausted(&ms);
+    drop(ms);
+    inner.changed.notify_waiters();
+    // 关停竞态复查(round-9.1 复核):本路径持写锁期间池可能已 shutdown
+    // 且其 `try_read` 快照落空;释放锁后补做载体关停,避免"标志已置而
+    // 连接仍活着"直到 PoolInner 最后一次释放。
+    inner.shutdown_sweep();
+    if let Some(redial) = redial {
+        if !inner.shutdown.load(Ordering::Acquire) {
+            inner.redialing.fetch_add(1, Ordering::AcqRel);
+            tokio::spawn(redial_loop(inner.clone(), redial));
+        }
+    }
+}
+
+/// 健康监视(优化项 5"故障收敛与健康探测"):周期扫描成员表,死亡载体
+/// 主动剔除并触发重拨——不依赖下一次 open_stream 撞上死成员才收敛
+/// (空闲池同样自愈)。持 Weak:池释放后自动退出,不泄漏任务。
+fn spawn_health_watch(inner: &Arc<PoolInner>) {
+    /// 扫描周期 = 空闲池的死亡→重拨感知延迟上限。
+    const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+    let weak = Arc::downgrade(inner);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(WATCH_INTERVAL).await;
+            let Some(inner) = weak.upgrade() else {
+                break; // 池已释放
+            };
+            if inner.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let dead: Vec<Arc<PoolMember>> = inner
+                .members
+                .read()
+                .await
+                .iter()
+                .filter(|m| m.mux.is_dead())
+                .cloned()
+                .collect();
+            for m in dead {
+                reap_member(&inner, m).await;
+            }
+        }
+    });
+}
+
+/// 重拨循环:退避重试至成功/放弃/池关停。成功 → 追加新成员(继承配方)
+/// 并清除池死标志;放弃(连续失败超上限)→ 成员表空则置死。
+async fn redial_loop(inner: Arc<PoolInner>, redial: PoolRedial) {
+    let mut backoff = REDIAL_BACKOFF_START;
+    for _ in 0..REDIAL_MAX_ATTEMPTS {
+        match redial().await {
+            Ok(mux) => {
+                let mut ms = inner.members.write().await;
+                if inner.shutdown.load(Ordering::Acquire) {
+                    // 池已关停:该 mux 从未入表,没有任何其它路径会关停它
+                    // ——`YamuxMultiplexer` 的 Drop 保持"driver 继续服务
+                    // 存量流"语义、不 abort,直接 return 会令新拨通的
+                    // driver + 物理连接永久驻留。此处显式 shutdown,并
+                    // 归还 in-flight 计数(否则 mark_dead_if_exhausted 永久
+                    // 失真)。
+                    drop(ms);
+                    mux.shutdown();
+                    inner.redialing.fetch_sub(1, Ordering::AcqRel);
+                    // 本次写锁可能正是 shutdown 的 try_read 落空的原因:
+                    // 释放后补扫其余成员。
+                    inner.shutdown_sweep();
+                    return;
+                }
+                // round-10.1:收敛已把补位目标数压到 final_k 时,本次拨号
+                // 若晚于收敛落地就丢弃——它可能是收敛前 `reap_member` 已
+                // spawn 的在途重拨,入表会让物理载体数长期多出
+                // `final_k + 1` 条(detach 只认身份,无法收回这条新成员)。
+                // 目标数在成员表读锁内写入(见 set_active_prefix),本检查在
+                // 写锁内读取,二者互斥,不存在"先读旧目标后入表"的窗口。
+                let target = inner.redial_target.load(Ordering::Acquire);
+                if ms.len() >= target {
+                    drop(ms);
+                    mux.shutdown();
+                    inner.redialing.fetch_sub(1, Ordering::AcqRel);
+                    inner.changed.notify_waiters();
+                    return;
+                }
+                ms.push(Arc::new(PoolMember::new(
+                    inner.next_member_id.fetch_add(1, Ordering::Relaxed),
+                    mux,
+                    Some(redial.clone()),
+                )));
+                inner.mark_dead_if_exhausted(&ms);
+                drop(ms);
+                inner.dead.store(false, Ordering::Release);
+                inner.changed.notify_waiters();
+                inner.redialing.fetch_sub(1, Ordering::AcqRel);
+                // 关停竞态复查(round-9.1 复核):shutdown 的 try_read 可能
+                // 在本写锁持有期间落空;入表成功也补做一次,保证关停后
+                // 新载体连接立即收敛。
+                inner.shutdown_sweep();
+                return;
+            }
+            Err(_) => {
+                if inner.shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(REDIAL_BACKOFF_MAX);
+            }
+        }
+    }
+    // 放弃/关停:在途计数回收;成员表空则置死(等待方得到错误而非永挂)
+    inner.redialing.fetch_sub(1, Ordering::AcqRel);
+    let ms = inner.members.read().await;
+    inner.mark_dead_if_exhausted(&ms);
+    drop(ms);
+    inner.changed.notify_waiters();
 }
 
 fn other(msg: &str) -> io::Error {
@@ -940,8 +1936,11 @@ async fn send_driver<S>(
                                 let _ = req.send(Ok(s));
                             }
                             Poll::Ready(Err(e)) => {
-                                let _ = req.send(Err(other(&format!("yamux: {e}"))));
+                                // 先置 dead 再回 Err:池(round-8 优化项 5)
+                                // 依据 is_dead 决定换载体重试,回 Err 时
+                                // 死亡标志必须已可见
                                 dead.store(true, Ordering::Relaxed);
+                                let _ = req.send(Err(other(&format!("yamux: {e}"))));
                                 return Poll::Ready(true);
                             }
                             Poll::Pending => {
@@ -963,8 +1962,9 @@ async fn send_driver<S>(
                         let _ = req.send(Ok(s));
                     }
                     Poll::Ready(Err(e)) => {
-                        let _ = req.send(Err(other(&format!("yamux: {e}"))));
+                        // 先置 dead 再回 Err(同上,池的重试判定依赖)
                         dead.store(true, Ordering::Relaxed);
+                        let _ = req.send(Err(other(&format!("yamux: {e}"))));
                         return Poll::Ready(true);
                     }
                     Poll::Pending => {
@@ -1042,6 +2042,7 @@ pub fn wrap_stream_as_server(
                 io,
                 yamux::Mode::Server,
                 max_streams,
+                DEFAULT_SHARD_WORKERS,
             )),
         })
     } else {
@@ -1067,6 +2068,7 @@ pub fn wrap_stream_as_server_duplex(
             write_io,
             yamux::Mode::Server,
             max_streams,
+            DEFAULT_SHARD_WORKERS,
         )),
     })
 }
@@ -1084,6 +2086,7 @@ pub fn wrap_stream_as_client(
                 io,
                 yamux::Mode::Client,
                 max_streams,
+                DEFAULT_SHARD_WORKERS,
             )),
         })
     } else {
@@ -1108,6 +2111,7 @@ pub fn wrap_stream_as_client_duplex(
             write_io,
             yamux::Mode::Client,
             max_streams,
+            DEFAULT_SHARD_WORKERS,
         )),
     })
 }
@@ -1125,6 +2129,1175 @@ mod tests {
     #[test]
     fn chunk_cap_is_64kib() {
         assert_eq!(CHUNK_CAP, 64 * 1024, "读缓冲上限红线(64KiB)不得放宽");
+    }
+
+    // ===== round-8 优化项 5:多物理载体连接池 =====
+
+    /// 关键 await 的统一时限(防断言性挂死拖垮测试套件)。
+    async fn deadline<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(std::time::Duration::from_secs(5), f)
+            .await
+            .expect("pool test deadline (5s)")
+    }
+
+    /// 可杀载体 IO:kill() 置位后读侧立刻 BrokenPipe 并唤醒挂起的
+    /// driver(模拟物理连接断开)。写侧在下次 poll 时亦立即失败。
+    struct KillState {
+        dead: AtomicBool,
+        read_waker: std::sync::Mutex<Option<std::task::Waker>>,
+    }
+
+    impl KillState {
+        fn kill(&self) {
+            self.dead.store(true, Ordering::SeqCst);
+            if let Some(w) = self.read_waker.lock().unwrap().take() {
+                w.wake();
+            }
+        }
+    }
+
+    struct KillIo {
+        inner: tokio::io::DuplexStream,
+        state: Arc<KillState>,
+    }
+
+    impl tokio::io::AsyncRead for KillIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.state.dead.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "carrier killed",
+                )));
+            }
+            let r = Pin::new(&mut this.inner).poll_read(cx, buf);
+            if r.is_pending() {
+                *this.state.read_waker.lock().unwrap() = Some(cx.waker().clone());
+            }
+            if this.state.dead.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "carrier killed",
+                )));
+            }
+            r
+        }
+    }
+
+    impl tokio::io::AsyncWrite for KillIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.state.dead.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "carrier killed",
+                )));
+            }
+            Pin::new(&mut self.get_mut().inner).poll_write(_cx, _buf)
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.state.dead.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "carrier killed",
+                )));
+            }
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// 建一条内存载体对:客户端 mux + 服务端 mux(服务端 IO 经 KillIo
+    /// 包装,可模拟物理断开)。
+    fn carrier_pair_killable(
+        max_streams: usize,
+    ) -> (YamuxMultiplexer, YamuxMultiplexer, Arc<KillState>) {
+        let (a, server, state) = carrier_pair_peer_killable(max_streams);
+        (
+            YamuxMultiplexer::new(
+                Box::new(a),
+                yamux::Mode::Client,
+                max_streams,
+                DEFAULT_SHARD_WORKERS,
+            ),
+            server,
+            state,
+        )
+    }
+
+    /// 同 [`carrier_pair_killable`],但对端保持裸 duplex(不包客户端 mux)
+    /// ——round-9.1 T-L1 需要直接从对端观察 EOF(socket 是否真的关闭)。
+    fn carrier_pair_peer_killable(
+        max_streams: usize,
+    ) -> (tokio::io::DuplexStream, YamuxMultiplexer, Arc<KillState>) {
+        let (a, b) = tokio::io::duplex(1024 * 1024);
+        let state = Arc::new(KillState {
+            dead: AtomicBool::new(false),
+            read_waker: std::sync::Mutex::new(None),
+        });
+        let server = KillIo {
+            inner: b,
+            state: state.clone(),
+        };
+        (
+            a,
+            YamuxMultiplexer::new(
+                Box::new(server),
+                yamux::Mode::Server,
+                max_streams,
+                DEFAULT_SHARD_WORKERS,
+            ),
+            state,
+        )
+    }
+
+    /// 服务端 echo 泵:accept 全部流并逐字节回显(数据面活性探针)。
+    fn spawn_echo_server(server: YamuxMultiplexer) {
+        tokio::spawn(async move {
+            while let Ok(mut st) = server.accept_stream().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match st.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if st.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// 轮转分派:K=3 池开 6 流,恰每载体 2 条(SYN|WU 建流即发,
+    /// 服务端 accept 立即就绪)。
+    #[tokio::test]
+    async fn yamux_pool_round_robin_across_carriers() {
+        const K: usize = 3;
+        const N: usize = 6;
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..K {
+            let (a, b) = tokio::io::duplex(1024 * 1024);
+            clients.push(YamuxMultiplexer::new(
+                Box::new(a),
+                yamux::Mode::Client,
+                16,
+                DEFAULT_SHARD_WORKERS,
+            ));
+            servers.push(YamuxMultiplexer::new(
+                Box::new(b),
+                yamux::Mode::Server,
+                16,
+                DEFAULT_SHARD_WORKERS,
+            ));
+        }
+        let pool = YamuxMultiplexerPool::new_client(clients, None);
+        for _ in 0..N {
+            deadline(pool.open_stream()).await.unwrap();
+        }
+        for s in &mut servers {
+            for _ in 0..(N / K) {
+                deadline(s.accept_stream()).await.unwrap();
+            }
+        }
+        // 恰 N/K:若某载体分派过多,下一行 accept 会挂起触发 deadline。
+        // 若某载体分派过少,上方循环已先行挂起。均匀性由此双向锁死。
+    }
+
+    /// 故障隔离:杀载体 0 后,池剔除该载体(收敛为 live=K-1),
+    /// 后续开流全部落在其余载体且数据面(echo)可用;被杀载体的
+    /// 服务端不再收到任何新流。
+    #[tokio::test]
+    async fn yamux_pool_carrier_failure_isolated() {
+        const K: usize = 3;
+        let mut clients = Vec::new();
+        let mut kills = Vec::new();
+        for _ in 0..K {
+            let (c, s, kill) = carrier_pair_killable(16);
+            clients.push(c);
+            kills.push(kill);
+            spawn_echo_server(s);
+        }
+        let pool = YamuxMultiplexerPool::new_client(clients, None);
+        // 杀前:每载体 1 流 echo 通
+        for i in 0..K {
+            let mut st = deadline(pool.open_stream()).await.unwrap();
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            st.write_all(format!("ping{i}").as_bytes()).await.unwrap();
+            let mut buf = [0u8; 5];
+            deadline(st.read_exact(&mut buf)).await.unwrap();
+            assert_eq!(&buf, format!("ping{i}").as_bytes());
+        }
+        // 杀载体 0 → 池收敛为 2 活载体
+        kills[0].kill();
+        let t0 = std::time::Instant::now();
+        while pool.live_carriers().await != K - 1 {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(3),
+                "carrier 0 must be reaped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // 后续 8 条流全部落在其余载体,echo 全通
+        for i in 0..8u32 {
+            let mut st = deadline(pool.open_stream()).await.unwrap();
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let probe = format!("after{i}").into_bytes();
+            st.write_all(&probe).await.unwrap();
+            let mut buf = vec![0u8; probe.len()];
+            deadline(st.read_exact(&mut buf)).await.unwrap();
+            assert_eq!(buf, probe);
+        }
+        assert!(!pool.is_dead());
+    }
+
+    /// 重拨恢复:K=1,载体死亡 → 池按配方自动重拨 → live 回到 1,
+    /// 新流在新载体上 echo 通;重拨恰发生 1 次。
+    #[tokio::test]
+    async fn yamux_pool_redial_recovers() {
+        let (c0, s0, kill) = carrier_pair_killable(16);
+        spawn_echo_server(s0);
+        let redials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let redials2 = redials.clone();
+        let redial: PoolRedial = Arc::new(move || {
+            redials2.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                let (a, b) = tokio::io::duplex(1024 * 1024);
+                let server = YamuxMultiplexer::new(
+                    Box::new(b),
+                    yamux::Mode::Server,
+                    16,
+                    DEFAULT_SHARD_WORKERS,
+                );
+                spawn_echo_server(server);
+                Ok(YamuxMultiplexer::new(
+                    Box::new(a),
+                    yamux::Mode::Client,
+                    16,
+                    DEFAULT_SHARD_WORKERS,
+                ))
+            })
+        });
+        let pool = YamuxMultiplexerPool::new_client(vec![c0], Some(redial));
+        let mut st = deadline(pool.open_stream()).await.unwrap();
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        st.write_all(b"before").await.unwrap();
+        let mut buf = [0u8; 6];
+        deadline(st.read_exact(&mut buf)).await.unwrap();
+        assert_eq!(&buf, b"before");
+
+        kill.kill();
+        // 等自愈完成:健康监视(≤500ms 周期)剔除死载体并触发重拨,
+        // 重拨成功补位。联合条件消除"死亡未传播时 live 仍为 1"的假阳性
+        // 窗口——redials ≥ 1 证明旧载体已被剔除(redial 只由收敛路径
+        // 触发),live == 1 证明新载体已入表。
+        let t0 = std::time::Instant::now();
+        loop {
+            let live = pool.live_carriers().await;
+            if live == 1 && redials.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "redial must restore the carrier (live={live}, redials={})",
+                redials.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // 重拨期间 open_stream 会被暂堵直到补位——deadline 兜底
+        let mut st = deadline(pool.open_stream()).await.unwrap();
+        st.write_all(b"after").await.unwrap();
+        let mut buf = [0u8; 5];
+        deadline(st.read_exact(&mut buf)).await.unwrap();
+        assert_eq!(&buf, b"after");
+        assert_eq!(redials.load(Ordering::SeqCst), 1, "exactly one redial");
+        assert!(!pool.is_dead());
+    }
+
+    // T-C4(round-10):set_active_prefix(1) 后所有 open_stream 落在成员 0。
+    // 用 3 个客户端 mux 各自 accept 计数观测分派落点(客户端开流 →
+    // 对端 server mux accept;哪个 server 收到即哪个成员被选中)。
+    #[tokio::test]
+    async fn set_active_prefix_restricts_round_robin() {
+        const K: usize = 3;
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..K {
+            let (a, b) = tokio::io::duplex(1024 * 1024);
+            clients.push(YamuxMultiplexer::new(
+                Box::new(a),
+                yamux::Mode::Client,
+                16,
+                DEFAULT_SHARD_WORKERS,
+            ));
+            servers.push(YamuxMultiplexer::new(
+                Box::new(b),
+                yamux::Mode::Server,
+                16,
+                DEFAULT_SHARD_WORKERS,
+            ));
+        }
+        let pool = YamuxMultiplexerPool::new_client(clients, None);
+        pool.set_active_prefix(1).await;
+        assert_eq!(pool.active_prefix().await, 1);
+
+        for _ in 0..6 {
+            deadline(pool.open_stream()).await.unwrap();
+        }
+        // 全部 6 条必须落在成员 0:成员 0 的 server accept 6 条
+        for _ in 0..6 {
+            deadline(servers[0].accept_stream()).await.unwrap();
+        }
+        // 其余成员一条都不该有;用超时确认(有流即返回 Ok)
+        for s in &servers[1..] {
+            let r = tokio::time::timeout(std::time::Duration::from_millis(100), s.accept_stream())
+                .await;
+            assert!(r.is_err(), "前缀外成员不得参与分派");
+        }
+
+        // 幂等与越界钳制:n=0 / n>K / 重复调用都不 panic,且上限被钳到 [1,K]
+        pool.set_active_prefix(0).await;
+        assert_eq!(pool.active_prefix().await, 1);
+        pool.set_active_prefix(1).await;
+        assert_eq!(pool.active_prefix().await, 1);
+        pool.set_active_prefix(usize::MAX).await;
+        assert_eq!(pool.active_prefix().await, K);
+        pool.set_active_prefix(usize::MAX).await;
+        assert_eq!(pool.active_prefix().await, K);
+    }
+
+    // detach_carrier(round-10):移除后 live 减 1、对端读到 EOF、且不触发
+    // 重拨——跨过 REDIAL_BACKOFF_START 与健康监视周期后成员数不回升。
+    #[tokio::test]
+    async fn detach_carrier_closes_and_never_redials() {
+        // 两个可杀载体对:peer 端保持裸 duplex 以观察 EOF。
+        let mut peers = Vec::new();
+        let mut members = Vec::new();
+        for _ in 0..2 {
+            let (peer, mux, _kill) = carrier_pair_peer_killable(16);
+            peers.push(peer);
+            members.push(mux);
+        }
+        let redials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r2 = redials.clone();
+        let redial: PoolRedial = Arc::new(move || {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                let (a, _b) = tokio::io::duplex(1024 * 1024);
+                Ok(YamuxMultiplexer::new(
+                    Box::new(a),
+                    yamux::Mode::Client,
+                    16,
+                    DEFAULT_SHARD_WORKERS,
+                ))
+            })
+        });
+        let pool = YamuxMultiplexerPool::new_client(members, Some(redial));
+        assert_eq!(pool.live_carriers().await, 2);
+
+        pool.detach_carrier(1).await;
+        assert_eq!(pool.live_carriers().await, 1, "detach 后只剩 1 条");
+        assert_eq!(pool.active_prefix().await, 1);
+
+        // 对端读到 EOF:detach 已 shutdown driver → socket drop
+        let mut p = peers.pop().unwrap();
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = [0u8; 64];
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match p.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("对端读不得报错:{e}"),
+                }
+            }
+        })
+        .await;
+        assert!(eof.is_ok(), "detach 必须关闭物理连接(对端 1s 内 EOF)");
+
+        // 不重拨:跨过 200ms 退避起点 + 500ms 健康监视周期 ×2
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert_eq!(redials.load(Ordering::SeqCst), 0, "detach 不得触发重拨");
+        assert_eq!(pool.live_carriers().await, 1, "成员数不得回升");
+
+        // 幂等:越界/重复 detach 不 panic,也不再减少
+        pool.detach_carrier(5).await;
+        pool.detach_carrier(0).await; // 移除最后一个 → 池空
+        assert_eq!(pool.live_carriers().await, 0);
+        pool.detach_carrier(0).await;
+        assert_eq!(pool.live_carriers().await, 0);
+    }
+
+    // detach_carrier:移除后剩余成员的轮转仍正确(K=3 → detach 1 →
+    // 2 条各分 2 流,均能被各自 server accept)。
+    #[tokio::test]
+    async fn detach_carrier_keeps_remaining_rr_correct() {
+        const K: usize = 3;
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..K {
+            let (a, b) = tokio::io::duplex(1024 * 1024);
+            clients.push(YamuxMultiplexer::new(
+                Box::new(a),
+                yamux::Mode::Client,
+                16,
+                DEFAULT_SHARD_WORKERS,
+            ));
+            servers.push(YamuxMultiplexer::new(
+                Box::new(b),
+                yamux::Mode::Server,
+                16,
+                DEFAULT_SHARD_WORKERS,
+            ));
+        }
+        let pool = YamuxMultiplexerPool::new_client(clients, None);
+        pool.detach_carrier(1).await;
+        assert_eq!(pool.live_carriers().await, 2);
+
+        for _ in 0..4 {
+            deadline(pool.open_stream()).await.unwrap();
+        }
+        for s in [&servers[0], &servers[2]] {
+            for _ in 0..2 {
+                deadline(s.accept_stream()).await.unwrap();
+            }
+        }
+        // 已 detach 的成员不得再接流:对端 mux 随物理连接关闭,要么
+        // accept 返回错误,要么超时;唯独不得返回一条流。
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            servers[1].accept_stream(),
+        )
+        .await;
+        assert!(!matches!(r, Ok(Ok(_))), "已 detach 的成员不得再接流");
+    }
+
+    // T-R1(round-10.1):open_stream_tagged 返回的 id 属于当前成员且与轮转
+    // 顺序一致。new_client 按表顺序分配 1..K,轮转从 seq=0 起步,故 6 条
+    // 流的 id 序列必须是 1,2,3,1,2,3;member_ids 快照同序。
+    #[tokio::test]
+    async fn open_stream_tagged_reports_round_robin_member() {
+        const K: usize = 3;
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..K {
+            let (a, b) = tokio::io::duplex(1024 * 1024);
+            clients.push(YamuxMultiplexer::new(
+                Box::new(a),
+                yamux::Mode::Client,
+                16,
+                DEFAULT_SHARD_WORKERS,
+            ));
+            servers.push(YamuxMultiplexer::new(
+                Box::new(b),
+                yamux::Mode::Server,
+                16,
+                DEFAULT_SHARD_WORKERS,
+            ));
+        }
+        let pool = YamuxMultiplexerPool::new_client(clients, None);
+        let ids = pool.member_ids().await;
+        assert_eq!(ids, vec![1, 2, 3], "身份按成员表顺序分配");
+
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            let (_s, id) = deadline(pool.open_stream_tagged()).await.unwrap();
+            got.push(id);
+        }
+        assert_eq!(got, vec![1, 2, 3, 1, 2, 3], "id 必须与轮转落点一致");
+        // 对端各 accept 2 条(落点归属的独立佐证)
+        for s in &mut servers {
+            for _ in 0..2 {
+                deadline(s.accept_stream()).await.unwrap();
+            }
+        }
+    }
+
+    // T-R2(round-10.1):detach_carrier_by_id 后 live 减 1、对端 EOF、跨过
+    // 重拨退避起点(200ms)后成员数不回升(无重拨环)。
+    #[tokio::test]
+    async fn detach_carrier_by_id_closes_and_never_redials() {
+        use tokio::io::AsyncReadExt as _;
+        let (mut peer0, mux0, _k0) = carrier_pair_peer_killable(16);
+        let (_peer1, mux1, _k1) = carrier_pair_peer_killable(16);
+        let redials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r2 = redials.clone();
+        let redial: PoolRedial = Arc::new(move || {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                let (a, _b) = tokio::io::duplex(1024 * 1024);
+                Ok(YamuxMultiplexer::new(
+                    Box::new(a),
+                    yamux::Mode::Client,
+                    16,
+                    DEFAULT_SHARD_WORKERS,
+                ))
+            })
+        });
+        let pool = YamuxMultiplexerPool::new_client(vec![mux0, mux1], Some(redial));
+        assert_eq!(pool.live_carriers().await, 2);
+        let before = pool.member_ids().await;
+
+        assert!(pool.detach_carrier_by_id(before[0]).await, "身份命中");
+        assert_eq!(pool.live_carriers().await, 1, "detach 后只剩 1 条");
+        assert_eq!(pool.member_ids().await, vec![before[1]], "只剩另一成员");
+
+        // 对端读到 EOF:detach 已 shutdown driver → socket drop
+        let mut buf = [0u8; 64];
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match peer0.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("对端读不得报错:{e}"),
+                }
+            }
+        })
+        .await;
+        assert!(eof.is_ok(), "按 id 摘除必须关闭物理连接(对端 1s 内 EOF)");
+
+        // 不重拨:300ms 已跨过 REDIAL_BACKOFF_START(200ms),重拨环若存在
+        // 会在该窗口内补回一条。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(redials.load(Ordering::SeqCst), 0, "按 id 摘除不得触发重拨");
+        assert_eq!(pool.live_carriers().await, 1, "成员数不得回升");
+    }
+
+    // T-R3(round-10.1):幂等/未知 id 返回 false 且不 panic;重拨补位的新
+    // 成员拿新 id,绝不复用旧 id(复用会让收敛阶段误摘新载体)。
+    #[tokio::test]
+    async fn detach_carrier_by_id_is_idempotent_and_redial_gets_fresh_id() {
+        let (c0, _s0, kill) = carrier_pair_killable(16);
+        let redials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r2 = redials.clone();
+        let redial: PoolRedial = Arc::new(move || {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                let (a, b) = tokio::io::duplex(1024 * 1024);
+                // 对端保持存活(否则新载体建即死,live 计数抖动)
+                tokio::spawn(async move {
+                    let _peer = b;
+                    futures::future::pending::<()>().await;
+                });
+                Ok(YamuxMultiplexer::new(
+                    Box::new(a),
+                    yamux::Mode::Client,
+                    16,
+                    DEFAULT_SHARD_WORKERS,
+                ))
+            })
+        });
+        let pool = YamuxMultiplexerPool::new_client(vec![c0], Some(redial));
+        let old_id = pool.member_ids().await[0];
+
+        // 未知 id:false 且不 panic;池成员表不变
+        assert!(!pool.detach_carrier_by_id(0).await, "0 不是成员身份");
+        assert!(
+            !pool.detach_carrier_by_id(u64::MAX).await,
+            "未知 id 返回 false"
+        );
+        assert_eq!(pool.member_ids().await, vec![old_id]);
+
+        // 杀载体 → 健康监视剔除并重拨补位,新成员 id 不得复用
+        kill.kill();
+        let t0 = std::time::Instant::now();
+        loop {
+            if pool.live_carriers().await == 1 && redials.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "redial must restore the carrier"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let ids = pool.member_ids().await;
+        assert_eq!(ids.len(), 1);
+        assert_ne!(ids[0], old_id, "重拨补位必须拿新 id,不得复用");
+
+        // 旧 id 已不在表:重复摘除返回 false(幂等);新 id 可摘
+        assert!(!pool.detach_carrier_by_id(old_id).await, "旧 id 已失效");
+        assert!(pool.detach_carrier_by_id(ids[0]).await, "新 id 可摘除");
+        assert!(
+            !pool.detach_carrier_by_id(ids[0]).await,
+            "重复摘除返回 false"
+        );
+    }
+
+    /// T-R3b(round-10.1 复核 regression):`reap_member` 可能在收敛前就已
+    /// spawn 重拨,拨号受 `connect_timeout`(默认 10s)约束——迟到的补位
+    /// 必须按补位目标数在入表前丢弃,物理载体数不得补回 `final_k + 1`,
+    /// 且被丢弃的载体连接必须真正关停(不能只是出表)。
+    #[tokio::test]
+    async fn slow_redial_landing_after_convergence_is_discarded() {
+        use tokio::io::AsyncReadExt as _;
+        let (c0, _s0, kill) = carrier_pair_killable(16);
+        let (c1, _s1, _k1) = carrier_pair_killable(16);
+        let redials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r2 = redials.clone();
+        // 慢拨:把"已 spawn 但尚未落地"的重拨具象化为 300ms 后才建好载体。
+        let peer_slot: Arc<tokio::sync::Mutex<Option<tokio::io::DuplexStream>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let slot = peer_slot.clone();
+        let redial: PoolRedial = Arc::new(move || {
+            r2.fetch_add(1, Ordering::SeqCst);
+            let slot = slot.clone();
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let (a, b) = tokio::io::duplex(1024 * 1024);
+                *slot.lock().await = Some(b);
+                Ok(YamuxMultiplexer::new(
+                    Box::new(a),
+                    yamux::Mode::Client,
+                    16,
+                    DEFAULT_SHARD_WORKERS,
+                ))
+            })
+        });
+        let pool = YamuxMultiplexerPool::new_client(vec![c0, c1], Some(redial));
+
+        // 杀成员 0 → 健康监视剔除并 spawn 重拨(重拨进入慢拨等待)。
+        kill.kill();
+        let t0 = std::time::Instant::now();
+        while pool.member_ids().await.len() != 1 || redials.load(Ordering::SeqCst) == 0 {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "reaper must reap and spawn redial"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // 收敛:目标 1(控制载体保留)。此刻重拨已在途,无法再被 detach
+        // 失效——只能由入表处的目标数检查拦下。
+        pool.set_active_prefix(1).await;
+
+        // 跨过慢拨完成点(300ms)+ 余量。旧实现会在 300ms 时补回一条,
+        // 使物理载体数 = final_k + 1 永久驻留。
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(redials.load(Ordering::SeqCst), 1, "只应有一次重拨");
+        assert_eq!(
+            pool.member_ids().await.len(),
+            1,
+            "迟到的重拨补位必须在入表前丢弃"
+        );
+        assert_eq!(pool.live_carriers().await, 1);
+
+        // 被丢弃的载体不得只"出表"而泄漏物理连接:对端必须读到 EOF。
+        let mut peer = peer_slot
+            .lock()
+            .await
+            .take()
+            .expect("slow redial must have produced a carrier");
+        let mut buf = [0u8; 64];
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match peer.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("对端读不得报错:{e}"),
+                }
+            }
+        })
+        .await;
+        assert!(eof.is_ok(), "被丢弃的补位载体必须关闭物理连接");
+    }
+
+    /// round-10.2 §2.1 regression:收敛时成员表因成员死亡未补位而只有 2 条,
+    /// `set_active_prefix(3)` 必须存**目标数**而非当时的表长;随后重拨补位
+    /// 使表回到 3 条时,分派前缀必须扩展到 3。修复前 `active_prefix` 被钳
+    /// 到 2,补位后仍冻结为 2 → 3 条流只落在 2 个成员上。
+    #[tokio::test]
+    async fn prefix_expands_when_redial_lands_after_convergence() {
+        let (c0, _s0, _k0) = carrier_pair_killable(16);
+        let (c1, _s1, k1) = carrier_pair_killable(16);
+        let (c2, _s2, _k2) = carrier_pair_killable(16);
+        let redials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r2 = redials.clone();
+        // 慢拨 300ms:保证 set_active_prefix 执行时表长仍为 2(补位未落地)。
+        let redial: PoolRedial = Arc::new(move || {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let (a, b) = tokio::io::duplex(1024 * 1024);
+                // 对端保持存活:新载体不得建即死。
+                tokio::spawn(async move {
+                    let _peer = b;
+                    futures::future::pending::<()>().await;
+                });
+                Ok(YamuxMultiplexer::new(
+                    Box::new(a),
+                    yamux::Mode::Client,
+                    16,
+                    DEFAULT_SHARD_WORKERS,
+                ))
+            })
+        });
+        let pool = YamuxMultiplexerPool::new_client(vec![c0, c1, c2], Some(redial));
+        assert_eq!(pool.member_ids().await.len(), 3);
+
+        // 杀成员 1 → 健康监视剔除(表长 2)并 spawn 慢重拨。
+        k1.kill();
+        let t0 = std::time::Instant::now();
+        while pool.member_ids().await.len() != 2 || redials.load(Ordering::SeqCst) == 0 {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "carrier 1 must be reaped and redial spawned"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // 收敛:此刻表长 2,目标 final_k=3。
+        pool.set_active_prefix(3).await;
+
+        // 等慢重拨补位落地(表长回到 3)。
+        let t0 = std::time::Instant::now();
+        while pool.member_ids().await.len() != 3 {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "redial must land after convergence"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            pool.active_prefix().await,
+            3,
+            "补位后前缀必须扩展到目标数(不得冻结在收敛时的表长)"
+        );
+
+        // 连续 3 次分派必须覆盖 3 个不同成员(修复前只有前 2 个参与轮转)。
+        let mut landed = Vec::new();
+        for _ in 0..3 {
+            let (_s, id) = deadline(pool.open_stream_tagged()).await.unwrap();
+            landed.push(id);
+        }
+        landed.sort_unstable();
+        landed.dedup();
+        assert_eq!(landed.len(), 3, "3 条流必须覆盖 3 个载体(前缀不得冻结)");
+    }
+
+    /// T-P1(round-9):运行中 attach_carrier 追加的成员立即参与
+    /// open_stream 轮转——1 成员池附加第 2 成员后开 2 流,恰每载体 1 条
+    /// (双向锁死均匀性,同 yamux_pool_round_robin_across_carriers)。
+    #[tokio::test]
+    async fn yamux_pool_attach_carrier_joins_round_robin() {
+        // 载体对 A(池初始成员)与 B(附加成员),各带对端客户端 mux
+        let (a_client, a_server) = tokio::io::duplex(1024 * 1024);
+        let (b_client, b_server) = tokio::io::duplex(1024 * 1024);
+        let client_a = YamuxMultiplexer::new(
+            Box::new(a_client),
+            yamux::Mode::Client,
+            16,
+            DEFAULT_SHARD_WORKERS,
+        );
+        let client_b = YamuxMultiplexer::new(
+            Box::new(b_client),
+            yamux::Mode::Client,
+            16,
+            DEFAULT_SHARD_WORKERS,
+        );
+        let server_a = YamuxMultiplexer::new(
+            Box::new(a_server),
+            yamux::Mode::Server,
+            16,
+            DEFAULT_SHARD_WORKERS,
+        );
+        let server_b = YamuxMultiplexer::new(
+            Box::new(b_server),
+            yamux::Mode::Server,
+            16,
+            DEFAULT_SHARD_WORKERS,
+        );
+
+        let pool = YamuxMultiplexerPool::new_server(vec![server_a]);
+        pool.attach_carrier(server_b).await;
+        assert_eq!(pool.live_carriers().await, 2, "附加成员必须在成员表中");
+
+        // 服务端池开 2 流(服务端开偶数 id 流,客户端 mux accept):
+        // 轮转恰覆盖初始成员 + 附加成员各 1 条
+        for _ in 0..2 {
+            deadline(pool.open_stream()).await.unwrap();
+        }
+        deadline(client_a.accept_stream()).await.unwrap();
+        deadline(client_b.accept_stream()).await.unwrap();
+        // 恰各 1 条:某载体多分派则下一条 accept 挂起触发 deadline,
+        // 少分派则上方循环已挂起。
+    }
+
+    /// T-P2(round-9):attach_carrier 后 accept_stream 合流新成员——
+    /// 两个客户端 mux 各开 2 流,池 accept 恰收 4 条(跨载体合流)。
+    #[tokio::test]
+    async fn yamux_pool_attach_carrier_accept_merges() {
+        let (a_client, a_server) = tokio::io::duplex(1024 * 1024);
+        let (b_client, b_server) = tokio::io::duplex(1024 * 1024);
+        let client_a = YamuxMultiplexer::new(
+            Box::new(a_client),
+            yamux::Mode::Client,
+            16,
+            DEFAULT_SHARD_WORKERS,
+        );
+        let client_b = YamuxMultiplexer::new(
+            Box::new(b_client),
+            yamux::Mode::Client,
+            16,
+            DEFAULT_SHARD_WORKERS,
+        );
+        let server_a = YamuxMultiplexer::new(
+            Box::new(a_server),
+            yamux::Mode::Server,
+            16,
+            DEFAULT_SHARD_WORKERS,
+        );
+        let server_b = YamuxMultiplexer::new(
+            Box::new(b_server),
+            yamux::Mode::Server,
+            16,
+            DEFAULT_SHARD_WORKERS,
+        );
+
+        let pool = YamuxMultiplexerPool::new_server(vec![server_a]);
+        pool.attach_carrier(server_b).await;
+
+        for c in [&client_a, &client_b] {
+            for _ in 0..2 {
+                deadline(c.open_stream()).await.unwrap();
+            }
+        }
+        for _ in 0..4 {
+            deadline(pool.accept_stream()).await.unwrap();
+        }
+        assert!(!pool.is_dead());
+    }
+
+    /// 服务端合流:3 条连接的 server mux 合成一池,3 个客户端各开 2 流,
+    /// 池 accept 恰收 6 条。
+    #[tokio::test]
+    async fn yamux_pool_server_accept_merges() {
+        const K: usize = 3;
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..K {
+            let (a, b) = tokio::io::duplex(1024 * 1024);
+            clients.push(YamuxMultiplexer::new(
+                Box::new(a),
+                yamux::Mode::Client,
+                16,
+                DEFAULT_SHARD_WORKERS,
+            ));
+            servers.push(YamuxMultiplexer::new(
+                Box::new(b),
+                yamux::Mode::Server,
+                16,
+                DEFAULT_SHARD_WORKERS,
+            ));
+        }
+        let pool = YamuxMultiplexerPool::new_server(servers);
+        for c in &clients {
+            for _ in 0..2 {
+                deadline(c.open_stream()).await.unwrap();
+            }
+        }
+        for _ in 0..(K * 2) {
+            deadline(pool.accept_stream()).await.unwrap();
+        }
+        assert!(!pool.is_dead());
+    }
+
+    /// T-L1(round-9.1 F1):服务端池 shutdown 必须收敛整套资源——
+    /// 载体物理连接关闭(对端读到 EOF)、live_carriers 归零、accept
+    /// 转发任务 1s 内全部退出。
+    #[tokio::test]
+    async fn pool_shutdown_closes_carriers_and_forward_tasks() {
+        use tokio::io::AsyncReadExt as _;
+        let mut members = Vec::new();
+        let mut peers = Vec::new();
+        for _ in 0..2 {
+            // 对端保持裸 duplex:直接从物理层观察 EOF(socket 是否真关)
+            let (peer, mux, _kill) = carrier_pair_peer_killable(16);
+            peers.push(peer);
+            members.push(mux);
+        }
+        let pool = YamuxMultiplexerPool::new_server(members);
+        assert_eq!(pool.live_carriers().await, 2);
+        // 让两个转发任务先 park 在各自载体的 accept_stream 上
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        pool.shutdown();
+
+        // 1) 对端读立即 EOF:driver 中止 → socket drop → 物理连接关闭。
+        //    建连初期可能残留 12B 帧头(建流授信/ACK),读到 EOF 为准。
+        for mut p in peers {
+            let mut buf = [0u8; 64];
+            let eof = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    match p.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(e) => panic!("对端读不得报错:{e}"),
+                    }
+                }
+            })
+            .await;
+            assert!(eof.is_ok(), "对端必须在 1s 内读到 EOF(物理连接已关闭)");
+        }
+        // 2) 成员 mux 全部置 dead → live_carriers 归零
+        assert_eq!(pool.live_carriers().await, 0, "shutdown 后无存活载体");
+        // 3) 转发任务 1s 内退出(自然收敛或 abort 均计数)
+        let t0 = std::time::Instant::now();
+        while pool.forward_tasks_exited() < 2 {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(1),
+                "转发任务必须收敛:已退出 {}/2",
+                pool.forward_tasks_exited()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// T-L2(round-9.1):shutdown 幂等——连续两次显式调用不 panic,
+    /// 池 Drop(内部再调一次)同样安全。
+    #[tokio::test]
+    async fn pool_shutdown_is_idempotent() {
+        let (c0, _s0, _k0) = carrier_pair_killable(16);
+        let pool = YamuxMultiplexerPool::new_client(vec![c0], None);
+        pool.shutdown();
+        pool.shutdown();
+        // Drop 路径再调一次 shutdown(impl Drop for YamuxMultiplexerPool)
+        drop(pool);
+    }
+
+    /// T-L3(round-9.1 F1):客户端池**无显式 shutdown**,整体 Drop 后其
+    /// driver 必须收敛——对端读到 EOF,且 PoolInner 最终释放(弱引用
+    /// 失效,不留转发任务/健康监视强持有)。
+    #[tokio::test]
+    async fn client_pool_drop_converges_drivers() {
+        use tokio::io::AsyncReadExt as _;
+        let (a, mut peer) = tokio::io::duplex(1024 * 1024);
+        let mux =
+            YamuxMultiplexer::new(Box::new(a), yamux::Mode::Client, 16, DEFAULT_SHARD_WORKERS);
+        let pool = YamuxMultiplexerPool::new_client(vec![mux], None);
+        let weak = pool.inner_weak();
+        drop(pool); // 无显式 shutdown:仅 Drop 兜底
+                    // 物理连接随 driver 中止关闭 → 对端读至 EOF(建连初期可能
+                    // 残留 12B 帧头,读到 EOF 为准)
+        let mut buf = [0u8; 64];
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match peer.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("对端读不得报错:{e}"),
+                }
+            }
+        })
+        .await;
+        assert!(eof.is_ok(), "客户端池 Drop 后对端必须读到 EOF");
+        // PoolInner 释放:转发任务(客户端池无)与健康监视(Weak)不滞留
+        let t0 = std::time::Instant::now();
+        while weak.upgrade().is_some() {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(1),
+                "PoolInner 必须随池 Drop 释放(无任务强持有)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// 复核回归(round-9.1 F1 补丁):池关停后 in-flight 重拨拨通的载体
+    /// 从未入表,必须由 redial_loop 显式关停——否则其 driver 与物理连接
+    /// 永久驻留(`YamuxMultiplexer` 的 Drop 不 abort),且 redialing 计数
+    /// 不归还。断言:对端 1s 内 EOF、计数归零、成员表仍为空。
+    #[tokio::test]
+    async fn redial_after_pool_shutdown_closes_fresh_carrier() {
+        use tokio::io::AsyncReadExt as _;
+        let (c0, _s0, _k0) = carrier_pair_killable(16);
+        let pool = YamuxMultiplexerPool::new_client(vec![c0], None);
+        let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<tokio::io::DuplexStream>();
+        let redial: PoolRedial = Arc::new(move || {
+            let tx = peer_tx.clone();
+            Box::pin(async move {
+                let (a, b) = tokio::io::duplex(1024 * 1024);
+                // 只传对端给测试;客户端 mux 随 redial 返回值交给 redial_loop
+                let _ = tx.send(b);
+                Ok(YamuxMultiplexer::new(
+                    Box::new(a),
+                    yamux::Mode::Client,
+                    16,
+                    DEFAULT_SHARD_WORKERS,
+                ))
+            })
+        });
+        // 模拟"重拨在途时池关停":reap_member 已 +1 并 spawn
+        pool.inner.redialing.fetch_add(1, Ordering::AcqRel);
+        pool.shutdown();
+        redial_loop(pool.inner.clone(), redial).await;
+
+        let mut peer = peer_rx.recv().await.expect("redial must produce a carrier");
+        let mut buf = [0u8; 64];
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match peer.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("对端读不得报错:{e}"),
+                }
+            }
+        })
+        .await;
+        assert!(eof.is_ok(), "池关停后重拨载体必须在 1s 内关闭(对端 EOF)");
+        assert_eq!(pool.redialing(), 0, "关停分支必须归还 in-flight 重拨计数");
+        assert_eq!(pool.live_carriers().await, 0, "关停后不得再入表");
+    }
+
+    /// 复核回归(round-9.1 F1 补丁):`shutdown()` 的成员快照撞上写锁
+    /// 持有者时只能置标志;写锁释放后的复查([`PoolInner::shutdown_sweep`],
+    /// attach/redial/reap 三个写路径均已接入)必须补做载体关停——否则
+    /// 显式拆除的立即收敛会退化为等 PoolInner 最后一次 Arc 释放。
+    #[tokio::test]
+    async fn shutdown_snapshot_miss_converges_after_write_unlock() {
+        use tokio::io::AsyncReadExt as _;
+        let mut members = Vec::new();
+        let mut peers = Vec::new();
+        for _ in 0..2 {
+            let (peer, mux, _kill) = carrier_pair_peer_killable(16);
+            peers.push(peer);
+            members.push(mux);
+        }
+        let pool = YamuxMultiplexerPool::new_server(members);
+        assert_eq!(pool.live_carriers().await, 2);
+        // 持写锁模拟 attach/reap 临界区:shutdown 的 try_read 必然落败,
+        // 成员快照为空(这正是发现所指的窗口)。
+        let guard = pool.inner.members.write().await;
+        pool.shutdown();
+        drop(guard); // 写路径释放锁
+        pool.inner.shutdown_sweep(); // 写路径释放锁后的复查
+
+        for mut p in peers {
+            let mut buf = [0u8; 64];
+            let eof = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    match p.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(e) => panic!("对端读不得报错:{e}"),
+                    }
+                }
+            })
+            .await;
+            assert!(eof.is_ok(), "快照落空后经复查必须关闭载体(对端 1s 内 EOF)");
+        }
+    }
+
+    /// round-9.2 回归:`reap_member` 的早退分支(成员已被并发路径收敛)
+    /// 释放写锁后必须复查关停标志并补做收敛。
+    ///
+    /// 时序:同一 member 连续两次走生产 [`reap_member`]——第一次把它移出
+    /// 成员表(模拟并发收敛);两次之间测试持成员表写锁调用
+    /// [`YamuxMultiplexerPool::shutdown`],其两次 `try_read`(成员快照 +
+    /// 末尾 sweep)必然落空,只置标志并 abort 转发任务,载体 driver 未关停;
+    /// 随后第二次 reap 必走早退分支。
+    ///
+    /// 修复前该测试必红:早退分支在返回前不调用
+    /// [`PoolInner::shutdown_sweep`],而 shutdown 的快照又为空 → 仍在表中
+    /// 的载体 driver 永不 abort,对端 1s 内读不到 EOF,`live_carriers()`
+    /// 停在 1。修复后:早退分支先 drop 写锁再 sweep → 表中载体被关停,
+    /// 对端 1s 内 EOF、`live_carriers()` 归零。
+    #[tokio::test]
+    async fn reap_early_return_sweeps_after_shutdown() {
+        use tokio::io::AsyncReadExt as _;
+        let (_p0, m0, _k0) = carrier_pair_peer_killable(16);
+        let (mut p1, m1, _k1) = carrier_pair_peer_killable(16);
+        let pool = YamuxMultiplexerPool::new_server(vec![m0, m1]);
+        assert_eq!(pool.live_carriers().await, 2);
+
+        // 第一次 reap:成员 0 被移出成员表(生产语义:已被并发路径收敛)。
+        let member = pool.inner.members.read().await[0].clone();
+        reap_member(&pool.inner, member.clone()).await;
+        assert_eq!(pool.live_carriers().await, 1, "第一次 reap 应移出成员 0");
+
+        // 持写锁关停:shutdown 的两次 try_read 均落空,只剩关停标志;
+        // 释放锁后不再有其他写路径会复查。
+        {
+            let guard = pool.inner.members.write().await;
+            pool.shutdown();
+            drop(guard);
+        }
+
+        // 第二次 reap 走早退分支 → 必须复查关停标志并关停表中残留载体。
+        reap_member(&pool.inner, member).await;
+
+        // 断言对象是仍在成员表里的载体 1;成员 0 已被测试移出,生产中被
+        // reap 时必已 dead,不在本断言范围。
+        let mut buf = [0u8; 64];
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match p1.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("对端读不得报错:{e}"),
+                }
+            }
+        })
+        .await;
+        assert!(
+            eof.is_ok(),
+            "早退分支必须补做关停:表中载体需在 1s 内关闭(对端 EOF)"
+        );
+        assert_eq!(pool.live_carriers().await, 0, "关停后不得残留活载体");
+    }
+
+    /// 复核回归:attach_carrier 与 shutdown 并发——写锁等待期间池关停,
+    /// 新载体不得入表,且其 driver 必须被关停(对端 EOF)。
+    #[tokio::test]
+    async fn attach_carrier_during_shutdown_is_closed() {
+        use tokio::io::AsyncReadExt as _;
+        let (c0, _s0, _k0) = carrier_pair_killable(16);
+        let pool = Arc::new(YamuxMultiplexerPool::new_server(vec![c0]));
+        let (mut peer, mux, _kill) = carrier_pair_peer_killable(16);
+
+        // 先占写锁,把 attach 排到写锁等待队列,再关停池。
+        let guard = pool.inner.members.write().await;
+        let p2 = pool.clone();
+        let attach = tokio::spawn(async move { p2.attach_carrier(mux).await });
+        // 让 attach 进入等待(写到 semaphore 队列),再关停
+        tokio::task::yield_now().await;
+        pool.shutdown();
+        drop(guard);
+        deadline(attach).await.unwrap();
+
+        // 池已关停:初始成员与新附加载体都不得存活(入表即会被计数)
+        assert_eq!(pool.live_carriers().await, 0, "关停后 attach 不得入表");
+        let mut buf = [0u8; 64];
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match peer.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("对端读不得报错:{e}"),
+                }
+            }
+        })
+        .await;
+        assert!(eof.is_ok(), "关停后附加载体必须立即关闭(对端 EOF)");
     }
 
     // round-6 复核修复回归(发送侧分片):停读-恢复 + 写完即 drop 的流,
@@ -1190,7 +3363,7 @@ mod tests {
             .expect("echo join");
     }
 
-    // round-5 §2.7/§4.3 + round-6 §4.4 锁:mux_config 不覆盖 shard_workers,
+    // round-5 §2.7/§4.3 + round-6 §4.4 锁:mux_config 保持默认 shard_workers,
     // halves 四元组的两个 Worker Vec 长度必须都等于 vendor 默认 4(三机
     // 验收以此为准;调参须另立规格)。经 into_halves 返回的 Vec 长度观测,
     // 不依赖 vendor 暴露 getter;纯构造不 poll,无需运行时(两半/Worker
@@ -1214,6 +3387,39 @@ mod tests {
             4,
             "send workers 与 RecvWorker 同 N 同模数(round-6 §4.4)"
         );
+    }
+
+    // T-C5(round-10):池规模 → 每载体 shard 映射。K=1 必须回到 4
+    // (红线:K=1 路径零回退),K≥4 收敛到 1,总量 ≤ 4。
+    #[test]
+    fn shard_workers_for_pool_size() {
+        assert_eq!(shard_workers_for_k(1), 4);
+        assert_eq!(shard_workers_for_k(2), 2);
+        assert_eq!(shard_workers_for_k(3), 1);
+        assert_eq!(shard_workers_for_k(4), 1);
+        assert_eq!(shard_workers_for_k(8), 1);
+        assert_eq!(shard_workers_for_k(0), 4, "0 按 1 处理,不 panic");
+        for k in 1..=8 {
+            assert!(
+                (1..=DEFAULT_SHARD_WORKERS).contains(&shard_workers_for_k(k)),
+                "K={k} 的 shard 必须在 1..=4"
+            );
+        }
+    }
+
+    // T-C5:参数化入口必须真实生效——K=2 时两侧各 2 个 Worker,
+    // 且与默认入口(4)可区分。
+    #[test]
+    fn mux_config_with_shards_is_effective() {
+        let (a, _b) = tokio::io::duplex(64);
+        let conn: MuxConn = yamux::Connection::new(
+            YamuxCarrier::new(Box::new(a)),
+            mux_config_with_shards(MUX_STREAMS_UNLIMITED, shard_workers_for_k(2)),
+            yamux::Mode::Client,
+        );
+        let (_recv, _send, workers, send_workers) = conn.into_halves();
+        assert_eq!(workers.len(), 2);
+        assert_eq!(send_workers.len(), 2);
     }
 
     // A4 长期锁(read_chunk_from_cap_lock):注入超限缓冲(256KiB,镜像池
@@ -1567,6 +3773,7 @@ mod tests {
                 Box::new(write_dup),
                 yamux::Mode::Server,
                 MUX_STREAMS_UNLIMITED,
+                DEFAULT_SHARD_WORKERS,
             );
             // echo:收 5 字节回 5 字节
             let mut s = mux.accept_stream().await.expect("server accept stream");
@@ -1582,6 +3789,7 @@ mod tests {
             Box::new(write_dup),
             yamux::Mode::Client,
             MUX_STREAMS_UNLIMITED,
+            DEFAULT_SHARD_WORKERS,
         );
         let mut c = mux.open_stream().await.expect("client open stream");
         c.write_all(b"hello").await.expect("client write");
