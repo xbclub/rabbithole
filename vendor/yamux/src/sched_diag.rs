@@ -385,3 +385,10 @@ pub fn dump_push(tag: &str) {
         PUSH_OTHER.load(Ordering::Relaxed)
     );
 }
+
+// ---- WU 调用栈追踪(仅前 3 次) ----
+static WU_TRACED: AtomicU64 = AtomicU64::new(0);
+
+pub fn trace_wu() -> bool {
+    WU_TRACED.fetch_add(1, Ordering::Relaxed) < 3
+}

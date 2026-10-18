@@ -1411,6 +1411,10 @@ mod halves {
         pub(crate) fn push_to_send(&self, f: Frame<()>) {
             if crate::sched_diag::enabled() {
                 crate::sched_diag::on_push_to_send(f.header().tag() as u8);
+                if f.header().tag() as u8 == 1 && crate::sched_diag::trace_wu() {
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    eprintln!("WU_STACK:\n{bt}");
+                }
             }
             self.to_send.lock().push_back(f);
             if let Some(w) = self.send_waker.lock().take() {
