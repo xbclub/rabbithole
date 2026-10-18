@@ -5749,3 +5749,99 @@ for {
 **验证:统计 yamux 帧的大小分布。**
 
 **这是下一轮的直接目标。**
+
+### 42.7 ⭐⭐⭐⭐⭐ 根因找到:窗口更新帧是数据帧的 4.2 倍
+
+**统计 yamux 帧的类型分布(2.22 Gbps,8 秒):**
+
+```
+FRAMETAG down data=203  wu=844  ping=6  goaway=0
+FRAMESIZE down total=1053 avg=33 <1K=1051 <8K=2 <32K=0 <64K=0
+```
+
+| 帧类型 | 数量 | 占比 |
+|---|---:|---:|
+| **WindowUpdate(WU)** | **844** | **80.2%** |
+| Data | 203 | 19.3% |
+| Ping | 6 | 0.6% |
+
+**⇒ 每发 1 个数据帧,就要发 4.2 个窗口更新帧。**
+
+**且 `avg=33 字节`、`<1K=1051/1053` —— 几乎全部是小帧。**
+
+### 42.8 这就是根因
+
+**回顾 §41.10 的 `fill_batch` 数据:**
+```
+calls=1272 zero=623 frames_per_call=0.64 bytes_per_call=18
+```
+
+**`bytes_per_call=18` 字节 —— 与 `avg=33 字节` 的帧大小吻合。**
+
+**⇒ FlushTask 每次 `fill_batch` 拿到的就是一个 WU 小帧(或什么都没有),
+然后要做一次完整的 `poll_ready` + `writev` + `poll_flush`。**
+
+**80% 的发送能力被 WU 帧占用。**
+
+### 42.9 为什么 WU 帧这么多
+
+**`next_window_update` 的触发条件(`flow_control.rs`):**
+
+```rust
+let bytes_received = self.max_receive_window - self.receive_window;
+let next_window_update = bytes_received.saturating_sub(buffer_len);
+if next_window_update < self.max_receive_window / 2 {
+    return None;   // 半窗阈值
+}
+```
+
+**`max_receive_window = 6MiB`,半窗阈值 = 3MiB。**
+
+**理论上每收 3MiB 才发一次 WU。8 秒 × 2.22 Gbps = 2.22 GB,
+应该有 2.22GB / 3MiB ≈ 740 次 WU。**
+
+**实测 844 次 —— **与理论完全吻合!**
+
+### 42.10 那为什么这是问题
+
+**因为 rh 的 WU 是**每流独立**的,而 16 条流各发各的。**
+
+**740 次 WU / 16 流 ≈ 46 次/流,看起来不多。**
+
+**但关键在于:**WU 帧和 Data 帧走**同一条 send_out 队列和同一个 FlushTask**。**
+
+**每个 WU 帧都要:**
+- 占用一次 `fill_batch` 调用
+- 触发一次 `poll_ready` + `writev` + `poll_flush`
+- **挤掉一个本可以发数据帧的机会**
+
+**⇒ 80% 的 FlushTask 调用被 WU 帧消耗。**
+
+### 42.11 为什么 frp 没有这个问题
+
+**frp 的 yamux(fatedier fork)窗口更新是**随数据帧捎带**的:**
+
+**`sendWindowUpdate` 在 `Stream.Write` 或 `Stream.Read` 里被调用,
+WU 帧通过 `sendCh` 发送 —— 但 frp 的 `sendLoop` 是阻塞式的,
+它一次 `select` 可能拿到多个待发帧并合并写。**
+
+**更关键:frp 的 `sendCh` 容量是 64,`sendLoop` 会尽可能批量取,
+一次 `writev` 写出多个帧。**
+
+**rh 的 FlushTask 每轮 `fill_batch` 只拿到 0.64 帧,根本攒不起批。**
+
+### 42.12 修复方向
+
+**让 FlushTask 在发 WU 帧时不要打断数据帧的批处理。**
+
+**具体:WU 帧应该与数据帧**合并**在同一次 writev 里,
+而不是各自触发一次完整的 poll 循环。**
+
+**验证:统计 `fill_batch` 返回 0 帧但 `to_send` 非空的比例
+(说明有帧但没取到)。**
+
+**或者更直接:检查 `next_frame` 的优先级 —— 它先取 `to_send`(WU),
+再取 `send_out`(数据)。若 WU 源源不断,数据帧会饥饿。**
+
+**这正是 §42.8 观测到的:`fill_batch` 每次只拿到 0.64 帧,
+因为每轮都被一个 WU 帧"喂饱"就返回了(队列空了)。**
