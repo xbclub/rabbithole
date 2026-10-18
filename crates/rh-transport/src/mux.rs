@@ -293,6 +293,36 @@ type MuxConn = yamux::Connection<YamuxCarrier>;
 /// 超限会打破与对端发送窗的锁步节奏)。
 const CHUNK_CAP: usize = 64 * 1024;
 
+/// round-11 诊断:pump_down 的读/写耗时分解。仅当 `RH_PUMP_STATS=1` 时
+/// 在 pump 结束时向 stderr 输出一行。用于判定下行瓶颈是"等数据"还是
+/// "写不出"。
+pub mod pump_diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static READ_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static READS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITES: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static CHUNKS: AtomicU64 = AtomicU64::new(0);
+    pub fn enabled() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var("RH_PUMP_STATS").map(|v| v == "1").unwrap_or(false))
+    }
+    pub fn dump(tag: &str) {
+        if !enabled() { return; }
+        let r = READ_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        let w = WRITE_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        let rd = READS.load(Ordering::Relaxed);
+        let wr = WRITES.load(Ordering::Relaxed);
+        let by = BYTES.load(Ordering::Relaxed);
+        let ch = CHUNKS.load(Ordering::Relaxed);
+        eprintln!(
+            "PUMP_STATS {tag} read_ms={r:.0} write_ms={w:.0} reads={rd} writes={wr} bytes={by} chunks={ch} avg_chunk={:.0}",
+            if ch > 0 { by as f64 / ch as f64 } else { 0.0 }
+        );
+    }
+}
+
 /// 规则取消后的收尾(FIN/close/shutdown)等待上限。
 /// 收尾可能永久 Pending:对端不读且发送缓冲满、对端接收窗耗尽、
 /// 自定义 IO 直接 Pending(主代理 cancel-close 复现:PendingShutdownIo)、
@@ -608,11 +638,18 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     let mut smalls: Vec<Bytes> = Vec::new();
     let mut smalls_bytes = 0usize;
     let clean = 'outer: loop {
+        let __t0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
         let chunk = match b_read.read_chunk().await {
             Ok(Some(c)) => c,
             Ok(None) => break 'outer true,
             Err(_) => break 'outer false,
         };
+        if let Some(t) = __t0 {
+            pump_diag::READ_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            pump_diag::READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            pump_diag::CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            pump_diag::BYTES.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         if chunk.len() >= CHUNK_CAP {
             if !flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await {
                 break 'outer false;
@@ -658,6 +695,7 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         }
     };
     let _ = flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await;
+    pump_diag::dump("down");
     clean
 }
 
