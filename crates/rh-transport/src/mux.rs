@@ -276,7 +276,7 @@ impl UpReader {
             {
                 self.pool_borrows += 1;
             }
-            return read_chunk_from(r, CHUNK_CAP).await;
+            return read_chunk_from(r, chunk_cap()).await;
         }
         let local = bytes::BytesMut::with_capacity(INIT_BUF_CAP);
         let chunk = read_chunk_into(r, INIT_BUF_CAP, local).await?;
@@ -292,6 +292,16 @@ type MuxConn = yamux::Connection<YamuxCarrier>;
 /// chunk 中继读块上限(读缓冲 64KiB 红线:yamux 窗口更新按读步进,
 /// 超限会打破与对端发送窗的锁步节奏)。
 const CHUNK_CAP: usize = 64 * 1024;
+
+/// round-11 诊断:块大小 env 覆盖。每块的固定成本(锁/唤醒/系统调用)若
+/// 是单流~2G 的原因,加大块应减少这些次数。默认 64KiB。
+fn chunk_cap() -> usize {
+    std::env::var("RH_MUX_CHUNK_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (16 * 1024..=1024 * 1024).contains(n))
+        .unwrap_or(CHUNK_CAP)
+}
 
 /// 规则取消后的收尾(FIN/close/shutdown)等待上限。
 /// 收尾可能永久 Pending:对端不读且发送缓冲满、对端接收窗耗尽、
