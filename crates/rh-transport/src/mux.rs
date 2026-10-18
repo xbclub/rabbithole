@@ -304,6 +304,10 @@ pub mod pump_diag {
     pub static WRITES: AtomicU64 = AtomicU64::new(0);
     pub static BYTES: AtomicU64 = AtomicU64::new(0);
     pub static CHUNKS: AtomicU64 = AtomicU64::new(0);
+    /// 单次读等待 > 1ms 的次数(判定是否在等上游)
+    pub static SLOW_READS: AtomicU64 = AtomicU64::new(0);
+    /// 单次读等待 > 10ms 的次数
+    pub static VERY_SLOW_READS: AtomicU64 = AtomicU64::new(0);
     pub fn enabled() -> bool {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *V.get_or_init(|| std::env::var("RH_PUMP_STATS").map(|v| v == "1").unwrap_or(false))
@@ -317,8 +321,10 @@ pub mod pump_diag {
         let by = BYTES.load(Ordering::Relaxed);
         let ch = CHUNKS.load(Ordering::Relaxed);
         eprintln!(
-            "PUMP_STATS {tag} read_ms={r:.0} write_ms={w:.0} reads={rd} writes={wr} bytes={by} chunks={ch} avg_chunk={:.0}",
-            if ch > 0 { by as f64 / ch as f64 } else { 0.0 }
+            "PUMP_STATS {tag} read_ms={r:.0} write_ms={w:.0} reads={rd} writes={wr} bytes={by} chunks={ch} avg_chunk={:.0} slow1ms={} slow10ms={}",
+            if ch > 0 { by as f64 / ch as f64 } else { 0.0 },
+            SLOW_READS.load(Ordering::Relaxed),
+            VERY_SLOW_READS.load(Ordering::Relaxed),
         );
     }
 }
@@ -645,7 +651,14 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             Err(_) => break 'outer false,
         };
         if let Some(t) = __t0 {
-            pump_diag::READ_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            let el = t.elapsed();
+            if el.as_millis() >= 1 {
+                pump_diag::SLOW_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if el.as_millis() >= 10 {
+                pump_diag::VERY_SLOW_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            pump_diag::READ_NS.fetch_add(el.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             pump_diag::READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             pump_diag::CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             pump_diag::BYTES.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
