@@ -4569,3 +4569,65 @@ write().await       → 至少 1 次 park(socket 满时)
 
 **若 rh 的 write 阻塞确实更长(4ms vs 更短),则差异在
 "rh 写目标 socket 的方式";若相近,则差异在别处。**
+
+### 36.7 直接观测:rh 的 write 在等什么
+
+**rh-client → 目标的连接(负载下):**
+
+```
+Send-Q = 0      ← 应用层无积压
+w0              ← 无线程在等写锁
+f152738         ← 152KB 已交给内核待发
+Recv-Q(目标侧) = 5,664,214  (5.6MB 未读)
+```
+
+**`Send-Q=0` + `w0` 说明:应用层把数据交给了内核,内核队列没有积压,
+也没有线程在等待。**
+
+**但目标侧 Recv-Q 有 5.6MB —— 目标不读。**
+
+**⇒ 这是端到端的背压:目标消费慢 → 内核窗口关闭 → rh 的 write 阻塞。**
+
+### 36.8 这个背压对 frp 是一样的
+
+**§35.1 已测:frp 的 Recv-Q 是 58.5MB(比 rh 还多)。**
+
+**⇒ 两者承受相同的端到端背压。**
+
+**但 frp 在这种背压下仍能到 3.0 G,rh 只有 1.8 G。**
+
+### 36.9 唯一可能的解释:两者的"背压响应方式"不同
+
+**当目标消费慢时:**
+
+| | 行为 |
+|---|---|
+| **frp** | 每条流的 goroutine 在 `write` 阻塞,**其他 15 条流继续读写**。阻塞是"每流独立"的。 |
+| **rh** | 每条流的 `pump_down` 在 `write().await` 阻塞,**其他流理论上也独立**。 |
+
+**理论上相同。但实测 rh 慢 40%。**
+
+**⇒ 差异只能在"阻塞期间系统还能做多少有用的事"。**
+
+**rh 的 8 个 tokio worker:当 16 条流中有 N 条阻塞时,
+剩余的 worker 可以处理其他流。但若阻塞的 task 占住了 worker
+(比如在 `write` 里做同步操作),就会影响其他流。**
+
+**验证:检查 `write_metered` 是否在阻塞时让出 worker。**
+
+### 36.10 下一轮:验证阻塞是否"让出 worker"
+
+**`write_metered` 内部是 `w.write(&b[off..]).await`。
+`w` 是 `WriteHalf<BoxedIo>`,其 `poll_write` 走 `std::sync::Mutex` 加锁后
+调用底层 `poll_write`。**
+
+**若底层返回 Pending,`WriteHalf` 会**释放锁并返回 Pending**,
+worker 可以去做别的。理论上没问题。**
+
+**但 `std::sync::Mutex` 在跨线程场景下可能引起**自旋**或**优先级反转**。**
+
+**验证方法:把 `mux_relay` 的 `tokio::io::split(a)` 改为 `a.split()`
+(tokio 的 `AsyncWriteExt::split`,用 `BiLock` 而非 `std::sync::Mutex`),
+看是否改善。**
+
+**这是一个有明确代码位置、可验证的改动。**
