@@ -5845,3 +5845,53 @@ WU 帧通过 `sendCh` 发送 —— 但 frp 的 `sendLoop` 是阻塞式的,
 
 **这正是 §42.8 观测到的:`fill_batch` 每次只拿到 0.64 帧,
 因为每轮都被一个 WU 帧"喂饱"就返回了(队列空了)。**
+
+### 42.13 ⭐⭐ 追踪到:673 个 WU 帧来自 `push_to_send`,但三条已知路径计数全为 0
+
+**`push_to_send` 的统计(2.06 Gbps,8 秒):**
+
+```
+PUSH down data=0  wu=673  ping=3
+FRAMETAG down data=225  wu=836  ping=6
+WUPATH down credit=0 ack0=0 zero_noack=0
+```
+
+**矛盾:**
+- `push_to_send` 压入 **673 个 WU**
+- 但 `send_window_update` 的两条路径(`credit`/`ack0`)计数都是 **0**
+
+**⇒ 有第三个 WU 产生源,且它直接调 `push_to_send`。**
+
+### 42.14 找到:两个 `send_window_update` 实现
+
+**`stream.rs` 里有两个同名函数:**
+
+| 行号 | 所属类型 | WU 路径 |
+|---|---|---|
+| **275** | **`Stream`(未拆分)** | `shared.push_to_send(frame.into())` (行 294) |
+| **537** | **`StreamReadHalf`(拆分后)** | 同左 (行 553) |
+
+**我的埋点加在了 **537**(拆分版),但实际生效的是 **275**(未拆分版)。**
+
+**⇒ rh 走的是未拆分的 `Stream::poll_read_chunk`,不是 `StreamReadHalf`。**
+
+### 42.15 这意味着什么
+
+**`Stream`(未拆分)的 `send_window_update` 每读一次都可能发 WU,
+而 `StreamReadHalf` 版本有 `conn_shared` 快车道优化。**
+
+**两者行为不同,而 rh 落在了较慢的那个上。**
+
+**验证:`steal_halves` 返回的是拆分后的类型,但内部 `inner` 可能仍是 `Stream`。**
+
+**若如此,则 rh 的所有读操作都走未拆分路径,包括:**
+- 每次 `poll_read_chunk` 都调 `send_window_update`
+- 每个 WU 都 `push_to_send`(直接进 to_send 队列,优先级最高)
+- **WU 帧挤占数据帧的发送机会**
+
+### 42.16 下一轮:确认 inner 类型并修复
+
+**需要确认 `RhMuxStreamRead.inner` 到底是 `Stream` 还是 `StreamReadHalf`。**
+
+**若是 `Stream`,则切换到 `StreamReadHalf` 可能直接解决问题
+(它有 `conn_shared` 快车道 + 更少的 WU)。**
