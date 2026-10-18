@@ -2419,3 +2419,67 @@ slow_writes=111~263
 | localhost 目标 | ✅ 3.48× |
 | 关键新数据 | 跨机 97% 时间在写,每块 4.62ms;与 localhost(81% 在读)完全相反 |
 | 待核实 | `mux_relay` 的 `a` 是否每流独立(决定"共享出口"假设成立与否) |
+
+### 27.51 ⚠️ "共享出口"假设被代码核实否定
+
+**核实 `mux_relay` 的调用粒度:**
+
+```rust
+// crates/rh-server/src/data.rs:683
+rh_transport::mux::mux_relay(user, b_r, b_w, limiter, Some(cancel)).await;
+```
+
+`user: BoxedIo` 是**该流自己的用户 socket**(每条用户连接 accept 一个),
+`mux_relay` **每流调用一次**。
+
+**⇒ 16 条流各有独立的 `user`、独立的 `WriteHalf`、独立的 `writev`。
+不存在"共享写出口"。**
+
+目标陈述里"载体级 task 共享 pump_down 出口"的假设**不成立**。
+
+### 27.52 那 4.62ms/块 的写等待是什么
+
+每流 64KiB 写自己的用户 socket 要 4.62ms = 14.2 MB/s = 113 Mbps。
+
+**这是该流自身的内核发送队列已满。** 而 socket 的发送速率由 TCP 拥塞控制
+决定,又受**对端(iperf3 目标)的接收窗口**约束。
+
+**⇒ 跨机时,每条流只能以 113 Mbps 的速度把数据交给目标,
+16 条流合计 1.8 Gbps —— 这就是 rh 的跨机上限。**
+
+### 27.53 frp 为什么能到 2.93 G
+
+frp 同样是 16 条流(4 条 workConn 流 × 每流 1 个用户连接),
+每流也是独立 socket。
+
+**两者在"每流写自己的 socket"这一点上完全相同。**
+
+**⇒ 差异不在用户态写路径,而在"流如何被创建与调度":**
+- frp:`poolCount=4` 预建 workConn,每个用户连接 1:1 取一条
+- rh:`pool_size=4` 同样预建,1:1 分配
+
+**两者结构相同。所以 0.72× 的差距必须来自更底层:**
+可能是 rh 的 yamux 分帧大小(6MiB split_send_size vs frp 的 32KiB)、
+或 rh 的 `TCP_NODELAY` 与批量写入造成的突发模式。
+
+### 27.54 下一轮的具体方向
+
+1. **对比两边的 TCP 层行为**:`ss -tinm` 看 rh 与 frp 各自数据连接的
+   `cwnd`、`retrans`、`notsent`。若 rh 的 retrans 显著更高,则分帧过大
+   导致丢包放大。
+2. **`split_send_size`**:rh 设为 6MiB(§14 提到"不再人为分片"),
+   而 frp 每帧 32KiB。**6MiB 的帧在跨机上会被 IP 分片或触发 MTU 问题**,
+   这可能是 4.62ms 写等待的真因。
+
+**这是一个有强烈先验的新假设:6MiB split_send_size 在跨机上可能有害。**
+验证方式:`RH_MUX_SPLIT_SEND=32768` 与默认 6MiB 对比。
+
+### 27.55 Round-7 总结(最终)
+
+| 项 | 状态 |
+|---|---|
+| 跨机 | ❌ 0.72×,**根因已收窄到 TCP 分帧层** |
+| localhost | ✅ 3.48× |
+| 已排除 | 共享写出口(代码核实)、futex、SO_SNDBUF、损耗、RTT、批量、分片通道、读批量、载体数 |
+| 当前最佳假设 | **6MiB `split_send_size` 在跨机链路上有害** |
+| 代码 | 全部诊断回退;93 项测试绿;环境已还原 |
