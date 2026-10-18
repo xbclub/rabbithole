@@ -2243,8 +2243,12 @@ mod halves {
                 let Some(frame) = self.next_frame() else {
                     break;
                 };
-                bytes += frame.wire_len();
+                let __wl = frame.wire_len();
+                bytes += __wl;
                 frames += 1;
+                if __diag {
+                    crate::sched_diag::on_frame_size(__wl as u64);
+                }
                 if let Err(e) = self.socket.start_send_unpin(frame) {
                     return Err(self.fatal(e.into()));
                 }

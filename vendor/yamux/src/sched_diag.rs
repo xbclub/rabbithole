@@ -224,3 +224,47 @@ pub fn dump_fill(tag: &str) {
         FILL_NS.load(Ordering::Relaxed) as f64 / c as f64
     );
 }
+
+// ---- 帧大小分布 ----
+pub static FRAME_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static FRAME_LT1K: AtomicU64 = AtomicU64::new(0);
+pub static FRAME_LT8K: AtomicU64 = AtomicU64::new(0);
+pub static FRAME_LT32K: AtomicU64 = AtomicU64::new(0);
+pub static FRAME_LT64K: AtomicU64 = AtomicU64::new(0);
+pub static FRAME_GE64K: AtomicU64 = AtomicU64::new(0);
+pub static FRAME_SUM_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub fn on_frame_size(n: u64) {
+    FRAME_TOTAL.fetch_add(1, Ordering::Relaxed);
+    FRAME_SUM_BYTES.fetch_add(n, Ordering::Relaxed);
+    if n < 1024 {
+        FRAME_LT1K.fetch_add(1, Ordering::Relaxed);
+    } else if n < 8192 {
+        FRAME_LT8K.fetch_add(1, Ordering::Relaxed);
+    } else if n < 32768 {
+        FRAME_LT32K.fetch_add(1, Ordering::Relaxed);
+    } else if n < 65536 {
+        FRAME_LT64K.fetch_add(1, Ordering::Relaxed);
+    } else {
+        FRAME_GE64K.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_frame_size(tag: &str) {
+    if !enabled() {
+        return;
+    }
+    let t = FRAME_TOTAL.load(Ordering::Relaxed);
+    if t == 0 {
+        return;
+    }
+    eprintln!(
+        "FRAMESIZE {tag} total={t} avg={:.0} <1K={} <8K={} <32K={} <64K={} >=64K={}",
+        FRAME_SUM_BYTES.load(Ordering::Relaxed) as f64 / t as f64,
+        FRAME_LT1K.load(Ordering::Relaxed),
+        FRAME_LT8K.load(Ordering::Relaxed),
+        FRAME_LT32K.load(Ordering::Relaxed),
+        FRAME_LT64K.load(Ordering::Relaxed),
+        FRAME_GE64K.load(Ordering::Relaxed)
+    );
+}
