@@ -56,6 +56,19 @@ pub(super) type ShardRoute = (ShardProducer<ShardMsg>, ShardProducer<ShardCtrl>)
 /// 分片通道容量(D2:cap 128;临界区 ~50ns,当前帧率下无争用问题)。
 pub(super) const SHARD_CHANNEL_CAP: usize = 128;
 
+/// round-11 诊断:分片通道容量 env 覆盖。16 流下 RecvHalf 单任务解帧
+/// 与 4 个 ShardWorker 之间的通道深度影响唤醒排队长度。
+pub(super) fn shard_channel_cap() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RH_SHARD_CHAN_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| (16..=8192).contains(n))
+            .unwrap_or(SHARD_CHANNEL_CAP)
+    })
+}
+
 /// SendWorker → FlushTask 帧通道容量(round-6 §2.1:每 Worker 一条
 /// `ShardChannel<Frame<()>>`,cap 128 帧;帧体 ≤ 单帧最大 body,内存上界
 /// 有界)。满即停:SendWorker 停止消费命令(pending_frame 单槽滞留),

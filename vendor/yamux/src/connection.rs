@@ -1618,9 +1618,9 @@ mod halves {
             let mut out_consumers = Vec::with_capacity(shard_n);
             for index in 0..shard_n {
                 let (msg_producer, msg_consumer) =
-                    shard::ShardChannel::with_capacity(shard::SHARD_CHANNEL_CAP);
+                    shard::ShardChannel::with_capacity(shard::shard_channel_cap());
                 let (ctrl_producer, ctrl_consumer) =
-                    shard::ShardChannel::with_capacity(shard::SHARD_CHANNEL_CAP);
+                    shard::ShardChannel::with_capacity(shard::shard_channel_cap());
                 let (new_streams_tx, new_streams_rx) = mpsc::channel(shard::NEW_STREAMS_CAP);
                 new_streams_rxs.push(new_streams_rx);
                 // send_out[k]:SendWorker k → FlushTask(SPSC,每 Worker 一条,
