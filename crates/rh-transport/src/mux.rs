@@ -335,6 +335,9 @@ pub mod pump_diag {
     /// 单次读等待 > 10ms 的次数
     pub static VERY_SLOW_READS: AtomicU64 = AtomicU64::new(0);
     pub static SLOW_WRITES: AtomicU64 = AtomicU64::new(0);
+    /// round-13:上一轮 read 返回到本轮 read 开始之间的间隔(循环开销)。
+    pub static LOOP_GAP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LOOP_GAP_N: AtomicU64 = AtomicU64::new(0);
     pub static READY_FIRST: AtomicU64 = AtomicU64::new(0);
     pub static PEND_FIRST: AtomicU64 = AtomicU64::new(0);
     pub static UP_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -396,6 +399,13 @@ rd_per_blk_ms={:.2} wr_per_blk_ms={:.2}",
             VERY_SLOW_READS.load(Ordering::Relaxed),
             SLOW_WRITES.load(Ordering::Relaxed),
         );
+        let gn = LOOP_GAP_N.load(Ordering::Relaxed);
+        if gn > 0 {
+            eprintln!(
+                "PUMP_GAP {tag} n={gn} avg_us={:.0}",
+                LOOP_GAP_NS.load(Ordering::Relaxed) as f64 / gn as f64 / 1000.0
+            );
+        }
         let rf = READY_FIRST.load(Ordering::Relaxed);
         let pf = PEND_FIRST.load(Ordering::Relaxed);
         let tot = rf + pf;
@@ -736,6 +746,7 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         Err,
     }
     let mut prefetch_slot: Option<Prefetched> = None;
+    let mut __last_read_end: Option<std::time::Instant> = None;
 
     let mut smalls: Vec<Bytes> = Vec::new();
     let mut smalls_bytes = 0usize;
@@ -747,6 +758,14 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     let mut by_bytes: u64 = 0;
     let mut wr_slow: u64 = 0;
     let clean = 'outer: loop {
+        // round-13 诊断:上一轮 read 返回到本轮 read 开始之间的间隔(循环开销)。
+        if let Some(prev) = __last_read_end {
+            pump_diag::LOOP_GAP_NS.fetch_add(
+                prev.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            pump_diag::LOOP_GAP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let __t0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
         // round-12:优先消费预取结果(上一轮写时已读好),避免再次等待。
         let chunk = if let Some(pf) = prefetch_slot.take() {
@@ -761,6 +780,11 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                 Ok(None) => break 'outer true,
                 Err(_) => break 'outer false,
             }
+        };
+        let __last_read_end = if pump_diag::enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
         };
         if let Some(t) = __t0 {
             rd_ns += t.elapsed().as_nanos() as u64;
