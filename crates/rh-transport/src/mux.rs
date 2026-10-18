@@ -315,6 +315,35 @@ pub mod pump_diag {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *V.get_or_init(|| std::env::var("RH_PUMP_STATS").map(|v| v == "1").unwrap_or(false))
     }
+    /// 单流口径输出:每个 pump_down 打印自己的统计。
+    #[allow(clippy::too_many_arguments)]
+    pub fn dump_local(
+        tag: &str,
+        rd_ns: u64,
+        wr_ns: u64,
+        rd_cnt: u64,
+        wr_cnt: u64,
+        bytes: u64,
+        wr_slow: u64,
+    ) {
+        if !enabled() || rd_cnt == 0 {
+            return;
+        }
+        let rd_ms = rd_ns as f64 / 1e6;
+        let wr_ms = wr_ns as f64 / 1e6;
+        let total = rd_ms + wr_ms;
+        eprintln!(
+            "PUMP_ONE {tag} reads={rd_cnt} writes={wr_cnt} bytes={bytes} \
+avg_chunk={:.0} read_ms={rd_ms:.0}({:.0}%) write_ms={wr_ms:.0}({:.0}%) slow_writes={wr_slow} \
+rd_per_blk_ms={:.2} wr_per_blk_ms={:.2}",
+            bytes as f64 / rd_cnt as f64,
+            if total > 0.0 { rd_ms * 100.0 / total } else { 0.0 },
+            if total > 0.0 { wr_ms * 100.0 / total } else { 0.0 },
+            rd_ms / rd_cnt as f64,
+            if wr_cnt > 0 { wr_ms / wr_cnt as f64 } else { 0.0 },
+        );
+    }
+
     pub fn dump(tag: &str) {
         if !enabled() { return; }
         let r = READ_NS.load(Ordering::Relaxed) as f64 / 1e6;
@@ -656,6 +685,13 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
 
     let mut smalls: Vec<Bytes> = Vec::new();
     let mut smalls_bytes = 0usize;
+    // 单流口径埋点(仅 RH_PUMP_STATS=1 时累加,关闭时零开销)
+    let mut rd_ns: u64 = 0;
+    let mut wr_ns: u64 = 0;
+    let mut rd_cnt: u64 = 0;
+    let mut wr_cnt: u64 = 0;
+    let mut by_bytes: u64 = 0;
+    let mut wr_slow: u64 = 0;
     let clean = 'outer: loop {
         let __t0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
         let chunk = match b_read.read_chunk().await {
@@ -664,17 +700,9 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             Err(_) => break 'outer false,
         };
         if let Some(t) = __t0 {
-            let el = t.elapsed();
-            if el.as_millis() >= 1 {
-                pump_diag::SLOW_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            if el.as_millis() >= 10 {
-                pump_diag::VERY_SLOW_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            pump_diag::READ_NS.fetch_add(el.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            pump_diag::READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            pump_diag::CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            pump_diag::BYTES.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            rd_ns += t.elapsed().as_nanos() as u64;
+            rd_cnt += 1;
+            by_bytes += chunk.len() as u64;
         }
         if chunk.len() >= CHUNK_CAP {
             if !flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await {
@@ -684,10 +712,10 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             let __ok = write_metered(a_w, &chunk, limiter).await;
             if let Some(t) = __w0 {
                 let el = t.elapsed();
-                pump_diag::WRITE_NS.fetch_add(el.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                pump_diag::WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                wr_ns += el.as_nanos() as u64;
+                wr_cnt += 1;
                 if el.as_millis() >= 1 {
-                    pump_diag::SLOW_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    wr_slow += 1;
                 }
             }
             if !__ok {
@@ -731,7 +759,8 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         }
     };
     let _ = flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await;
-    pump_diag::dump("down");
+    // 单流口径:本 pump 自己的累计(不是全局)
+    pump_diag::dump_local("down", rd_ns, wr_ns, rd_cnt, wr_cnt, by_bytes, wr_slow);
     clean
 }
 
