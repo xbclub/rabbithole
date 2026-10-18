@@ -100,3 +100,35 @@ pub fn dump(tag: &str) {
         HIT_GT_10MS.load(Ordering::Relaxed),
     );
 }
+
+// ---- park 时窗口状态(二分判据)----
+pub static PARK_WIN0: AtomicU64 = AtomicU64::new(0);   // send_window == 0
+pub static PARK_WIN_LOW: AtomicU64 = AtomicU64::new(0); // 0 < w < 64KiB
+pub static PARK_WIN_OK: AtomicU64 = AtomicU64::new(0);  // >= 64KiB(说明不是窗口)
+
+pub fn on_park_with_window(w: u32) {
+    if w == 0 {
+        PARK_WIN0.fetch_add(1, Ordering::Relaxed);
+    } else if w < 64 * 1024 {
+        PARK_WIN_LOW.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PARK_WIN_OK.fetch_add(1, Ordering::Relaxed);
+    }
+    on_park();
+}
+
+pub fn dump_window(tag: &str) {
+    if !enabled() {
+        return;
+    }
+    let a = PARK_WIN0.load(Ordering::Relaxed);
+    let b = PARK_WIN_LOW.load(Ordering::Relaxed);
+    let c = PARK_WIN_OK.load(Ordering::Relaxed);
+    let t = a + b + c;
+    if t == 0 {
+        return;
+    }
+    eprintln!(
+        "PARK_WIN {tag} total={t} win0={a} win_low={b} win_ok={c}"
+    );
+}

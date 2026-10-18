@@ -524,6 +524,11 @@ impl StreamReadHalf {
             if __sd { crate::sched_diag::end_poll(); }
             return Poll::Ready(Ok(Some(bytes)));
         }
+        // round-11 诊断:park 时记录 send_window 是否耗尽,二分判据。
+        if crate::sched_diag::enabled() {
+            let sw = shared.flow_controller.send_window();
+            crate::sched_diag::on_park_with_window(sw);
+        }
         if crate::sched_diag::enabled() { crate::sched_diag::on_park(); }
         if __sd { crate::sched_diag::end_poll(); }
         Poll::Pending
