@@ -846,7 +846,18 @@ fn mux_config_with_shards(max_streams: usize, shard_workers: usize) -> yamux::Co
     // 窗口恒定——不再受共享预算钳制、不再 BDP 自增(frp 对照与删除
     // 理由见上)。发送端初窗仍 256KiB——对端只见标准 WU,线路兼容。
     // 本改动只覆盖 yamux(mux 路径),不声称修复 nomux/QUIC/KCP。
-    cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
+    // round-11(2026-10-18 高 RTT 实测):窗口是单流吞吐的硬上界
+    // (≈ window/RTT)。实测 25ms RTT 下单流 888 Mbps、直连仅 40 Mbps,
+    // 但 6MiB/25.5ms 理论上限 1974 Mbps 未吃满 —— 窗口只是上界之一。
+    // 默认沿用 6MiB(frp 对齐基线);`RH_MUX_STREAM_WINDOW`(字节)可
+    // 覆盖,用于高 RTT 链路定向放大。内存敞口 = 并发流数 × 窗口
+    // (flow_control.rs 顶部护栏),生产建议配合 limits.mux_streams。
+    let stream_window = std::env::var("RH_MUX_STREAM_WINDOW")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 256 * 1024)
+        .unwrap_or(6 * 1024 * 1024);
+    cfg.set_initial_stream_receive_window(stream_window);
     // 分片 Worker 数(round-5 §2.7 锁默认 4;round-10 起由调用方按池规模
     // 传入)。该值只作用于 halves 路径(本文件两路入口均走 halves),未
     // 拆分 Active 路径忽略。`shard_workers == DEFAULT_SHARD_WORKERS` 时与
