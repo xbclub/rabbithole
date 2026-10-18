@@ -132,3 +132,61 @@ pub fn dump_window(tag: &str) {
         "PARK_WIN {tag} total={t} win0={a} win_low={b} win_ok={c}"
     );
 }
+
+// ---- RecvHalf poll 统计(验证"poll 间隔 34ms"假设)----
+pub static FRAMES_IN_POLL: AtomicU64 = AtomicU64::new(0);
+static RECV_POLLS: AtomicU64 = AtomicU64::new(0);
+static RECV_FRAMES: AtomicU64 = AtomicU64::new(0);
+static RECV_PENDING: AtomicU64 = AtomicU64::new(0);
+static RECV_POLL_NS: AtomicU64 = AtomicU64::new(0);
+static LAST_RECV_POLL: AtomicU64 = AtomicU64::new(0); // 单调纳秒时间戳
+static GAP_SUM_NS: AtomicU64 = AtomicU64::new(0);
+static GAP_N: AtomicU64 = AtomicU64::new(0);
+static GAP_GT_1MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+pub fn on_recv_poll(dur: std::time::Duration, frames: u64, pending: bool) {
+    RECV_POLLS.fetch_add(1, Ordering::Relaxed);
+    RECV_FRAMES.fetch_add(frames, Ordering::Relaxed);
+    if pending {
+        RECV_PENDING.fetch_add(1, Ordering::Relaxed);
+    }
+    RECV_POLL_NS.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+
+    let t = now_ns();
+    let prev = LAST_RECV_POLL.swap(t, Ordering::Relaxed);
+    if prev != 0 && t > prev {
+        let gap = t - prev;
+        GAP_SUM_NS.fetch_add(gap, Ordering::Relaxed);
+        GAP_N.fetch_add(1, Ordering::Relaxed);
+        if gap > 1_000_000 {
+            GAP_GT_1MS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn dump_recv(tag: &str) {
+    if !enabled() {
+        return;
+    }
+    let p = RECV_POLLS.load(Ordering::Relaxed);
+    if p == 0 {
+        return;
+    }
+    let f = RECV_FRAMES.load(Ordering::Relaxed);
+    let g = GAP_N.load(Ordering::Relaxed).max(1);
+    eprintln!(
+        "RECV_POLL {tag} polls={p} frames={f} frames_per_poll={:.1} pending={} in_poll_us={:.1} gap_avg_us={} gap_gt_1ms={}",
+        f as f64 / p as f64,
+        RECV_PENDING.load(Ordering::Relaxed),
+        RECV_POLL_NS.load(Ordering::Relaxed) as f64 / p as f64 / 1000.0,
+        GAP_SUM_NS.load(Ordering::Relaxed) / g / 1000,
+        GAP_GT_1MS.load(Ordering::Relaxed)
+    );
+}

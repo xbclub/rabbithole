@@ -1744,6 +1744,24 @@ mod halves {
         /// (该帧已从载体读出)、交付 Workers 的全部建流产出(含其 fatal
         /// 排空新建的),全部落地后才返回终结结果。
         pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Stream>>> {
+            // round-11 诊断:统计每次 poll 处理的帧数与 poll 间隔。
+            let __diag = crate::sched_diag::enabled();
+            let __t0 = if __diag { Some(std::time::Instant::now()) } else { None };
+            let __frames_at_entry = if __diag {
+                Some(crate::sched_diag::FRAMES_IN_POLL.load(std::sync::atomic::Ordering::Relaxed))
+            } else { None };
+            let __r = self.poll_inner(cx);
+            if let (Some(t), Some(f0)) = (__t0, __frames_at_entry) {
+                crate::sched_diag::on_recv_poll(
+                    t.elapsed(),
+                    crate::sched_diag::FRAMES_IN_POLL.load(std::sync::atomic::Ordering::Relaxed) - f0,
+                    matches!(__r, Poll::Pending),
+                );
+            }
+            __r
+        }
+
+        fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Stream>>> {
             loop {
                 if self.finished {
                     return Poll::Ready(None);
@@ -1844,7 +1862,10 @@ mod halves {
                 //    tokio 任务内循环本就不抢占);帧循环自然受通道容量
                 //    节流(cap 128)。
                 match self.socket.poll_next_unpin(cx) {
-                    Poll::Ready(Some(Ok(frame))) => match self.on_frame(frame, cx) {
+                    Poll::Ready(Some(Ok(frame))) => {
+                        crate::sched_diag::FRAMES_IN_POLL
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        match self.on_frame(frame, cx) {
                         Ok(Routed::Done) => {}
                         Ok(Routed::Backpressured { index, msg }) => {
                             self.pending_route = Some((index, msg));
@@ -1859,7 +1880,8 @@ mod halves {
                             self.begin_fatal(e, true);
                             continue;
                         }
-                    },
+                        }
+                    }
                     Poll::Ready(Some(Err(e))) => {
                         let e: ConnectionError = e.into();
                         self.begin_fatal(e, true);

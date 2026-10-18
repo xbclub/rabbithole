@@ -750,6 +750,7 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                 pump_diag::dump_local("down-mid", rd_ns, wr_ns, rd_cnt, wr_cnt, by_bytes, wr_slow);
                 yamux::sched_diag::dump("read");
                 yamux::sched_diag::dump_window("read");
+                yamux::sched_diag::dump_recv("down");
             }
         }
         if chunk.len() >= CHUNK_CAP {
