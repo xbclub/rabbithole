@@ -2248,6 +2248,7 @@ mod halves {
                 frames += 1;
                 if __diag {
                     crate::sched_diag::on_frame_size(__wl as u64);
+                    crate::sched_diag::on_frame_tag(frame.header().tag() as u8);
                 }
                 if let Err(e) = self.socket.start_send_unpin(frame) {
                     return Err(self.fatal(e.into()));

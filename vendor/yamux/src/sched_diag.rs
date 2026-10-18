@@ -268,3 +268,31 @@ pub fn dump_frame_size(tag: &str) {
         FRAME_GE64K.load(Ordering::Relaxed)
     );
 }
+
+// ---- 帧类型分布 ----
+pub static TAG_DATA: AtomicU64 = AtomicU64::new(0);
+pub static TAG_WU: AtomicU64 = AtomicU64::new(0);
+pub static TAG_PING: AtomicU64 = AtomicU64::new(0);
+pub static TAG_GOAWAY: AtomicU64 = AtomicU64::new(0);
+
+pub fn on_frame_tag(tag: u8) {
+    match tag {
+        0 => { TAG_DATA.fetch_add(1, Ordering::Relaxed); }
+        1 => { TAG_WU.fetch_add(1, Ordering::Relaxed); }
+        2 => { TAG_PING.fetch_add(1, Ordering::Relaxed); }
+        _ => { TAG_GOAWAY.fetch_add(1, Ordering::Relaxed); }
+    }
+}
+
+pub fn dump_tags(tag: &str) {
+    if !enabled() {
+        return;
+    }
+    eprintln!(
+        "FRAMETAG {tag} data={} wu={} ping={} goaway={}",
+        TAG_DATA.load(Ordering::Relaxed),
+        TAG_WU.load(Ordering::Relaxed),
+        TAG_PING.load(Ordering::Relaxed),
+        TAG_GOAWAY.load(Ordering::Relaxed)
+    );
+}
