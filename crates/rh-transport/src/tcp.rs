@@ -138,7 +138,6 @@ async fn verify(
     multiplex: bool,
 ) -> io::Result<(crate::BoxedIo, Option<crate::BoxedIo>, bool)> {
     stream.set_nodelay(true).ok();
-    apply_socket_buffers(&stream);
     set_tcp_keepalive(&stream);
     // round-E2:裸 TCP 分支(tls.is_none() && !ws_upgrade)在装箱前产生
     // 写侧 fd 副本,供 accept 交付时走 duplex mux。peek_prefix 只从主
@@ -204,31 +203,6 @@ async fn peek_prefix(mut io: crate::BoxedIo) -> io::Result<([u8; 4], crate::Boxe
 }
 
 #[allow(unused)]
-/// round-11:按 env 放大 socket 收发缓冲(默认不动 = 内核自动调优)。
-/// `RH_SOCK_RCVBUF` / `RH_SOCK_SNDBUF`(字节,>=64KiB 生效)。
-/// 只放大不缩小;splice.rs:1716 的"不为制造背压触碰缓冲"红线不受影响
-/// (未设 env 时本函数直接返回,行为逐字节不变)。
-fn apply_socket_buffers(stream: &tokio::net::TcpStream) {
-    let rcv = std::env::var("RH_SOCK_RCVBUF")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n >= 64 * 1024);
-    let snd = std::env::var("RH_SOCK_SNDBUF")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n >= 64 * 1024);
-    if rcv.is_none() && snd.is_none() {
-        return;
-    }
-    let s = socket2::SockRef::from(stream);
-    if let Some(n) = rcv {
-        let _ = s.set_recv_buffer_size(n);
-    }
-    if let Some(n) = snd {
-        let _ = s.set_send_buffer_size(n);
-    }
-}
-
 fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     use socket2::{SockRef, TcpKeepalive};
     let s = SockRef::from(stream);
@@ -495,7 +469,6 @@ async fn dial_tcp(cfg: &ClientTransportConfig) -> io::Result<tokio::net::TcpStre
         None => tokio::net::TcpStream::connect(cfg.server_addr).await?,
     };
     stream.set_nodelay(true).ok();
-    apply_socket_buffers(&stream);
     set_tcp_keepalive(&stream);
     Ok(stream)
 }
