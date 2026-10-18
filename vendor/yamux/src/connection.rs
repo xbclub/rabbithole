@@ -2237,6 +2237,8 @@ mod halves {
         fn fill_batch(&mut self) -> Result<usize> {
             let mut frames = 0usize;
             let mut bytes = 0usize;
+            let __diag = crate::sched_diag::enabled();
+            let __t0 = if __diag { Some(std::time::Instant::now()) } else { None };
             while frames < MAX_BATCH_FRAMES && bytes < MAX_BATCH_BYTES {
                 let Some(frame) = self.next_frame() else {
                     break;
@@ -2246,6 +2248,9 @@ mod halves {
                 if let Err(e) = self.socket.start_send_unpin(frame) {
                     return Err(self.fatal(e.into()));
                 }
+            }
+            if let Some(t) = __t0 {
+                crate::sched_diag::on_fill_batch(frames, bytes, t.elapsed());
             }
             Ok(frames)
         }

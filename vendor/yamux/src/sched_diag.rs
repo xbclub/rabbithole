@@ -190,3 +190,37 @@ pub fn dump_recv(tag: &str) {
         GAP_GT_1MS.load(Ordering::Relaxed)
     );
 }
+
+// ---- FlushTask 批处理统计 ----
+pub static FILL_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static FILL_FRAMES: AtomicU64 = AtomicU64::new(0);
+pub static FILL_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static FILL_NS: AtomicU64 = AtomicU64::new(0);
+pub static FILL_ZERO: AtomicU64 = AtomicU64::new(0);
+
+pub fn on_fill_batch(frames: usize, bytes: usize, dur: std::time::Duration) {
+    FILL_CALLS.fetch_add(1, Ordering::Relaxed);
+    if frames == 0 {
+        FILL_ZERO.fetch_add(1, Ordering::Relaxed);
+    }
+    FILL_FRAMES.fetch_add(frames as u64, Ordering::Relaxed);
+    FILL_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    FILL_NS.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+}
+
+pub fn dump_fill(tag: &str) {
+    if !enabled() {
+        return;
+    }
+    let c = FILL_CALLS.load(Ordering::Relaxed);
+    if c == 0 {
+        return;
+    }
+    eprintln!(
+        "FILL {tag} calls={c} zero={} frames_per_call={:.2} bytes_per_call={:.0} ns_per_call={:.0}",
+        FILL_ZERO.load(Ordering::Relaxed),
+        FILL_FRAMES.load(Ordering::Relaxed) as f64 / c as f64,
+        FILL_BYTES.load(Ordering::Relaxed) as f64 / c as f64,
+        FILL_NS.load(Ordering::Relaxed) as f64 / c as f64
+    );
+}
