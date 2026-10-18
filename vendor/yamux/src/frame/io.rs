@@ -51,6 +51,20 @@ const MAX_FRAME_BODY_LEN: usize = crate::MIB;
 /// 不阻塞 WU 回程节奏的形态。
 const READ_RESERVE: usize = 64 * 1024;
 
+/// round-11 诊断:READ_RESERVE 可用 env 覆盖,供上下行分向标定。
+/// 历史记录(64KiB→256KiB)在 ×16 **上行**有 -4.0% 回退(延迟 WU 回程);
+/// 下行方向本次实测为 +9%(倒 U)。默认仍 64KiB。
+pub(crate) fn read_reserve() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RH_YAMUX_READ_RESERVE")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| (16 * 1024..=1024 * 1024).contains(n))
+            .unwrap_or(READ_RESERVE)
+    })
+}
+
 /// 小帧 copy-out 阈值(≤ READ_RESERVE)。goal-repair C1:帧体不完整时
 /// staging 按 `missing.max(READ_RESERVE)` 预留,交错大帧会驱动 backing
 /// 扩容迁移;若小帧仍以零拷贝切片交付,未消费的小切片会把整段
@@ -562,10 +576,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
                 }
                 // 帧体不完整:按缺口预留
                 let missing = body_len - (this.read.len() - header::HEADER_SIZE);
-                this.read.reserve(missing.max(READ_RESERVE));
+                this.read.reserve(missing.max(read_reserve()));
             } else {
                 // 帧头不完整(或 staging 空):批量预留
-                this.read.reserve(READ_RESERVE);
+                this.read.reserve(read_reserve());
             }
 
             // 2) 从底层读入 staging 空闲区(已按需零填,满足初始化契约)
