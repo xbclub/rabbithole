@@ -976,14 +976,7 @@ fn mux_config_with_shards(max_streams: usize, shard_workers: usize) -> yamux::Co
     // 现抬到 6MiB=单流窗口界,即"不再人为分片"。数据面经 CHUNK_CAP
     // =64KiB 块写入(mux.rs 中继路径),实际上线帧大小不变,此改动
     // 只移除人为帽,行为等价 frp 的"写多少发多少,上限受 sendWindow"。
-    // round-11 诊断:`RH_MUX_SPLIT_SEND` 覆盖分帧上限(默认 6MiB)。
-    // frp 每帧 32KiB;6MiB 在跨机链路上可能放大丢包/排队。
-    let split_send = std::env::var("RH_MUX_SPLIT_SEND")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| (8 * 1024..=8 * 1024 * 1024).contains(n))
-        .unwrap_or(6 * 1024 * 1024);
-    cfg.set_split_send_size(split_send);
+    cfg.set_split_send_size(6 * 1024 * 1024);
     // 单流初始接收窗 = 恒定接收窗(round-2,goal-repair G2/G6;round-3
     // 对齐 frp):
     // 【实测】round-1 三机测试床(benchmark/runs/goal-repair/round-1/
