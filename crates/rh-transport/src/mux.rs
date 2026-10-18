@@ -311,6 +311,12 @@ type MuxConn = yamux::Connection<YamuxCarrier>;
 
 /// chunk 中继读块上限(读缓冲 64KiB 红线:yamux 窗口更新按读步进,
 /// 超限会打破与对端发送窗的锁步节奏)。
+/// round-12:`RH_MUX_PREFETCH=1` 启用"写当前块 + 读下一块"并发。
+fn prefetch_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("RH_MUX_PREFETCH").map(|v| v == "1").unwrap_or(false))
+}
+
 const CHUNK_CAP: usize = 64 * 1024;
 
 /// round-11 诊断:pump_down 的读/写耗时分解。仅当 `RH_PUMP_STATS=1` 时
@@ -723,6 +729,14 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         ok
     }
 
+    /// round-12 预取槽:写当前块期间并发读出的下一块。
+    enum Prefetched {
+        Chunk(Bytes),
+        Eof,
+        Err,
+    }
+    let mut prefetch_slot: Option<Prefetched> = None;
+
     let mut smalls: Vec<Bytes> = Vec::new();
     let mut smalls_bytes = 0usize;
     // 单流口径埋点(仅 RH_PUMP_STATS=1 时累加,关闭时零开销)
@@ -734,10 +748,19 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     let mut wr_slow: u64 = 0;
     let clean = 'outer: loop {
         let __t0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
-        let chunk = match b_read.read_chunk().await {
-            Ok(Some(c)) => c,
-            Ok(None) => break 'outer true,
-            Err(_) => break 'outer false,
+        // round-12:优先消费预取结果(上一轮写时已读好),避免再次等待。
+        let chunk = if let Some(pf) = prefetch_slot.take() {
+            match pf {
+                Prefetched::Chunk(c) => c,
+                Prefetched::Eof => break 'outer true,
+                Prefetched::Err => break 'outer false,
+            }
+        } else {
+            match b_read.read_chunk().await {
+                Ok(Some(c)) => c,
+                Ok(None) => break 'outer true,
+                Err(_) => break 'outer false,
+            }
         };
         if let Some(t) = __t0 {
             rd_ns += t.elapsed().as_nanos() as u64;
@@ -758,7 +781,21 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                 break 'outer false;
             }
             let __w0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
-            let __ok = write_metered(a_w, &chunk, limiter).await;
+            // round-12 预取:写当前块与读下一块并发,打破"读→写→读"的串行。
+            // 只在满块直写路径生效(转发主力形态),小块聚合路径不变。
+            let __ok = if prefetch_enabled() {
+                let read_fut = b_read.read_chunk();
+                let write_fut = write_metered(a_w, &chunk, limiter);
+                let (nr, nw) = futures::join!(read_fut, write_fut);
+                prefetch_slot = match nr {
+                    Ok(Some(c)) => Some(Prefetched::Chunk(c)),
+                    Ok(None) => Some(Prefetched::Eof),
+                    Err(_) => Some(Prefetched::Err),
+                };
+                nw
+            } else {
+                write_metered(a_w, &chunk, limiter).await
+            };
             if let Some(t) = __w0 {
                 let el = t.elapsed();
                 wr_ns += el.as_nanos() as u64;
