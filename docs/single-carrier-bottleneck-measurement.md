@@ -647,3 +647,45 @@ frp 同样是每流一个 goroutine,但它用 **32KiB `io.CopyBuffer` 且是同�
 **下一步(下一轮):** 用本次埋点做 64K/128K/256K 的三档 × 5 样本复测,
 并把 `write_metered` 的耗时按块大小分档统计。若 256K 能稳定 +10% 以上,
 即为可落地的改动。
+
+### 17.5 目标侧排除 + 写慢的真实归属
+
+在 16 流下测目标侧(iperf3 -s)CPU:**0.22 核**。**目标不是瓶颈。**
+
+因此 §17.1 的"写耗时 96.7s(60%)"归因于 **rh 自己的写入路径**:
+
+`mux_relay` 的 `pump_down` 拿到的是 `a_w: &mut WriteHalf<BoxedIo>`
+(`tokio::io::split` 产物),每块 64KiB 走:
+`BoxedIo` 动态派发 → `WriteHalf` 的 std `Mutex` 加锁 → `poll_write` → syscall。
+
+**每次写要过 1 次动态派发 + 1 次互斥锁 + 1 次 syscall。**
+
+### 17.6 `relay_mode=splice` 在 mux 模式下不生效
+
+配置 `relay_mode = "splice"`,但 mux 流走的是 `client_chunk_gate()`
+(`forward.rs:199-201`:`use_compression_flag_clear && relay_mode != "copy"`),
+即只要不是 `copy` 就返回 true → 走 `mux_relay` 的 chunk 路径。
+
+`splice` 分支只在 `plain_tcp(&peer)` 与 `plain_tcp(&local)` **同时**为真时生效,
+而 mux 流的 `peer` 是 `RhMuxStream`,**永远不是裸 TCP**。
+
+⇒ **`relay_mode=splice` 在 MUX=1(默认)下对数据面零作用。**
+这与旧分析 H7「MUX=1 下内核 splice 结构性不可达」一致,本轮首次用运行时
+证据确认。
+
+### 17.7 下一轮的三个候选(按预期收益)
+
+| # | 改动 | 依据 | 预期 |
+|---|---|---|---:|
+| 1 | `pump_down` 消除 `WriteHalf` + `BoxedIo` 的双层包装 | 每块省 1 锁 + 1 动态派发,38336 次/10s | 5~15% |
+| 2 | `CHUNK_CAP` 64K→128K(5 样本复测) | 循环数减半,§14.2 单样本 +9% 方向 | 0~10% |
+| 3 | 让 mux 流支持内核 splice(架构级) | `RhMuxStream` 目前无 fd | 大改,收益未知 |
+
+候选 1 最可能落地:把 `mux_relay` 的 `a` 参数从 `BoxedIo` 改成
+`Arc<dyn Io>` 或直接传 split 后的裸写半,**避免 `WriteHalf` 的锁**。
+当前 `tokio::io::split` 对 `BoxedIo` 用一个 `std::sync::Mutex` 保护同一个
+对象,而上行读泵也持有同一把锁——**上下行在互相争锁**。
+
+> 这是本轮最有价值的新发现:**同一条流的上行读与下行写在争同一个
+> `split` 锁**。frp 的 `io.CopyBuffer` 两个方向是完全独立的 fd/goroutine,
+> 不存在共享锁。
