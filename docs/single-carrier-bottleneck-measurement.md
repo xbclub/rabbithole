@@ -1402,3 +1402,53 @@ Round-5 后段跨机链路恢复到 2.41~2.75 Gbps(裸链路,master 仅 12 次�
 
 **⇒ 目标未完成。** 但方向上明确了:**要修的是"从 1 条流到 4 条流的扩展",
 而不是"单流性能"或"mux 绝对能力"(localhost 证明后者能到 6.38 G)。**
+
+---
+
+## 25. Round-5 修复尝试:分片路由 `sid % N` → `(sid >> 1) % N` (已回退)
+
+### 25.1 动机
+
+`route_index = sid % N`,而 yamux 的 stream id 步长为 2(奇偶分侧):
+
+| N | 旧公式实际使用的分片 | 新公式 |
+|---:|---|---|
+| 2 | **只用 1 个** `[1,1,1,1]` | 2 个 `[0,1,0,1]` |
+| 4 | **只用 2 个** `[1,3,1,3]` | 4 个 `[0,1,2,3]` |
+
+`shard_workers_for_k(1) = 4` ⇒ **默认 K=1 部署下,4 个分片只有 2 个承载数据**。
+这是 §24 中"rh 的 ×1→×4 扩展只有 1.29×"的一个合理候选。
+
+### 25.2 实施
+
+三处同改(收敛为 `shard::route_index(sid: u32, n: usize)`):
+- `RecvHalf::route_index`
+- `SendHalf::push_new_receiver`
+- `ShardWorker::owns`
+
+### 25.3 结果:测试失败,**回退**
+
+```
+worker_ctrl_remove_frame_matrix        FAILED  Open → exactly one RST, got []
+worker_eof_flushes_routed_frames...    FAILED
+halves_syn_storm_256_streams           FAILED  "handle #0 out of order"
+                                                left: StreamId(4) right: StreamId(2)
+```
+
+**`halves_syn_storm_256_streams` 的失败是决定性的**:新公式把相邻 sid
+(2,4,6,...)分散到不同 Worker,**破坏了新流交付的全局顺序**。
+
+旧公式下相邻 sid 落在同一 Worker,天然保序;新公式下就没有这个性质了。
+
+**⇒ 分片路由不能简单替换。** 若要并行化,必须**额外引入按 sid 排序的
+交付队列**(或让 RecvHalf 统一排序后再交付),这是结构性改动,不是一处
+公式切换。
+
+### 25.4 这次失败的价值
+
+1. **确认了旧公式是有意的设计**,不是疏忽——它是"保序"与"均分"之间的
+   权衡,选了保序。
+2. **§24 的"×4 扩展不足"不能靠改路由解决**,需要另找原因。
+3. **93 项测试捕获了一个真实协议回归**,验证了测试套的价值。
+
+代码已 `git checkout` 回退,93 项测试全绿。
