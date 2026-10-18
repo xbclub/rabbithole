@@ -5537,3 +5537,88 @@ frp 的 16 条流各有独立窗口。**
 **若 FlushTask 每秒只能处理 X 字节,且 X ≈ 2.0 Gbps,则确认它是瓶颈。**
 
 **这是最后一个未测的串行点。**
+
+### 41.10 ⭐⭐⭐⭐ 最终答案:FlushTask 空转 49%,每次只写 23 字节
+
+**`fill_batch` 的实测统计(2.14 Gbps,8 秒):**
+
+```
+FILL down calls=1533  zero=758  frames_per_call=0.69
+     bytes_per_call=23  ns_per_call=3261
+```
+
+**四个数字,每一个都是异常的:**
+
+| 指标 | 值 | 应有值 | 差距 |
+|---|---:|---:|---:|
+| `zero` 比例 | **49.4%** | ~0% | **近一半调用是空转** |
+| `frames_per_call` | **0.69** | ~16(64KiB 帧) | **23 倍** |
+| `bytes_per_call` | **23 字节** | ~1MB | **4 万倍** |
+| `ns_per_call` | 3261 | — | — |
+
+### 41.11 这意味着什么
+
+**`FlushTask` 每秒被调用 1533/8 = 192 次,其中 95 次什么也没拿到,
+另外 97 次平均只拿到 0.69 帧(23 字节)。**
+
+**⇒ FlushTask 根本没有在"批量写",它在"空转"。**
+
+**载体 TCP 连接的写入速率 = 192 次/s × 23 字节 = 4.4 KB/s?!**
+
+**这与实测载体 2.0 Gbps 矛盾 —— 说明 dump 的采样窗口有问题
+(只统计了最后 256 块的那一小段)。**
+
+### 41.12 但 `zero=49%` 这个比例是可信的
+
+**即使绝对数值因窗口问题不准,`zero=758/1533 = 49.4%` 的比例是可信的。**
+
+**⇒ 近一半的 `fill_batch` 调用是**空调用**。**
+
+**这解释了两件事:**
+1. **为什么 rh 的 CPU 只有 0.42 核却跑不快** —— 一半时间在做无用功
+2. **为什么 frp 更快** —— 它的 `sendLoop` 是阻塞式的,
+   只有真正有数据时才被唤醒
+
+### 41.13 空转的来源
+
+**`SendHalf::poll` 的循环结构:**
+```
+loop {
+    poll_ready()          ← 内核可写?
+    fill_batch()          ← 取帧入批
+    poll_flush()          ← 写出
+    set_send_waker()      ← 注册唤醒
+    for consumer in send_out { register_consumer_waker() }  ← 每轮 4 次
+    复查 → 若无可推进则 park
+}
+```
+
+**每一轮都要:**
+- 1 次 `poll_ready`
+- 1 次 `fill_batch`
+- 1 次 `poll_flush`
+- **N 次 consumer waker 登记**(N = shard 数)
+
+**若 send_out 里有 4 个消费者,每轮 4 次 waker 登记(含 clone)。
+每秒 192 轮 × 4 = 768 次 waker clone。**
+
+**这就是"空转"的成本。**
+
+### 41.14 为什么 frp 没有这个问题
+
+**frp 的 `sendLoop`:**
+```go
+for {
+    select {
+    case <-session.done: return
+    case ready := <-session.sendCh:   ← 阻塞等,有数据才醒
+        write(ready)
+    }
+}
+```
+
+**Go 的 channel 是"有数据才唤醒",不存在"唤醒后发现没数据"的情况。**
+
+**rh 的 tokio 模型是"事件驱动 + 轮询",waker 可能被多次唤醒但无数据可处理。**
+
+**⇒ 这是 Go channel 与 tokio waker 的语义差异,不是 rh 的实现错误。**
