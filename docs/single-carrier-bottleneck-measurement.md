@@ -1652,3 +1652,59 @@ rh 1.06~1.47 G,其实 rh 略强;但两者都远低于裸链路 7.7 G)。
 - 若 `send_window > 0` 但 `buffer` 空 ⇒ 是上游解帧节流,方向不同
 
 **这是二分判据,能直接决定修复方向。**
+
+### 26.17 ⭐⭐ 二分判据结果:park 时 send_window 全部充裕
+
+```
+PARK_WIN read total=205  win0=0  win_low=0  win_ok=205
+```
+
+**205 次 park 中,`send_window` 全部 >= 64KiB(`win_ok=205`),
+一次都没有窗口耗尽。**
+
+**⇒ 窗口假设彻底排除。park 是在等上游数据到达。**
+
+### 26.18 完整因果链(本轮最终定位)
+
+```
+单流 1.05~1.20 Gbps(裸链路 7.7 G)
+  ↓
+pump_down 每块 0.40ms
+  ↓ 拆解
+98.9% 的读立即就绪(≈0ms)
+ 1.1% 的读 park,每次 ~34ms  ← 全部读延迟在这里
+  ↓ park 时状态
+send_window 充裕(205/205 都 >=64KiB)
+  ↓ 因此
+不是窗口问题,是**等上游数据到达流缓冲**
+  ↓ 上游是谁
+RecvHalf 解帧 → 分片通道(cap 128)→ ShardWorker → 流 buffer
+```
+
+### 26.19 为什么"98.9% 就绪"却还在等
+
+看起来矛盾,实则自洽:
+- 一条流要跑满 1.2 Gbps,需要每 0.4ms 交付一块 64KiB
+- RecvHalf 解帧是**单个任务**,它同时服务这条流的**上游**(socket 收包)
+- **当 RecvHalf 在处理别的帧(或自身调度延迟)时,这条流的 buffer 就空了**
+- 于是 pump 进入 34ms 的 park(这段时间 RecvHalf 慢下来了)
+
+34ms 这个量级,对应的是 **RecvHalf 一次 poll 内处理大批帧后 park,
+直到新数据到达的间隔**。
+
+### 26.20 修复方向(下一轮)
+
+**核心:让 `RecvHalf` 更快地把解出的帧推到流缓冲,或减少它对单条流的
+服务间隔。**
+
+候选(按风险排序):
+1. **`SHARD_CHANNEL_CAP` 128 → 512/1024**:缓冲更多待处理帧,让
+   ShardWorker 有活可干而不必等 RecvHalf(§17.16 测过 1024 但环境退化,
+   需在 localhost 重测)。
+2. **RecvHalf 的 `route_index` 查找**:每帧一次取模,已很轻。
+3. **分片 Worker 数与 `shard_workers_for_k(1)=4`**:§25 已证不能改路由,
+   但可试 `RH_MUX_SHARDS=2`(让所有流落同一 worker,减少跨 worker 竞争)。
+4. **`READ_RESERVE`**:RecvHalf 每轮读 64KiB,提高到 256KiB 让单轮解出
+   更多帧(localhost 无 WU 回程顾虑,可安全测试)。
+
+**下一轮在 localhost 上把这 4 个候选逐一 A/B,单流指标为准。**
