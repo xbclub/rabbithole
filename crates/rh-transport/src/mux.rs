@@ -331,10 +331,6 @@ pub mod pump_diag {
     pub static SLOW_WRITES: AtomicU64 = AtomicU64::new(0);
     pub static READY_FIRST: AtomicU64 = AtomicU64::new(0);
     pub static PEND_FIRST: AtomicU64 = AtomicU64::new(0);
-    pub static W_LT100US: AtomicU64 = AtomicU64::new(0);
-    pub static W_LT1MS: AtomicU64 = AtomicU64::new(0);
-    pub static W_LT5MS: AtomicU64 = AtomicU64::new(0);
-    pub static W_GT5MS: AtomicU64 = AtomicU64::new(0);
     pub static UP_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static UP_CHUNKS: AtomicU64 = AtomicU64::new(0);
     pub fn enabled() -> bool {
@@ -393,13 +389,6 @@ rd_per_blk_ms={:.2} wr_per_blk_ms={:.2}",
             SLOW_READS.load(Ordering::Relaxed),
             VERY_SLOW_READS.load(Ordering::Relaxed),
             SLOW_WRITES.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "PUMP_WDIST {tag} <100us={} <1ms={} <5ms={} >=5ms={}",
-            W_LT100US.load(Ordering::Relaxed),
-            W_LT1MS.load(Ordering::Relaxed),
-            W_LT5MS.load(Ordering::Relaxed),
-            W_GT5MS.load(Ordering::Relaxed)
         );
         let rf = READY_FIRST.load(Ordering::Relaxed);
         let pf = PEND_FIRST.load(Ordering::Relaxed);
@@ -770,20 +759,10 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             }
             let __w0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
             let __ok = write_metered(a_w, &chunk, limiter).await;
-            let __wr_el = __w0.map(|t| t.elapsed());
-            if let Some(el) = __wr_el {
+            if let Some(t) = __w0 {
+                let el = t.elapsed();
                 wr_ns += el.as_nanos() as u64;
                 wr_cnt += 1;
-                let us = el.as_micros() as u64;
-                if us < 100 {
-                    pump_diag::W_LT100US.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                } else if us < 1000 {
-                    pump_diag::W_LT1MS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                } else if us < 5000 {
-                    pump_diag::W_LT5MS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    pump_diag::W_GT5MS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
                 if el.as_millis() >= 1 {
                     wr_slow += 1;
                 }
