@@ -308,6 +308,7 @@ pub mod pump_diag {
     pub static SLOW_READS: AtomicU64 = AtomicU64::new(0);
     /// 单次读等待 > 10ms 的次数
     pub static VERY_SLOW_READS: AtomicU64 = AtomicU64::new(0);
+    pub static SLOW_WRITES: AtomicU64 = AtomicU64::new(0);
     pub fn enabled() -> bool {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *V.get_or_init(|| std::env::var("RH_PUMP_STATS").map(|v| v == "1").unwrap_or(false))
@@ -321,10 +322,11 @@ pub mod pump_diag {
         let by = BYTES.load(Ordering::Relaxed);
         let ch = CHUNKS.load(Ordering::Relaxed);
         eprintln!(
-            "PUMP_STATS {tag} read_ms={r:.0} write_ms={w:.0} reads={rd} writes={wr} bytes={by} chunks={ch} avg_chunk={:.0} slow1ms={} slow10ms={}",
+            "PUMP_STATS {tag} read_ms={r:.0} write_ms={w:.0} reads={rd} writes={wr} bytes={by} chunks={ch} avg_chunk={:.0} slow1ms={} slow10ms={} slowwrites={}",
             if ch > 0 { by as f64 / ch as f64 } else { 0.0 },
             SLOW_READS.load(Ordering::Relaxed),
             VERY_SLOW_READS.load(Ordering::Relaxed),
+            SLOW_WRITES.load(Ordering::Relaxed),
         );
     }
 }
@@ -667,7 +669,17 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             if !flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await {
                 break 'outer false;
             }
-            if !write_metered(a_w, &chunk, limiter).await {
+            let __w0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
+            let __ok = write_metered(a_w, &chunk, limiter).await;
+            if let Some(t) = __w0 {
+                let el = t.elapsed();
+                pump_diag::WRITE_NS.fetch_add(el.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                pump_diag::WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if el.as_millis() >= 1 {
+                    pump_diag::SLOW_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            if !__ok {
                 break 'outer false;
             }
             continue;
