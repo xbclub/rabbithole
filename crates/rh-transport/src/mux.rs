@@ -703,6 +703,12 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             rd_ns += t.elapsed().as_nanos() as u64;
             rd_cnt += 1;
             by_bytes += chunk.len() as u64;
+            // 循环内定期快照:短期负载下 pump 不会退出,退出点的 dump
+            // 拿不到样本(§17.10)。每 256 块(~16MiB)打印一次当前累计,
+            // 便于在测试进行中取窗口值。
+            if rd_cnt % 256 == 0 {
+                pump_diag::dump_local("down-mid", rd_ns, wr_ns, rd_cnt, wr_cnt, by_bytes, wr_slow);
+            }
         }
         if chunk.len() >= CHUNK_CAP {
             if !flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await {
