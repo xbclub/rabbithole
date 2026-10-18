@@ -63,6 +63,17 @@ const SMALL_FRAME_COPY: usize = 4 * 1024;
 /// 上限连续取帧入队(§3.3)。64 = 1MiB/64KiB 的 16 满帧留足余量:64KiB
 /// 主力帧由字节上限先封顶,小帧(4KiB 控制交错)场景才由本上限封顶,
 /// 得以更深聚合。
+pub(crate) fn max_batch_frames() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RH_MAX_BATCH_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| (1..=64).contains(n))
+            .unwrap_or(MAX_BATCH_FRAMES)
+    })
+}
+
 pub(crate) const MAX_BATCH_FRAMES: usize = 64;
 
 /// 跨帧批量写的聚合上限——字节(round-5 §3.2;round-7 扩至 1MiB)。只约束
@@ -390,7 +401,7 @@ impl WriteState {
                 }
             }
             for (appended, f) in queue.iter().enumerate() {
-                if appended >= MAX_BATCH_FRAMES {
+                if appended >= max_batch_frames() {
                     break;
                 }
                 let need = 1 + usize::from(!f.body.is_empty());
