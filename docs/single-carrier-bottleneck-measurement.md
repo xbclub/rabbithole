@@ -1759,3 +1759,65 @@ socket 可读事件的唤醒频率问题(而非处理能力)。
 所有诊断开关(`RH_PUMP_STATS`/`RH_SCHED_STATS`/`RH_SHARD_CHAN_CAP`/
 `RH_YAMUX_READ_RESERVE`/`RH_MUX_STREAM_WINDOW`)**均默认关闭,生产行为不变**。
 §25 的路由改动已回退,93 项 yamux 测试全绿。
+
+---
+
+## 27. ⭐⭐⭐ Round-7:strace 定位 —— futex 占 52%,sendto 每次 113us
+
+### 27.1 RecvHalf poll 统计(推翻"poll 间隔"假设)
+
+```
+RECV_POLL down polls=225 frames=15961 frames_per_poll=70.9
+          pending=218 in_poll_us=24833 gap_avg_us=66148 gap_gt_1ms=204
+```
+
+**每次 poll 处理 70.9 帧**(连续解帧效率高),但**每次 poll 内部花费 24.8ms**。
+⇒ 不是"poll 频率低",而是**poll 内部每帧要 350us**。
+
+### 27.2 strace 系统调用剖析(决定性)
+
+`sudo strace -f -c -p <rh-server>` 6 秒,单流 1.06 G:
+
+| 系统调用 | 时间占比 | 次数 | 每次均耗时 |
+|---|---:|---:|---:|
+| **futex** | **52.45%** | 138 | **20,617 μs** |
+| epoll_wait | 17.78% | 144 | 6,699 μs |
+| **sendto** | 14.00% | 6,720 | **113 μs** |
+| recvfrom | 7.86% | 6,752 | **63 μs** |
+| madvise | 5.69% | 70 | 4,407 μs |
+| write | 2.09% | 2,458 | 46 μs |
+
+### 27.3 三条可靠结论
+
+1. **futex 占 52%,单次 20.6ms** —— 这是**线程在等锁或等条件变量**,
+   不是 CPU 计算。与 §16.1"没有线程热点"完全自洽:线程不忙,但在等锁。
+
+2. **`sendto` 每次 113 μs,是正常值(几 μs)的 20~30 倍** ——
+   **内核发送队列已满,`sendto` 在内核态等待空间**。这是"写不出去"的
+   直接证据,与 §22.7 跨机场景的形态一致。
+
+3. **`recvfrom` 每次 63 μs,同样偏高** —— 接收侧也在等。
+
+### 27.4 与 frp 的机制差异(修正后的最终解释)
+
+frp 每流一个 goroutine 做**同步阻塞**的 `io.CopyBuffer`:
+- 阻塞时 Go runtime 把该 goroutine 挂到 epoll,**不占用 OS 线程**
+- 一条流阻塞不影响其他流
+
+rh 用 tokio task + **`parking_lot::Mutex` 保护流状态**:
+- 每帧路由、每次 buffer 访问都要取锁
+- **futex 20.6ms 说明有明显的锁等待**
+
+**⇒ rh 的锁粒度太细或持有过久,导致 52% 时间在 futex。**
+
+### 27.5 下一轮方向(首次有了系统调用级证据)
+
+1. **定位哪个锁贡献了 futex**:`strace -f -e trace=futex -c` 分线程看,
+   或用 `-T` 看单次 futex 的调用栈相关地址。
+2. **`sendto` 113us 说明 socket 发送缓冲不够**:但 §16.3 已证显式设大缓冲
+   反而变差(0.86 G)——**这里的矛盾需要重新审视**:那次是把 rcvbuf/sndbuf
+   同时设为 8MiB,可能触发了 bufferbloat;应只调 `SO_SNDBUF`。
+3. **减少 per-frame 锁**:`route_index` 已免锁,但 `try_push` 到分片通道
+   内部仍有 `parking_lot::Mutex`(shard.rs 的 ShardChannel)。
+
+**这是本轮首次拿到"时间到底花在哪"的系统级证据,不再依赖代码猜测。**
