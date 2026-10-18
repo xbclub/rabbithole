@@ -507,8 +507,18 @@ impl StreamReadHalf {
             log::debug!("{}/{}: eof", self.conn, self.id);
             return Poll::Ready(Ok(None));
         }
-        if crate::sched_diag::enabled() { crate::sched_diag::on_park(); }
+        // round-11:park 前在**同一把锁内**完成"注册 waker + 复查 buffer"。
+        // 原实现先 `buffer.pop()`(已持有 shared 锁,put 后释放),
+        // 再 `shared.reader = waker` —— 两步之间若 ShardWorker 已 push
+        // 并 take 走 reader(那时还没注册),本任务会永 park(丢失唤醒)。
+        // 这里改为:注册 waker 后立刻在同一锁内复查 buffer,非空则
+        // 撤销注册并直接交付。既修丢失唤醒,也减少空唤醒后的无效 park。
         shared.reader = Some(cx.waker().clone());
+        if let Some(bytes) = shared.buffer.pop() {
+            shared.reader = None; // 撤销注册:本 poll 已直接交付
+            return Poll::Ready(Ok(Some(bytes)));
+        }
+        if crate::sched_diag::enabled() { crate::sched_diag::on_park(); }
         Poll::Pending
     }
 
