@@ -357,3 +357,31 @@ pub fn dump_wu_path(tag: &str) {
         WUP_ACK0_NOACK.load(Ordering::Relaxed)
     );
 }
+
+// ---- to_send 压入的帧类型 ----
+pub static PUSH_DATA: AtomicU64 = AtomicU64::new(0);
+pub static PUSH_WU: AtomicU64 = AtomicU64::new(0);
+pub static PUSH_PING: AtomicU64 = AtomicU64::new(0);
+pub static PUSH_OTHER: AtomicU64 = AtomicU64::new(0);
+
+pub fn on_push_to_send(tag: u8) {
+    match tag {
+        0 => { PUSH_DATA.fetch_add(1, Ordering::Relaxed); }
+        1 => { PUSH_WU.fetch_add(1, Ordering::Relaxed); }
+        2 => { PUSH_PING.fetch_add(1, Ordering::Relaxed); }
+        _ => { PUSH_OTHER.fetch_add(1, Ordering::Relaxed); }
+    }
+}
+
+pub fn dump_push(tag: &str) {
+    if !enabled() {
+        return;
+    }
+    eprintln!(
+        "PUSH {tag} data={} wu={} ping={} other={}",
+        PUSH_DATA.load(Ordering::Relaxed),
+        PUSH_WU.load(Ordering::Relaxed),
+        PUSH_PING.load(Ordering::Relaxed),
+        PUSH_OTHER.load(Ordering::Relaxed)
+    );
+}

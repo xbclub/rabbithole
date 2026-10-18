@@ -1409,6 +1409,9 @@ mod halves {
         /// pub(crate)(round-9):WU 快车道由 stream.rs(connection 的后代
         /// 模块)调用,仅可见性提升,行为不变。
         pub(crate) fn push_to_send(&self, f: Frame<()>) {
+            if crate::sched_diag::enabled() {
+                crate::sched_diag::on_push_to_send(f.header().tag() as u8);
+            }
             self.to_send.lock().push_back(f);
             if let Some(w) = self.send_waker.lock().take() {
                 w.wake()
