@@ -485,6 +485,7 @@ pub struct StreamReadHalf {
 impl StreamReadHalf {
     /// 同 [`Stream::poll_read_chunk`]。
     pub fn poll_read_chunk(&mut self, cx: &mut Context) -> Poll<io::Result<Option<bytes::Bytes>>> {
+        if crate::sched_diag::enabled() { crate::sched_diag::on_poll(); }
         if !self.config.read_after_close && self.sender.is_closed() {
             return Poll::Ready(Ok(None));
         }
@@ -506,6 +507,7 @@ impl StreamReadHalf {
             log::debug!("{}/{}: eof", self.conn, self.id);
             return Poll::Ready(Ok(None));
         }
+        if crate::sched_diag::enabled() { crate::sched_diag::on_park(); }
         shared.reader = Some(cx.waker().clone());
         Poll::Pending
     }

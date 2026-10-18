@@ -29,6 +29,7 @@
 mod chunks;
 mod error;
 mod frame;
+pub mod sched_diag;
 pub mod pool;
 
 pub(crate) mod connection;
