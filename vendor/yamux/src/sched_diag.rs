@@ -330,3 +330,30 @@ pub fn dump_wu(tag: &str) {
         WU_SUM.load(Ordering::Relaxed) / 1024 / 1024
     );
 }
+
+// ---- WU 路径分布 ----
+pub static WUP_CREDIT: AtomicU64 = AtomicU64::new(0);   // 有 credit
+pub static WUP_ACK0: AtomicU64 = AtomicU64::new(0);     // 0-credit + ACK
+pub static WUP_ACK0_NOACK: AtomicU64 = AtomicU64::new(0); // 0-credit 无 ACK(异常)
+
+pub fn on_wu_path(has_credit: bool, ack: bool) {
+    if has_credit {
+        WUP_CREDIT.fetch_add(1, Ordering::Relaxed);
+    } else if ack {
+        WUP_ACK0.fetch_add(1, Ordering::Relaxed);
+    } else {
+        WUP_ACK0_NOACK.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_wu_path(tag: &str) {
+    if !enabled() {
+        return;
+    }
+    eprintln!(
+        "WUPATH {tag} credit={} ack0={} zero_noack={}",
+        WUP_CREDIT.load(Ordering::Relaxed),
+        WUP_ACK0.load(Ordering::Relaxed),
+        WUP_ACK0_NOACK.load(Ordering::Relaxed)
+    );
+}

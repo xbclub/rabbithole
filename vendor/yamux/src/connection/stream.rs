@@ -569,6 +569,8 @@ impl StreamReadHalf {
         if credit.is_none() && !ack_pending {
             return Poll::Ready(Ok(()));
         }
+        // round-22 诊断:区分"纯 WU"与"0-credit WU+ACK"两条路径。
+        crate::sched_diag::on_wu_path(credit.is_some(), ack_pending);
         let frame = {
             let mut shared = self.shared();
             let mut header = Header::window_update(self.id, credit.unwrap_or(0));
