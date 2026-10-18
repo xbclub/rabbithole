@@ -311,6 +311,18 @@ type MuxConn = yamux::Connection<YamuxCarrier>;
 
 /// chunk 中继读块上限(读缓冲 64KiB 红线:yamux 窗口更新按读步进,
 /// 超限会打破与对端发送窗的锁步节奏)。
+/// round-11 诊断:下行单块写拆分数(`RH_MUX_WRITE_SPLIT`,默认 1 = 不拆)。
+fn write_split() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RH_MUX_WRITE_SPLIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| (1..=8).contains(n))
+            .unwrap_or(1)
+    })
+}
+
 const CHUNK_CAP: usize = 64 * 1024;
 
 /// round-11 诊断:pump_down 的读/写耗时分解。仅当 `RH_PUMP_STATS=1` 时
@@ -758,7 +770,25 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                 break 'outer false;
             }
             let __w0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
-            let __ok = write_metered(a_w, &chunk, limiter).await;
+            // round-11 诊断:把单次写拆成 SPLIT 份,验证 writev 批量假设。
+            let __split = write_split();
+            let __ok = if __split <= 1 || chunk.len() <= __split {
+                write_metered(a_w, &chunk, limiter).await
+            } else {
+                let total = chunk.len();
+                let step = (total + __split - 1) / __split;
+                let mut ok = true;
+                let mut off = 0;
+                while off < total {
+                    let end = (off + step).min(total);
+                    if !write_metered(a_w, &chunk.slice(off..end), limiter).await {
+                        ok = false;
+                        break;
+                    }
+                    off = end;
+                }
+                ok
+            };
             if let Some(t) = __w0 {
                 let el = t.elapsed();
                 wr_ns += el.as_nanos() as u64;
