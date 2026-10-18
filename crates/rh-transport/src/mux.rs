@@ -144,7 +144,27 @@ impl RhMuxStreamRead {
         if let Some(b) = self.pending.pop_front() {
             return Ok(Some(b));
         }
-        std::future::poll_fn(|cx| self.inner.poll_read_chunk(cx)).await
+        // round-11 诊断:统计"首次 poll 是否立即就绪"(buffer 非空),
+        // 以区分"等上游"与"取数固定开销"。
+        let mut first = true;
+        std::future::poll_fn(|cx| {
+            let r = self.inner.poll_read_chunk(cx);
+            if first {
+                first = false;
+                if pump_diag::enabled() {
+                    match &r {
+                        std::task::Poll::Ready(_) => {
+                            pump_diag::READY_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        std::task::Poll::Pending => {
+                            pump_diag::PEND_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            r
+        })
+        .await
     }
 
     /// 立即取一块:无就绪数据返回 `Ok(None)`(不挂起)。供聚合写侧
@@ -309,6 +329,8 @@ pub mod pump_diag {
     /// 单次读等待 > 10ms 的次数
     pub static VERY_SLOW_READS: AtomicU64 = AtomicU64::new(0);
     pub static SLOW_WRITES: AtomicU64 = AtomicU64::new(0);
+    pub static READY_FIRST: AtomicU64 = AtomicU64::new(0);
+    pub static PEND_FIRST: AtomicU64 = AtomicU64::new(0);
     pub static UP_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static UP_CHUNKS: AtomicU64 = AtomicU64::new(0);
     pub fn enabled() -> bool {
@@ -359,6 +381,15 @@ rd_per_blk_ms={:.2} wr_per_blk_ms={:.2}",
             VERY_SLOW_READS.load(Ordering::Relaxed),
             SLOW_WRITES.load(Ordering::Relaxed),
         );
+        let rf = READY_FIRST.load(Ordering::Relaxed);
+        let pf = PEND_FIRST.load(Ordering::Relaxed);
+        let tot = rf + pf;
+        if tot > 0 {
+            eprintln!(
+                "PUMP_RF {tag} ready_first={rf} pend_first={pf} ready_pct={:.1}%",
+                rf as f64 * 100.0 / tot as f64
+            );
+        }
         eprintln!(
             "PUMP_UP {tag} up_bytes={} up_chunks={}",
             UP_BYTES.load(Ordering::Relaxed),
