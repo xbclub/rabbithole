@@ -76,6 +76,9 @@ impl FlowController {
 
         self.assert_invariants(buffer_len);
 
+        // round-22 诊断:统计实际发出的 WU credit 分布。
+        crate::sched_diag::on_wu_credit(next_window_update as u64);
+
         Some(next_window_update)
     }
 

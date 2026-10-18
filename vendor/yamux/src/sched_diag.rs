@@ -296,3 +296,37 @@ pub fn dump_tags(tag: &str) {
         TAG_GOAWAY.load(Ordering::Relaxed)
     );
 }
+
+// ---- WU credit 分布 ----
+pub static WU_ZERO: AtomicU64 = AtomicU64::new(0);
+pub static WU_LT64K: AtomicU64 = AtomicU64::new(0);
+pub static WU_LT1M: AtomicU64 = AtomicU64::new(0);
+pub static WU_GE1M: AtomicU64 = AtomicU64::new(0);
+pub static WU_SUM: AtomicU64 = AtomicU64::new(0);
+
+pub fn on_wu_credit(c: u64) {
+    WU_SUM.fetch_add(c, Ordering::Relaxed);
+    if c == 0 {
+        WU_ZERO.fetch_add(1, Ordering::Relaxed);
+    } else if c < 64 * 1024 {
+        WU_LT64K.fetch_add(1, Ordering::Relaxed);
+    } else if c < 1024 * 1024 {
+        WU_LT1M.fetch_add(1, Ordering::Relaxed);
+    } else {
+        WU_GE1M.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_wu(tag: &str) {
+    if !enabled() {
+        return;
+    }
+    eprintln!(
+        "WUCREDIT {tag} zero={} <64K={} <1M={} >=1M={} sum={}MB",
+        WU_ZERO.load(Ordering::Relaxed),
+        WU_LT64K.load(Ordering::Relaxed),
+        WU_LT1M.load(Ordering::Relaxed),
+        WU_GE1M.load(Ordering::Relaxed),
+        WU_SUM.load(Ordering::Relaxed) / 1024 / 1024
+    );
+}
