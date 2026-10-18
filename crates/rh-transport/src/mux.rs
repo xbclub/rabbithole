@@ -373,6 +373,13 @@ rd_per_blk_ms={:.2} wr_per_blk_ms={:.2}",
             rd_ms / rd_cnt as f64,
             if wr_cnt > 0 { wr_ms / wr_cnt as f64 } else { 0.0 },
         );
+        let gn = LOOP_GAP_N.load(Ordering::Relaxed);
+        if gn > 0 {
+            eprintln!(
+                "PUMP_GAP {tag} n={gn} avg_us={:.0}",
+                LOOP_GAP_NS.load(Ordering::Relaxed) as f64 / gn as f64 / 1000.0
+            );
+        }
         let rf = READY_FIRST.load(Ordering::Relaxed);
         let pf = PEND_FIRST.load(Ordering::Relaxed);
         let tot = rf + pf;
@@ -399,13 +406,6 @@ rd_per_blk_ms={:.2} wr_per_blk_ms={:.2}",
             VERY_SLOW_READS.load(Ordering::Relaxed),
             SLOW_WRITES.load(Ordering::Relaxed),
         );
-        let gn = LOOP_GAP_N.load(Ordering::Relaxed);
-        if gn > 0 {
-            eprintln!(
-                "PUMP_GAP {tag} n={gn} avg_us={:.0}",
-                LOOP_GAP_NS.load(Ordering::Relaxed) as f64 / gn as f64 / 1000.0
-            );
-        }
         let rf = READY_FIRST.load(Ordering::Relaxed);
         let pf = PEND_FIRST.load(Ordering::Relaxed);
         let tot = rf + pf;
