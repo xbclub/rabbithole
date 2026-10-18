@@ -852,15 +852,6 @@ fn mux_config_with_shards(max_streams: usize, shard_workers: usize) -> yamux::Co
     // 拆分 Active 路径忽略。`shard_workers == DEFAULT_SHARD_WORKERS` 时与
     // round-5 行为逐字节等价(既有验收断言原样绿);K>1 客户端经
     // [`shard_workers_for_k`] 缩减,使总 Worker 数 ≈ 4 而非 4K。
-    // round-11 诊断:分片数 env 覆盖。sid 步长 2 使 `sid % N` 在 N=4 时
-    // 只落 {1,3} 两个分片(connection.rs route_index / shard.rs owns),
-    // 实测数据面只用 2/4 个 Worker。改 N=2 应使分布无损,改 N 也可验证
-    // 分片是否是吞吐约束。生产默认仍按 K 推导。
-    let shard_workers = std::env::var("RH_MUX_SHARDS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .map(|n| n.clamp(1, 64))
-        .unwrap_or(shard_workers);
     cfg.set_shard_workers(shard_workers.clamp(1, 64));
     cfg
 }
