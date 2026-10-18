@@ -2186,22 +2186,13 @@ mod halves {
                 }
 
                 self.shared.set_send_waker(cx.waker());
-                // round-21 优化:consumer waker 只在**将要 park** 时登记。
-                //
-                // 原实现每轮无条件为全部 send_out[k] 登记(4 次 Mutex + 4 次
-                // Waker::clone)。实测 fill_batch 49% 是空调用、每轮 192 次,
-                // 这部分纯属开销。
-                //
-                // 安全性:下方 park 前有完整复查(sink_idle 时查 to_send 与
-                // has_pending),且 sink_idle==false 时 EPOLLOUT 必已武装、
-                // 不存在丢唤醒(见下方原有论证)。故把登记移到复查之后、
-                // 返回 Pending 之前即可,语义等价。
-                let __register_consumers = |this: &Self, cx: &Context<'_>| {
-                    for consumer in &this.send_out_consumers {
-                        consumer.register_consumer_waker(cx.waker());
-                    }
-                };
-                let _ = &__register_consumers;
+                // round-6 §3.2:每轮循环**无条件**为全部 send_out[k] 登记
+                // 消费者 waker(与 set_send_waker 同点;防线不依赖"只在
+                // park 时登记"——Worker push 空变非空即唤醒,登记前压入
+                // 的帧由下方复查捕获)。
+                for consumer in &self.send_out_consumers {
+                    consumer.register_consumer_waker(cx.waker());
+                }
                 // Round-D3(自旋修复)+ Round-D3-2(丢唤醒修复)+ round-6
                 // §3.2(send_out 项):复查项 = 无需载体即可推进的错误,
                 // **加** to_send 与 send_out——但两者都以 sink_idle 为门
@@ -2229,8 +2220,6 @@ mod halves {
                 {
                     continue;
                 }
-                // 确认要 park:此刻才登记 consumer waker(见上方注释)。
-                __register_consumers(self, cx);
                 return Poll::Pending;
             }
         }
