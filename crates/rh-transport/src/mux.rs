@@ -146,10 +146,8 @@ impl RhMuxStreamRead {
         }
         // round-11 诊断:统计"首次 poll 是否立即就绪"(buffer 非空),
         // 以区分"等上游"与"取数固定开销"。
-        // round-14 诊断:下行单块截断(模拟 frp 的 32KiB copy 粒度)。
-        let dl = down_chunk_limit();
         let mut first = true;
-        let r = std::future::poll_fn(|cx| {
+        std::future::poll_fn(|cx| {
             let r = self.inner.poll_read_chunk(cx);
             if first {
                 first = false;
@@ -166,18 +164,7 @@ impl RhMuxStreamRead {
             }
             r
         })
-        .await;
-        // 截断:超出上限的部分放回 pending 队列(下次优先交付)。
-        if dl < usize::MAX {
-            if let Ok(Some(b)) = &r {
-                if b.len() > dl {
-                    let tail = b.slice(dl..);
-                    self.pending.push_front(tail);
-                    return Ok(Some(b.slice(..dl)));
-                }
-            }
-        }
-        r
+        .await
     }
 
     /// 立即取一块:无就绪数据返回 `Ok(None)`(不挂起)。供聚合写侧
@@ -328,18 +315,6 @@ type MuxConn = yamux::Connection<YamuxCarrier>;
 fn prefetch_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("RH_MUX_PREFETCH").map(|v| v == "1").unwrap_or(false))
-}
-
-/// round-14:`RH_DOWN_CHUNK` 限制下行单次交付的字节数(默认不限制)。
-fn down_chunk_limit() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RH_DOWN_CHUNK")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| (4 * 1024..=1024 * 1024).contains(n))
-            .unwrap_or(usize::MAX)
-    })
 }
 
 const CHUNK_CAP: usize = 64 * 1024;
