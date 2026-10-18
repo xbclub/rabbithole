@@ -5895,3 +5895,58 @@ WUPATH down credit=0 ack0=0 zero_noack=0
 
 **若是 `Stream`,则切换到 `StreamReadHalf` 可能直接解决问题
 (它有 `conn_shared` 快车道 + 更少的 WU)。**
+
+### 42.17 WU 频率是正常的,但它打断了批处理
+
+**`PUSH wu=412`(8 秒,16 流):**
+
+**每流 412/16 ≈ 26 次。8 秒 2 GB / 16 流 = 125 MB/流。
+125 MB / 3 MiB(半窗) ≈ 41 次。**
+
+**实测 26 次,与理论同量级(偏少,因为窗口有预授)。**
+
+**⇒ WU 的产生频率是**正常的**,不是 bug。**
+
+**问题在于:每个 WU 都是一次独立的 `push_to_send`,
+FlushTask 每轮只能取到它,数据帧排在 `send_out` 后面。**
+
+**`FILL frames_per_call=0.80` 证实了这点:每轮只取到 0.8 帧。**
+
+### 42.18 饥饿机制(完整)
+
+```
+16 条流各自每收 3MiB → 压 1 个 WU 到 to_send
+  ↓
+FlushTask: next_frame() 优先取 to_send → 拿到 WU(12 字节)
+  ↓
+fill_batch 再取 → to_send 空 → 取 send_out(数据帧)
+  ↓
+但数据帧在 send_out 里,要经过严格轮转扫描
+  ↓
+若扫描时某 shard 恰好空,就 break
+  ↓
+本批只有 1 个 WU(12 字节)就写出
+  ↓
+下一轮重复
+```
+
+**⇒ 每发一个 12 字节的 WU,就要走一遍完整的 poll_ready + writev + poll_flush。**
+
+**这就是 `ns_per_call=5499`(5.5μs/次)的来源。**
+
+### 42.19 修复方案
+
+**让 WU 帧不单独触发写出,而是与数据帧合并。**
+
+**最小改动:`fill_batch` 取到 WU 后**继续**取数据帧,直到真正取不到为止
+(当前逻辑已经如此,但 `next_frame` 在 `to_send` 空后立即转向 `send_out`,
+而 `send_out` 的严格轮转可能第一个就空)。**
+
+**更有效的改动:调整 `next_frame` 的优先级——数据帧优先于 WU 帧。**
+
+**理由:WU 是流控元数据,延迟几毫秒无影响;数据帧延迟则直接影响吞吐。**
+
+**验证:把 `next_frame` 改为先取 `send_out`,再取 `to_send`。**
+
+**风险:可能影响控制帧(Pong/GoAway/RST)的时效性。需限定只降低
+**纯 WU 帧**的优先级,保留 Pong/GoAway 的高优先级。**
