@@ -309,6 +309,8 @@ pub mod pump_diag {
     /// 单次读等待 > 10ms 的次数
     pub static VERY_SLOW_READS: AtomicU64 = AtomicU64::new(0);
     pub static SLOW_WRITES: AtomicU64 = AtomicU64::new(0);
+    pub static UP_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static UP_CHUNKS: AtomicU64 = AtomicU64::new(0);
     pub fn enabled() -> bool {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *V.get_or_init(|| std::env::var("RH_PUMP_STATS").map(|v| v == "1").unwrap_or(false))
@@ -327,6 +329,11 @@ pub mod pump_diag {
             SLOW_READS.load(Ordering::Relaxed),
             VERY_SLOW_READS.load(Ordering::Relaxed),
             SLOW_WRITES.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "PUMP_UP {tag} up_bytes={} up_chunks={}",
+            UP_BYTES.load(Ordering::Relaxed),
+            UP_CHUNKS.load(Ordering::Relaxed)
         );
     }
 }
@@ -506,6 +513,10 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
         if let Some(l) = limiter {
             let mut r = l.reserve(chunk.len()).await;
             r.consume(chunk.len());
+        }
+        if pump_diag::enabled() {
+            pump_diag::UP_BYTES.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            pump_diag::UP_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if b_write.write_chunk(chunk).await.is_err() {
             return false;
