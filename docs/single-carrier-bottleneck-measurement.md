@@ -6560,3 +6560,59 @@ read_frame() → on_frame() → route() → try_push(分片通道)
 **⇒ 170μs 花在 `read_frame` 本身或 `on_frame` 的路由计算上。**
 
 **下一轮:`perf` 采样服务端的 `in_poll` 期间热点。**
+
+### 43.19 带符号的 perf:内核态占 90%,用户态几乎为零
+
+**重新构建(去掉 `strip = true`),符号表 24625 项。重新采样:**
+
+| 函数 | 占比 | 域 |
+|---|---:|---|
+| `copy_user_generic_unrolled` | **14.08%** | 内核 |
+| `__lock_text_start` | 7.37% | 内核 |
+| `clear_page_orig` | 6.67% | 内核 |
+| `0x1a110a`(libc) | 4.63% | 用户(libc) |
+| `finish_task_switch` | 3.21% | 内核 |
+| `free_unref_page` | 3.10% | 内核 |
+| `vmxnet3_tq_xmit` | 2.72% | 内核 |
+| `0x1a0b8a`(libc) | 2.35% | 用户(libc) |
+| `syscall`(libc) | 1.62% | 用户(libc) |
+| `rmqueue` | 1.61% | 内核 |
+| **`tokio::runtime::...::worker::run`** | **1.58%** | **用户(rh)** |
+
+**⇒ rh 自己的代码只占 1.58%。其余是内核 + libc。**
+
+### 43.20 内存管理合计占 25.5%
+
+**`copy_user_generic_unrolled` 14.08%
++ `clear_page_orig` 6.67%
++ `free_unref_page` 3.10%
++ `rmqueue` 1.61%
+= **25.46%**。**
+
+**`clear_page_orig` 是"分配新页并清零",`free_unref_page` 是"释放页"。**
+
+**两者合计 9.77% ⟹ **每秒有大量页被分配和释放**。**
+
+**这是 `Bytes` 引用计数 + `BytesMut` 扩容的代价。**
+
+### 43.21 与 frp 对比(同一套测量)
+
+**frp 同项:**
+- `copy_user_generic_unrolled` 7.52%
+- `clear_page_orig` 3.73%
+- `free_unref_page` 1.53%
+- `rmqueue` 1.25%
+- 合计 **14.03%**
+
+**⇒ rh 的内存管理开销是 frp 的 1.82 倍。**
+
+### 43.22 这是本轮的可靠结论
+
+> **rh 有 25.5% 的 CPU 花在内存拷贝与页管理上,frp 只有 14.0%。**
+> **差距 11.5 个百分点,正好对应两者 CPU 用量差异的很大一部分。**
+
+**而 `tokio::worker::run` 只占 1.58% ⟹ **不是 tokio 调度的问题**。**
+
+**⇒ 根因指向:`Bytes`/`BytesMut` 的内存分配与拷贝频率过高。**
+
+**下一轮:统计页分配次数,定位是哪个分配点。**
