@@ -554,6 +554,35 @@ impl Multiplexer {
         }
     }
 
+    /// [`Self::attach_yamux_carrier_with_cap`] 的**交还载体**变体(round-53)。
+    ///
+    /// cap 裁决语义完全相同(同一把 `members` 写锁内判定),区别是被拒时
+    /// 把载体 `Err(mux)` 交还给调用方,而不是丢弃。用途:调用方还要在被拒
+    /// 载体上写 `ok:false` ACK,写完并冲刷后才能关——所以载体必须先在
+    /// 拒绝后继续存活。
+    ///
+    /// 为什么不直接用前者的"丢弃"语义:`YamuxMultiplexer` 没有 `impl Drop`,
+    /// drop 只 detach driver 而不关连接,拒绝就等于泄漏一条无人驱动的载体
+    /// (实测 probe 流 3s 读不到 EOF)。
+    ///
+    /// 非池变体返回 `None`(与 [`Self::attach_yamux_carrier_with_cap`] 同口径:
+    /// 调用方据此走 `NOT_POOLED` 拒绝路径,不涉及载体交接)。
+    pub async fn attach_yamux_carrier_with_cap_gated(
+        &self,
+        mux: mux::YamuxMultiplexer,
+        cap: usize,
+    ) -> Option<Result<mux::AttachOutcome, mux::YamuxMultiplexer>> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => {
+                Some(p.attach_carrier_with_cap_gated(mux, cap).await)
+            }
+            // 非池变体:无 accept 语义,按原约定返回 None。载体 `mux` 随本
+            // 参数被 drop——与修前 `attach_yamux_carrier_with_cap` 的 `_`
+            // 分支同行为(该分支根本不消费 mux,由调用方后续处置)。
+            _ => None,
+        }
+    }
+
     /// 运行中把一条已 accept 的服务端 yamux 载体附加进本多路复用器
     /// (round-9 服务端会话聚合)。仅 [`MultiplexerInner::YamuxPool`] 变体
     /// 支持(返回 true);其余变体返回 false,载体由调用方处置。

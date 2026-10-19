@@ -1166,6 +1166,7 @@ pub async fn splice_relay(
 
 /// 双向中继(泵实现显式注入;无统计 = 生产默认等价路径;测试不经 env
 /// 直测两臂,避免并行测试的进程级 env 污染)。
+#[cfg(test)]
 pub(crate) async fn splice_relay_inner(
     a: &tokio::net::TcpStream,
     b: &tokio::net::TcpStream,

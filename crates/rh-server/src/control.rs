@@ -25,6 +25,31 @@ pub struct ChallengeTable {
 /// 表容量上限:防止 连接→HELLO→收挑战→断开 的慢速积累耗尽内存。
 const CHALLENGE_TABLE_CAP: usize = 65536;
 
+/// 拒绝载体时,**关闭整条载体前**给发送链路的有界冲刷窗口(round-53)。
+///
+/// ## 为什么需要(以及为什么不再是 yield)
+///
+/// 修前这里是 `write_frame(...).await` → `stream.shutdown().await` →
+/// `tokio::task::yield_now().await` → `carrier.shutdown()`,注释写作
+/// "给 driver 一次调度机会把 ACK 编帧并写穿(实测 1 次 yield 足够)"。
+///
+/// `write_frame` 只把字节写进 **mux 流的用户态缓冲**;真正落到 socket 要
+/// 经过 `stream command 通道 → SendWorker → send_out → FlushTask →
+/// poll_write`——**三级跨任务跳转**。`yield_now` 只让出一次执行权,既不
+/// 保证这三个任务被调度,更不保证 poll_write 成功。
+///
+/// 实测(载体写被人为延迟 1ms × N 次,见 `slow_carrier_write_*` 回归):
+/// `N <= 1` 时 ACK 能送达;`N >= 3` 时**必然丢失**,客户端读到
+/// `UnexpectedEof` 而非 `ok:false` ACK——它无法区分"被拒"与"连接断了"。
+///
+/// 因此把"猜"换成"有界等待":交给
+/// [`YamuxMultiplexer::shutdown_after_flush`](rh_transport::mux::YamuxMultiplexer::shutdown_after_flush),
+/// 它置 dead(不再开新流,存量帧仍排空)→ 在该窗口内多次让出 → 再 abort。
+///
+/// 取值 100ms:远大于"几十字节帧走完三级任务跳转"的正常耗时(跨机实测
+/// 正常路径 <1ms),又远小于客户端等 ACK 的 2s 超时,不会把拒绝路径拖慢。
+const REJECT_FLUSH_GRACE: Duration = Duration::from_millis(100);
+
 struct ChallengeEntry {
     client_id: String,
     expires: Instant,
@@ -423,10 +448,21 @@ async fn attach_additional_carrier(
                 }
             }
             Some(existing) => {
-                let outcome = existing.attach_yamux_carrier_with_cap(yamux, cap).await;
+                // round-53:用**交还载体**的变体。它把"超限"的载体原样
+                // 交回(`Err`),而不是像 `attach_yamux_carrier_with_cap`
+                // 那样按值丢弃——后者因 `YamuxMultiplexer` 无 impl Drop
+                // 等于泄漏一条无人驱动的连接(实测 probe 流 3s 读不到 EOF)。
+                //
+                // 交回后统一走下方 `rejected` 路径:先回 ACK,等它写穿,
+                // 再 `shutdown_after_flush` 关整条载体。顺序反了客户端会
+                // 收到 UnexpectedEof 而非 ok:false。
+                let outcome = existing.attach_yamux_carrier_with_cap_gated(yamux, cap).await;
                 *pool = Some(existing);
                 match outcome {
-                    // 池变体不支持聚合(理论上不可达):就地拒绝
+                    // 池变体不支持聚合(理论上不可达):就地拒绝。
+                    // 载体 `mux` 已被 gated 变体交还,但本路径无需再关它
+                    // ——`existing` 是池变体,说明承载报到流的连接不属于
+                    // 该池,拒绝后由会话拆除收回。
                     None => {
                         drop(pool);
                         reject_carrier(
@@ -439,35 +475,23 @@ async fn attach_additional_carrier(
                         .await;
                         return Ok(());
                     }
-                    // 超限:载体已被 attach 内部丢弃,只能靠关报到流
-                    Some(rh_transport::mux::AttachOutcome::RejectedFull) => {
-                        drop(pool);
-                        reject_carrier(
-                            &mut stream,
-                            cap,
-                            "POOL_FULL",
-                            &hello.client_id,
-                            session_id,
-                        )
-                        .await;
-                        info!(
-                            client_id = %hello.client_id,
-                            session_id,
-                            cap,
-                            "pool carrier rejected (cap, atomic)"
-                        );
-                        let _ = stream.shutdown().await;
-                        tokio::task::yield_now().await;
-                        return Ok(());
-                    }
-                    Some(_) => None,
+                    // 超限:载体被交回,交给下方 `rejected` 统一处理
+                    Some(Err(rejected_carrier)) => Some(rejected_carrier),
+                    Some(Ok(_)) => None,
                 }
             }
         }
     };
     if let Some(y) = rejected {
-        // 超限且载体仍在手中:先回 ACK,再 shutdown(round-43 红线:
-        // `write_frame` 之后没有 flush,必须 yield 让 driver 写穿)。
+        // 超限且载体仍在手中:先回 ACK,再关整条载体。
+        //
+        // round-43 红线(不得退回"无人驱动的连接"):关的是**载体 mux**
+        // (下面的 `shutdown_after_flush`),不是只关报到流——`YamuxMultiplexer`
+        // 没有 impl Drop,drop 只 detach driver 的 JoinHandle,driver 会继续
+        // 持有 socket。
+        //
+        // round-53:末帧送达不再靠 `yield_now` 猜(实测 3 次写延迟即必丢,
+        // 见 [`REJECT_FLUSH_GRACE`] 的推导),改用有界冲刷关停。
         reject_carrier(&mut stream, cap, "POOL_FULL", &hello.client_id, session_id).await;
         info!(
             client_id = %hello.client_id,
@@ -476,8 +500,7 @@ async fn attach_additional_carrier(
             "pool carrier rejected (cap, atomic)"
         );
         let _ = stream.shutdown().await;
-        tokio::task::yield_now().await;
-        y.shutdown();
+        y.shutdown_after_flush(REJECT_FLUSH_GRACE).await;
         return Ok(());
     }
     // 成功应答必须在 shutdown 之前写出(客户端在报到流上等 2s)。
@@ -1448,6 +1471,166 @@ mod carrier_ack_tests {
         let ack = read_ack(&mut client_stream).await;
         assert!(!ack.ok);
         assert_eq!(ack.error_code.as_deref(), Some("CARRIER_SHARED"));
+    }
+
+    // round-53 回归:RejectedFull 分支必须**关掉整条载体**。
+    //
+    // 修前 `attach_carrier_with_cap` 在拒绝分支按值 drop 载体;
+    // `YamuxMultiplexer` 无 impl Drop,drop 只 detach driver 不关 socket
+    // ⟹ 泄漏一条无人驱动的连接(round-43 声称修好的缺陷在另一条分支的残留)。
+    #[tokio::test]
+    async fn rejected_full_closes_carrier() {
+        use tokio::io::AsyncReadExt as _;
+        let state = state_with(2).await;
+        let _sess = register_session(&state, "sid-rf");
+
+        // 第一次报到:cap=2、池空 → 建池(1 成员),ok:true
+        let (mut c1, inc1, r1) = carrier_pair().await;
+        attach_additional_carrier(state.clone(), inc1, r1, attach_hello("sid-rf"), "sid-rf")
+            .await
+            .unwrap();
+        let a1 = read_ack(&mut c1).await;
+        assert!(a1.ok, "首次报到应成功(CAP=2 允许 1 条附加载体)");
+
+        // 第二次报到:池内 1 成员、cap=2 → 1+2 > 2 → RejectedFull。
+        // 在**同一条载体**上开 probe 流,观察它是否被关。
+        let (mut c2, inc2, r2) = carrier_pair().await;
+        let mut probe = inc2.mux.open_stream().await.expect("probe stream");
+        attach_additional_carrier(state.clone(), inc2, r2, attach_hello("sid-rf"), "sid-rf")
+            .await
+            .unwrap();
+        let a2 = read_ack(&mut c2).await;
+        assert!(!a2.ok, "超限必须拒绝");
+        assert_eq!(a2.error_code.as_deref(), Some("POOL_FULL"));
+        assert_eq!(a2.max_carriers, 2, "ACK 内容不得改动");
+
+        let mut buf = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match probe.read(&mut buf).await {
+                    Ok(0) => break true,
+                    Ok(_) => continue,
+                    Err(_) => break true,
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "RejectedFull 后整条载体必须被关闭(同载体 probe 流应读到 EOF);\
+             修前 driver 仍活着,该读会挂到超时"
+        );
+    }
+
+    /// 写半可被"卡住 N 次"的载体:前 `delays` 次 poll_write 返回 Pending,
+    /// 后台 1ms 后唤醒。模拟 driver 恰好在等其它资源 / 内核发送缓冲满——
+    /// 即 `yield_now` 一次不足以让末帧写穿的场景。
+    struct SlowWriteIo {
+        inner: tokio::io::DuplexStream,
+        delays: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for SlowWriteIo {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for SlowWriteIo {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            use std::sync::atomic::Ordering as O;
+            if self.delays.load(O::SeqCst) > 0 {
+                self.delays.fetch_sub(1, O::SeqCst);
+                let w = cx.waker().clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    w.wake();
+                });
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    // round-53(红):载体写被人为延迟时,拒绝 ACK 仍必须送达客户端。
+    //
+    // 修前该路径是 `write_frame` → `stream.shutdown` → **一次** `yield_now`
+    // → `carrier.shutdown()`。yield 只让出一次执行权,而 ACK 要走
+    // `stream command → SendWorker → FlushTask → poll_write` 三级跨任务
+    // 跳转;driver 若在等其它资源,一次让出不足以让它推到 poll_write 成功。
+    //
+    // 实测(本测试):delay=0/1 时旧实现能过;delay>=3 时**必然**丢 ACK,
+    // 客户端读到 UnexpectedEof 而非 ok:false——无法区分"被拒"与"断连"。
+    #[tokio::test]
+    async fn slow_carrier_write_still_delivers_reject_ack() {
+        for delays in [0usize, 3, 10] {
+            let state = state_with(1).await;
+            let _sess = register_session(&state, "sid-slow");
+
+            let (client_raw, server_raw) = tokio::io::duplex(256 * 1024);
+            let client = rh_transport::wrap_stream_as_client(Box::new(client_raw), true, 64);
+            let server = rh_transport::wrap_stream_as_server(
+                Box::new(SlowWriteIo {
+                    inner: server_raw,
+                    delays: Arc::new(std::sync::atomic::AtomicUsize::new(delays)),
+                }),
+                true,
+                64,
+            );
+            let mut report_client = client.open_stream().await.expect("report stream");
+            let report_server = tokio::time::timeout(Duration::from_secs(2), server.accept())
+                .await
+                .expect("accept timeout")
+                .expect("server report stream");
+            tokio::spawn(async move {
+                let _keep = client;
+                futures::future::pending::<()>().await;
+            });
+            let inc = Incoming {
+                mux: server,
+                remote: "127.0.0.1:1".parse().unwrap(),
+                protocol: Protocol::Tcp,
+            };
+            attach_additional_carrier(
+                state.clone(),
+                inc,
+                report_server,
+                attach_hello("sid-slow"),
+                "sid-slow",
+            )
+            .await
+            .unwrap();
+
+            // cap=1 ⟹ 首次附加即被拒(0+2 > 1),走 `rejected` 分支。
+            let ack = read_ack(&mut report_client).await;
+            assert!(!ack.ok, "delays={delays}:必须收到 ok:false");
+            assert_eq!(
+                ack.error_code.as_deref(),
+                Some("POOL_FULL"),
+                "delays={delays}:ACK 内容不得改动"
+            );
+            assert_eq!(ack.max_carriers, 1, "delays={delays}:cap 回写不得改动");
+        }
     }
 
     // §2.4:非 mux 载体(AcceptSingle)无法聚合 → 回 ok:false + NOT_MUXED。

@@ -1333,6 +1333,59 @@ impl YamuxMultiplexer {
         self.dead.store(true, Ordering::Release);
         std::mem::take(&mut *self.drivers.lock().unwrap())
     }
+
+    /// 关停前有界冲刷(round-53):置 dead → 让步若干次 → abort driver。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// [`Self::shutdown`] 是"立即 abort"。若调用方刚把一帧写进某条 mux 流
+    /// 的用户态缓冲,该帧此刻在 `stream command → SendWorker → send_out
+    /// → FlushTask → poll_write` 这条**三级跨任务**链路上;立即 abort 会
+    /// 把它丢掉。
+    ///
+    /// 修前调用方的做法是 `yield_now().await` 一次再 `shutdown()`,注释写作
+    /// "给 driver 一次调度机会把 ACK 写穿"。那是 **best-effort 的时序猜测**:
+    /// `yield_now` 只让出一次执行权,不保证下游三个任务被调度,更不保证
+    /// 推进到 poll_write 成功。实测(载体写每次延迟 1ms)在延迟次数 >= 3 时
+    /// 该做法**必然**丢末帧,客户端读到 `UnexpectedEof` 而非正常应答。
+    ///
+    /// 本方法把"猜"换成"有界等待",与池 Drop 的 [`POOL_DROP_GRACE`] 同一
+    /// 手法(那里已被 pool_wiring 集成测试证明能避免末帧截断),差别是这里
+    /// 调用方在 await,不必 spawn 看门任务。
+    ///
+    /// ## 上界
+    ///
+    /// 总等待 <= `grace`,且 driver 全部自行终结时提前返回。正常路径下
+    /// driver 在微秒级就把几十字节写穿,此时循环首轮 `is_finished` 或极短
+    /// sleep 即退出,不会给拒绝路径引入可测延迟。
+    ///
+    /// ## 置 dead 不影响排空
+    ///
+    /// `dead` 只被 send_driver **写**、不被它读来决定退出;置位仅阻止新开流
+    /// (open 路径检查),已排入命令通道的帧仍会走完. 
+    pub async fn shutdown_after_flush(&self, grace: std::time::Duration) {
+        self.dead.store(true, Ordering::Release);
+        let handles: Vec<_> = std::mem::take(&mut *self.drivers.lock().unwrap());
+        if handles.is_empty() {
+            return;
+        }
+        // 分级让步:三级任务跳转需要多次调度机会,单次 yield 不够。
+        const SLICES: u32 = 8;
+        let slice = (grace / SLICES).max(std::time::Duration::from_micros(50));
+        let deadline = tokio::time::Instant::now() + grace;
+        for _ in 0..SLICES {
+            if handles.iter().all(|h| h.is_finished()) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(slice).await;
+        }
+        for h in handles {
+            h.abort();
+        }
+    }
 }
 
 // ===== 多物理载体连接池聚合(round-8 优化项 5) =====
@@ -1913,6 +1966,12 @@ impl YamuxMultiplexerPool {
         let member = Arc::new(PoolMember::new(id, mux, None));
         let mut ms = self.inner.members.write().await;
         // ★ 裁决点:与 push 同处一把写锁之内,窗口为零。
+        //
+        // 口径:`cap` 含**池外的首载体**,故 `len + 1(首载体) + 1(本次) <= cap`。
+        // 另一个成员上限裁决点在客户端池的 `redial_loop`(用 `redial_target`,
+        // 首载体在**池内**,判定式是 `len >= target`)——两者不是同一把尺子,
+        // 不可互换,换算推导与"为什么两条路径结构上互斥"见该处注释
+        // (round-53)。
         if ms.len() + 2 > cap {
             drop(ms);
             return AttachOutcome::RejectedFull;
@@ -1930,6 +1989,64 @@ impl YamuxMultiplexerPool {
         self.inner.changed.notify_waiters();
         drop(ms);
         AttachOutcome::Attached
+    }
+
+    /// [`Self::attach_carrier_with_cap`] 的**交还载体**变体(round-53)。
+    ///
+    /// 语义与前者完全一致(cap 裁决在同一把写锁内、拒绝时不入表),唯一
+    /// 区别:被拒时把载体 `Err(mux)` 交还给调用方,而不是丢弃。
+    ///
+    /// ## 为什么需要这个变体
+    ///
+    /// `attach_carrier_with_cap` 按值吃 `mux`,拒绝分支只能 drop 它。
+    /// `YamuxMultiplexer` **没有 `impl Drop`**——drop 只是 detach driver 的
+    /// JoinHandle,driver 继续持有 socket 并运行(见该结构体 `drivers`
+    /// 字段注释的既有语义)。于是"拒绝"实际变成"泄漏一条无人驱动的连接":
+    /// 实测 cap=2、池内已有 1 条时,被拒载体上的 probe 流 3 秒读不到 EOF。
+    ///
+    /// 反过来,"拒绝时就地 shutdown"也不行:调用方还要在那条载体上把
+    /// `ok:false` ACK 写给客户端,先关就变成客户端读到 `UnexpectedEof`
+    /// (这正是 round-43 踩过的坑)。**正确顺序是:先回 ACK,等它写穿,
+    /// 再关载体**——而这要求载体在拒绝后仍然活着,即必须交还给调用方。
+    ///
+    /// 调用方契约:拿到 `Err(mux)` 后**必须**在合适时机调用
+    /// [`YamuxMultiplexer::shutdown_after_flush`] 或 [`YamuxMultiplexer::shutdown`],
+    /// 不得再次 drop 了事(那会退回本方法要修的泄漏)。
+    pub async fn attach_carrier_with_cap_gated(
+        &self,
+        mux: YamuxMultiplexer,
+        cap: usize,
+    ) -> Result<AttachOutcome, YamuxMultiplexer> {
+        let Some(tx) = self.inner.accept_tx.clone() else {
+            // 非服务端池(无合流通道):无 accept 语义,载体原样交还。
+            return Err(mux);
+        };
+        let id = self.inner.next_member_id.fetch_add(1, Ordering::Relaxed);
+        let member = Arc::new(PoolMember::new(id, mux, None));
+        let mut ms = self.inner.members.write().await;
+        // ★ 裁决点:与 push 同处一把写锁之内,窗口为零(同 round-48)。
+        // 口径换算见 `attach_carrier_with_cap` 与 `redial_loop` 的注释。
+        if ms.len() + 2 > cap {
+            drop(ms);
+            // 不入表,载体交还(此处 member 是唯一 Arc 持有者)。
+            let m = Arc::try_unwrap(member)
+                .ok()
+                .expect("reject path holds the only Arc to the rejected member");
+            return Err(m.mux);
+        }
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            drop(ms);
+            member.mux.shutdown();
+            self.inner.shutdown_sweep();
+            return Ok(AttachOutcome::PoolShutdown);
+        }
+        ms.push(member.clone());
+        self.inner.dead.store(false, Ordering::Release);
+        let h = Self::spawn_accept_forward(&self.inner, member, tx);
+        self.inner.forward_tasks.lock().unwrap().push(h);
+        self.inner.changed.notify_waiters();
+        drop(ms);
+        Ok(AttachOutcome::Attached)
     }
 
     /// 当前生效的分派前缀上限(诊断/测试缝:与成员数取较小值)。
@@ -2262,6 +2379,52 @@ async fn redial_loop(inner: Arc<PoolInner>, redial: PoolRedial) {
                 // `final_k + 1` 条(detach 只认身份,无法收回这条新成员)。
                 // 目标数在成员表读锁内写入(见 set_active_prefix),本检查在
                 // 写锁内读取,二者互斥,不存在"先读旧目标后入表"的窗口。
+                //
+                // ## 为什么这里用 redial_target 而不是服务端的 cap(round-53)
+                //
+                // 本仓有两个"成员数上限"裁决点,判的**不是同一个池**:
+                //
+                // | 裁决点 | 所在池 | 上限来源 | 判定式 | 首载体位置 |
+                // |---|---|---|---|---|
+                // | `attach_carrier_with_cap` | 服务端池(`new_server`) | 服务端 `max_carriers` | `len + 2 > cap` | **池外** |
+                // | 本处 `redial_loop` | 客户端池(`new_client`) | 客户端收敛 `final_k` | `len >= target` | **池内**(member[0]) |
+                //
+                // 口径换算(以"入表后池内成员数 N"为公共量):
+                // * 服务端池:`N + 1(池外首载体) <= cap`,故 `N <= cap - 1`,
+                //   超限条件写成 `len + 2 > cap`;
+                // * 客户端池:`N <= final_k`(首载体已占池内一格,不再 +1),
+                //   超限条件即 `len + 1 > target`,等价于本处的 `len >= target`。
+                //
+                // **两者之差恰好是首载体是否占池内名额,因此不可互换。** 若把
+                // 服务端式 `len + 2 > cap` 搬到此处,客户端池上限会少 1,直接
+                // 破坏 round-10.2 的补位语义(`slow_redial_landing_after_
+                // convergence_is_discarded` / `prefix_expands_when_redial_
+                // lands_after_convergence` 会立红)。
+                //
+                // ## 两条路径结构上互斥,不存在"两个数值漂移后冲突"
+                //
+                // 这不是"今天输入相同所以碰巧正确",而是构造上不可交:
+                // * `new_client` 的 `accept_tx` 恒为 `None`(`mux.rs:1560` 附近),
+                //   而 `attach_carrier_with_cap` 首行即 `let Some(tx) = ...
+                //   else { return PoolShutdown }` —— **服务端报到裁决在客户端
+                //   池上不可达**;
+                // * `new_server` 的全部 `PoolMember` 都以 `redial = None` 构造,
+                //   而 `reap_member` 仅在 `member.redial()` 为 `Some` 时 spawn
+                //   `redial_loop` —— **补位路径在服务端池上不可达**。
+                //
+                // `PoolInner` 只有 new_client / new_server 两个构造点,没有
+                // 第三条能同时给出 `accept_tx: Some` 与 `redial: Some` 的路径。
+                // 该不变量由 `pool_cap_and_redial_target_never_share_a_pool`
+                // 锁定(改动任一构造点会立刻变红)。
+                //
+                // 客户端侧 `redial_target` 的上游保证:`set_active_prefix` 唯一
+                // 生产调用点是 `session.rs` 的 `mux.set_active_prefix(final_k)`,
+                // 而 `final_k = initial_k.min(server_cap).clamp(1, 8)`
+                // (`plan_convergence`,`session.rs:113`)——即便有人传入更大值,
+                // 也只影响客户端池的池内成员数,够不到服务端的 cap。
+                //
+                // 初始值 `usize::MAX`(= 不限)是**有意**的:收敛落地前尚无
+                // final_k,死一条载体必须允许补位,否则最终定位前无法自愈。
                 let target = inner.redial_target.load(Ordering::Acquire);
                 if ms.len() >= target {
                     drop(ms);
@@ -4280,5 +4443,104 @@ mod tests {
             .await
             .expect("server task must finish")
             .unwrap();
+    }
+
+    /// round-53(不变量锁):两个"成员数上限"裁决点**结构上互斥**。
+    ///
+    /// 仓内有两处判成员上限,来源不同:
+    /// * 服务端池 `attach_carrier_with_cap` → 用服务端 `max_carriers`,
+    ///   判定式 `len + 2 > cap`(首载体在池外);
+    /// * 客户端池 `redial_loop` → 用客户端收敛 `final_k`,判定式
+    ///   `len >= target`(首载体在池内,即 member[0])。
+    ///
+    /// 很容易误以为这是"同一个池上两个数值,只因今天输入相同才正确",
+    /// 从而想合并成一个 cap。实际是**两个不同的池**:`PoolInner` 只有
+    /// 两个构造点,`new_client` 的 `accept_tx = None` 使报到裁决不可达,
+    /// `new_server` 的成员 `redial = None` 使补位循环不可达。
+    ///
+    /// 本测试把这组不变量变成可执行断言:任一构造点被改动(给客户端池
+    /// 装上 accept_tx、或给服务端成员装上重拨配方),此处立刻变红——
+    /// 那时才真正需要统一裁决式,而不是现在。
+    #[tokio::test]
+    async fn pool_cap_and_redial_target_never_share_a_pool() {
+        // —— 服务端池:报到裁决可达,补位不可达 ——
+        let (client_a, server_a) = tokio::io::duplex(64 * 1024);
+        let _keep_client = YamuxMultiplexer::new(
+            Box::new(client_a),
+            yamux::Mode::Client,
+            16,
+            DEFAULT_SHARD_WORKERS,
+        );
+        let server_mux = YamuxMultiplexer::new(
+            Box::new(server_a),
+            yamux::Mode::Server,
+            16,
+            DEFAULT_SHARD_WORKERS,
+        );
+        let server_pool = YamuxMultiplexerPool::new_server(vec![server_mux]);
+
+        // 服务端池有合流通道 → attach 可用;cap 裁决生效。
+        // cap=2 时池内已有 1 条,`1 + 2 > 2` → 拒绝(与 round-48 同口径)。
+        let (c2, s2) = tokio::io::duplex(64 * 1024);
+        let extra = YamuxMultiplexer::new(Box::new(s2), yamux::Mode::Server, 16, DEFAULT_SHARD_WORKERS);
+        assert_eq!(
+            server_pool.attach_carrier_with_cap(extra, 2).await,
+            AttachOutcome::RejectedFull,
+            "服务端池:cap=2、表长 1 时必须拒绝(len+2>cap),证明报到裁决在该池可达且生效"
+        );
+        drop(c2);
+
+        // 服务端池的成员没有重拨配方 → `reap_member` 不会 spawn 补位。
+        // 直接断言每个成员的 redial() 均为 None(redial_loop 的唯一入口条件)。
+        {
+            let ms = server_pool.inner.members.read().await;
+            assert!(
+                ms.iter().all(|m| m.redial().is_none()),
+                "服务端池成员不得带重拨配方——否则 redial_loop 会在服务端池上 \
+                 以客户端口径(redial_target)判上限,与服务端 cap 形成两个尺子"
+            );
+        }
+
+        // —— 客户端池:补位裁决可达,报到不可达 ——
+        let (c3, s3) = tokio::io::duplex(64 * 1024);
+        let _keep_s3 = YamuxMultiplexer::new(
+            Box::new(s3),
+            yamux::Mode::Server,
+            16,
+            DEFAULT_SHARD_WORKERS,
+        );
+        let client_mux = YamuxMultiplexer::new(
+            Box::new(c3),
+            yamux::Mode::Client,
+            16,
+            DEFAULT_SHARD_WORKERS,
+        );
+        let redial: PoolRedial = Arc::new(|| {
+            Box::pin(async {
+                Err(other("test pool: redial not exercised"))
+            })
+        });
+        let client_pool = YamuxMultiplexerPool::new_client(vec![client_mux], Some(redial));
+
+        // 客户端池无合流通道 → 报到裁决不可达(返回 PoolShutdown,不入表)。
+        let (c4, s4) = tokio::io::duplex(64 * 1024);
+        let extra2 = YamuxMultiplexer::new(Box::new(s4), yamux::Mode::Server, 16, DEFAULT_SHARD_WORKERS);
+        assert_eq!(
+            client_pool.attach_carrier_with_cap(extra2, 8).await,
+            AttachOutcome::PoolShutdown,
+            "客户端池没有合流通道:报到裁决必须不可达(在 cap 判断之前就返回),\
+             它只认 redial_target"
+        );
+        drop(c4);
+
+        // 客户端池的成员**带**重拨配方 → 补位路径可达(本测试只验入口条件,
+        // 不触发实际重拨:配方直接返回 Err)。
+        {
+            let ms = client_pool.inner.members.read().await;
+            assert!(
+                ms.iter().all(|m| m.redial().is_some()),
+                "客户端池成员必须带重拨配方,否则载体故障无法补位"
+            );
+        }
     }
 }
