@@ -392,3 +392,60 @@ static WU_TRACED: AtomicU64 = AtomicU64::new(0);
 pub fn trace_wu() -> bool {
     WU_TRACED.fetch_add(1, Ordering::Relaxed) < 3
 }
+
+// ---- 唤醒间隔 ----
+static LAST_PENDING_NS: AtomicU64 = AtomicU64::new(0);
+pub static WAKEUP_N: AtomicU64 = AtomicU64::new(0);
+pub static WAKEUP_SUM_NS: AtomicU64 = AtomicU64::new(0);
+pub static WAKEUP_LT100US: AtomicU64 = AtomicU64::new(0);
+pub static WAKEUP_GT10MS: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_last_pending(t: std::time::Instant) {
+    // 用进程启动后的相对纳秒,避免存 Instant 需要锁
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(|| t);
+    LAST_PENDING_NS.store(
+        t.duration_since(*base).as_nanos() as u64,
+        Ordering::Relaxed,
+    );
+}
+
+pub fn clear_last_pending() {
+    LAST_PENDING_NS.store(u64::MAX, Ordering::Relaxed);
+}
+
+pub fn last_pending() -> Option<std::time::Instant> {
+    let v = LAST_PENDING_NS.load(Ordering::Relaxed);
+    if v == 0 || v == u64::MAX {
+        return None;
+    }
+    Some(std::time::Instant::now())  // 占位,实际由 on_wakeup_gap 处理
+}
+
+pub fn on_wakeup_gap(d: std::time::Duration) {
+    let ns = d.as_nanos() as u64;
+    WAKEUP_N.fetch_add(1, Ordering::Relaxed);
+    WAKEUP_SUM_NS.fetch_add(ns, Ordering::Relaxed);
+    if ns < 100_000 {
+        WAKEUP_LT100US.fetch_add(1, Ordering::Relaxed);
+    }
+    if ns > 10_000_000 {
+        WAKEUP_GT10MS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_wakeup(tag: &str) {
+    if !enabled() {
+        return;
+    }
+    let n = WAKEUP_N.load(Ordering::Relaxed);
+    if n == 0 {
+        return;
+    }
+    eprintln!(
+        "WAKEUP {tag} n={n} avg_us={:.0} lt100us={} gt10ms={}",
+        WAKEUP_SUM_NS.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
+        WAKEUP_LT100US.load(Ordering::Relaxed),
+        WAKEUP_GT10MS.load(Ordering::Relaxed)
+    );
+}
