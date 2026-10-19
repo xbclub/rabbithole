@@ -7331,3 +7331,93 @@ SPARE_EMPTY  (无输出 ⟹ count=0)
 READ_RESERVE(有害)、WU 开销(0.03%)。**
 
 **累计 58 项候选排除。**
+
+### 43.71 ⭐⭐⭐⭐⭐⭐⭐ 铁证:epoll_wait 每秒 3104 次,但 RecvHalf 只 poll 320 次
+
+**perf stat 实测(6 秒,1.87 Gbps):**
+
+| 指标 | 次数 | 每秒 |
+|---|---:|---:|
+| `epoll_wait` | 18,624 | **3,104 /s** |
+| `sched_switch` | 35,058 | 5,843 /s |
+| **RecvHalf poll** | 2,561 | **320 /s** |
+
+**⇒ epoll 每秒被唤醒 3104 次,但 RecvHalf 每秒只被 poll 320 次。**
+
+**差 9.7 倍。**
+
+### 43.72 这就是丢唤醒的确证
+
+**tokio 的 reactor 在 epoll 有事件时,会唤醒对应的 task。**
+
+**若 RecvHalf 的 task 被正确唤醒,它的 poll 次数应该 ≈ epoll 事件数。**
+
+**实测差 9.7 倍 ⟹ **大部分 epoll 事件没有转化为 RecvHalf 的 poll**。**
+
+**⇒ 这是真正的丢唤醒,发生在 tokio reactor → task 的传递环节。**
+
+### 43.73 为什么 tokio 会丢唤醒
+
+**tokio 的 `TcpStream::poll_read` 语义:**
+1. 尝试非阻塞 `read()`
+2. 若返回 `WouldBlock`,把当前 waker 注册到 reactor
+3. 返回 `Pending`
+
+**若在步骤 2 和 3 之间数据到达,reactor 会立即触发一次唤醒。**
+
+**但 tokio 的 reactor 对**同一个 fd 的多次就绪事件会合并**(edge-triggered
+或 level-triggered 的取舍)。**
+
+**若 `poll_read` 在一次 poll 里读了多次(循环读),而 waker 只在
+第一次注册,后续的就绪事件可能被合并掉。**
+
+### 43.74 更可能的解释:yamux 的读循环
+
+**`frame::Io::poll_next` 的循环:**
+```rust
+loop {
+    // 1) staging 有完整帧 → 交付
+    // 2) 从底层读入 staging
+    let n = ready!(poll_read(cx, spare))?;   // ← 这里 Pending 就整体 Pending
+    ...
+}
+```
+
+**若 staging 里有多个完整帧,`poll_next` 每次只交付 1 帧就返回。**
+
+**RecvHalf 的 `poll_inner` 循环调用 `read_frame` 多次,直到 Pending。**
+
+**⇒ 每次 poll 应该处理多帧。实测 `frames_per_poll=5.3`。**
+
+**但 epoll 3104 次/s 说明内核频繁通知,而 poll 只有 320 次/s。**
+
+**⇒ 中间有 2784 次/s 的通知被"吞掉"了。**
+
+### 43.75 这可能是 tokio 的正常行为
+
+**tokio 的 reactor 是**共享**的:一个 worker 线程的 epoll 会监听
+**所有**注册在该 worker 上的 fd。**
+
+**⇒ 3104 次 epoll_wait 包含了所有 socket(载体 + 16 个用户连接)的事件。**
+
+**而 RecvHalf 只关心载体那一个 fd。**
+
+**⇒ 3104 次里只有一部分是载体的。**
+
+**载体占比 = 1 / 17 ≈ 6% ⟹ 182 次/s。**
+
+**而 RecvHalf poll 320 次/s > 182。**
+
+**⇒ 没有丢唤醒!我的推断错了。**
+
+### 43.76 修正:epoll 事件数不能直接对比
+
+**`epoll_wait` 是**每个 worker 线程**各调一次,且监听多个 fd。**
+
+**16 个 worker × 194 次/s = 3104 次/s。**
+
+**每个 worker 的 epoll 监听它自己负责的 fd。**
+
+**⇒ 无法从总数推断载体的唤醒次数。**
+
+**这个验证方法无效。**
