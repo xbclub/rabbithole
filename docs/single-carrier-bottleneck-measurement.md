@@ -6052,3 +6052,75 @@ recvfrom(30, "", 65536, 0, NULL, NULL) = 12     ← 只读到 12 字节
 
 **若也是几十字节 → 问题在客户端的分片逻辑。**
 **若是 64KiB → 问题在网络层(MTU 分片)。**
+
+### 42.28 ⭐⭐⭐⭐⭐⭐⭐ 最终根因:一半的 writev 返回 EAGAIN
+
+**rh-client 往载体写的 strace(真实跨机负载):**
+
+```
+writev(10, [...], 36) = 65160                              ← 成功,65KiB
+writev(10, [...], 33) = -1 EAGAIN (Resource temporarily unavailable)
+writev(10, [...], 31) = 65160
+writev(10, [...], 29) = -1 EAGAIN
+writev(10, [...], 27) = 65160
+writev(10, [...], 25) = -1 EAGAIN
+```
+
+**每一个成功的 writev 后面都跟着一个 EAGAIN。**
+
+**⇒ 50% 的 writev 调用是空转的(内核发送队列已满)。**
+
+### 42.29 这解释了一切
+
+| 观测 | 解释 |
+|---|---|
+| **载体 2.00 G vs frp 3.20 G** | **一半的写调用被 EAGAIN 浪费** |
+| `copy_user_generic_unrolled` 14.30%(frp 7.52%) | EAGAIN 前仍要做 iov 准备 |
+| `fill_batch` 每次 0.8 帧 | 写不出去,队列积压 |
+| `ns_per_call=5499` | 每次都要走 poll_ready → EAGAIN → park |
+| CPU 只用 0.42 核 | 大量时间在 EAGAIN 后 park 等可写 |
+| **服务端 recvfrom 只读到 81/12 字节** | **客户端写不出去,只能发小包** |
+
+### 42.30 为什么 frp 没有这个问题
+
+**frp 的 `sendLoop`:**
+```go
+case ready := <-session.sendCh:
+    _, err := conn.Write(ready)   ← 阻塞写,内核队列满就等
+```
+
+**Go 的 `conn.Write` 是**阻塞**的:队列满时 goroutine 挂起,
+等 EPOLLOUT 再继续 —— **不会返回 EAGAIN**。**
+
+**rh 的 tokio `poll_write` 是**非阻塞**的:队列满时返回 `Pending`
+(对应 EAGAIN),然后要重新 park/unpark。**
+
+**⇒ 差异不是"能不能写",而是"写不出去时的处理方式"。**
+
+**Go:阻塞等待,由 runtime 调度,无用户态轮询。**
+**rh:返回 Pending,FlushTask 要重新走一遍 poll_ready → fill_batch → poll_flush。**
+
+### 42.31 为什么 rh 会有一半的写失败
+
+**关键:`writev` 一次写 65KiB,而载体的 `tb`(发送缓冲)只有 87KB。**
+
+**⇒ 写 65KiB 后,缓冲只剩 22KB,下一次写 65KiB 必然 EAGAIN。**
+
+**这就是 50% 失败率的原因:单次写量(65KiB)接近发送缓冲(87KB)。**
+
+**frp 每次写 32KiB,缓冲 87KB 可以连续写 2 次才满 —— 失败率低得多。**
+
+### 42.32 这是一个可以精确修复的问题
+
+**方案:减小单次 writev 的字节数,使发送缓冲能容纳多次写。**
+
+**但 §34.7 测过 `RH_DOWN_CHUNK=32KiB`,无改善 —— 因为那改的是
+"从 mux 流读出多少",不是"writev 写多少"。**
+
+**正确的修复点:在 `fill_batch` 里限制单批的字节数,
+使一次 writev 不超过发送缓冲的一半(约 40KiB)。**
+
+**`MAX_BATCH_BYTES` 当前是 1MiB,但实际被 64KiB 的帧限制。
+应改为 `min(MAX_BATCH_BYTES, tb/2)`。**
+
+**验证:把单批上限设为 32KiB,看 EAGAIN 率是否下降、吞吐是否提升。**
