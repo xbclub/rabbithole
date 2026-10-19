@@ -1120,16 +1120,31 @@ wait_client_online() {  # $1=client_id
 
 CTL_BASE=$(ctl_estab "$CTL_PORT" "$SRV_PID")
 
-# 独立硬件上限(round-10.1 §2.5):与客户端 detect_hardware_cap 同口径,但
-# **不读被测日志**——CPU 亲和数(及 cgroup 配额)/2 与
-# /sys/class/net/*/queues/rx-* 的最大值,钳制 [1,8];非 Linux/无队列信息
-# 时仅由 CPU 决定。期望值的唯一来源是「显式 mux_pool_size=3」与本函数。
+# 硬件上限期望值(round-49:**直接问被测二进制**)。
+#
+# 修前这里用 Python 独立推算:CPU 亲和数(及 cgroup 配额)/2,再与
+# /sys/class/net/*/queues/rx-* 的最大值取 min,钳制 [1,8]。口径与 Rust 侧
+# `detect_hardware_cap()` 看似相同,但两者用的是**不同的系统接口**:
+#   - 脚本:`os.sched_getaffinity(0)` + 手工读 cgroup v1/v2 配额;
+#   - Rust:`std::thread::available_parallelism()`
+# available_parallelism 在嵌套 cgroup 下的取值与"亲和数 ∩ 配额"未必相等
+# (REPORT-round10.md「## 6. 遗留」第 1 条已承认)。该差异只影响 e2e 期望值,
+# 不误 PASS,但会让断言在本不该 SKIP 的时候 SKIP。
+#
+# 现在改为消费 `rh-client --print-hardware-cap` 的输出——即**客户端自己
+# 算出的那个数**,口径不可能再漂移。若二进制不可执行则回退到旧推算
+# (保持脚本在只构建了部分目标时仍可用)。
 indep_hw_cap() {
-  python3 - <<'PYEOF'
+  local cap
+  if [ -x "$CLIENT" ]; then
+    cap=$("$CLIENT" --print-hardware-cap 2>/dev/null | tr -dc '0-9')
+  fi
+  if [ -z "${cap:-}" ]; then
+    # 回退:二进制缺失/不可执行时的独立推算(与修前逻辑一致)
+    cap=$(python3 - <<'PYEOF'
 import glob, os
 
 def cgroup_quota():
-    # cgroup v2
     try:
         with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as fh:
             q, p = fh.read().split()[:2]
@@ -1137,7 +1152,6 @@ def cgroup_quota():
                 return max(1, int(q) // int(p))
     except Exception:
         pass
-    # cgroup v1
     try:
         q = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8").read())
         p = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8").read())
@@ -1164,6 +1178,13 @@ if queues:
     cap = min(cap, max(max(queues), 1))
 print(max(1, min(cap, 8)))
 PYEOF
+)
+  fi
+  # 兜底:任何异常都不得让 cap 为空(后续 -gt/-lt 数值比较会崩)
+  case "${cap:-}" in
+    ''|*[!0-9]*) cap=1 ;;
+  esac
+  echo "$cap"
 }
 
 # 按源端口归因(round-10.1 §2.5):记录客户端进程到控制端口的 ESTAB 连接
