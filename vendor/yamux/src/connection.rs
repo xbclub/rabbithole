@@ -1805,10 +1805,16 @@ mod halves {
         pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Stream>>> {
             // round-11 诊断:统计每次 poll 处理的帧数与 poll 间隔。
             let __diag = crate::sched_diag::enabled();
-            let __t0 = if __diag { Some(std::time::Instant::now()) } else { None };
+            let __t0 = if __diag {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let __frames_at_entry = if __diag {
                 Some(crate::sched_diag::FRAMES_IN_POLL.load(std::sync::atomic::Ordering::Relaxed))
-            } else { None };
+            } else {
+                None
+            };
             let __r = self.poll_inner(cx);
             // round-25 诊断:记录 poll 的 Pending 次数与帧数,用于算唤醒间隔。
             if __diag {
@@ -1817,7 +1823,8 @@ mod halves {
             if let (Some(t), Some(f0)) = (__t0, __frames_at_entry) {
                 crate::sched_diag::on_recv_poll(
                     t.elapsed(),
-                    crate::sched_diag::FRAMES_IN_POLL.load(std::sync::atomic::Ordering::Relaxed) - f0,
+                    crate::sched_diag::FRAMES_IN_POLL.load(std::sync::atomic::Ordering::Relaxed)
+                        - f0,
                     matches!(__r, Poll::Pending),
                 );
             }
@@ -1962,26 +1969,26 @@ mod halves {
                         crate::sched_diag::FRAMES_IN_POLL
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         match self.on_frame(frame, cx) {
-                        Ok(Routed::Done) => {}
-                        Ok(Routed::Backpressured { index, msg }) => {
-                            // round-34:先进侧链,不立刻停读——健康分片的
-                            // 帧与控制帧(PING/WU)继续推进。只有侧链已满
-                            // (说明该分片持续阻塞、突发已超上界)才回落到
-                            // 真正的 TCP 停读。
-                            if !self.stash_pending_route(index, msg) {
-                                self.shared.set_recv_waker(cx.waker());
-                                // 复查(要点 1 防线):错误槽/Worker 消亡不丢唤醒
-                                if self.shared.error.lock().is_some() || self.workers_gone() {
-                                    continue;
+                            Ok(Routed::Done) => {}
+                            Ok(Routed::Backpressured { index, msg }) => {
+                                // round-34:先进侧链,不立刻停读——健康分片的
+                                // 帧与控制帧(PING/WU)继续推进。只有侧链已满
+                                // (说明该分片持续阻塞、突发已超上界)才回落到
+                                // 真正的 TCP 停读。
+                                if !self.stash_pending_route(index, msg) {
+                                    self.shared.set_recv_waker(cx.waker());
+                                    // 复查(要点 1 防线):错误槽/Worker 消亡不丢唤醒
+                                    if self.shared.error.lock().is_some() || self.workers_gone() {
+                                        continue;
+                                    }
+                                    return Poll::Pending; // 侧链满:背压,TCP 停读
                                 }
-                                return Poll::Pending; // 侧链满:背压,TCP 停读
+                                continue; // 继续解下一帧
                             }
-                            continue; // 继续解下一帧
-                        }
-                        Err(e) => {
-                            self.begin_fatal(e, true);
-                            continue;
-                        }
+                            Err(e) => {
+                                self.begin_fatal(e, true);
+                                continue;
+                            }
                         }
                     }
                     Poll::Ready(Some(Err(e))) => {
@@ -2458,7 +2465,11 @@ mod halves {
             let mut frames = 0usize;
             let mut bytes = 0usize;
             let __diag = crate::sched_diag::enabled();
-            let __t0 = if __diag { Some(std::time::Instant::now()) } else { None };
+            let __t0 = if __diag {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             while frames < MAX_BATCH_FRAMES && bytes < crate::frame::max_batch_bytes() {
                 let Some(frame) = self.next_frame() else {
                     break;

@@ -456,7 +456,9 @@ async fn attach_additional_carrier(
                 // 交回后统一走下方 `rejected` 路径:先回 ACK,等它写穿,
                 // 再 `shutdown_after_flush` 关整条载体。顺序反了客户端会
                 // 收到 UnexpectedEof 而非 ok:false。
-                let outcome = existing.attach_yamux_carrier_with_cap_gated(yamux, cap).await;
+                let outcome = existing
+                    .attach_yamux_carrier_with_cap_gated(yamux, cap)
+                    .await;
                 *pool = Some(existing);
                 match outcome {
                     // 池变体不支持聚合(理论上不可达):就地拒绝。
@@ -1831,8 +1833,8 @@ mod carrier_attach_concurrency_tests {
             let st = state.clone();
             let (mut cs, inc, ss) = pair().await;
             handles.push(tokio::spawn(async move {
-                let r = attach_additional_carrier(st, inc, ss, hello_for("sid-conc"), "sid-conc")
-                    .await;
+                let r =
+                    attach_additional_carrier(st, inc, ss, hello_for("sid-conc"), "sid-conc").await;
                 // 读 ACK,判定该次报到是成功还是被拒
                 let mut buf = bytes::BytesMut::with_capacity(512);
                 let mut accepted = false;
@@ -1843,8 +1845,9 @@ mod carrier_attach_concurrency_tests {
                 .await
                 {
                     if ty == FrameType::CARRIER_ATTACH_ACK {
-                        if let Ok(a) =
-                            serde_json::from_slice::<rh_protocol::message::CarrierAttachAck>(&payload)
+                        if let Ok(a) = serde_json::from_slice::<
+                            rh_protocol::message::CarrierAttachAck,
+                        >(&payload)
                         {
                             accepted = a.ok;
                         }
@@ -1894,8 +1897,8 @@ mod carrier_attach_concurrency_tests {
             let st = state.clone();
             let (mut cs, inc, ss) = pair().await;
             handles.push(tokio::spawn(async move {
-                let _ = attach_additional_carrier(st, inc, ss, hello_for("sid-one"), "sid-one")
-                    .await;
+                let _ =
+                    attach_additional_carrier(st, inc, ss, hello_for("sid-one"), "sid-one").await;
                 let mut buf = bytes::BytesMut::with_capacity(512);
                 let _ = tokio::time::timeout(
                     Duration::from_secs(2),

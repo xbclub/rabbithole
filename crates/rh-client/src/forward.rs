@@ -757,10 +757,7 @@ mod tests {
             d_a.load(Ordering::SeqCst),
             "半关闭兜底后必须释放 a 侧 IO(否则 socket 钉死 FIN-WAIT-2)"
         );
-        assert!(
-            d_b.load(Ordering::SeqCst),
-            "半关闭兜底后必须释放 b 侧 IO"
-        );
+        assert!(d_b.load(Ordering::SeqCst), "半关闭兜底后必须释放 b 侧 IO");
     }
 
     /// round-52 对照(半关闭红线):正常半关闭**不得**被 grace 提前打断。

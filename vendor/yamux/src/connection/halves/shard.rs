@@ -3075,7 +3075,11 @@ mod tests {
             let workers = f.shared.workers.lock();
             for _ in 0..cap {
                 let h = Header::data(StreamId::new(2), 0);
-                if workers[0].0.try_push(ShardMsg::Frame(Frame::new(h).into())).is_err() {
+                if workers[0]
+                    .0
+                    .try_push(ShardMsg::Frame(Frame::new(h).into()))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -3122,11 +3126,7 @@ mod tests {
             4,
             "分片 0 必须收编一半接收器(不得闲置)"
         );
-        assert_eq!(
-            f.send_workers[1].streams.len(),
-            4,
-            "分片 1 必须收编另一半"
-        );
+        assert_eq!(f.send_workers[1].streams.len(), 4, "分片 1 必须收编另一半");
         for (k, w) in f.send_workers.iter().enumerate() {
             assert!(
                 !w.streams.is_empty(),

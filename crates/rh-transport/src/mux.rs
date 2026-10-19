@@ -154,10 +154,12 @@ impl RhMuxStreamRead {
                 if pump_diag::enabled() {
                     match &r {
                         std::task::Poll::Ready(_) => {
-                            pump_diag::READY_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            pump_diag::READY_FIRST
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         std::task::Poll::Pending => {
-                            pump_diag::PEND_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            pump_diag::PEND_FIRST
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
@@ -360,7 +362,11 @@ pub mod pump_diag {
     pub static UP_CHUNKS: AtomicU64 = AtomicU64::new(0);
     pub fn enabled() -> bool {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *V.get_or_init(|| std::env::var("RH_PUMP_STATS").map(|v| v == "1").unwrap_or(false))
+        *V.get_or_init(|| {
+            std::env::var("RH_PUMP_STATS")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+        })
     }
     /// 单流口径输出:每个 pump_down 打印自己的统计。
     #[allow(clippy::too_many_arguments)]
@@ -384,10 +390,22 @@ pub mod pump_diag {
 avg_chunk={:.0} read_ms={rd_ms:.0}({:.0}%) write_ms={wr_ms:.0}({:.0}%) slow_writes={wr_slow} \
 rd_per_blk_ms={:.2} wr_per_blk_ms={:.2}",
             bytes as f64 / rd_cnt as f64,
-            if total > 0.0 { rd_ms * 100.0 / total } else { 0.0 },
-            if total > 0.0 { wr_ms * 100.0 / total } else { 0.0 },
+            if total > 0.0 {
+                rd_ms * 100.0 / total
+            } else {
+                0.0
+            },
+            if total > 0.0 {
+                wr_ms * 100.0 / total
+            } else {
+                0.0
+            },
             rd_ms / rd_cnt as f64,
-            if wr_cnt > 0 { wr_ms / wr_cnt as f64 } else { 0.0 },
+            if wr_cnt > 0 {
+                wr_ms / wr_cnt as f64
+            } else {
+                0.0
+            },
         );
         let gn = LOOP_GAP_N.load(Ordering::Relaxed);
         if gn > 0 {
@@ -421,7 +439,9 @@ partial_writes={pw} sockwrite_per_blk_ms={:.2}",
     }
 
     pub fn dump(tag: &str) {
-        if !enabled() { return; }
+        if !enabled() {
+            return;
+        }
         let r = READ_NS.load(Ordering::Relaxed) as f64 / 1e6;
         let w = WRITE_NS.load(Ordering::Relaxed) as f64 / 1e6;
         let rd = READS.load(Ordering::Relaxed);
@@ -776,7 +796,11 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             );
             pump_diag::LOOP_GAP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let __t0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
+        let __t0 = if pump_diag::enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // round-31 项 5 流水线:每轮"写当前收集批"与"填下一批"并发。
         //
         // 修前(round-30 及更早)满块走"一块一次 write()"直写,只有小块
@@ -809,7 +833,10 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => break,
-                Err(_) => { batch_eof = true; break; }
+                Err(_) => {
+                    batch_eof = true;
+                    break;
+                }
             }
         }
         if batch.is_empty() {
@@ -849,7 +876,11 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             None
         };
 
-        let __w0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
+        let __w0 = if pump_diag::enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // 写这批;未达上限时并发读下一块(读结果进 pending,不阻塞写)。
         let __ok = if prefetch_enabled() && batch_bytes < DOWN_BATCH_BYTES && !batch_eof {
             let write_fut = flush(a_w, &mut batch, &mut batch_bytes, limiter);
@@ -1362,7 +1393,7 @@ impl YamuxMultiplexer {
     /// ## 置 dead 不影响排空
     ///
     /// `dead` 只被 send_driver **写**、不被它读来决定退出;置位仅阻止新开流
-    /// (open 路径检查),已排入命令通道的帧仍会走完. 
+    /// (open 路径检查),已排入命令通道的帧仍会走完.
     pub async fn shutdown_after_flush(&self, grace: std::time::Duration) {
         self.dead.store(true, Ordering::Release);
         let handles: Vec<_> = std::mem::take(&mut *self.drivers.lock().unwrap());
@@ -4009,11 +4040,7 @@ mod tests {
             4,
             "显式 8 @ 4 核:压到核数 4,而非 8"
         );
-        assert_eq!(
-            auto_shard_workers_with(Some(0), 8),
-            1,
-            "显式 0 钳到下限 1"
-        );
+        assert_eq!(auto_shard_workers_with(Some(0), 8), 1, "显式 0 钳到下限 1");
         assert_eq!(
             auto_shard_workers_with(Some(999), 8),
             8,
@@ -4482,7 +4509,8 @@ mod tests {
         // 服务端池有合流通道 → attach 可用;cap 裁决生效。
         // cap=2 时池内已有 1 条,`1 + 2 > 2` → 拒绝(与 round-48 同口径)。
         let (c2, s2) = tokio::io::duplex(64 * 1024);
-        let extra = YamuxMultiplexer::new(Box::new(s2), yamux::Mode::Server, 16, DEFAULT_SHARD_WORKERS);
+        let extra =
+            YamuxMultiplexer::new(Box::new(s2), yamux::Mode::Server, 16, DEFAULT_SHARD_WORKERS);
         assert_eq!(
             server_pool.attach_carrier_with_cap(extra, 2).await,
             AttachOutcome::RejectedFull,
@@ -4503,28 +4531,18 @@ mod tests {
 
         // —— 客户端池:补位裁决可达,报到不可达 ——
         let (c3, s3) = tokio::io::duplex(64 * 1024);
-        let _keep_s3 = YamuxMultiplexer::new(
-            Box::new(s3),
-            yamux::Mode::Server,
-            16,
-            DEFAULT_SHARD_WORKERS,
-        );
-        let client_mux = YamuxMultiplexer::new(
-            Box::new(c3),
-            yamux::Mode::Client,
-            16,
-            DEFAULT_SHARD_WORKERS,
-        );
-        let redial: PoolRedial = Arc::new(|| {
-            Box::pin(async {
-                Err(other("test pool: redial not exercised"))
-            })
-        });
+        let _keep_s3 =
+            YamuxMultiplexer::new(Box::new(s3), yamux::Mode::Server, 16, DEFAULT_SHARD_WORKERS);
+        let client_mux =
+            YamuxMultiplexer::new(Box::new(c3), yamux::Mode::Client, 16, DEFAULT_SHARD_WORKERS);
+        let redial: PoolRedial =
+            Arc::new(|| Box::pin(async { Err(other("test pool: redial not exercised")) }));
         let client_pool = YamuxMultiplexerPool::new_client(vec![client_mux], Some(redial));
 
         // 客户端池无合流通道 → 报到裁决不可达(返回 PoolShutdown,不入表)。
         let (c4, s4) = tokio::io::duplex(64 * 1024);
-        let extra2 = YamuxMultiplexer::new(Box::new(s4), yamux::Mode::Server, 16, DEFAULT_SHARD_WORKERS);
+        let extra2 =
+            YamuxMultiplexer::new(Box::new(s4), yamux::Mode::Server, 16, DEFAULT_SHARD_WORKERS);
         assert_eq!(
             client_pool.attach_carrier_with_cap(extra2, 8).await,
             AttachOutcome::PoolShutdown,

@@ -573,9 +573,7 @@ impl Multiplexer {
         cap: usize,
     ) -> Option<Result<mux::AttachOutcome, mux::YamuxMultiplexer>> {
         match &self.inner {
-            MultiplexerInner::YamuxPool(p) => {
-                Some(p.attach_carrier_with_cap_gated(mux, cap).await)
-            }
+            MultiplexerInner::YamuxPool(p) => Some(p.attach_carrier_with_cap_gated(mux, cap).await),
             // 非池变体:无 accept 语义,按原约定返回 None。载体 `mux` 随本
             // 参数被 drop——与修前 `attach_yamux_carrier_with_cap` 的 `_`
             // 分支同行为(该分支根本不消费 mux,由调用方后续处置)。

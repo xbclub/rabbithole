@@ -239,9 +239,7 @@ fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
 /// 协议开销),所以设置 N 之后读回通常是 2N。
 fn carrier_sndbuf() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        parse_carrier_sndbuf(std::env::var("RH_MUX_SNDBUF").ok().as_deref())
-    })
+    *V.get_or_init(|| parse_carrier_sndbuf(std::env::var("RH_MUX_SNDBUF").ok().as_deref()))
 }
 
 /// [`carrier_sndbuf`] 的纯函数内核(可单测,不碰进程级 env)。
@@ -432,9 +430,7 @@ where
             Some(Err(e)) => {
                 // 先收干净"已完成但尚未取出"的成功成员(now_or_never 只消耗
                 // 就绪队列,不等待在途拨号),否则 drop 掉它们同样是泄漏。
-                while let Some(Some(done)) =
-                    futures::FutureExt::now_or_never(inflight.next())
-                {
+                while let Some(Some(done)) = futures::FutureExt::now_or_never(inflight.next()) {
                     if let Ok(m) = done {
                         members.push(m);
                     }
@@ -623,7 +619,11 @@ mod sndbuf_tests {
     #[test]
     fn parse_clamps_to_range() {
         assert_eq!(parse_carrier_sndbuf(Some("4194304")), 4 * 1024 * 1024);
-        assert_eq!(parse_carrier_sndbuf(Some(" 1048576 ")), 1024 * 1024, "允许空白");
+        assert_eq!(
+            parse_carrier_sndbuf(Some(" 1048576 ")),
+            1024 * 1024,
+            "允许空白"
+        );
         assert_eq!(parse_carrier_sndbuf(Some("1")), 4096, "过小钳到 4096");
         assert_eq!(
             parse_carrier_sndbuf(Some("999999999999")),
@@ -724,9 +724,8 @@ mod pool_leak_tests {
 
         type Dial = std::pin::Pin<
             Box<
-                dyn std::future::Future<
-                        Output = std::io::Result<crate::mux::YamuxMultiplexer>,
-                    > + Send,
+                dyn std::future::Future<Output = std::io::Result<crate::mux::YamuxMultiplexer>>
+                    + Send,
             >,
         >;
         let dials: Vec<Dial> = (0..3)
@@ -799,23 +798,16 @@ mod pool_leak_tests {
         s2.write_all(b"live2").await.unwrap();
 
         let mut buf = [0u8; 128];
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            peer1.read(&mut buf),
-        )
-        .await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            peer2.read(&mut buf),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(300), peer1.read(&mut buf)).await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(300), peer2.read(&mut buf)).await;
 
         // 统一 boxed 以便同质收集
         type Dial = std::pin::Pin<
             Box<
-                dyn std::future::Future<
-                        Output = std::io::Result<crate::mux::YamuxMultiplexer>,
-                    > + Send,
+                dyn std::future::Future<Output = std::io::Result<crate::mux::YamuxMultiplexer>>
+                    + Send,
             >,
         >;
         let dials: Vec<Dial> = vec![
@@ -872,8 +864,8 @@ mod pool_leak_tests {
         stream.write_all(b"live").await.unwrap();
 
         let mut buf = [0u8; 128];
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), peer.read(&mut buf))
-            .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(300), peer.read(&mut buf)).await;
 
         drop(mux);
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -912,15 +904,12 @@ mod pool_leak_tests {
     async fn all_dials_success_returns_live_members() {
         type Dial = std::pin::Pin<
             Box<
-                dyn std::future::Future<
-                        Output = std::io::Result<crate::mux::YamuxMultiplexer>,
-                    > + Send,
+                dyn std::future::Future<Output = std::io::Result<crate::mux::YamuxMultiplexer>>
+                    + Send,
             >,
         >;
         let dials: Vec<Dial> = (0..3)
-            .map(|_| {
-                Box::pin(async { Ok(make_mux()) }) as Dial
-            })
+            .map(|_| Box::pin(async { Ok(make_mux()) }) as Dial)
             .collect();
         let members = collect_pool_members(dials, 3).await.expect("全部成功");
         assert_eq!(members.len(), 3, "应返回 3 个成员");

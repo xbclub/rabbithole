@@ -348,7 +348,10 @@ impl Stream {
                 drop(shared);
                 // 快车道可用时直压 to_send;否则走流级 mpsc(容量已在
                 // 上面 poll_ready 确认,start_send 无失败)。
-                if let Some(shared_conn) = self.conn_shared.as_ref().filter(|_| self.flag == Flag::None)
+                if let Some(shared_conn) = self
+                    .conn_shared
+                    .as_ref()
+                    .filter(|_| self.flag == Flag::None)
                 {
                     let frame: Frame<Either<Data, WindowUpdate>> =
                         Frame::window_update(self.id, credit).right();
@@ -534,9 +537,14 @@ impl StreamReadHalf {
     /// 停一拍。
     pub fn poll_read_chunk(&mut self, cx: &mut Context) -> Poll<io::Result<Option<bytes::Bytes>>> {
         let __sd = crate::sched_diag::enabled();
-        if __sd { crate::sched_diag::on_poll(); crate::sched_diag::begin_poll(); }
+        if __sd {
+            crate::sched_diag::on_poll();
+            crate::sched_diag::begin_poll();
+        }
         if !self.config.read_after_close && self.sender.is_closed() {
-            if __sd { crate::sched_diag::end_poll(); }
+            if __sd {
+                crate::sched_diag::end_poll();
+            }
             return Poll::Ready(Ok(None));
         }
 
@@ -575,12 +583,10 @@ impl StreamReadHalf {
                                     shared.reader = None; // 撤销注册:本 poll 已直接交付
                                     Some(ReadStep::Data(bytes, credit))
                                 }
-                                None => {
-                                    Some(ReadStep::Parked(
-                                        credit,
-                                        shared.flow_controller.send_window(),
-                                    ))
-                                }
+                                None => Some(ReadStep::Parked(
+                                    credit,
+                                    shared.flow_controller.send_window(),
+                                )),
                             }
                         }
                         None => Some(ReadStep::Eof),
@@ -595,12 +601,16 @@ impl StreamReadHalf {
                             Frame::window_update(self.id, credit).right();
                         conn_shared.push_to_send(frame.into());
                     }
-                    if __sd { crate::sched_diag::end_poll(); }
+                    if __sd {
+                        crate::sched_diag::end_poll();
+                    }
                     return Poll::Ready(Ok(Some(bytes)));
                 }
                 Some(ReadStep::Eof) => {
                     log::debug!("{}/{}: eof", self.conn, self.id);
-                    if __sd { crate::sched_diag::end_poll(); }
+                    if __sd {
+                        crate::sched_diag::end_poll();
+                    }
                     return Poll::Ready(Ok(None));
                 }
                 Some(ReadStep::Parked(credit, send_window)) => {
@@ -615,7 +625,9 @@ impl StreamReadHalf {
                         crate::sched_diag::on_park_with_window(send_window);
                         crate::sched_diag::on_park();
                     }
-                    if __sd { crate::sched_diag::end_poll(); }
+                    if __sd {
+                        crate::sched_diag::end_poll();
+                    }
                     return Poll::Pending;
                 }
                 // ack_pending:落冷路径(带 ACK 的 WU 走旧 mpsc 通路)
@@ -629,7 +641,9 @@ impl StreamReadHalf {
             // C3:同 Stream::poll_read_chunk——缓冲优先于通道错误交付。
             Poll::Ready(Err(e)) => {
                 if self.shared.lock().buffer.is_empty() {
-                    if __sd { crate::sched_diag::end_poll(); }
+                    if __sd {
+                        crate::sched_diag::end_poll();
+                    }
                     return Poll::Ready(Err(e));
                 }
             }
@@ -637,12 +651,16 @@ impl StreamReadHalf {
         }
         let mut shared = self.shared();
         if let Some(bytes) = shared.buffer.pop() {
-            if __sd { crate::sched_diag::end_poll(); }
+            if __sd {
+                crate::sched_diag::end_poll();
+            }
             return Poll::Ready(Ok(Some(bytes)));
         }
         if !shared.state().can_read() {
             log::debug!("{}/{}: eof", self.conn, self.id);
-            if __sd { crate::sched_diag::end_poll(); }
+            if __sd {
+                crate::sched_diag::end_poll();
+            }
             return Poll::Ready(Ok(None));
         }
         // round-11:park 前在**同一把锁内**完成"注册 waker + 复查 buffer"。
@@ -654,7 +672,9 @@ impl StreamReadHalf {
         shared.reader = Some(cx.waker().clone());
         if let Some(bytes) = shared.buffer.pop() {
             shared.reader = None; // 撤销注册:本 poll 已直接交付
-            if __sd { crate::sched_diag::end_poll(); }
+            if __sd {
+                crate::sched_diag::end_poll();
+            }
             return Poll::Ready(Ok(Some(bytes)));
         }
         // round-11 诊断:park 时记录 send_window 是否耗尽,二分判据。
@@ -662,8 +682,12 @@ impl StreamReadHalf {
             let sw = shared.flow_controller.send_window();
             crate::sched_diag::on_park_with_window(sw);
         }
-        if crate::sched_diag::enabled() { crate::sched_diag::on_park(); }
-        if __sd { crate::sched_diag::end_poll(); }
+        if crate::sched_diag::enabled() {
+            crate::sched_diag::on_park();
+        }
+        if __sd {
+            crate::sched_diag::end_poll();
+        }
         Poll::Pending
     }
 
@@ -1219,7 +1243,8 @@ impl Shared {
     /// 回窗额度判定(纯函数,不记账):缓冲长度取**当前**值。调用方须在
     /// "取块之后"调用才与 frp 同语义(见 [`StreamReadHalf::poll_read_chunk`])。
     pub(crate) fn pending_window_update(&self) -> Option<u32> {
-        self.flow_controller.pending_window_update(self.buffer.len())
+        self.flow_controller
+            .pending_window_update(self.buffer.len())
     }
 
     /// 记账本轮授出的额度(须紧随无失败的帧压入)。

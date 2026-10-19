@@ -315,10 +315,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
     /// `poll_writev`;写出 n 字节后先烧穿 current 余段、再逐帧核销队列,
     /// 落在帧中间的位置成为新的 current/offset。帧不会跨 writev 拆分
     /// 核销——单帧(含超 [`MAX_BATCH_BYTES`] 的)整帧归属一个 current。
-    fn poll_write_batch(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>>
+    fn poll_write_batch(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>
     where
         T: Writev2 + Unpin,
     {
@@ -470,7 +467,6 @@ fn recycle_body(body: bytes::Bytes) {
         crate::pool::put(bm);
     }
 }
-
 
 fn poisoned_error() -> io::Error {
     io::Error::other("Sink is in poisoned state due to previous write error")

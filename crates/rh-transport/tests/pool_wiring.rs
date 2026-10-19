@@ -223,7 +223,9 @@ async fn shard_workers_reports_on_single_carrier_path() {
     });
 
     let cfg = tcp_pool_cfg(addr);
-    let single = deadline(rh_transport::connect(&cfg)).await.expect("connect");
+    let single = deadline(rh_transport::connect(&cfg))
+        .await
+        .expect("connect");
 
     let reported = single
         .shard_workers()

@@ -17,7 +17,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 pub fn enabled() -> bool {
-    *ENABLED.get_or_init(|| std::env::var("RH_SCHED_STATS").map(|v| v == "1").unwrap_or(false))
+    *ENABLED.get_or_init(|| {
+        std::env::var("RH_SCHED_STATS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 // 每线程独立的 park 时戳(避免跨流污染):thread_local 足够,因为
@@ -102,9 +106,9 @@ pub fn dump(tag: &str) {
 }
 
 // ---- park 时窗口状态(二分判据)----
-pub static PARK_WIN0: AtomicU64 = AtomicU64::new(0);   // send_window == 0
+pub static PARK_WIN0: AtomicU64 = AtomicU64::new(0); // send_window == 0
 pub static PARK_WIN_LOW: AtomicU64 = AtomicU64::new(0); // 0 < w < 64KiB
-pub static PARK_WIN_OK: AtomicU64 = AtomicU64::new(0);  // >= 64KiB(说明不是窗口)
+pub static PARK_WIN_OK: AtomicU64 = AtomicU64::new(0); // >= 64KiB(说明不是窗口)
 
 pub fn on_park_with_window(w: u32) {
     if w == 0 {
@@ -128,9 +132,7 @@ pub fn dump_window(tag: &str) {
     if t == 0 {
         return;
     }
-    eprintln!(
-        "PARK_WIN {tag} total={t} win0={a} win_low={b} win_ok={c}"
-    );
+    eprintln!("PARK_WIN {tag} total={t} win0={a} win_low={b} win_ok={c}");
 }
 
 // ---- RecvHalf poll 统计(验证"poll 间隔 34ms"假设)----
@@ -277,10 +279,18 @@ pub static TAG_GOAWAY: AtomicU64 = AtomicU64::new(0);
 
 pub fn on_frame_tag(tag: u8) {
     match tag {
-        0 => { TAG_DATA.fetch_add(1, Ordering::Relaxed); }
-        1 => { TAG_WU.fetch_add(1, Ordering::Relaxed); }
-        2 => { TAG_PING.fetch_add(1, Ordering::Relaxed); }
-        _ => { TAG_GOAWAY.fetch_add(1, Ordering::Relaxed); }
+        0 => {
+            TAG_DATA.fetch_add(1, Ordering::Relaxed);
+        }
+        1 => {
+            TAG_WU.fetch_add(1, Ordering::Relaxed);
+        }
+        2 => {
+            TAG_PING.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            TAG_GOAWAY.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -332,8 +342,8 @@ pub fn dump_wu(tag: &str) {
 }
 
 // ---- WU 路径分布 ----
-pub static WUP_CREDIT: AtomicU64 = AtomicU64::new(0);   // 有 credit
-pub static WUP_ACK0: AtomicU64 = AtomicU64::new(0);     // 0-credit + ACK
+pub static WUP_CREDIT: AtomicU64 = AtomicU64::new(0); // 有 credit
+pub static WUP_ACK0: AtomicU64 = AtomicU64::new(0); // 0-credit + ACK
 pub static WUP_ACK0_NOACK: AtomicU64 = AtomicU64::new(0); // 0-credit 无 ACK(异常)
 
 pub fn on_wu_path(has_credit: bool, ack: bool) {
@@ -366,10 +376,18 @@ pub static PUSH_OTHER: AtomicU64 = AtomicU64::new(0);
 
 pub fn on_push_to_send(tag: u8) {
     match tag {
-        0 => { PUSH_DATA.fetch_add(1, Ordering::Relaxed); }
-        1 => { PUSH_WU.fetch_add(1, Ordering::Relaxed); }
-        2 => { PUSH_PING.fetch_add(1, Ordering::Relaxed); }
-        _ => { PUSH_OTHER.fetch_add(1, Ordering::Relaxed); }
+        0 => {
+            PUSH_DATA.fetch_add(1, Ordering::Relaxed);
+        }
+        1 => {
+            PUSH_WU.fetch_add(1, Ordering::Relaxed);
+        }
+        2 => {
+            PUSH_PING.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            PUSH_OTHER.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

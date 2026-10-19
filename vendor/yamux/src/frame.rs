@@ -17,8 +17,8 @@ use header::{Data, GoAway, Header, Ping, StreamId, WindowUpdate};
 use std::{convert::TryInto, num::TryFromIntError};
 
 pub(crate) use io::Io;
-pub use io::{FrameDecodeError, Sequential, Writev2};
 pub(crate) use io::{max_batch_bytes, MAX_BATCH_FRAMES};
+pub use io::{FrameDecodeError, Sequential, Writev2};
 
 /// A Yamux message frame consisting of header and body.
 #[derive(Clone, Debug, PartialEq, Eq)]

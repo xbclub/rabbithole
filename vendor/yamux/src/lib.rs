@@ -29,8 +29,8 @@
 mod chunks;
 mod error;
 mod frame;
-pub mod sched_diag;
 pub mod pool;
+pub mod sched_diag;
 
 pub(crate) mod connection;
 mod tagged_stream;
