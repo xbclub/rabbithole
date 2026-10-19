@@ -996,12 +996,30 @@ fn mux_config(max_streams: usize) -> yamux::Config {
 }
 
 /// 分片 Worker 默认数(vendor 默认,round-5 起被三机验收锁定)。
+/// round-27:`RH_SHARD_WORKERS` 可覆盖默认分片数(默认 4)。
+///
+/// 动机:`route_index = sid % N`,而 yamux 的 sid 步长为 2(只用奇数)。
+/// N=4 时 `sid%4` 只产生 {1,3} —— **4 个分片只有 2 个承载数据**。
+/// N=3 时 `sid%3` 产生 {0,1,2} —— 3 个分片全用上。
+///
+/// 保序不受影响:同一流的 sid 固定,`sid % N` 恒定落在同一分片。
+pub fn default_shard_workers() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RH_SHARD_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| (1..=8).contains(n))
+            .unwrap_or(DEFAULT_SHARD_WORKERS)
+    })
+}
+
 pub const DEFAULT_SHARD_WORKERS: usize = 4;
 
 /// 池规模 → 每载体 shard 数(round-10):总 Worker 预算按 4 计,
 /// K 越大每载体分得越少;下限 1。K=1 必须仍为 4(红线:K=1 零回退)。
 pub fn shard_workers_for_k(k: usize) -> usize {
-    (DEFAULT_SHARD_WORKERS / k.max(1)).max(1)
+    (default_shard_workers() / k.max(1)).max(1)
 }
 
 fn mux_config_with_shards(max_streams: usize, shard_workers: usize) -> yamux::Config {
