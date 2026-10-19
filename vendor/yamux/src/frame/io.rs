@@ -186,6 +186,19 @@ pub(crate) struct Io<T> {
     io: T,
     read: Staging,
     write_state: WriteState,
+    /// 发送批队列——**常驻**,跨批复用容量。
+    ///
+    /// round-30:原实现把队列内嵌在 `WriteState::Batch` 里,批写穿后
+    /// `write_state = Init` 使整个 `VecDeque` 被 drop,下一批首帧再
+    /// `VecDeque::with_capacity(MAX_BATCH_FRAMES)` 重建。批频率约
+    /// 100~200 次/s(§42),即每秒 100~200 次分配+释放。
+    ///
+    /// 提升为常驻字段后:批写穿只清空元素、保留容量,下批直接 push。
+    queue: VecDeque<PendingFrame>,
+    /// 半写中的帧(`offset < wire_len`);`None` 时下一轮自队首取。
+    current: Option<PendingFrame>,
+    /// `current` 的已写偏移(跨帧头/帧体边界计)。
+    offset: usize,
 }
 
 /// 接收 staging:批量读入 + 零拷贝帧体切片。
@@ -289,71 +302,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
             io,
             read: Staging::new(),
             write_state: WriteState::Init,
+            queue: VecDeque::with_capacity(MAX_BATCH_FRAMES),
+            current: None,
+            offset: 0,
         }
     }
-}
-
-/// 已编码待写帧:12B 帧头 + 帧体(所有权自 [`Frame`] 转入,写穿后归池)。
-struct PendingFrame {
-    header: [u8; header::HEADER_SIZE],
-    body: bytes::Bytes,
-}
-
-impl PendingFrame {
-    /// 线上总字节(帧头 + 帧体)。
-    fn wire_len(&self) -> usize {
-        header::HEADER_SIZE + self.body.len()
-    }
-}
-
-/// The stages of writing `Frame`s.
-///
-/// round-5 §3.2 批队列:`start_send` 只入队;`poll_ready` 把半写中的
-/// `current` 余段与队列后续帧拼成 IoSlice 数组一次 [`Writev2::poll_writev`]
-/// 写出,按返回字节跨帧推进 `offset`,写穿的帧体归池。`Ready(Ok)` 仅当
-/// 队列 + current 全部写穿(→ `Init`);载体 Pending 时半写状态原地保留;
-/// 写错误 → `Poisoned`(B4:此后拒绝新帧,原始 IO 错误向上传播)。
-enum WriteState {
-    /// 队列空且无半写。
-    Init,
-    Batch {
-        queue: VecDeque<PendingFrame>,
-        /// 半写中的帧(`offset < wire_len`);`None` 时下一轮自队首取。
-        current: Option<PendingFrame>,
-        /// `current` 的已写偏移(跨帧头/帧体边界计)。
-        offset: usize,
-    },
-    Poisoned,
-}
-
-impl fmt::Debug for WriteState {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            WriteState::Init => f.write_str("(WriteState::Init)"),
-            WriteState::Batch {
-                queue,
-                current,
-                offset,
-            } => write!(
-                f,
-                "(WriteState::Batch (queued {}) (current offset {offset} body-len {:?}))",
-                queue.len(),
-                current.as_ref().map(|c| c.body.len())
-            ),
-            WriteState::Poisoned => f.write_str("(WriteState::Poisoned)"),
-        }
-    }
-}
-
-/// 帧写穿:池化帧体按值取回归还(引用计数不为 1 时自然释放)。
-fn recycle_body(body: bytes::Bytes) {
-    if let Ok(mut bm) = body.try_into_mut() {
-        bm.clear();
-        crate::pool::put(bm);
-    }
-}
-
-impl WriteState {
     /// 批量写出队列 + current,直至全部写穿(`Ready(Ok)`)/ 载体 Pending
     /// (半写状态原地保留)/ 写错误(调用方置 Poisoned)。
     ///
@@ -362,20 +315,24 @@ impl WriteState {
     /// `poll_writev`;写出 n 字节后先烧穿 current 余段、再逐帧核销队列,
     /// 落在帧中间的位置成为新的 current/offset。帧不会跨 writev 拆分
     /// 核销——单帧(含超 [`MAX_BATCH_BYTES`] 的)整帧归属一个 current。
-    fn poll_write_batch<T: Writev2 + Unpin>(
+    fn poll_write_batch(
         &mut self,
-        io: &mut T,
         cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        let WriteState::Batch {
+    ) -> Poll<io::Result<()>>
+    where
+        T: Writev2 + Unpin,
+    {
+        if !matches!(self.write_state, WriteState::Batch) {
+            // Init / Poisoned 由调用方处理,不该到达这里
+            return Poll::Ready(Ok(()));
+        }
+        let Self {
+            io,
             queue,
             current,
             offset,
-        } = self
-        else {
-            // Init / Poisoned 由调用方处理,不该到达这里
-            return Poll::Ready(Ok(()));
-        };
+            ..
+        } = self;
         loop {
             if current.is_none() {
                 match queue.pop_front() {
@@ -468,6 +425,53 @@ impl WriteState {
     }
 }
 
+/// 已编码待写帧:12B 帧头 + 帧体(所有权自 [`Frame`] 转入,写穿后归池)。
+struct PendingFrame {
+    header: [u8; header::HEADER_SIZE],
+    body: bytes::Bytes,
+}
+
+impl PendingFrame {
+    /// 线上总字节(帧头 + 帧体)。
+    fn wire_len(&self) -> usize {
+        header::HEADER_SIZE + self.body.len()
+    }
+}
+
+/// The stages of writing `Frame`s.
+///
+/// round-5 §3.2 批队列:`start_send` 只入队;`poll_ready` 把半写中的
+/// `current` 余段与队列后续帧拼成 IoSlice 数组一次 [`Writev2::poll_writev`]
+/// 写出,按返回字节跨帧推进 `offset`,写穿的帧体归池。`Ready(Ok)` 仅当
+/// 队列 + current 全部写穿(→ `Init`);载体 Pending 时半写状态原地保留;
+/// 写错误 → `Poisoned`(B4:此后拒绝新帧,原始 IO 错误向上传播)。
+enum WriteState {
+    /// 队列空且无半写。
+    Init,
+    /// 有批在途(队列与半写状态在 `Io` 的常驻字段里)。
+    Batch,
+    Poisoned,
+}
+
+impl fmt::Debug for WriteState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            WriteState::Init => f.write_str("(WriteState::Init)"),
+            WriteState::Batch => f.write_str("(WriteState::Batch)"),
+            WriteState::Poisoned => f.write_str("(WriteState::Poisoned)"),
+        }
+    }
+}
+
+/// 帧写穿:池化帧体按值取回归还(引用计数不为 1 时自然释放)。
+fn recycle_body(body: bytes::Bytes) {
+    if let Ok(mut bm) = body.try_into_mut() {
+        bm.clear();
+        crate::pool::put(bm);
+    }
+}
+
+
 fn poisoned_error() -> io::Error {
     io::Error::other("Sink is in poisoned state due to previous write error")
 }
@@ -486,13 +490,18 @@ where
         log::trace!("{}: write: {:?}", this.id, this.write_state);
         match this.write_state {
             WriteState::Init => Poll::Ready(Ok(())),
-            WriteState::Batch { .. } => match this.write_state.poll_write_batch(&mut this.io, cx) {
+            WriteState::Batch => match this.poll_write_batch(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Err(e)) => {
                     this.write_state = WriteState::Poisoned;
                     Poll::Ready(Err(e))
                 }
                 Poll::Ready(Ok(())) => {
+                    // round-30:批写穿后只清空元素、**保留容量**。
+                    // 下批首帧直接 push_back,不再 with_capacity 重建。
+                    debug_assert!(this.queue.is_empty(), "batch drained but queue non-empty");
+                    this.current = None;
+                    this.offset = 0;
                     this.write_state = WriteState::Init;
                     Poll::Ready(Ok(()))
                 }
@@ -516,17 +525,13 @@ where
             header: header::encode(&f.header),
             body: f.body,
         };
-        match &mut this.write_state {
-            WriteState::Batch { queue, .. } => queue.push_back(frame),
-            state => {
-                let mut queue = VecDeque::with_capacity(MAX_BATCH_FRAMES);
-                queue.push_back(frame);
-                *state = WriteState::Batch {
-                    queue,
-                    current: None,
-                    offset: 0,
-                };
-            }
+        // round-30:队列常驻,不再每批重建。
+        this.queue.push_back(frame);
+        if !matches!(this.write_state, WriteState::Batch) {
+            // 首批:重置半写状态(队列已在上一批排空时 clear 过)
+            this.current = None;
+            this.offset = 0;
+            this.write_state = WriteState::Batch;
         }
         Ok(())
     }
