@@ -396,6 +396,12 @@ pub struct TlsServerOptions {
 }
 
 /// 客户端传输配置。
+///
+/// **本结构体不承载载体数 K**。K 由调用方(`rh-client`)按「显式
+/// `mux_pool_size` / 协议基线 → 硬件上限 → 服务端 `max_carriers` 收敛」三段式
+/// 算出,再作为参数传给 [`connect_pool`](crate::connect_pool)。曾经存在的
+/// `carriers` 字段被赋值却从未被生产代码读取,已删除(round-44)——
+/// 改它不会改变载体数,只会造成误判。
 #[derive(Debug, Clone)]
 pub struct ClientTransportConfig {
     pub protocol: Protocol,
@@ -408,14 +414,6 @@ pub struct ClientTransportConfig {
     pub alpn: Vec<String>,
     /// 拨号总超时。
     pub connect_timeout: std::time::Duration,
-    /// 多载体池规模(round-9):TCP/TLS/WS/WSS 多路复用路径的物理连接数
-    /// (经 [`connect_pool`])。1 = 单载体(默认,严格等价旧路径);QUIC/KCP
-    /// 自带多路复用,忽略本参数。
-    ///
-    /// 0 只表示"未显式指定"的**期望值**(round-10.1:仅诊断/传递用,无
-    /// 生产读取点)——实际定容在会话层(`rh-client` 的三段式公式)计算,
-    /// 再以显式参数传入 [`connect_pool`]。本字段不参与自动定容。
-    pub carriers: usize,
 }
 
 impl Default for ClientTransportConfig {
@@ -428,7 +426,6 @@ impl Default for ClientTransportConfig {
             proxy_url: None,
             alpn: vec!["rhtp".to_string()],
             connect_timeout: std::time::Duration::from_secs(10),
-            carriers: 1,
         }
     }
 }

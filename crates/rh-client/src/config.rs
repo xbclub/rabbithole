@@ -71,6 +71,14 @@ impl ClientConfig {
         Ok(toml::from_str(&text)?)
     }
 
+    /// 构造传输层配置。
+    ///
+    /// **载体数 K 不经过本结构体**(round-44 修正):`mux_pool_size` 由
+    /// [`session::initial_k_for`](crate::session::initial_k_for) 结合协议基线
+    /// 与硬件上限算出 K,再作为显式参数传给 `connect_pool`。
+    ///
+    /// `ClientTransportConfig` 里曾经的 `carriers` 字段被赋值却从未被生产
+    /// 代码读取(改它不会改变载体数),已删除。
     pub fn transport_cfg(&self) -> anyhow::Result<rh_transport::ClientTransportConfig> {
         let protocol = Protocol::parse(&self.protocol)
             .ok_or_else(|| anyhow::anyhow!("bad protocol {}", self.protocol))?;
@@ -95,9 +103,6 @@ impl ClientConfig {
             proxy_url: self.proxy_url.clone(),
             alpn: vec!["rhtp".into()],
             connect_timeout: std::time::Duration::from_secs(10),
-            // 传输层公共类型不引入 Option(round-10 §2.1-4):0 = 自动,
-            // 非零 = 显式期望值;最终 K 由 session 的三段式定容决定。
-            carriers: self.mux_pool_size.unwrap_or(0),
         })
     }
 
@@ -281,11 +286,11 @@ mod tests {
             c.mux_pool_size, None,
             "默认必须是自动定容(None),不得回落到旧的 1"
         );
-        assert_eq!(
-            c.transport_cfg().unwrap().carriers,
-            0,
-            "None 必须经 transport_cfg 落为 0(自动哨兵)"
-        );
+        // round-44:mux_pool_size=None 表示"自动定容",生效的 K 取协议基线
+        // (tcp=1)。断言真正参与定容的 initial_k_for_with,而不是已删除的
+        // ClientTransportConfig::carriers。
+        let (k, _cap) = crate::session::initial_k_for_with(&c, rh_transport::Protocol::Tcp, 8);
+        assert_eq!(k, 1, "None(自动定容)在 tcp 协议下应得到协议基线 K=1");
 
         // 有 env:覆盖默认;布尔解析大小写不敏感
         std::env::set_var("RH_SERVER", "127.0.0.1:7100");
@@ -301,7 +306,9 @@ mod tests {
         assert!(!c.multiplex);
         assert!(c.tls_insecure_skip_verify);
         assert_eq!(c.mux_pool_size, Some(4), "RH_MUX_POOL_SIZE 覆盖为显式值");
-        assert_eq!(c.transport_cfg().unwrap().carriers, 4);
+        // 显式 4:生效的 K 必须是 4(硬件上限放大到 8 以免被钳)
+        let (k, _cap) = crate::session::initial_k_for_with(&c, rh_transport::Protocol::Tcp, 8);
+        assert_eq!(k, 4, "RH_MUX_POOL_SIZE=4 必须让生效 K=4");
 
         // 显式单载体:Some(1) 必须与 None(自动)可区分。先回到 None
         // (模拟"文件未配置"),env 才会按优先级生效。
@@ -309,11 +316,11 @@ mod tests {
         std::env::set_var("RH_MUX_POOL_SIZE", "1");
         c.apply_env().unwrap();
         assert_eq!(c.mux_pool_size, Some(1));
-        assert_eq!(
-            c.transport_cfg().unwrap().carriers,
-            1,
-            "显式单载体透传 1,而不是自动哨兵 0"
-        );
+        // 显式 1:生成为 K=1。注意它与 None(自动)在 tcp 下同为 1,
+        // 二者只能靠 mux_pool_size 本身区分(上一行已断言 Some(1))。
+        // 这里补一条更强的判据:即使硬件上限放大,显式 1 也不会被抬高。
+        let (k, _cap) = crate::session::initial_k_for_with(&c, rh_transport::Protocol::Tcp, 8);
+        assert_eq!(k, 1, "显式 K=1 不得被硬件上限抬高");
 
         // 非正整数:报错且带变量名与合法范围。空值按"未设置"处理
         // (与其余 RH_* 变量的 s() 过滤一致),不在本断言内。
@@ -368,17 +375,23 @@ server_addr = "127.0.0.1:7100"
 client_id = "c"
 secret = "s"
 "#;
+        // round-44:断言生效 K(initial_k_for_with)而不是已删除的
+        // ClientTransportConfig::carriers。三态的语义差异看 K:tls 协议基线
+        // 为 2,因此"未配置"落 2、"显式 3"落 3、"显式 1"落 1——三者可区分。
         let absent: ClientConfig = toml::from_str(base).unwrap();
         assert_eq!(absent.mux_pool_size, None);
-        assert_eq!(absent.transport_cfg().unwrap().carriers, 0);
+        let (k, _) = crate::session::initial_k_for_with(&absent, rh_transport::Protocol::Tls, 8);
+        assert_eq!(k, 2, "未配置时取 tls 协议基线 K=2");
 
         let explicit: ClientConfig = toml::from_str(&format!("{base}mux_pool_size = 3\n")).unwrap();
         assert_eq!(explicit.mux_pool_size, Some(3));
-        assert_eq!(explicit.transport_cfg().unwrap().carriers, 3);
+        let (k, _) = crate::session::initial_k_for_with(&explicit, rh_transport::Protocol::Tls, 8);
+        assert_eq!(k, 3, "显式 3 覆盖协议基线");
 
         let one: ClientConfig = toml::from_str(&format!("{base}mux_pool_size = 1\n")).unwrap();
         assert_eq!(one.mux_pool_size, Some(1));
-        assert_eq!(one.transport_cfg().unwrap().carriers, 1);
+        let (k, _) = crate::session::initial_k_for_with(&one, rh_transport::Protocol::Tls, 8);
+        assert_eq!(k, 1, "显式 1 覆盖协议基线(单载体)");
     }
 
     // T-C3(round-10,勘误版):硬件上限纯函数四态覆盖——能读到队列数时

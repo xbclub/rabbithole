@@ -90,7 +90,7 @@ fn initial_k_for(cfg: &ClientConfig, protocol: rh_transport::Protocol) -> (usize
 /// 纯函数(可单测):硬件上限由调用方注入,测试不依赖跑测机器的核数与
 /// 网卡队列(≤3 核机器 cpu_cap=1,硬编码 tls K=2 的断言会假红)。
 /// 生产入口 [`initial_k_for`] 传入真实探测值。
-fn initial_k_for_with(
+pub(crate) fn initial_k_for_with(
     cfg: &ClientConfig,
     protocol: rh_transport::Protocol,
     hardware_cap: usize,

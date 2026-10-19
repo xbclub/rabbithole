@@ -11,15 +11,13 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 
-fn tcp_pool_cfg(
-    addr: std::net::SocketAddr,
-    carriers: usize,
-) -> rh_transport::ClientTransportConfig {
+/// K 不经过 `ClientTransportConfig`(round-44:该字段已删除)——它由调用方
+/// 显式传给 `connect_pool`。本 helper 因此只构造协议/地址/多路复用开关。
+fn tcp_pool_cfg(addr: std::net::SocketAddr) -> rh_transport::ClientTransportConfig {
     rh_transport::ClientTransportConfig {
         protocol: rh_transport::Protocol::Tcp,
         server_addr: addr,
         multiplex: true,
-        carriers,
         ..Default::default()
     }
 }
@@ -82,7 +80,7 @@ async fn pool_wiring_client_pool_server_attach_full_path() {
 
     // 客户端:拨 K=2 池;控制流占用轮转序号 0(首载体),后续 3 条数据流
     // 轮转覆盖两条载体(序号 1→载体 1,2→载体 0,3→载体 1)。
-    let tcfg = tcp_pool_cfg(addr, 2);
+    let tcfg = tcp_pool_cfg(addr);
     let pool = rh_transport::connect_pool(&tcfg, 2)
         .await
         .expect("connect_pool");
@@ -132,7 +130,7 @@ async fn pool_wiring_single_carrier_equivalence() {
         }
     });
 
-    let tcfg = tcp_pool_cfg(addr, 1);
+    let tcfg = tcp_pool_cfg(addr);
     // 路径一:connect_pool(carriers=1)→ 内部退化为 connect_stream
     let mux = rh_transport::connect_pool(&tcfg, 1)
         .await
