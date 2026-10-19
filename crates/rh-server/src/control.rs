@@ -378,6 +378,40 @@ async fn attach_additional_carrier(
             cap,
             "pool carrier rejected (cap)"
         );
+        // round-43:超限拒绝后**必须关闭整条载体连接**,不能 `return Ok(())`
+        // 让它悬空。
+        //
+        // ## 缺陷
+        //
+        // 修前只回 `ok:false` 就返回。`stream` 只是载体上的第一条流(承载
+        // HELLO/ACK),而**真正持有物理连接的是 `inc.mux`**。
+        // `YamuxMultiplexer` 没有 `impl Drop`——drop 它只是 detach driver 的
+        // JoinHandle,driver 继续持有 socket 并运行(mux.rs:1147-1150:为
+        // 「正常路径零漂移」刻意保留)。于是被拒载体的 driver 永远活着,
+        // 客户端在其上开的新流无人接收 —— 偶发流挂起,直到 driver 下次
+        // send 失败才退出(REPORT-round10.md「## 6. 遗留」第 2 条已承认)。
+        //
+        // ## 关闭顺序(踩过两个坑,顺序不能反)
+        //
+        // 1. `write_frame` 只把 ACK 写进 mux 流的用户态缓冲,真正上 wire 要
+        //    等 driver 编帧发出。若紧接着 abort driver,ACK 会丢,客户端读到
+        //    `UnexpectedEof`(既有测试
+        //    `attach_over_cap_rejects_pool_full_without_aggregating` 抓到)。
+        // 2. 因此:**关报到流**(半关闭 + flush)→ **让 driver 把 ACK 写出去**
+        //    → **再 shutdown 整条载体**。
+        //
+        // 裸模式(AcceptSingle)无 yamux,只关报到流即可。
+        let _ = stream.shutdown().await;
+        // 给 mux driver 一次调度机会把 ACK 编帧并写穿(实测 1 次 yield
+        // 足够;若仍丢失,下面的 ACK 内容断言会发现)。
+        tokio::task::yield_now().await;
+        // 载体 mux 若被别处持有(理论上此路径独占,防御性处理)则不做
+        // 额外动作:报到流已关,客户端仍能收到 ACK 并感知失败。
+        if let Ok(m) = Arc::try_unwrap(inc.mux) {
+            if let Some(yamux) = m.into_yamux() {
+                yamux.shutdown();
+            }
+        }
         return Ok(());
     }
     // 取出该连接的 yamux 载体:此路径独占 Incoming(未与任何 accept 循环
@@ -1219,6 +1253,100 @@ mod carrier_ack_tests {
             sess.mux_pool.lock().await.is_none(),
             "拒绝路径不得把载体聚合进池"
         );
+    }
+
+    // round-43 回归:超限拒绝后**必须关闭整条载体连接**。
+    //
+    // ## 缺陷
+    //
+    // 修前 `reject_carrier` 写完 `ok:false` ACK 就 `return Ok(())`。`stream`
+    // 只是载体上的第一条流(承载 HELLO/ACK),而**真正持有物理连接的是
+    // `inc.mux`**。`YamuxMultiplexer` 没有 `impl Drop`——drop 它只是 detach
+    // driver 的 JoinHandle,driver 继续持有 socket 并运行
+    // (mux.rs:1147-1150:为「正常路径零漂移」刻意保留)。
+    //
+    // 于是被拒载体的 driver 永远活着,客户端在其上开的新流无人接收 ——
+    // 表现为偶发流挂起(REPORT-round10.md「## 6. 遗留」第 2 条已承认)。
+    //
+    // ## 判据
+    //
+    // 拒绝后客户端在**同一载体**上的另一条流必须能读到 EOF/错误(载体已关)。
+    // 修复前该读会一直挂到超时。
+    #[tokio::test]
+    async fn attach_over_cap_closes_carrier_after_ack() {
+        use tokio::io::AsyncReadExt as _;
+
+        let state = state_with(1).await;
+        let _sess = register_session(&state, "sid-close");
+
+        // 手搭载体:把 server mux 装进 Incoming 交给被测函数,
+        // 另留一条 probe 流观察载体是否被关。
+        let (client_raw, server_raw) = tokio::io::duplex(256 * 1024);
+        let client = rh_transport::wrap_stream_as_client(Box::new(client_raw), true, 64);
+        let server = rh_transport::wrap_stream_as_server(Box::new(server_raw), true, 64);
+
+        // 报到流(承载 HELLO + ACK)
+        let mut report_client = client.open_stream().await.expect("report stream");
+        let report_server = tokio::time::timeout(Duration::from_secs(2), server.accept())
+            .await
+            .expect("accept timeout")
+            .expect("server report stream");
+
+        // probe 流:用于观察载体是否被关闭
+        let mut probe_client = client.open_stream().await.expect("probe stream");
+        let _probe_server = tokio::time::timeout(Duration::from_secs(2), server.accept())
+            .await
+            .expect("accept timeout")
+            .expect("server probe stream");
+
+        // 客户端 mux 必须存活(driver 需要它)
+        tokio::spawn(async move {
+            let _keep = client;
+            futures::future::pending::<()>().await;
+        });
+
+        let inc = Incoming {
+            mux: server,
+            remote: "127.0.0.1:1".parse().unwrap(),
+            protocol: Protocol::Tcp,
+        };
+
+        // 走生产路径:cap=1、池空 → 0+2 > 1 → 拒绝
+        attach_additional_carrier(
+            state.clone(),
+            inc,
+            report_server,
+            attach_hello("sid-close"),
+            "sid-close",
+        )
+        .await
+        .unwrap();
+
+        // 1) ACK 必须送达(关闭在写完之后)
+        let ack = read_ack(&mut report_client).await;
+        assert!(!ack.ok, "超限必须拒绝");
+        assert_eq!(ack.error_code.as_deref(), Some("POOL_FULL"));
+        assert_eq!(ack.max_carriers, 1, "ACK 内容不得改动");
+
+        // 2) 载体必须被关闭:同一载体上的 probe 流读到 EOF/错误。
+        //    修复前 driver 仍活着,该读会一直挂到超时。
+        let mut buf = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match probe_client.read(&mut buf).await {
+                    Ok(0) => break true,
+                    Ok(_) => continue,
+                    Err(_) => break true,
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "超限拒绝后整条载体必须被关闭(同载体的 probe 流应读到 EOF);\
+             若超时,说明 driver 仍存活 —— round-43 的缺陷"
+        );
+        assert!(closed.unwrap(), "读端必须观察到 EOF 或错误");
     }
 
     // T-R5(边界):cap=2 时第一条附加载体(0+2<=2)允许,第二条(1+2>2)拒绝。
