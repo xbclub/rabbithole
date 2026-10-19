@@ -64,3 +64,14 @@ benchmark/runs/
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Third-party reference sources fetched for performance comparison (frp v0.71.0
+# and its fmux implementation). Read-only research material, not part of the
+# build: the workspace depends on `vendor/yamux`, never on these trees.
+benchmark/frp-src-v0.71.0/
+benchmark/frp-yamux-src/
+
+# Stray frontend bundle fragments dropped at the repo root by a build tool.
+# Matches the Vite/React chunk naming pattern only; real sources live under
+# console/src.
+/workflow-*.js
