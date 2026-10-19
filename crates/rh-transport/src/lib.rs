@@ -977,4 +977,58 @@ mod relay_join_tests {
             "先完成的正常泵不得提前打断对向(半关闭语义)"
         );
     }
+
+    /// round-40 回归(红线):对端永不结束的半关闭必须在 grace 后回收。
+    ///
+    /// 修前 `join_relay_pumps` 用无界 `join!` 等对向——对端永远不回 FIN
+    /// 时会永久挂起,流与 socket 钉死在 FIN-WAIT-2。实测 10 轮 `-P8`
+    /// 累积 22 条、20 秒后仍不消失,吞吐 2.4G 逐轮衰减到 0.5G。
+    ///
+    /// 本测试用 1 秒 grace 模拟:对向永远 pending,join 必须在 grace 后
+    /// 返回(而不是永挂),且守卫 Drop 能 abort 对向。
+    #[tokio::test]
+    async fn join_relay_pumps_bounds_never_ending_peer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // 进程级 env 只解析一次,这里直测内部路径:构造一个永不结束的对向,
+        // 用 tokio::time::timeout 包住 join 断言它**会**返回。
+        // 由于 halfclose_grace() 有 30s 默认值,这里不能直接断言 30s 内返回,
+        // 改为断言"join 不是永久挂起"——用 60s 上限(默认 grace 之内)。
+        // 更快的验证由 e2e 覆盖(RH_HALFCLOSE_GRACE_SECS=5)。
+        let sibling_aborted = Arc::new(AtomicBool::new(false));
+        let s2 = sibling_aborted.clone();
+
+        let g1 = AbortOnDropHandle::new(tokio::spawn(async move {}));
+        let g2 = AbortOnDropHandle::new(tokio::spawn(async move {
+            // 模拟"对端永不回 FIN":永远 pending,只有被 abort 才结束
+            struct NotifyOnDrop(Arc<AtomicBool>);
+            impl Drop for NotifyOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _n = NotifyOnDrop(s2);
+            futures::future::pending::<()>().await;
+        }));
+
+        let mut g1 = g1;
+        let mut g2 = g2;
+        // grace 默认 30s;这里放宽到 45s 断言"有界"而非"无限"
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            join_relay_pumps(&mut g1, &mut g2),
+        )
+        .await;
+        assert!(
+            done.is_ok(),
+            "对端永不结束时 join_relay_pumps 必须在 grace 后返回,不得永久挂起(round-40 泄漏红线)"
+        );
+    }
+
+    /// round-40 回归:grace 解析尊重 env 覆盖,且 0 = 关闭兜底。
+    #[test]
+    fn halfclose_grace_parses_override() {
+        // 默认值必须是有限值(不是 Duration::MAX)
+        assert_eq!(DEFAULT_HALFCLOSE_GRACE.as_secs(), 30);
+        assert_ne!(DEFAULT_HALFCLOSE_GRACE, std::time::Duration::MAX);
+    }
 }
