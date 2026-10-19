@@ -392,3 +392,8 @@ static WU_TRACED: AtomicU64 = AtomicU64::new(0);
 pub fn trace_wu() -> bool {
     WU_TRACED.fetch_add(1, Ordering::Relaxed) < 3
 }
+
+pub fn no_wu() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("RH_NO_WU").map(|v| v == "1").unwrap_or(false))
+}

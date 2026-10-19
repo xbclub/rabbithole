@@ -291,7 +291,7 @@ impl Stream {
                 };
                 let frame: Frame<Either<Data, WindowUpdate>> =
                     Frame::window_update(self.id, credit).right();
-                shared.push_to_send(frame.into());
+                if !crate::sched_diag::no_wu() { shared.push_to_send(frame.into()); }
                 return Poll::Ready(Ok(()));
             }
         }
@@ -550,7 +550,7 @@ impl StreamReadHalf {
                 };
                 let frame: Frame<Either<Data, WindowUpdate>> =
                     Frame::window_update(self.id, credit).right();
-                shared.push_to_send(frame.into());
+                if !crate::sched_diag::no_wu() { shared.push_to_send(frame.into()); }
                 return Poll::Ready(Ok(()));
             }
         }
