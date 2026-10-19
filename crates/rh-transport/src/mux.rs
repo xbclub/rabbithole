@@ -280,6 +280,20 @@ async fn read_chunk_into<R: tokio::io::AsyncRead + Unpin>(
 /// * 初始相:每次读分配本地 12KiB(< MIN_RECYCLE,不经池;滴流/空闲连接
 ///   不钉池缓冲),读满一次即升级;
 /// * 池相:照旧 `pool::get(CHUNK_CAP)`(批量流保持池复用)。
+///
+/// 非阻塞读的三态结果(round-55)。
+///
+/// 不能用 `Option<Bytes>`:那样"EOF"与"暂无数据"无法区分,批量收集会把
+/// clean EOF 当成"本批结束",推迟半关闭的发现。
+enum TryChunk {
+    /// 有新数据。
+    Data(Bytes),
+    /// 对端已 EOF(本批应结束,且下一轮 `read_chunk` 会返回 `Ok(None)`)。
+    Eof,
+    /// 暂时没有数据(不挂起)。
+    Empty,
+}
+
 #[derive(Default)]
 struct UpReader {
     upgraded: bool,
@@ -289,6 +303,46 @@ struct UpReader {
 }
 
 impl UpReader {
+    /// 非阻塞读:数据未就绪立即返回 `Ok(None)`,**不挂起**(round-55)。
+    ///
+    /// 用于上行批量收集:当前块已收下后,把"此刻已就绪"的后续块一并收进
+    /// 同一批。语义与 [`RhMuxStreamRead::try_read_chunk`] 一致(那边是 mux
+    /// 流自带 pending 队列;这里是通用 AsyncRead,靠单次 poll 判定)。
+    ///
+    /// 单次 poll 会注册一次 waker:若随后没有数据到达,该 waker 可能指向
+    /// 已被丢弃的 future——这里刻意用一个 noop waker,避免悬挂唤醒。
+    async fn try_read_chunk<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        r: &mut R,
+    ) -> io::Result<TryChunk> {
+        let cap = if self.upgraded { CHUNK_CAP } else { INIT_BUF_CAP };
+        let mut bm = pool_get(cap);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let n = {
+            let spare = bm.spare_capacity_mut();
+            let limit = spare.len().min(cap);
+            let mut rb = ReadBuf::uninit(&mut spare[..limit]);
+            match Pin::new(&mut *r).poll_read(&mut cx, &mut rb) {
+                Poll::Ready(Ok(())) => rb.filled().len(),
+                Poll::Ready(Err(e)) => return Err(e),
+                // 未就绪:本批到此为止(不等待)
+                Poll::Pending => return Ok(TryChunk::Empty),
+            }
+        };
+        if n == 0 {
+            // EOF 必须与"暂无数据"区分:否则批量收集会把 clean EOF 吞成
+            // "本批结束",下一轮 read_chunk 再 poll 一次虽然也能读到 0,
+            // 但会让 EOF 的发现推迟一个批次的时长。
+            return Ok(TryChunk::Eof);
+        }
+        if n >= INIT_BUF_CAP {
+            self.upgraded = true;
+        }
+        unsafe { bm.advance_mut(n) };
+        Ok(TryChunk::Data(bm.freeze()))
+    }
+
     async fn read_chunk<R: tokio::io::AsyncRead + Unpin>(
         &mut self,
         r: &mut R,
@@ -328,6 +382,16 @@ fn prefetch_enabled() -> bool {
 
 const CHUNK_CAP: usize = 64 * 1024;
 
+/// 上行单批收集的段数上限(round-55,对齐下行的 `SMALL_CHUNK_SEGS`)。
+const UP_BATCH_SEGS: usize = 64;
+
+/// 上行单批收集的字节上限(round-55,对齐下行的 `DOWN_BATCH_BYTES`)。
+///
+/// 上行每块是 `CHUNK_CAP`=64KiB,1MiB = 16 个满块。取值理由同下行:
+/// 既能摊薄每块的帧构造/唤醒开销,又不会把单批拖成"写满整个发送缓冲"
+/// 的长阻塞。超过 1MiB 的收益递减(内核单次 writev 接纳量有限)。
+const UP_BATCH_BYTES: usize = 1024 * 1024;
+
 /// round-11 诊断:pump_down 的读/写耗时分解。仅当 `RH_PUMP_STATS=1` 时
 /// 在 pump 结束时向 stderr 输出一行。用于判定下行瓶颈是"等数据"还是
 /// "写不出"。
@@ -360,6 +424,9 @@ pub mod pump_diag {
     pub static PEND_FIRST: AtomicU64 = AtomicU64::new(0);
     pub static UP_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static UP_CHUNKS: AtomicU64 = AtomicU64::new(0);
+    /// round-55:上行耗时分解(此前 pump_up 只有字节/块计数,无法判断
+    /// "读用户连接慢"还是"写载体慢")。统计经 [`dump_up`] 在 pump 结束时
+    /// 输出一行到 stderr,仅在 `RH_PUMP_STATS=1` 时生效。
     pub fn enabled() -> bool {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *V.get_or_init(|| {
@@ -640,24 +707,104 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
     limiter: &Option<std::sync::Arc<dyn crate::ChunkLimiter>>,
 ) -> bool {
     let mut reader = UpReader::default();
+    let diag = pump_diag::enabled();
+    let mut read_ns: u64 = 0;
+    let mut write_ns: u64 = 0;
+    let mut slow_reads: u64 = 0;
+    let mut slow_writes: u64 = 0;
     loop {
+        let t_read = std::time::Instant::now();
         let chunk = match reader.read_chunk(a_r).await {
             Ok(Some(c)) => c,
-            Ok(None) => return true,
+            Ok(None) => {
+                if diag {
+                    dump_up(read_ns, write_ns, slow_reads, slow_writes);
+                }
+                return true;
+            }
             Err(_) => return false,
         };
+        if diag {
+            let el = t_read.elapsed().as_nanos() as u64;
+            read_ns += el;
+            if el > 1_000_000 {
+                slow_reads += 1;
+            }
+        }
         if let Some(l) = limiter {
             let mut r = l.reserve(chunk.len()).await;
             r.consume(chunk.len());
         }
-        if pump_diag::enabled() {
-            pump_diag::UP_BYTES.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            pump_diag::UP_CHUNKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if diag {
+            pump_diag::UP_BYTES.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            pump_diag::UP_CHUNKS.fetch_add(1, Ordering::Relaxed);
         }
-        if b_write.write_chunk(chunk).await.is_err() {
+        // round-55:批量收集(对齐下行的 DOWN_BATCH_BYTES)。
+        //
+        // 修前这里逐块 `write_chunk`,每块 64KiB(CHUNK_CAP)单独构造 mux
+        // 帧并单独过一遍发送链路。下行早有等价聚合(`DOWN_BATCH_BYTES`
+        // =1MiB / `SMALL_CHUNK_SEGS`=128),上行没有——这是上下行不对称
+        // 的直接来源。
+        //
+        // 收集策略与下行一致:先无条件收下当前块,再用 `try_read_chunk`
+        // (不挂起)把**已经就绪**的后续块一并收进来,直到 UP_BATCH_BYTES
+        // 触顶。没有就绪块时立即写出,不额外等 RTT(保延迟)。
+        let mut batch: Vec<Bytes> = Vec::with_capacity(UP_BATCH_SEGS);
+        batch.push(chunk);
+        let mut batch_bytes: usize = batch.iter().map(|c| c.len()).sum();
+        while batch.len() < UP_BATCH_SEGS && batch_bytes < UP_BATCH_BYTES {
+            match reader.try_read_chunk(a_r).await {
+                Ok(TryChunk::Data(c)) => {
+                    batch_bytes += c.len();
+                    batch.push(c);
+                }
+                Ok(TryChunk::Eof) | Ok(TryChunk::Empty) | Err(_) => break,
+            }
+        }
+        let t_write = std::time::Instant::now();
+        let wres = async {
+            for c in batch.drain(..) {
+                b_write.write_chunk(c).await?;
+            }
+            Ok::<(), io::Error>(())
+        }
+        .await;
+        if diag {
+            let el = t_write.elapsed().as_nanos() as u64;
+            write_ns += el;
+            if el > 1_000_000 {
+                slow_writes += 1;
+            }
+        }
+        if wres.is_err() {
+            if diag {
+                dump_up(read_ns, write_ns, slow_reads, slow_writes);
+            }
             return false;
         }
     }
+}
+
+/// 上行统计输出(round-55,`RH_PUMP_STATS=1` 时生效)。
+fn dump_up(read_ns: u64, write_ns: u64, slow_reads: u64, slow_writes: u64) {
+    let bytes = pump_diag::UP_BYTES.load(Ordering::Relaxed);
+    let chunks = pump_diag::UP_CHUNKS.load(Ordering::Relaxed);
+    if chunks == 0 {
+        return;
+    }
+    let rd_ms = read_ns as f64 / 1e6;
+    let wr_ms = write_ns as f64 / 1e6;
+    let total = rd_ms + wr_ms;
+    eprintln!(
+        "PUMP_UP bytes={bytes} chunks={chunks} avg_chunk={:.0} \
+read_ms={rd_ms:.0}({:.0}%) write_ms={wr_ms:.0}({:.0}%) \
+rd_per_blk_ms={:.2} wr_per_blk_ms={:.2} slow_reads={slow_reads} slow_writes={slow_writes}",
+        bytes as f64 / chunks as f64,
+        if total > 0.0 { rd_ms * 100.0 / total } else { 0.0 },
+        if total > 0.0 { wr_ms * 100.0 / total } else { 0.0 },
+        rd_ms / chunks as f64,
+        wr_ms / chunks as f64,
+    );
 }
 
 /// down 侧聚合的段数上限:一次冲刷的 writev 至多聚合这么多段。

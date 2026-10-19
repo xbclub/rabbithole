@@ -213,16 +213,81 @@ func runSrc(addr string, seconds float64, conns int) {
 	})
 }
 
+// ---------------------------------------------------------------- reverse
+//
+// 上行(反向)测量需要一个**主动拨号**的一端和一个**被动接受**的一端,
+// 与 sink/src 的角色刚好对调:
+//
+//	隧道发布端(test2)        隧道接入端(test3)
+//	revsink <addr> ...  ──拨号──►  revsrc <port> ...
+//	   (持续写)                      (接受并读空)
+//
+// 命名按"数据流向"而非"谁拨号":revsink = 反向的接收端角色(它其实是
+// 发送方)。这样 `revsrc`/`revsink` 与正向的 sink/src 在脚本里语义对称。
+
+// runRevSink 拨号到 addr 并持续写。它是上行方向的**发送方**。
+func runRevSink(addr string, seconds float64, conns int) {
+	runSrc(addr, seconds, conns) // 与正向 src 的发送逻辑完全一致
+}
+
+// runRevSrc 监听 port,接受连接并读空。它是上行方向的**接收方**。
+//
+// 与 runSink 的差别:连接由对端(隧道发布端)主动拨入,sink 侧不限制
+// 连接数上限(隧道发布端自己决定开几条),但同样在到期时打断读阻塞。
+func runRevSrc(port int, seconds float64, maxConns int) {
+	runSink(port, seconds, maxConns)
+}
+
 // ---------------------------------------------------------------- main
 
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage:")
-		fmt.Fprintln(os.Stderr, "  loadgen sink <port> <seconds> [maxConns]")
-		fmt.Fprintln(os.Stderr, "  loadgen src  <host:port> <seconds> <conns>")
+		fmt.Fprintln(os.Stderr, "  loadgen sink    <port> <seconds> [maxConns]   # 正向:接受并读空")
+		fmt.Fprintln(os.Stderr, "  loadgen src     <host:port> <seconds> <conns> # 正向:拨号并写")
+		fmt.Fprintln(os.Stderr, "  loadgen revsrc  <port> <seconds> [maxConns]   # 上行:接受并读空(接收方)")
+		fmt.Fprintln(os.Stderr, "  loadgen revsink <host:port> <seconds> <conns> # 上行:拨号并写(发送方)")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "revsrc":
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "revsrc needs <port> <seconds> [maxConns]")
+			os.Exit(2)
+		}
+		port, err := strconv.Atoi(os.Args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bad port: %v\n", err)
+			os.Exit(2)
+		}
+		sec, err := strconv.ParseFloat(os.Args[3], 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bad seconds: %v\n", err)
+			os.Exit(2)
+		}
+		maxConns := 4096
+		if len(os.Args) >= 5 {
+			if v, err := strconv.Atoi(os.Args[4]); err == nil {
+				maxConns = v
+			}
+		}
+		runRevSrc(port, sec, maxConns)
+	case "revsink":
+		if len(os.Args) < 5 {
+			fmt.Fprintln(os.Stderr, "revsink needs <host:port> <seconds> <conns>")
+			os.Exit(2)
+		}
+		sec, err := strconv.ParseFloat(os.Args[3], 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bad seconds: %v\n", err)
+			os.Exit(2)
+		}
+		conns, err := strconv.Atoi(os.Args[4])
+		if err != nil || conns < 1 {
+			fmt.Fprintln(os.Stderr, "bad conns")
+			os.Exit(2)
+		}
+		runRevSink(os.Args[2], sec, conns)
 	case "sink":
 		if len(os.Args) < 4 {
 			fmt.Fprintln(os.Stderr, "sink needs <port> <seconds> [maxConns]")
