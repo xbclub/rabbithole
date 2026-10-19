@@ -6995,3 +6995,64 @@ poll 周期 = 619μs(处理) + 2646μs(等待) = 3.27ms。
 ### 43.46 下一轮:采样服务端 Recv-Q 分布
 
 **若 Recv-Q 经常 >0(有数据未读),则确认是唤醒延迟。**
+
+### 43.47 ⭐⭐⭐⭐⭐⭐ 铁证:44% 的采样中服务端 Recv-Q > 0,最高 3.38 MB
+
+**50 次高频采样(间隔 50ms),服务端载体 socket 的 Recv-Q:**
+
+```
+sample 1:  Recv-Q=65,160
+sample 2:  Recv-Q=260,640
+sample 3:  Recv-Q=583,808
+sample 23: Recv-Q=1,577,112
+sample 29: Recv-Q=2,085,120
+sample 38: Recv-Q=3,384,408   ← 3.38 MB 未读!
+...
+nonzero = 22 / 50  (44%)
+```
+
+**⇒ 44% 的时间里,服务端 socket 里有**大量未读数据**(最高 3.38MB),
+但 RecvHalf 却返回 `Pending` 等 2.65ms。**
+
+### 43.48 这是丢唤醒(Lost Wakeup)的确证
+
+**Recv-Q > 0 ⟹ 内核有数据可读 ⟹ `poll_read` 应立即返回 Ready。**
+
+**但实测 `pending=98.6%` —— 几乎每次都返回 Pending。**
+
+**⇒ 唯一解释:epoll 的唤醒没有传递到 RecvHalf 的 task。**
+
+**这是典型的**丢唤醒**:数据到了,但 task 没被唤醒,要等下一个
+无关事件把它带醒(或超时)。**
+
+### 43.49 这与 f7020c0 的修复是什么关系
+
+**§18 记录过一次修复:`StreamReadHalf::poll_read_chunk` 里
+"注册 waker 后在同一锁下复查缓冲区",关闭了丢唤醒窗口。**
+
+**但那是**流级**的 `poll_read_chunk`,不是**连接级**的 `RecvHalf::poll`。**
+
+**⇒ 连接级的丢唤醒还没修。**
+
+### 43.50 可能的丢唤醒点
+
+**`RecvHalf::poll_inner` 的循环:**
+```
+loop {
+    read_frame()  → Pending ⟹ 注册 waker,返回 Pending
+    on_frame()    → route(分片通道)
+}
+```
+
+**若 `read_frame` 返回 Pending 时注册的 waker 是**旧的**(cx 已变),
+或注册后**没有复查**,就会丢唤醒。**
+
+**§43.47 的数据(44% 时间有未读数据)强烈暗示这个窗口存在。**
+
+### 43.51 下一步:定位 RecvHalf 的 waker 注册点
+
+**检查 `frame::Io::poll_next` 里 `poll_read` 的 waker 注册与复查逻辑。**
+
+**若它在返回 Pending 前没有"注册后复查 socket 可读性",就是 bug。**
+
+**这与 f7020c0 修的是同一类问题,但在连接层。**
