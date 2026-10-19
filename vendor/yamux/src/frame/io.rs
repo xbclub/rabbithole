@@ -49,18 +49,6 @@ const MAX_FRAME_BODY_LEN: usize = crate::MIB;
 /// WU 窗口更新回程被推迟,流控信用回路时延增大(Round-7 批时序回退同类
 /// 机制)。READ_RESERVE 保持 64KiB;接收侧 syscall 削减的探索须另寻
 /// 不阻塞 WU 回程节奏的形态。
-/// round-27:`RH_READ_RESERVE` 可覆盖(默认 64KiB)。
-fn read_reserve() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RH_READ_RESERVE")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| (8 * 1024..=1024 * 1024).contains(n))
-            .unwrap_or(READ_RESERVE)
-    })
-}
-
 const READ_RESERVE: usize = 64 * 1024;
 
 /// 小帧 copy-out 阈值(≤ READ_RESERVE)。goal-repair C1:帧体不完整时
@@ -596,7 +584,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
                 this.read.reserve(missing.max(READ_RESERVE));
             } else {
                 // 帧头不完整(或 staging 空):批量预留
-                this.read.reserve(read_reserve());
+                this.read.reserve(READ_RESERVE);
             }
 
             // 2) 从底层读入 staging 空闲区(已按需零填,满足初始化契约)
