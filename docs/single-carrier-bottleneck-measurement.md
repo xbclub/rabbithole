@@ -9001,3 +9001,95 @@ left: StreamId(4) right: StreamId(2)
 **⇒ 差异可能来自"跨机的网络波动",而非 rh 本身。**
 
 **⇒ 需要在跨机环境下用更长的测试和更多样本,确认 rh 的真实稳态。**
+
+---
+
+## 49. Round-30:⚠️ 发现重大变量 —— frp 一直在跑 TLS
+
+### 49.1 来源
+
+**外部静态分析报告指出:`benchmark/peer-frp.sh` 在 `PROTO=tcp` 时
+没有显式关闭 TLS,而 frp 自 v0.50.0 起默认 `tls.enable = true`。**
+
+**核实源码(`benchmark/frp-src-v0.71.0/pkg/config/v1/client.go:184`):**
+
+```go
+func (c *TLSClientConfig) Complete() {
+    c.Enable = util.EmptyOr(c.Enable, lo.ToPtr(true))   // ← 默认 true
+    ...
+}
+```
+
+**⇒ frp 默认开 TLS。**
+
+### 49.2 我此前的所有 frp 配置都没关 TLS
+
+**`/tmp/rhlab/frp/frpc.toml`、`/tmp/rhlab/loopfrp/frpc.toml` 均无
+`transport.tls.enable` 设置 ⟹ **一直在跑 TLS**。**
+
+### 49.3 实测:关 TLS 后 frp 同机提升 2.06 倍
+
+**同机,iperf3 30 秒,16 流:**
+
+| frp 配置 | 0-10s | 10-20s | 20-30s | **均值** |
+|---|---:|---:|---:|---:|
+| **TLS 开(默认)** | 1.34 | 1.34 | 1.36 | **1.35 G** |
+| **TLS 关** | 2.70 | 2.83 | 2.80 | **2.78 G** |
+
+**⇒ 提升 2.06 倍。**
+
+### 49.4 这推翻了 §48 的"5.15 倍"结论
+
+| 对比 | rh | frp | 比值 |
+|---|---:|---:|---:|
+| §48.2(TLS 开) | 6.95 G | 1.35 G | **5.15×** |
+| **修正(TLS 关)** | 6.95 G | **2.78 G** | **2.50×** |
+
+**⇒ rh 的真实优势是 2.50 倍,不是 5.15 倍。**
+
+**仍然领先,但幅度减半。**
+
+### 49.5 这个变量影响所有历史对比
+
+**Round-1 到 Round-29 的所有 frp 数据,都可能混入了 TLS 开销。**
+
+**⇒ 此前所有"rh vs frp"的比值都需要重新审视。**
+
+**特别是跨机的 0.72×(rh 2.23 vs frp 3.09)——若 frp 跨机也是 TLS,
+那关掉后 frp 会更快,rh 的差距更大。**
+
+**⇒ 需要在关 TLS 的条件下重测跨机对比。**
+
+### 49.6 报告的其他可确认发现(静态核实通过)
+
+**以下四点我逐条核实,均属实:**
+
+| 发现 | 核实结果 |
+|---|---|
+| **1. 每批发送重新分配 `VecDeque`** | ✅ `poll_ready` Ready 时 `write_state=Init` 丢弃队列;下批 `VecDeque::with_capacity(64)` 重建 |
+| **2. Pending 后仍调 `poll_flush`,内部再进状态机** | ✅ `poll_flush` 第一行就是 `ready!(poll_ready_unpin)` |
+| **3. RH 先回窗后取块,frp 先取块后回窗** | ✅ RH `send_window_update()` → `buffer.pop()`;frp `recvBuf.Read()` → `sendWindowUpdate()` |
+| **4. 一次读块四次流锁** | ✅ `state.can_read()`、`ack_pending`、`next_window_update()`、`buffer.pop()` 各一次 |
+
+**报告的另外几条"旧解释失效"判断也核实无误:**
+- frp `tcpMux=true` 时确实仍是 1 条物理连接(我 §30.1 已纠正过)
+- frp 也只有一个 recvLoop + 一个 sendLoop
+- `relay_mode=splice` 对 mux 流确实是 no-op
+
+### 49.7 下一步
+
+**优先级排序(基于报告建议 + 我的核实):**
+
+**P0(确定性减少操作,风险低):**
+1. **批队列复用** —— 排空后保留 `VecDeque` 容量,不 drop
+2. **避免 Pending 后重复推进同一批** —— `poll_flush` 不该在 `poll_ready` Pending 时调用
+
+**P1(时序修正,中等风险):**
+3. **回窗时机改为"取块后判定"** —— 对齐 frp
+4. **合并四次流锁为一次**
+
+**P2(结构性,高风险):**
+5. 减少 Worker 接力
+6. 缓冲生命周期优化
+
+**⇒ 先做 P0(两处都是纯粹的"少做无用功",语义不变)。**
