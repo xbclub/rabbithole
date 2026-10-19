@@ -606,7 +606,9 @@ pub async fn mux_relay(
     if abnormal {
         return; // 守卫 Drop → abort 对向(及未完成侧)
     }
-    let _ = tokio::join!(g1, g2);
+    // round-40:clean EOF 的半关闭等待加**有界兜底**。对端永不回 FIN 时
+    // 不再永久钉在 FIN-WAIT-2(实测 10 轮累积 22 条,吞吐 2.4G→0.5G)。
+    crate::join_relay_pumps(&mut g1, &mut g2).await;
 }
 
 /// up 侧搬运:a 读 → mux 帧体。限速=读侧计费:fill 完成即预留并即时消费

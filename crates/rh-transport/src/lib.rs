@@ -119,10 +119,46 @@ impl std::future::Future for AbortOnDropHandle {
     }
 }
 
-/// 中继父任务收尾(全部 relay 共用):双向子泵 join,附加两条收敛保证:
+/// 半关闭的**有界兜底**上限(round-40)。
+///
+/// `clean EOF` 路径本应无界等待完整半关闭(红线:不硬加短超时,否则
+/// FIN 尚未写穿即放弃会截断半关闭)。但实测存在**对端永不回 FIN** 的
+/// 情形,此时 socket 永久停在 `FIN-WAIT-2`/`CLOSING`,流与 IO 都不释放:
+///
+/// * 复现:`-P8` 连跑 10 轮,客户端侧 `ss -tan` 到本地目标的连接出现
+///   `22 CLOSING + 22 FIN-WAIT-2`,且 20 秒后仍不消失(约 2.2 条/轮);
+/// * 对照(同参数直连、不经隧道):只有 `TIME-WAIT`,零残留;
+/// * 后果:长跑后连接数单调增长,吞吐从 2.4 G 逐轮衰减到 0.5 G,
+///   最终耗尽 fd。
+///
+/// 取值 30s 的理由:远大于任何正常 RTT(跨机实测 0.1~0.5ms)与 TCP
+/// 重传窗口(RTO 下限 200ms,3 次重传 ≈ 1.4s),不会误伤正常半关闭;
+/// 又远小于"永不发生"的量级,能及时回收。可用环境变量
+/// `RH_HALFCLOSE_GRACE_SECS` 覆盖(0 = 关闭兜底,回到旧的无界等待)。
+const DEFAULT_HALFCLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 半关闭兜底上限(env 可覆盖,进程内只解析一次)。
+pub(crate) fn halfclose_grace() -> std::time::Duration {
+    static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        match std::env::var("RH_HALFCLOSE_GRACE_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            Some(0) => std::time::Duration::MAX,
+            Some(s) => std::time::Duration::from_secs(s.min(3600)),
+            None => DEFAULT_HALFCLOSE_GRACE,
+        }
+    })
+}
+
+/// 中继父任务收尾(全部 relay 共用):双向子泵 join,附加三条收敛保证:
 /// * 单向 panic → 立即返回(守卫 Drop → abort 对向泵)——单向故障不得
 ///   让对向泵永存(对向可能在等一个永远不来的 EOF);
-/// * 双向正常 → 等两向各自自然结束(半关闭语义:一向 EOF 后对向继续服务)。
+/// * 双向正常 → 等两向各自自然结束(半关闭语义:一向 EOF 后对向继续服务);
+/// * **半关闭有界兜底(round-40)**:对向在 [`halfclose_grace`] 内仍未结束
+///   即放弃等待并 abort——见 [`halfclose_grace`] 的实测依据(对端永不回
+///   FIN 时 socket 永久停 FIN-WAIT-2,10 轮累积 22 条,吞吐 2.4G→0.5G)。
 ///
 /// 父任务取消(本 future 被 drop)→ 守卫 Drop → 双向 abort(A1 语义不变)。
 pub async fn join_relay_pumps(g1: &mut AbortOnDropHandle, g2: &mut AbortOnDropHandle) {
@@ -134,8 +170,27 @@ pub async fn join_relay_pumps(g1: &mut AbortOnDropHandle, g2: &mut AbortOnDropHa
         // panic 侧守卫已完成(不再 abort);对向守卫随本函数返回被 drop → abort
         return;
     }
-    // 先完成的一向是正常结束:等对向自然结束(已完成的立即返回)
-    let _ = tokio::join!(g1, g2);
+    // 先完成的一向是正常结束:等对向自然结束(已完成的立即返回),
+    // 外加半关闭有界兜底。
+    let grace = halfclose_grace();
+    if grace == std::time::Duration::MAX {
+        let _ = tokio::join!(g1, g2);
+        return;
+    }
+    let both = async {
+        let _ = futures::join!(&mut *g1, &mut *g2);
+    };
+    if tokio::time::timeout(grace, both).await.is_err() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                "half-close timeout: peer never completed close handshake; \
+                 aborting relay to release the stream (round-40 leak fix)"
+            );
+        });
+        // 守卫随本函数返回被 drop → abort 双向子泵 → fd 释放
+    }
 }
 
 /// chunk 中继限速预留(预留/消费/退款三态;goal-repair A5 送达计费合同):
