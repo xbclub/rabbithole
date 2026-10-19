@@ -7056,3 +7056,76 @@ loop {
 **若它在返回 Pending 前没有"注册后复查 socket 可读性",就是 bug。**
 
 **这与 f7020c0 修的是同一类问题,但在连接层。**
+
+### 43.52 找到可疑点:`SplitSocket::poll_read` 会因"锁被写半持有"而 Pending
+
+**代码(`connection.rs:1186`):**
+
+```rust
+impl<T: AsyncRead + Unpin> AsyncRead for SplitSocket<T> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8])
+        -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let mut guard = ready!(this.io.poll_lock(cx));   // ← 关键
+        Pin::new(&mut *guard).poll_read(cx, buf)
+    }
+}
+```
+
+**`poll_lock` 在锁被**对端(写半)持有**时返回 `Pending`,并注册
+"锁释放时唤醒"的 waker。**
+
+### 43.53 这就是丢唤醒的机制
+
+**场景:**
+1. `SendHalf` 正在 `poll_write`(持有锁,内核发送队列满 → 返回 Pending)
+2. `RecvHalf` 调用 `poll_read` → `poll_lock` 拿不到锁 → 返回 Pending
+3. **此时 socket 接收缓冲里可能有大量数据(§43.47 实测最高 3.38MB)**
+4. `SendHalf` 释放锁 → 唤醒 `RecvHalf`
+5. 但 `SendHalf` 的 `poll_write` 是**在 poll 循环里**的,
+   它释放锁后立即又去 `fill_batch`/`poll_flush`,可能**再次持锁**
+6. `RecvHalf` 被唤醒后,**再次拿不到锁**,又 Pending
+
+**⇒ 读写两半在同一把锁上互相饿死(lock starvation)。**
+
+### 43.54 这解释了所有观测
+
+| 观测 | 解释 |
+|---|---|
+| 44% 时间 Recv-Q > 0(最高 3.38MB) | **有数据但读半拿不到锁** |
+| `pending=98.6%` | 读半频繁因锁 Pending |
+| poll 间隔 2.65ms | 等锁释放 + 重新调度 |
+| 客户端 `rwnd_limited 19.2%`(frp 5.9%) | 服务端读不动,窗口关闭 |
+| 服务端 CPU 只有 1.27 核 | 大量时间在等锁 |
+| frp 没有此问题 | **Go 的 net.Conn 支持并发读写,无共享锁** |
+
+### 43.55 为什么 frp 没有这个问题
+
+**Go 的 `net.TCPConn` 有独立的读锁和写锁(`fd.readLock` / `fd.writeLock`),
+读写可以**真正并发**。**
+
+**rh 的 `SplitSocket` 用**一把锁**保护整个 socket,读写互斥。**
+
+**⇒ 这是架构级的锁设计差异,不是配置问题。**
+
+### 43.56 修复方向
+
+**方案 A:读写分离锁。**
+`SplitSocket` 改用两把锁(读锁 + 写锁),底层 T 需要支持
+"读半/写半各自独占"。但 `T` 是 `AsyncRead + AsyncWrite`,
+**Rust 的类型系统不保证读半和写半可以安全地同时借用。**
+
+**方案 B:用 `Arc<Mutex<T>>` + 分离的读写路径。**
+若底层是 `TcpStream`,可以用 `try_clone` 得到两个独立 fd。
+
+**方案 C:改用 `tokio::net::TcpStream::into_split()`,**
+它返回 `OwnedReadHalf` / `OwnedWriteHalf`,内部用 `Arc<TcpStream>`,
+**读写不互斥**(TCP 本身支持全双工)。
+
+**⇒ 方案 C 是最直接的:把 `tokio::io::split(a)` 换成
+`TcpStream::into_split()`(对裸 TCP),或用 `tokio_util::io::SyncIoBridge`。**
+
+**但 §17.7 已记录 `mux_relay` 用的是 `tokio::io::split`(std::sync::Mutex)。
+而这里 `SplitSocket` 是 yamux 内部对**载体**连接的封装。**
+
+**⇒ 两个不同的 split,都需要检查。**
