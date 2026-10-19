@@ -330,7 +330,14 @@ impl UpReader {
             match Pin::new(&mut *r).poll_read(&mut cx, &mut rb) {
                 Poll::Ready(Ok(())) => rb.filled().len(),
                 Poll::Ready(Err(e)) => return Err(e),
-                // 未就绪:本批到此为止(不等待)
+                // 未就绪:本批到此为止(不等待)。
+                //
+                // 注意 noop waker 的代价:这次 poll 会把 tokio 的读就绪
+                // 注册覆盖成 noop,随后 `read_chunk` 重新 poll 时才装回真
+                // waker。因为调用方紧接着要么继续 `try_read_chunk` 直到
+                // Empty、要么落入 `read_chunk` 阻塞等,所以不会永久丢唤醒
+                // (read_chunk 的 poll 必然重装)。代价最多是每批多一次
+                // 无效 poll,不构成正确性问题。
                 Poll::Pending => return Ok(TryChunk::Empty),
             }
         };
