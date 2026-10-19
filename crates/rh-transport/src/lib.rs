@@ -535,6 +535,25 @@ impl Multiplexer {
         }
     }
 
+    /// **带容量裁决**的载体附加(round-48):「判断成员数」与「入表」在池的
+    /// 同一把 `members` 写锁内完成,消除并发报到的短暂超限。
+    ///
+    /// `cap` = 池内成员总数上限(调用方负责把首载体占的名额折算进去)。
+    /// 返回 [`mux::AttachOutcome::RejectedFull`] 时**未入表**,该载体由
+    /// 调用方负责拒绝/关闭。
+    ///
+    /// 非池变体返回 `None`(调用方据此走原有拒绝路径)。
+    pub async fn attach_yamux_carrier_with_cap(
+        &self,
+        mux: mux::YamuxMultiplexer,
+        cap: usize,
+    ) -> Option<mux::AttachOutcome> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => Some(p.attach_carrier_with_cap(mux, cap).await),
+            _ => None,
+        }
+    }
+
     /// 运行中把一条已 accept 的服务端 yamux 载体附加进本多路复用器
     /// (round-9 服务端会话聚合)。仅 [`MultiplexerInner::YamuxPool`] 变体
     /// 支持(返回 true);其余变体返回 false,载体由调用方处置。

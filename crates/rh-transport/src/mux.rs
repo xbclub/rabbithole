@@ -1510,6 +1510,17 @@ const POOL_DROP_GRACE: std::time::Duration = std::time::Duration::from_millis(25
 /// 多物理载体连接池:open_stream 按全局原子计数轮转分派到第
 /// `seq mod K` 个载体;accept(服务端池)自合流通道交付;载体故障自动
 /// 剔除 + 退避重拨,其余载体存量流不受影响。
+/// [`YamuxMultiplexerPool::attach_carrier_with_cap`] 的结果(round-48)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachOutcome {
+    /// 已成功入表(含 spawn accept 转发任务)。
+    Attached,
+    /// 池内成员数已达 cap,**未入表**。调用方负责拒绝该载体。
+    RejectedFull,
+    /// 池已关停;载体已被 shutdown,未入表。
+    PoolShutdown,
+}
+
 pub struct YamuxMultiplexerPool {
     inner: Arc<PoolInner>,
     /// 服务端合流接收器(None = 客户端池,accept 返回错误)。
@@ -1864,6 +1875,61 @@ impl YamuxMultiplexerPool {
         self.inner.redial_target.store(want, Ordering::Release);
         self.inner.active_prefix.store(want, Ordering::Release);
         drop(ms);
+    }
+
+    /// **带容量裁决**的载体附加(round-48):把「成员数判断」与「push 进表」
+    /// 放进**同一把 `members` 写锁**内,消除并发报到的短暂超限。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 修前调用方是「读成员数(一次锁)→ 判断 → 聚合(另一次锁)」三步,
+    /// 两个附加连接并发报到时可能都通过检查并各自聚合,让 K 短暂达到
+    /// `cap + 1`(`control.rs` 的注释自认「检查非原子」)。
+    ///
+    /// ## 与 [`YamuxMultiplexerPool::attach_carrier`] 的关系
+    ///
+    /// 逻辑相同(push + spawn accept 转发 + 通知 + 关停短路),唯一区别是
+    /// 在**已持写锁的状态下**先判 `ms.len() + 2 > cap`。`cap` 的语义是
+    /// **含首载体的总载体数上限**(与调用方 `max_carriers` 同源):
+    /// 成员数 + 首载体 1 + 本次 1 <= cap 才允许,故超限条件是
+    /// `ms.len() + 2 > cap`。
+    ///
+    /// 返回:
+    /// - `AttachOutcome::Attached`:已入表(含 spawn 转发);
+    /// - `AttachOutcome::RejectedFull`:成员数已达 cap,**未入表**;
+    /// - `AttachOutcome::PoolShutdown`:池已关停,载体已 shutdown。
+    ///
+    /// 注:被拒载体的处置(关连接/回 ACK)由调用方负责——本函数只保证
+    /// 「拒绝时不入表」这一不变量。
+    pub async fn attach_carrier_with_cap(
+        &self,
+        mux: YamuxMultiplexer,
+        cap: usize,
+    ) -> AttachOutcome {
+        let Some(tx) = self.inner.accept_tx.clone() else {
+            return AttachOutcome::PoolShutdown;
+        };
+        let id = self.inner.next_member_id.fetch_add(1, Ordering::Relaxed);
+        let member = Arc::new(PoolMember::new(id, mux, None));
+        let mut ms = self.inner.members.write().await;
+        // ★ 裁决点:与 push 同处一把写锁之内,窗口为零。
+        if ms.len() + 2 > cap {
+            drop(ms);
+            return AttachOutcome::RejectedFull;
+        }
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            drop(ms);
+            member.mux.shutdown();
+            self.inner.shutdown_sweep();
+            return AttachOutcome::PoolShutdown;
+        }
+        ms.push(member.clone());
+        self.inner.dead.store(false, Ordering::Release);
+        let h = Self::spawn_accept_forward(&self.inner, member, tx);
+        self.inner.forward_tasks.lock().unwrap().push(h);
+        self.inner.changed.notify_waiters();
+        drop(ms);
+        AttachOutcome::Attached
     }
 
     /// 当前生效的分派前缀上限(诊断/测试缝:与成员数取较小值)。

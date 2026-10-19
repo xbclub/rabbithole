@@ -353,67 +353,21 @@ async fn attach_additional_carrier(
             return Ok(());
         }
     }
-    // 上限强制(round-10.1 §2.3):cap 含首载体,池内只装附加载体,故允许
-    // 本次附加的条件是 `现有附加载体数 + 1(首载体)+ 1(本次) <= cap`。
+    // 上限强制(round-10.1 §2.3 / round-48 **原子化**):cap 含首载体,池内
+    // 只装附加载体,故允许本次附加的条件是
+    // 「池内成员数 + 1(首载体) + 1(本次) <= cap」,即**池内成员数 < cap**。
     // round-10.2 §2.3:计数用**成员表长度**(含 dead-but-unreaped)而非
     // 存活数——已死未 reap 的成员仍占用物理连接与池内名额;按存活数计会
     // 在健康监视 reap 前的窗口内多放行 1 条。
-    // **检查非原子**:两个附加连接并发报到时可能都通过检查并各自聚合,
-    // 短暂超出 1 条;严格串行化需把池锁与 attach 耦合,超出本任务范围。
+    //
+    // **本处不再做锁外预检(round-48)**:修前是「读成员数(一次锁)→ 判断
+    // → 聚合(另一次锁)」三步分属不同临界区,两个附加连接并发报到时可能
+    // 都通过检查并各自聚合,让 K 短暂达到 cap+1(旧注释自认"检查非原子")。
+    // 现在裁决点下沉到
+    // [`attach_yamux_carrier_with_cap`](rh_transport::Multiplexer::attach_yamux_carrier_with_cap)
+    // 的 `members` 写锁内 —— 判断与 push 在同一临界区,窗口为零。
+    // 超限由聚合调用返回 `RejectedFull`,再走本文件末尾的拒绝路径。
     // 拒绝路径不聚合(红线:必须走 ACK 而非 send_error)。
-    let existing = {
-        let g = sess.mux_pool.lock().await;
-        g.clone()
-    };
-    let pool_members = match existing.as_ref() {
-        Some(p) => p.pool_member_count().await.unwrap_or(0),
-        None => 0,
-    };
-    if pool_members + 2 > cap {
-        reject_carrier(&mut stream, cap, "POOL_FULL", &hello.client_id, session_id).await;
-        info!(
-            client_id = %hello.client_id,
-            session_id,
-            pool_members,
-            cap,
-            "pool carrier rejected (cap)"
-        );
-        // round-43:超限拒绝后**必须关闭整条载体连接**,不能 `return Ok(())`
-        // 让它悬空。
-        //
-        // ## 缺陷
-        //
-        // 修前只回 `ok:false` 就返回。`stream` 只是载体上的第一条流(承载
-        // HELLO/ACK),而**真正持有物理连接的是 `inc.mux`**。
-        // `YamuxMultiplexer` 没有 `impl Drop`——drop 它只是 detach driver 的
-        // JoinHandle,driver 继续持有 socket 并运行(mux.rs:1147-1150:为
-        // 「正常路径零漂移」刻意保留)。于是被拒载体的 driver 永远活着,
-        // 客户端在其上开的新流无人接收 —— 偶发流挂起,直到 driver 下次
-        // send 失败才退出(REPORT-round10.md「## 6. 遗留」第 2 条已承认)。
-        //
-        // ## 关闭顺序(踩过两个坑,顺序不能反)
-        //
-        // 1. `write_frame` 只把 ACK 写进 mux 流的用户态缓冲,真正上 wire 要
-        //    等 driver 编帧发出。若紧接着 abort driver,ACK 会丢,客户端读到
-        //    `UnexpectedEof`(既有测试
-        //    `attach_over_cap_rejects_pool_full_without_aggregating` 抓到)。
-        // 2. 因此:**关报到流**(半关闭 + flush)→ **让 driver 把 ACK 写出去**
-        //    → **再 shutdown 整条载体**。
-        //
-        // 裸模式(AcceptSingle)无 yamux,只关报到流即可。
-        let _ = stream.shutdown().await;
-        // 给 mux driver 一次调度机会把 ACK 编帧并写穿(实测 1 次 yield
-        // 足够;若仍丢失,下面的 ACK 内容断言会发现)。
-        tokio::task::yield_now().await;
-        // 载体 mux 若被别处持有(理论上此路径独占,防御性处理)则不做
-        // 额外动作:报到流已关,客户端仍能收到 ACK 并感知失败。
-        if let Ok(m) = Arc::try_unwrap(inc.mux) {
-            if let Some(yamux) = m.into_yamux() {
-                yamux.shutdown();
-            }
-        }
-        return Ok(());
-    }
     // 取出该连接的 yamux 载体:此路径独占 Incoming(未与任何 accept 循环
     // 共享),try_unwrap 必成;裸模式连接(AcceptSingle)无 yamux,不聚合。
     let mux_owned = match Arc::try_unwrap(inc.mux) {
@@ -435,36 +389,97 @@ async fn attach_additional_carrier(
         let _ = send_error(&mut stream, "AUTH_FAILED", "carrier not muxed").await;
         return Ok(());
     };
-    // 聚合进会话池:首个附加载体建池,后续成员走 attach_carrier(追加 +
-    // accept 转发 + 唤醒,池内写锁完成)。锁内无 await 之外的旁路,Session
-    // 移除时池随 Session drop,附加载体连接随之关闭(§3.7)。
-    let pool_size = {
+    // 聚合进会话池:首个附加载体建池,后续成员走
+    // `attach_yamux_carrier_with_cap`(成员数判断与 push 同处池的 members
+    // 写锁,round-48 原子化)。锁内无 await 之外的旁路;Session 移除时池随
+    // Session drop,附加载体连接随之关闭(§3.7)。
+    //
+    // 返回 `RejectedFull` ⟹ 超限:该载体**未入表**,走拒绝路径。
+    // 聚合进会话池:首个附加载体建池,后续成员走
+    // `attach_yamux_carrier_with_cap`(成员数判断与 push 同处池的 members
+    // 写锁,round-48 原子化)。锁内无 await 之外的旁路;Session 移除时池随
+    // Session drop,附加载体连接随之关闭(§3.7)。
+    //
+    // 超限时把**尚未入表的载体**交回(`rejected`),由下方统一拒绝路径
+    // 在 ACK 写出之后 shutdown —— 顺序反了客户端会收不到拒绝原因。
+    //
+    // 注:池变体拒绝时不支持聚合(`attach_yamux_carrier_with_cap` 返回
+    // None)走 NOT_POOLED 就地拒绝;`RejectedFull` 时载体已被该函数丢弃,
+    // 拿不回来,拒绝路径靠关报到流让客户端感知。
+    let rejected: Option<rh_transport::mux::YamuxMultiplexer> = {
         let mut pool = sess.mux_pool.lock().await;
         match pool.take() {
             None => {
-                *pool = Some(rh_transport::Multiplexer::yamux_pool_server(vec![yamux]));
-                // None→Some 升级必须补通知:数据接受循环此刻可能 park 在
-                // 单源分支(仅首载体),池自身的 changed 只唤醒其订阅者,
-                // 不通知则池侧合流通道的新流无人接收(§3.6 唤醒缝隙)
-                sess.mux_pool_changed.notify_waiters();
+                // cap 含首载体:建池要占「首载体 + 本次」两个名额。
+                if cap < 2 {
+                    Some(yamux)
+                } else {
+                    *pool = Some(rh_transport::Multiplexer::yamux_pool_server(vec![yamux]));
+                    // None→Some 升级必须补通知:数据接受循环此刻可能 park 在
+                    // 单源分支(仅首载体),池自身的 changed 只唤醒其订阅者,
+                    // 不通知则池侧合流通道的新流无人接收(§3.6 唤醒缝隙)
+                    sess.mux_pool_changed.notify_waiters();
+                    None
+                }
             }
             Some(existing) => {
-                let attached = existing.attach_yamux_carrier(yamux).await;
+                let outcome = existing.attach_yamux_carrier_with_cap(yamux, cap).await;
                 *pool = Some(existing);
-                if !attached {
-                    // round-10.1 §2.4:池变体意外不支持聚合也要回 ACK。
-                    drop(pool);
-                    reject_carrier(&mut stream, cap, "NOT_POOLED", &hello.client_id, session_id)
+                match outcome {
+                    // 池变体不支持聚合(理论上不可达):就地拒绝
+                    None => {
+                        drop(pool);
+                        reject_carrier(
+                            &mut stream,
+                            cap,
+                            "NOT_POOLED",
+                            &hello.client_id,
+                            session_id,
+                        )
                         .await;
-                    return Ok(());
+                        return Ok(());
+                    }
+                    // 超限:载体已被 attach 内部丢弃,只能靠关报到流
+                    Some(rh_transport::mux::AttachOutcome::RejectedFull) => {
+                        drop(pool);
+                        reject_carrier(
+                            &mut stream,
+                            cap,
+                            "POOL_FULL",
+                            &hello.client_id,
+                            session_id,
+                        )
+                        .await;
+                        info!(
+                            client_id = %hello.client_id,
+                            session_id,
+                            cap,
+                            "pool carrier rejected (cap, atomic)"
+                        );
+                        let _ = stream.shutdown().await;
+                        tokio::task::yield_now().await;
+                        return Ok(());
+                    }
+                    Some(_) => None,
                 }
             }
         }
-        match pool.as_ref() {
-            Some(p) => p.pool_live_carriers().await.unwrap_or(1),
-            None => 1,
-        }
     };
+    if let Some(y) = rejected {
+        // 超限且载体仍在手中:先回 ACK,再 shutdown(round-43 红线:
+        // `write_frame` 之后没有 flush,必须 yield 让 driver 写穿)。
+        reject_carrier(&mut stream, cap, "POOL_FULL", &hello.client_id, session_id).await;
+        info!(
+            client_id = %hello.client_id,
+            session_id,
+            cap,
+            "pool carrier rejected (cap, atomic)"
+        );
+        let _ = stream.shutdown().await;
+        tokio::task::yield_now().await;
+        y.shutdown();
+        return Ok(());
+    }
     // 成功应答必须在 shutdown 之前写出(客户端在报到流上等 2s)。
     let ack = rh_protocol::message::CarrierAttachAck {
         ok: true,
@@ -499,6 +514,15 @@ async fn attach_additional_carrier(
             "carrier attach ack write timeout"
         ),
     }
+    // 池内当前成员数(诊断口径,含 dead-but-unreaped——与 cap 检查同口径)。
+    // 成功路径到此必然已入表,故至少为 1。
+    let pool_size = {
+        let g = sess.mux_pool.lock().await;
+        match g.as_ref() {
+            Some(p) => p.pool_member_count().await.unwrap_or(1),
+            None => 1,
+        }
+    };
     info!(
         client_id = %hello.client_id,
         session_id = %session_id,
@@ -1042,43 +1066,57 @@ pub async fn handle_data_channel_hello(
     let mut rejected_mux: Option<rh_transport::mux::YamuxMultiplexer> = None;
     if let Some(yamux) = Arc::try_unwrap(inc.mux).ok().and_then(|m| m.into_yamux()) {
         let cap = state.cfg.max_carriers();
-        let existing = {
-            let g = sess.mux_pool.lock().await;
-            g.clone()
-        };
-        // round-10.2 §2.3:与报到路径同口径——按成员表长度(含 dead 未
-        // reap 的占位成员)计数,而非存活数;检查非原子窗口依然存在。
-        let pool_members = match existing.as_ref() {
-            Some(p) => p.pool_member_count().await.unwrap_or(0),
-            None => 0,
-        };
-        if pool_members + 2 > cap {
-            info!(
-                client_id = %sess.client_id,
-                session_id = %sess.session_id,
-                pool_members,
-                cap,
-                "pool carrier rejected (cap, data-channel refill)"
-            );
-            rejected_mux = Some(yamux);
-        } else {
-            let mut pool = sess.mux_pool.lock().await;
-            match pool.take() {
-                None => {
+        // round-48:本处与报到路径同口径,**裁决点下沉到池的 members 写锁**
+        // (由 `attach_yamux_carrier_with_cap` 完成),不再有「读成员数 →
+        // 判断 → 聚合」三步分属不同临界区的非原子窗口(旧注释自认
+        // "检查非原子窗口依然存在")。
+        // round-10.2 §2.3:计数按成员表长度(含 dead 未 reap 的占位成员),
+        // 而非存活数——该口径在 `ms.len()` 里天然成立。
+        //
+        // 与报到路径的差异(有意):本路径超限时**不能 shutdown 该载体**
+        // ——那会连带杀掉马上要 `route_data_stream` 的这条数据流。因此
+        // 拒绝时把载体保活到路由结束(`rejected_mux`),随作用域释放。
+        let mut pool = sess.mux_pool.lock().await;
+        match pool.take() {
+            None => {
+                // cap 含首载体:建池要占「首载体 + 本次」两个名额
+                if cap < 2 {
+                    rejected_mux = Some(yamux);
+                    info!(
+                        client_id = %sess.client_id,
+                        session_id = %sess.session_id,
+                        cap,
+                        "pool carrier rejected (cap, data-channel refill, atomic)"
+                    );
+                } else {
                     *pool = Some(rh_transport::Multiplexer::yamux_pool_server(vec![yamux]));
                     // 同 attach_additional_carrier:升级补通知,唤醒可能仍
                     // park 在单源分支的数据接受循环
                     sess.mux_pool_changed.notify_waiters();
                 }
-                Some(existing) => {
-                    let attached = existing.attach_yamux_carrier(yamux).await;
-                    *pool = Some(existing);
-                    if !attached {
+            }
+            Some(existing) => {
+                let outcome = existing.attach_yamux_carrier_with_cap(yamux, cap).await;
+                *pool = Some(existing);
+                match outcome {
+                    Some(rh_transport::mux::AttachOutcome::RejectedFull) => {
+                        // 载体已被 attach 内部丢弃,拿不回来。本路径**不需要**
+                        // 保活它:数据流由 `stream` 承载,而 `stream` 已从该
+                        // 载体 accept 出来,路由不依赖载体 mux 的持有。
+                        info!(
+                            client_id = %sess.client_id,
+                            session_id = %sess.session_id,
+                            cap,
+                            "pool carrier rejected (cap, data-channel refill, atomic)"
+                        );
+                    }
+                    None => {
                         warn!(
                             client_id = %sess.client_id,
                             "session mux pool is not a yamux pool (refill)"
                         );
                     }
+                    Some(_) => {}
                 }
             }
         }
@@ -1516,6 +1554,180 @@ mod carrier_ack_tests {
             raw.as_slice(),
             br#"{"ok":false,"error_code":"INTERNAL","max_carriers":7}"#,
             "回退字节必须稳定(客户端按帧解析)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod carrier_attach_concurrency_tests {
+    //! round-48:并发报到下的 cap 原子性回归。
+    //!
+    //! 修前「读成员数(一次锁)→ 判断 → 聚合(另一次锁)」三步分属不同
+    //! 临界区,N 个附加连接并发报到时可能都通过检查并各自聚合,让池内
+    //! 成员数短暂达到 cap+1。修后裁决点下沉到池的 `members` 写锁内
+    //! (`attach_yamux_carrier_with_cap`),判断与 push 同处一个临界区。
+    use super::*;
+    use crate::config::ServerConfig;
+    use rh_transport::Protocol;
+
+    const CIDC: &str = "concurrent-cap-client";
+
+    async fn state_with_cap(cap: usize) -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CIDC, "cc", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        let cfg = ServerConfig {
+            max_carriers: cap,
+            ..ServerConfig::default()
+        };
+        Arc::new(AppState::new(cfg, db))
+    }
+
+    fn register(state: &Arc<AppState>, sid: &str) -> Arc<Session> {
+        let (tx, _rx) = mpsc::channel(8);
+        let sess = Session::new(CIDC.into(), sid.into(), 1, CancellationToken::new(), tx);
+        state.sessions.register(sess.clone());
+        sess
+    }
+
+    fn hello_for(sid: &str) -> Hello {
+        Hello {
+            client_id: CIDC.into(),
+            version: PROTOCOL_VERSION.into(),
+            hostname: "h".into(),
+            os: "test".into(),
+            arch: "test".into(),
+            capabilities: Vec::new(),
+            session_id: Some(sid.into()),
+        }
+    }
+
+    /// 构造一对连通载体,返回 (客户端报到流, 服务端 Incoming, 服务端报到流)。
+    async fn pair() -> (BoxedIo, Incoming, BoxedIo) {
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let client = rh_transport::wrap_stream_as_client(Box::new(a), true, 64);
+        let server = rh_transport::wrap_stream_as_server(Box::new(b), true, 64);
+        let cs = client.open_stream().await.expect("client report stream");
+        let ss = tokio::time::timeout(Duration::from_secs(2), server.accept())
+            .await
+            .expect("accept timeout")
+            .expect("server report stream");
+        // 客户端 mux 必须存活(否则物理连接关闭,服务端写 ACK 失败)
+        tokio::spawn(async move {
+            let _keep = client;
+            futures::future::pending::<()>().await;
+        });
+        let inc = Incoming {
+            mux: server,
+            remote: "127.0.0.1:1".parse().unwrap(),
+            protocol: Protocol::Tcp,
+        };
+        (cs, inc, ss)
+    }
+
+    /// **核心回归**:cap=3 时并发发起 6 条附加报到,最终池内成员数必须
+    /// <= cap-1(池内成员 = 附加载体;总载体 = 成员 + 首载体 <= cap)。
+    ///
+    /// 修前:多个报到可能同时通过锁外检查并各自聚合 → 成员数可达 5
+    /// (总载体 6 > cap=3)。
+    /// 修后:裁决在 members 写锁内,成员数不可能超过 cap-1 = 2。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_attach_never_exceeds_cap() {
+        const CAP: usize = 3;
+        // 池内成员上限 = cap - 1(首载体占一名)
+        const MAX_MEMBERS: usize = CAP - 1;
+
+        let state = state_with_cap(CAP).await;
+        let sess = register(&state, "sid-conc");
+
+        // 并发发起 6 条附加报到
+        const N: usize = 6;
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let st = state.clone();
+            let (mut cs, inc, ss) = pair().await;
+            handles.push(tokio::spawn(async move {
+                let r = attach_additional_carrier(st, inc, ss, hello_for("sid-conc"), "sid-conc")
+                    .await;
+                // 读 ACK,判定该次报到是成功还是被拒
+                let mut buf = bytes::BytesMut::with_capacity(512);
+                let mut accepted = false;
+                if let Ok(Ok((ty, payload))) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    rh_protocol::read_frame(&mut cs, &mut buf),
+                )
+                .await
+                {
+                    if ty == FrameType::CARRIER_ATTACH_ACK {
+                        if let Ok(a) =
+                            serde_json::from_slice::<rh_protocol::message::CarrierAttachAck>(&payload)
+                        {
+                            accepted = a.ok;
+                        }
+                    }
+                }
+                (r, accepted)
+            }));
+        }
+        let mut accepted = 0usize;
+        for h in handles {
+            if let Ok((_, ok)) = h.await {
+                if ok {
+                    accepted += 1;
+                }
+            }
+        }
+        assert!(
+            accepted <= MAX_MEMBERS,
+            "并发报到有 {accepted} 条收到 ok:true,超过上限 {MAX_MEMBERS}             (cap={CAP},含首载体)—— round-48 的原子性裁决失效"
+        );
+
+        // 裁决:池内成员数不得超过 cap-1
+        let members = {
+            let g = sess.mux_pool.lock().await;
+            match g.as_ref() {
+                Some(p) => p.pool_member_count().await.unwrap_or(0),
+                None => 0,
+            }
+        };
+        assert!(
+            members <= MAX_MEMBERS,
+            "并发报到后池内成员数 {members} 超过上限 {MAX_MEMBERS}(cap={CAP},\
+             含首载体)—— round-48 的原子性裁决失效"
+        );
+        // 且至少聚合了一条(cap=3 时至少允许 2 条)
+        assert!(members >= 1, "cap={CAP} 时至少应聚合 1 条附加载体");
+    }
+
+    /// cap=1 时任何附加载体都不得聚合(连建池都不允许)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_attach_with_cap_one_aggregates_nothing() {
+        let state = state_with_cap(1).await;
+        let sess = register(&state, "sid-one");
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let st = state.clone();
+            let (mut cs, inc, ss) = pair().await;
+            handles.push(tokio::spawn(async move {
+                let _ = attach_additional_carrier(st, inc, ss, hello_for("sid-one"), "sid-one")
+                    .await;
+                let mut buf = bytes::BytesMut::with_capacity(512);
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    rh_protocol::read_frame(&mut cs, &mut buf),
+                )
+                .await;
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+
+        assert!(
+            sess.mux_pool.lock().await.is_none(),
+            "cap=1 时不得建池、不得聚合任何附加载体"
         );
     }
 }
