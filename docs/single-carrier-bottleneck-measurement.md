@@ -7129,3 +7129,48 @@ impl<T: AsyncRead + Unpin> AsyncRead for SplitSocket<T> {
 而这里 `SplitSocket` 是 yamux 内部对**载体**连接的封装。**
 
 **⇒ 两个不同的 split,都需要检查。**
+
+### 43.57 ⚠️ 锁争用假设被否定:READLOCK miss=0
+
+**加了 `on_read_lock_miss` 计数后实测(2.92 Gbps):**
+
+```
+POLLGAP polls=8575 pending=8411 gap_avg_us=2676 gt1ms=2496
+READLOCK  (无输出 ⟹ miss=0)
+```
+
+**⇒ 读半**从未**因"锁被写半持有"而 Pending。**
+
+**§43.52~43.56 的锁饥饿假设**被否定**。**
+
+### 43.58 为什么锁不是问题
+
+**`SplitSocket` 的 `poll_lock` 只在**对端正在 poll** 时才会 Pending。**
+
+**而 `poll_read`/`poll_write` 的临界区极短(一次 syscall),
+实际冲突概率很低。**
+
+**⇒ 与 §36.11 的线程状态观测一致(11 个线程 S,1 个 R,procs_blocked=0)。**
+
+### 43.59 但 44% 时间 Recv-Q > 0 仍是事实
+
+**§43.47 的观测(22/50 采样 Recv-Q>0,最高 3.38MB)与 `pending=98%`
+同时成立。**
+
+**若锁不是原因,那 `poll_read` 返回 Pending 时内核确实"看起来没数据"。**
+
+**⇒ 可能 `poll_read` 走的是**另一个** socket?**
+
+**关键:yamux 的 `SplitSocket<T>` 里的 `T` 是什么?**
+
+**若是 `BoxedIo`(rh-transport 封装),它可能有自己的缓冲层,
+`poll_read` 从缓冲读,而缓冲空时返回 Pending —— 但内核 socket 有数据。**
+
+**⇒ 这才是丢唤醒的真正位置。**
+
+### 43.60 下一轮:确认 BoxedIo 的 poll_read 实现
+
+**检查 `crates/rh-transport` 里 `BoxedIo` 的 `poll_read` 是否直接
+转发到 `TcpStream`,还是经过中间缓冲。**
+
+**若经过缓冲 ⟹ 缓冲空但内核有数据 ⟹ 需要检查缓冲的填充逻辑。**
