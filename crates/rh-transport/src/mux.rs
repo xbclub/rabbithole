@@ -315,7 +315,11 @@ impl UpReader {
         &mut self,
         r: &mut R,
     ) -> io::Result<TryChunk> {
-        let cap = if self.upgraded { CHUNK_CAP } else { INIT_BUF_CAP };
+        let cap = if self.upgraded {
+            up_chunk_cap()
+        } else {
+            INIT_BUF_CAP
+        };
         let mut bm = pool_get(cap);
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);
@@ -352,7 +356,7 @@ impl UpReader {
             {
                 self.pool_borrows += 1;
             }
-            return read_chunk_from(r, CHUNK_CAP).await;
+            return read_chunk_from(r, up_chunk_cap()).await;
         }
         let local = bytes::BytesMut::with_capacity(INIT_BUF_CAP);
         let chunk = read_chunk_into(r, INIT_BUF_CAP, local).await?;
@@ -380,7 +384,38 @@ fn prefetch_enabled() -> bool {
     })
 }
 
+/// 上行读块上限(默认 64KiB)。
+///
+/// 修前是 `const CHUNK_CAP = 64KiB`,并有一条"红线 2"测试锁死不得放宽。
+/// round-56 实测发现:该上限只对**下行**(读 mux 流)有意义——那边
+/// yamux 的窗口更新按读步进,读块超限会打破与对端发送窗的锁步节奏。
+/// 但上行读的是**用户 socket**,不存在这个约束。
+///
+/// 实测(rh-server 上行,n=16):`read_ms` 占 pump 时间 **100%**、
+/// `write_ms` 0%,`rd_per_batch_ms=0.42`。吞吐 ≈ CHUNK_CAP/读耗时
+/// = 64KiB/0.42ms ≈ 1.25 Gbps,与实测 1.34 G 吻合——**读块大小直接
+/// 就是上行吞吐上限**。
 const CHUNK_CAP: usize = 64 * 1024;
+
+/// 上行读块上限(可调,默认 256KiB)。
+///
+/// 与 [`CHUNK_CAP`] 分开:下行必须保持 64KiB 锁步,上行可以放大。
+/// 环境变量 `RH_UP_CHUNK_CAP` 可覆盖(1024..=1MiB),便于 A/B。
+fn up_chunk_cap() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RH_UP_CHUNK_CAP")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1024, 1024 * 1024))
+            .unwrap_or(256 * 1024)
+    })
+}
+
+// 下行读块上限由 `CHUNK_CAP` 承担(见其文档);上行用 `up_chunk_cap()`。
+// `CHUNK_CAP` 目前只被红线测试与下行路径的注释引用,保留它是为了让
+// 「下行必须 64KiB 锁步」这条约束有一个具名的锚点。
+const _: usize = CHUNK_CAP;
 
 /// 上行单批收集的段数上限(round-55,对齐下行的 `SMALL_CHUNK_SEGS`)。
 const UP_BATCH_SEGS: usize = 64;
@@ -701,6 +736,24 @@ pub async fn mux_relay(
 /// up 侧搬运:a 读 → mux 帧体。限速=读侧计费:fill 完成即预留并即时消费
 /// (预留等待期间父/取消经外层 select 释放本 future → 预留自动退还,不丢令牌)。
 /// 返回 true = 以 clean EOF 结束;false = 读/写错误(调用方有界收尾)。
+///
+/// # round-56:补上游流水线(对齐 `pump_down` 的 prefetch)
+///
+/// round-55 加了批聚合但**没有加流水线**:先读一块、再写出去、再读下一块,
+/// 严格串行。实测 `PUMP_UP` 的 read_ms/write_ms 在各流之间剧烈摆动
+/// (100%/0% ↔ 3%/97%),正是"读的时候写不了、写的时候读不了"的形态。
+///
+/// `pump_down` 早在 round-31 就解决了同款问题:用 `pending` 保存预取块,
+/// 写当前批的同时并发读下一块(`select(读, 写)`)。上行读的是用户 socket,
+/// 没有 mux 流那样的 pending 队列可以抢收,所以**只能靠并发预取**填满
+/// 管道——这也是 round-55 的 `try_read_chunk` 抢收几乎总是返回 Empty 的
+/// 原因(单次 poll 时数据确实还没到)。
+///
+/// 结构与下行逐点对应:
+/// * `pending`:上一轮预取到的块,作为本轮批的首块;
+/// * 本轮先收下 pending + 抢收已就绪块,组成批;
+/// * 写这批的同时 `select` 读下一块,读先完成则存进 `pending` 供下轮用;
+/// * 写一旦失败立即返回(**收敛红线**:不能 join,写错后读可能永挂)。
 async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
     a_r: &mut R,
     b_write: &mut RhMuxStreamWrite,
@@ -712,63 +765,104 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
     let mut write_ns: u64 = 0;
     let mut slow_reads: u64 = 0;
     let mut slow_writes: u64 = 0;
+
+    // 上一轮写期间预取到的块(下一轮批的首块)。
+    let mut pending: Option<Bytes> = None;
+
     loop {
         let t_read = std::time::Instant::now();
-        let chunk = match reader.read_chunk(a_r).await {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                if diag {
-                    dump_up(read_ns, write_ns, slow_reads, slow_writes);
+        // 组装本轮批:首块(pending 或新读)+ 所有已就绪块,直到上限。
+        let mut batch: Vec<Bytes> = Vec::with_capacity(UP_BATCH_SEGS);
+        let mut batch_bytes = 0usize;
+        let mut batch_eof = false;
+
+        if let Some(first) = pending.take() {
+            batch_bytes += first.len();
+            batch.push(first);
+        }
+        while batch_bytes < UP_BATCH_BYTES && batch.len() < UP_BATCH_SEGS {
+            match reader.try_read_chunk(a_r).await {
+                Ok(TryChunk::Data(c)) => {
+                    batch_bytes += c.len();
+                    batch.push(c);
                 }
-                return true;
+                Ok(TryChunk::Eof) => {
+                    batch_eof = true;
+                    break;
+                }
+                Ok(TryChunk::Empty) | Err(_) => break,
             }
-            Err(_) => return false,
-        };
+        }
+        if batch.is_empty() {
+            // 本轮无料:阻塞等一块(唯一会等 RTT 的地方,EOF 在此收敛)
+            match reader.read_chunk(a_r).await {
+                Ok(Some(c)) => {
+                    batch_bytes += c.len();
+                    batch.push(c);
+                }
+                Ok(None) => {
+                    if diag {
+                        dump_up(read_ns, write_ns, slow_reads, slow_writes);
+                    }
+                    return true;
+                }
+                Err(_) => {
+                    if diag {
+                        dump_up(read_ns, write_ns, slow_reads, slow_writes);
+                    }
+                    return false;
+                }
+            }
+        }
         if diag {
             let el = t_read.elapsed().as_nanos() as u64;
             read_ns += el;
             if el > 1_000_000 {
                 slow_reads += 1;
             }
-        }
-        if let Some(l) = limiter {
-            let mut r = l.reserve(chunk.len()).await;
-            r.consume(chunk.len());
-        }
-        if diag {
-            pump_diag::UP_BYTES.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            pump_diag::UP_BYTES.fetch_add(batch_bytes as u64, Ordering::Relaxed);
             pump_diag::UP_CHUNKS.fetch_add(1, Ordering::Relaxed);
         }
-        // round-55:批量收集(对齐下行的 DOWN_BATCH_BYTES)。
-        //
-        // 修前这里逐块 `write_chunk`,每块 64KiB(CHUNK_CAP)单独构造 mux
-        // 帧并单独过一遍发送链路。下行早有等价聚合(`DOWN_BATCH_BYTES`
-        // =1MiB / `SMALL_CHUNK_SEGS`=128),上行没有——这是上下行不对称
-        // 的直接来源。
-        //
-        // 收集策略与下行一致:先无条件收下当前块,再用 `try_read_chunk`
-        // (不挂起)把**已经就绪**的后续块一并收进来,直到 UP_BATCH_BYTES
-        // 触顶。没有就绪块时立即写出,不额外等 RTT(保延迟)。
-        let mut batch: Vec<Bytes> = Vec::with_capacity(UP_BATCH_SEGS);
-        batch.push(chunk);
-        let mut batch_bytes: usize = batch.iter().map(|c| c.len()).sum();
-        while batch.len() < UP_BATCH_SEGS && batch_bytes < UP_BATCH_BYTES {
-            match reader.try_read_chunk(a_r).await {
-                Ok(TryChunk::Data(c)) => {
-                    batch_bytes += c.len();
-                    batch.push(c);
-                }
-                Ok(TryChunk::Eof) | Ok(TryChunk::Empty) | Err(_) => break,
-            }
+        if let Some(l) = limiter {
+            let mut r = l.reserve(batch_bytes).await;
+            r.consume(batch_bytes);
         }
+
+        // 写这批;未达上限时并发读下一块(读结果进 pending,不阻塞写)。
         let t_write = std::time::Instant::now();
-        let wres = async {
+        let write_all = async {
             for c in batch.drain(..) {
-                b_write.write_chunk(c).await?;
+                if b_write.write_chunk(c).await.is_err() {
+                    return false;
+                }
             }
-            Ok::<(), io::Error>(())
-        }
-        .await;
+            true
+        };
+
+        let ok = if prefetch_enabled() && batch_bytes < UP_BATCH_BYTES && !batch_eof {
+            let write_fut = write_all;
+            futures::pin_mut!(write_fut);
+            let mut read_fut = Some(Box::pin(reader.read_chunk(a_r)));
+            loop {
+                match read_fut.take() {
+                    Some(rf) => {
+                        futures::pin_mut!(rf);
+                        match futures::future::select(rf, write_fut.as_mut()).await {
+                            futures::future::Either::Left((nr, _)) => match nr {
+                                Ok(Some(c)) if !c.is_empty() => pending = Some(c),
+                                Ok(_) => batch_eof = true,
+                                Err(_) => batch_eof = true,
+                            },
+                            futures::future::Either::Right((ok, _)) => break ok,
+                        }
+                    }
+                    None => break write_fut.await,
+                }
+            }
+        } else {
+            write_all.await
+        };
+
         if diag {
             let el = t_write.elapsed().as_nanos() as u64;
             write_ns += el;
@@ -776,11 +870,17 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
                 slow_writes += 1;
             }
         }
-        if wres.is_err() {
+        if !ok {
             if diag {
                 dump_up(read_ns, write_ns, slow_reads, slow_writes);
             }
             return false;
+        }
+        if batch_eof && pending.is_none() {
+            if diag {
+                dump_up(read_ns, write_ns, slow_reads, slow_writes);
+            }
+            return true;
         }
     }
 }
@@ -788,22 +888,22 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
 /// 上行统计输出(round-55,`RH_PUMP_STATS=1` 时生效)。
 fn dump_up(read_ns: u64, write_ns: u64, slow_reads: u64, slow_writes: u64) {
     let bytes = pump_diag::UP_BYTES.load(Ordering::Relaxed);
-    let chunks = pump_diag::UP_CHUNKS.load(Ordering::Relaxed);
-    if chunks == 0 {
+    let batches = pump_diag::UP_CHUNKS.load(Ordering::Relaxed);
+    if batches == 0 {
         return;
     }
     let rd_ms = read_ns as f64 / 1e6;
     let wr_ms = write_ns as f64 / 1e6;
     let total = rd_ms + wr_ms;
     eprintln!(
-        "PUMP_UP bytes={bytes} chunks={chunks} avg_chunk={:.0} \
+        "PUMP_UP bytes={bytes} batches={batches} avg_batch={:.0} \
 read_ms={rd_ms:.0}({:.0}%) write_ms={wr_ms:.0}({:.0}%) \
-rd_per_blk_ms={:.2} wr_per_blk_ms={:.2} slow_reads={slow_reads} slow_writes={slow_writes}",
-        bytes as f64 / chunks as f64,
+rd_per_batch_ms={:.2} wr_per_batch_ms={:.2} slow_reads={slow_reads} slow_writes={slow_writes}",
+        bytes as f64 / batches as f64,
         if total > 0.0 { rd_ms * 100.0 / total } else { 0.0 },
         if total > 0.0 { wr_ms * 100.0 / total } else { 0.0 },
-        rd_ms / chunks as f64,
-        wr_ms / chunks as f64,
+        rd_ms / batches as f64,
+        wr_ms / batches as f64,
     );
 }
 
