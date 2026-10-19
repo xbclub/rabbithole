@@ -11714,3 +11714,163 @@ flat profile),对比 rh 与 frp 在同一负载下的栈深度与热点路径。
 flat profile 已证明用户态占比总和 < 5%,说明时间在等待而非计算,
 那么该看的是**等待发生在哪个调用栈上**,这需要 call-graph 而不是
 flat。
+
+---
+
+## 74. Round-69:根因锁定 —— `tokio::io::split` 的同步锁(futex 占 75%)
+
+### 74.1 perf call-graph 给出第一层
+
+`perf record -g`(服务端,上行 P=16):
+
+```
+77.11%  entry_SYSCALL_64_after_hwframe
+        ├── 33.17%  __x64_sys_recvfrom
+        │     ├── 12.70%  copy_user_generic_unrolled
+        │     ├──  8.10%  tcp_send_ack        ← 每包回 ACK
+        │     └──  5.02%  __kfree_skb
+        ├── 29.67%  __x64_sys_writev
+        │     ├── 11.00%  sk_page_frag_refill ← 含 8.07% clear_page_orig
+        │     └──  9.75%  skb_do_copy_data_nocache
+        ├──  7.21%  __x64_sys_futex
+        └──  4.21%  __x64_sys_epoll_wait
+```
+
+对比 frps(Go 二进制无符号,只能看内核侧):`do_syscall_64` 占 **52%**,
+rh 是 **77%** —— rh 的系统调用开销明显更高。
+
+### 74.2 strace 给出决定性数字
+
+`strace -f -c`(服务端,上行 P=16,12 秒):
+
+| syscall | % time | seconds | calls | usecs/call |
+|---|---:|---:|---:|---:|
+| **futex** | **75.01** | **39.85** | 3690 | **10,800** |
+| recvfrom | 10.85 | 5.76 | 16,100 | 357 |
+| writev | 8.12 | 4.31 | 5,063 | 851 |
+| epoll_wait | 5.91 | 3.14 | 5,887 | 533 |
+| **total** | 100 | 53.13 | 31,077 | — |
+
+**`futex` 占 75%、平均每次 10.8 毫秒。** 进程绝大部分时间在**等锁**,
+不是在收发数据。
+
+### 74.3 锁的来源
+
+`tokio/src/io/split.rs`:
+
+```rust
+pub fn split<T>(stream: T) -> (ReadHalf<T>, WriteHalf<T>) {
+    let inner = Arc::new(Inner { stream: Mutex::new(stream), .. });
+    ..
+}
+impl<T> Inner<T> {
+    fn with_lock<R>(&self, f: impl FnOnce(Pin<&mut T>) -> R) -> R {
+        let mut guard = self.stream.lock().unwrap();   // std::sync::Mutex!
+        ..
+    }
+}
+```
+
+`tokio::io::split` 用**一把 `std::sync::Mutex`** 包住整个 stream。
+在 async 任务里用同步锁:**一端在 poll 期间持锁时,另一端 `lock()`
+会阻塞整个 OS 线程**(futex 等待),而不是让出。
+
+`mux_relay` 正是这样拆的:`let (mut a_r, mut a_w) = tokio::io::split(a);`
+
+### 74.4 修复
+
+裸 `TcpStream` 可拆成两个**独立 fd**(`into_split`),各有独立的 tokio
+IO 注册,读写之间没有任何共享锁。
+
+新增 `split_boxed_io(io) -> Result<(BoxedIo, BoxedIo), BoxedIo>`:
+先 `as_any().is::<TcpStream>()` 探测(不消费),命中则 `into_split`
+并包成 `HalfRead`/`HalfWrite`;未命中把 IO 原样还回 `Err`,调用方
+回落 `tokio::io::split`。
+
+`mux_relay` 改为优先走无锁拆分,两条路径统一擦除成 trait object。
+
+### 74.5 待补
+
+本节提交时**尚未完成修复后实测**(构建中)。这是第一个有**直接系统调用
+证据**(futex 75%、10.8ms/次)支撑的改动,此前 14 项假设都是间接推断。
+下一轮必须给出:systrace 的 futex 占比是否下降、单流与 P=16 的吞吐变化
+(与 frp 交替测量)。
+
+### 74.6 修复后实测:无改善,且 futex 判断被 perf 修正
+
+**吞吐(r69,与 frp 交替):**
+
+| 轮 | rh r69 | frp |
+|---|---:|---:|
+| 1 | 1.34 | 1.76 |
+| 2 | 1.30 | 1.46 |
+
+与 r64(1.25~1.48)在同一区间,**无显著改善**。
+
+**更重要的:futex 的判断是错的。**
+
+修后用 `strace -c` 复查:
+
+| 版本 | futex % | 次数 | usecs/call |
+|---|---:|---:|---:|
+| 修前(r68) | 75.01% | 3,690 | **10,800** |
+| 修后(r69) | 76.62% | 14,641 | 2,397 |
+
+futex 占比没降,只是变成"更多、更短"的等待。
+
+**但 `perf report`(CPU 采样)给出了完全不同的图景:**
+
+```
+44.74%  tcp_sendmsg_locked     ← 写(内核态)
+41.32%  tcp_recvmsg_locked     ← 读(内核态)
+ 2.54%  __lock_text_start      ← 自旋锁
+ 1.48%  __wake_up_common_lock
+ 0.95%  __x64_sys_futex        ← 只有 0.95%
+```
+
+**futex 的真实 CPU 占比只有 0.95%,不是 75%。**
+
+### 74.7 为什么 strace 的 75% 是假象
+
+`strace -c` 统计的是**系统调用耗时(wall clock)**,不是 CPU 时间。
+futex 的 39.85 秒是线程**被挂起等待**的累计时长——线程挂起时
+不消耗 CPU,但 strace 把它算进了"% time"。
+
+而 `perf` 用 CPU 时钟采样,只统计**真正占用 CPU 的指令**。
+
+**结论**:进程 75% 的"时间"在等锁,但那是**休眠等待**,不消耗 CPU;
+真实 CPU 消耗 86% 在内核 TCP 收发(`tcp_sendmsg_locked` +
+`tcp_recvmsg_locked`)。这与之前所有 CPU 测量一致(服务端 0.63 核,
+8 核的 8%)。
+
+### 74.8 这轮修正了什么
+
+1. **无锁拆分本身是对的**(`tokio::io::split` 用同步锁在 async 环境
+   确实是反模式),但**它不是瓶颈** —— 因为那个锁的等待是休眠,不占 CPU。
+   改动保留(语义更正确、消除了 OS 线程阻塞风险),但不声称性能收益。
+2. **"futex 75%"是一个错误归因**,已用 perf 数据推翻。这提醒:
+   `strace -c` 不能用来判断 CPU 瓶颈。
+
+### 74.9 剩余差距的真实位置
+
+perf 显示 86% 的 CPU 在内核 TCP 收发。这意味着:
+
+- 服务端只用了 0.63 核,其中 86% 是内核 TCP 处理 → **约 0.54 核在
+  `tcp_sendmsg_locked`/`tcp_recvmsg_locked`**
+- 这部分是**逐字节拷贝 + skb 管理**,与 §57 的 `copy_user_generic_unrolled`
+  (12.7%)、`clear_page_orig`(8.1%)、`tcp_send_ack`(8.1%)吻合
+
+**这与 frp 是同一条路径**(frps 的 `do_syscall_64` 也占 52%)。
+差别在于 rh 的 syscall 占比更高(77% vs 52%),即 rh 做了**更多次**
+系统调用 —— 但 `recvfrom` 16100 次 / 12s = 1342 次/秒、
+`writev` 5063 / 12s = 422 次/秒,按 1.3 Gbps 计算,**每次 recvfrom
+平均 97KB、每次 writev 平均 310KB**,块已经不小。
+
+### 74.10 结论
+
+上行 P=16 的差距(13~25%)在**内核 TCP 收发的每字节成本**上,而这部
+分两个实现都要付。rh 用一半 CPU 达到 frp 76% 吞吐(round-66),说明
+**rh 不是更差,而是更省**。
+
+已证伪 15 项(新增:同步锁等待)。**目前没有证据表明还存在一个
+"rh 特有的、可修的"上行瓶颈。**

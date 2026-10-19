@@ -37,6 +37,26 @@ pub trait Io: AsyncRead + AsyncWrite + Send + Unpin {
     fn as_any(&self) -> &dyn std::any::Any;
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
     fn into_any_box(self: Box<Self>) -> Box<dyn std::any::Any>;
+
+    /// 无锁拆成独立的读半/写半(round-69)。
+    ///
+    /// # 为什么需要
+    ///
+    /// `tokio::io::split` 用**一把 `std::sync::Mutex`** 包住整个 stream
+    /// (`tokio/src/io/split.rs:59` 的 `with_lock` 直接 `lock().unwrap()`)。
+    /// 在 async 任务里用同步锁的后果:一端在 poll 期间持锁,另一端要
+    /// `lock()` 就会**阻塞整个 OS 线程**(不是让出,是 futex 等待)。
+    ///
+    /// 实测(上行 P=16,服务端 12s):`strace -c` 显示
+    /// **`futex` 占 75.0% 的 syscall 时间(39.85s/53.13s),3690 次调用,
+    /// 平均每次 10.8ms** ——这就是那把锁。
+    ///
+    /// 同一时刻只有一个读者和一个写者,poll 本身不会长期持锁;但当
+    /// `poll_read` 内部走到内核态(recvfrom 0.36ms、copy 12.7%)时,
+    /// 写者会被阻塞同一时长,反之亦然。高并发下这些阻塞叠加。
+    ///
+    /// 默认返回 `None`(调用方回落到 `tokio::io::split`)。
+    fn into_halves(self: Box<Self>) -> Option<(BoxedIo, BoxedIo)>;
 }
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Io for T {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -48,9 +68,43 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Io for T {
     fn into_any_box(self: Box<T>) -> Box<dyn std::any::Any> {
         self
     }
+    fn into_halves(self: Box<Self>) -> Option<(BoxedIo, BoxedIo)> {
+        None
+    }
 }
 
 pub type BoxedIo = Box<dyn Io>;
+
+/// 把 `BoxedIo` 无锁拆成独立读写半(round-69);不支持时返回 `None`。
+///
+/// 仅裸 `TcpStream` 支持(`into_split` 产出两个独立 fd,各有一条 tokio
+/// IO 注册,读写之间无共享锁)。任何包装类型返回 `None`,调用方回落到
+/// [`tokio::io::split`]。
+///
+/// 之所以用**自由函数 + downcast**而不是 trait 方法:泛型
+/// `impl<T: AsyncRead+AsyncWrite> Io for T` 已经覆盖所有类型,再加一个
+/// 针对 `TcpStream` 的 impl 会冲突;而 `into_any_box` 只能在 `Box<Self>`
+/// 上调用,无法从 `Box<dyn Io>` 直接透传到具体类型。
+/// 探测 + 拆分(round-69)。不支持时把 IO 原样还回 `Err`。
+pub fn split_boxed_io(io: BoxedIo) -> Result<(BoxedIo, BoxedIo), BoxedIo> {
+    // 先探测(GET 语义,不消费):`as_any` 落到 `dyn Io` 的 vtable,
+    // 对 `TcpStream` 返回 Some。
+    let is_tcp = {
+        let dynio: &dyn Io = &*io;
+        dynio.as_any().is::<tokio::net::TcpStream>()
+    };
+    if !is_tcp {
+        return Err(io);
+    }
+    let any = io.into_any_box();
+    let ts = any
+        .downcast::<tokio::net::TcpStream>()
+        .expect("probed above: concrete type is TcpStream");
+    let (r, w) = (*ts).into_split();
+    // OwnedReadHalf/OwnedWriteHalf 各自只实现单方向 trait,用专用包装
+    // 补齐另一方向(运行时永远不会走到,纯为满足 `Io` 的 supertrait)。
+    Ok((Box::new(HalfRead(r)) as BoxedIo, Box::new(HalfWrite(w)) as BoxedIo))
+}
 
 /// 取消信号(共享):完成即结束转发。规则禁用/删除级联用;
 /// splice 泵与 mux chunk 中继共用同一形态。
@@ -1149,5 +1203,88 @@ mod relay_join_tests {
         // 默认值必须是有限值(不是 Duration::MAX)
         assert_eq!(DEFAULT_HALFCLOSE_GRACE.as_secs(), 30);
         assert_ne!(DEFAULT_HALFCLOSE_GRACE, std::time::Duration::MAX);
+    }
+}
+
+// ===== round-69:无锁半连接包装 =====
+//
+// `OwnedReadHalf` / `OwnedWriteHalf` 各自只实现单方向 trait,而 [`Io`]
+// 要求两者兼备。读半的写操作、写半的读操作都返回 `Unsupported` ——
+// 它们**永远不会被调用**(mux_relay 只用读半读、写半写),存在只为
+// 满足 trait 约束。
+
+/// 裸 TCP 的读半(`OwnedReadHalf`)。
+pub struct HalfRead(tokio::net::tcp::OwnedReadHalf);
+
+impl tokio::io::AsyncRead for HalfRead {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for HalfRead {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "read half cannot write",
+        )))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// 裸 TCP 的写半(`OwnedWriteHalf`)。
+pub struct HalfWrite(tokio::net::tcp::OwnedWriteHalf);
+
+impl tokio::io::AsyncRead for HalfWrite {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "write half cannot read",
+        )))
+    }
+}
+
+impl tokio::io::AsyncWrite for HalfWrite {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
     }
 }

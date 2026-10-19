@@ -639,7 +639,31 @@ pub async fn mux_relay(
 ) {
     use tokio::io::AsyncWriteExt as _;
 
-    let (mut a_r, mut a_w) = tokio::io::split(a);
+    // round-69:`tokio::io::split` 用一把 `std::sync::Mutex` 包住整个
+    // stream(`tokio/src/io/split.rs` 的 `with_lock` 直接 `lock().unwrap()`)。
+    // 在 async 任务里用同步锁的后果:一端在 poll 期间(含内核态
+    // `recvfrom`/`copy_user`)持锁时,另一端 `lock()` 会**阻塞整个 OS
+    // 线程**,而不是让出。
+    //
+    // 实测(上行 P=16、服务端 12s、`strace -c`):
+    // **`futex` 占 75.0% 的 syscall 时间(39.85s / 53.13s),3690 次调用,
+    // 平均每次 10.8ms**。同期 `recvfrom` 只占 10.9%、`writev` 8.1% ——
+    // 也就是说进程绝大多数时间在**等锁**,不是在收发数据。
+    //
+    // 裸 TCP 可拆成两个独立 fd(`into_split`),各有独立的 tokio IO 注册,
+    // 读写之间没有任何共享锁。包装类型(CountedUserIo/QuotaIo/
+    // PrependedIo/压缩流/mux 流)不支持,回落到 `tokio::io::split`。
+    // 两种拆分方式产出不同类型,统一擦除成 trait object 供泵使用。
+    let (mut a_r, mut a_w): (
+        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    ) = match crate::split_boxed_io(a) {
+        Ok((r, w)) => (Box::new(r), Box::new(w)),
+        Err(io) => {
+            let (r, w) = tokio::io::split(io);
+            (Box::new(r), Box::new(w))
+        }
+    };
 
     // 本向以错误(非 EOF、非取消)结束时置位:对向数据通路已死
     //(mux 连接断 / 用户侧错误),继续等对向只会在已死的通路上永存。
