@@ -139,6 +139,8 @@ async fn verify(
 ) -> io::Result<(crate::BoxedIo, Option<crate::BoxedIo>, bool)> {
     stream.set_nodelay(true).ok();
     set_tcp_keepalive(&stream);
+    // round-41:载体发送缓冲调优(默认 0 = 不触碰,零漂移)
+    apply_carrier_sndbuf(&stream);
     // round-E2:裸 TCP 分支(tls.is_none() && !ws_upgrade)在装箱前产生
     // 写侧 fd 副本,供 accept 交付时走 duplex mux。peek_prefix 只从主
     //(读)侧消费 4 字节——双 fd 共享同一内核收队列,但写侧绝不读
@@ -208,6 +210,62 @@ fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     let s = SockRef::from(stream);
     let ka = TcpKeepalive::new().with_time(Duration::from_secs(30));
     let _ = s.set_tcp_keepalive(&ka);
+}
+
+/// 载体 TCP socket 的 `SO_SNDBUF` 目标值(round-41,**默认 0 = 不触碰**)。
+///
+/// 本项目此前**刻意**不碰 `SO_SNDBUF`/`SO_RCVBUF`(`splice.rs:1716` 红线:
+/// "不为制造背压触碰任何 SO_RCVBUF/SO_SNDBUF")。本开关不改变该立场——
+/// 默认行为与改动前逐字节一致,只在显式设置 `RH_MUX_SNDBUF` 时才调用
+/// `setsockopt`,用于给"发送缓冲是否限制吞吐"这个**从未被单独测过的
+/// 变量**一个明确判决。
+///
+/// 背景(为什么值得测一次):
+/// * 实测载体 `SO_SNDBUF` = 87,040 B ≈ 85 KiB(内核 autotune,见
+///   `benchmark/runs/goal-repair/targeted-before-round-3/REPORT.md:26`);
+/// * 0.3 ms RTT 下 2.4 Gbps 的 BDP ≈ 90 KiB ⇒ **发送缓冲正好一个 BDP,
+///   没有余量吸收突发**;
+/// * 而 `pump_down` 一次冲刷是 1 MiB 批(`mux.rs` `DOWN_BATCH_BYTES`),
+///   约 11 倍 BDP ⇒ 必然被内核切成多次部分写。
+///
+/// 反向证据(一并记录,避免过度期待):refrelay(无 yamux、64 KiB 单写)
+/// 同样停在 2.0 G;splice 路径 `NOTSENT_LOWAT=1MiB` 已生效仍 2.0 G;
+/// 三个独立实现都在 2.0 G。**故本项预期收益可能为 0——测出 0 也是有
+/// 价值的结论。**
+///
+/// 取值:未设或 0 → 不设置;否则钳到 [4096, 64 MiB],非法值忽略走默认。
+///
+/// 注意 Linux 会把 `setsockopt(SO_SNDBUF)` 的值**翻倍**(内核预留一半给
+/// 协议开销),所以设置 N 之后读回通常是 2N。
+fn carrier_sndbuf() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        parse_carrier_sndbuf(std::env::var("RH_MUX_SNDBUF").ok().as_deref())
+    })
+}
+
+/// [`carrier_sndbuf`] 的纯函数内核(可单测,不碰进程级 env)。
+///
+/// 规则:`None`/空/非法/0 → 0(不设置);否则钳到 [4096, 64 MiB]。
+fn parse_carrier_sndbuf(raw: Option<&str>) -> usize {
+    match raw.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(0) | None => 0,
+        Some(n) => n.clamp(4096, 64 * 1024 * 1024),
+    }
+}
+
+/// 应用 [`carrier_sndbuf`](若有)。**失败静默忽略**:旧内核/权限不足/
+/// 非 TCP socket 都不应让建连失败或进程退出。
+///
+/// 默认(env 未设/为 0)走空分支,**不调用任何 setsockopt**——这是零漂移
+/// 红线,由 `tests::sndbuf_default_is_noop` 守住。
+fn apply_carrier_sndbuf(stream: &tokio::net::TcpStream) {
+    let want = carrier_sndbuf();
+    if want == 0 {
+        return;
+    }
+    use socket2::SockRef;
+    let _ = SockRef::from(stream).set_send_buffer_size(want);
 }
 
 /// mux_streams:并发流上限的有效值(0 已折算),每连接 accept 时读取 → 热改对新连接生效。
@@ -470,5 +528,98 @@ async fn dial_tcp(cfg: &ClientTransportConfig) -> io::Result<tokio::net::TcpStre
     };
     stream.set_nodelay(true).ok();
     set_tcp_keepalive(&stream);
+    // round-41:载体发送缓冲调优(默认 0 = 不触碰,零漂移)
+    apply_carrier_sndbuf(&stream);
     Ok(stream)
+}
+
+#[cfg(test)]
+mod sndbuf_tests {
+    use super::*;
+
+    /// 纯函数内核:未设/空/非法/0 都必须是 0(= 不设置,零漂移红线)。
+    #[test]
+    fn parse_defaults_to_noop() {
+        assert_eq!(parse_carrier_sndbuf(None), 0, "未设 env 必须不触碰");
+        assert_eq!(parse_carrier_sndbuf(Some("")), 0, "空值必须不触碰");
+        assert_eq!(parse_carrier_sndbuf(Some("0")), 0, "显式 0 必须不触碰");
+        assert_eq!(parse_carrier_sndbuf(Some("abc")), 0, "非法值必须不触碰");
+        assert_eq!(parse_carrier_sndbuf(Some("  ")), 0, "空白必须不触碰");
+        assert_eq!(parse_carrier_sndbuf(Some("-1")), 0, "负值必须不触碰");
+    }
+
+    /// 合法值原样采用,并钳到 [4096, 64 MiB]。
+    #[test]
+    fn parse_clamps_to_range() {
+        assert_eq!(parse_carrier_sndbuf(Some("4194304")), 4 * 1024 * 1024);
+        assert_eq!(parse_carrier_sndbuf(Some(" 1048576 ")), 1024 * 1024, "允许空白");
+        assert_eq!(parse_carrier_sndbuf(Some("1")), 4096, "过小钳到 4096");
+        assert_eq!(
+            parse_carrier_sndbuf(Some("999999999999")),
+            64 * 1024 * 1024,
+            "过大钳到 64 MiB"
+        );
+    }
+
+    /// 零漂移红线:默认路径**不调用任何 setsockopt**,socket 的发送缓冲
+    /// 与未调用前逐字节一致。
+    ///
+    /// 用真实 TCP 连接(loopback)读回 `send_buffer_size` 比对:内核 autotune
+    /// 的初值在同一进程内是确定的,所以"调用前 == 调用后"是可判定断言。
+    #[tokio::test]
+    async fn sndbuf_default_is_noop() {
+        use socket2::SockRef;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = accept.await.unwrap().unwrap();
+
+        // 前置条件:该测试进程未设置 RH_MUX_SNDBUF(否则跳过,避免受
+        // 外部环境干扰而误报)。
+        if carrier_sndbuf() != 0 {
+            eprintln!("RH_MUX_SNDBUF 已设置为非 0,跳过零漂移断言");
+            return;
+        }
+
+        let before = SockRef::from(&client).send_buffer_size().unwrap();
+        apply_carrier_sndbuf(&client);
+        let after = SockRef::from(&client).send_buffer_size().unwrap();
+        assert_eq!(
+            before, after,
+            "默认(env 未设)时不得改动 SO_SNDBUF:before={before} after={after}"
+        );
+
+        // 服务端同理(verify 路径)
+        let sb = SockRef::from(&server).send_buffer_size().unwrap();
+        apply_carrier_sndbuf(&server);
+        let sa = SockRef::from(&server).send_buffer_size().unwrap();
+        assert_eq!(sb, sa, "默认时服务端侧同样不得改动 SO_SNDBUF");
+    }
+
+    /// 显式设置生效:Linux 会把 `setsockopt(SO_SNDBUF)` 翻倍,故断言
+    /// 读回值 >= 目标(而不是 ==)。
+    ///
+    /// 直接调 socket2 设值(不经 env,避免进程级 OnceLock 与并行测试冲突),
+    /// 验证"选定的 API 在该平台可用且语义如预期"——这是 `apply_carrier_sndbuf`
+    /// 的实现依据。
+    #[tokio::test]
+    async fn sndbuf_explicit_set_takes_effect() {
+        use socket2::SockRef;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = accept.await.unwrap().unwrap();
+
+        let target = 4 * 1024 * 1024;
+        SockRef::from(&client).set_send_buffer_size(target).unwrap();
+        let got = SockRef::from(&client).send_buffer_size().unwrap();
+        assert!(
+            got >= target,
+            "Linux 会翻倍,读回应 >= 目标:target={target} got={got}"
+        );
+    }
 }
