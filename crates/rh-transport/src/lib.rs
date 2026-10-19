@@ -13,7 +13,7 @@ pub mod kcp;
 pub mod mux;
 pub use mux::{
     wrap_stream_as_client, wrap_stream_as_server, PoolRedial, YamuxMultiplexer,
-    YamuxMultiplexerPool, MUX_STREAMS_UNLIMITED, YAMUX_POOL_DEFAULT_CARRIERS,
+    YamuxMultiplexerPool, MUX_STREAMS_UNLIMITED,
 };
 pub mod proxy_dial;
 pub mod quic;
@@ -363,6 +363,15 @@ impl fmt::Display for Protocol {
 /// 多载体池协议基线(round-10):tls/wss 受单核串行加解密限制,默认多载体;
 /// tcp/ws 单载体已接近路径上限(实测 t/d 0.973~1.077),保持 1;
 /// QUIC/KCP 自带多路复用,恒 1。
+///
+/// # 这是默认 K 的唯一来源(round-45)
+///
+/// 默认载体数**只**由本函数决定。调用链:
+/// `mux_pool_size`(None) → 本函数 → `min(hardware_cap)` →
+/// `final_k = initial_k.min(server_cap)`(服务端收敛只减不增)。
+///
+/// 曾经有一个「池默认载体数 = 4」的常量从未被读取,却让多份设计文档误以为
+/// 默认 K 是 4;已删除。**若将来要改默认载体数,改这里,不要再引入同类常量。**
 ///
 /// 该值只是**期望值**,最终 K 还要经硬件探测与服务端 `max_carriers` 收敛
 /// (见 rh-client 的 pool sizing);此处不读环境/配置。
@@ -772,7 +781,17 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
 
 /// 客户端:建立 K 条物理连接组成多载体池(round-8 优化项 5)。TCP/TLS/
 /// WS/WSS 多路复用路径走池(`carriers <= 1` 时等价 [`connect`]);QUIC/KCP
-/// 自带多路复用,忽略 carriers 走单连接。推荐 K = [`YAMUX_POOL_DEFAULT_CARRIERS`]。
+/// 自带多路复用,忽略 `carriers` 走单连接。
+///
+/// # K 的取值(round-45 修正)
+///
+/// 本函数**不决定** K,由调用方显式传入。默认值见
+/// [`default_carriers`]:tcp/ws = 1,tls/wss = 2,quic/kcp = 1。
+/// 显式配置见 `rh-client` 的 `mux_pool_size`(env `RH_MUX_POOL_SIZE`)。
+///
+/// 曾经此处写「推荐 K = 4」并引用一个从未被读取的常量,那与实现不符——
+/// [`default_carriers`] 的上限是 2,服务端收敛只减不增,默认路径永远
+/// 到不了 4。该常量已删除。
 pub async fn connect_pool(
     cfg: &ClientTransportConfig,
     carriers: usize,

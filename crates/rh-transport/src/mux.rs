@@ -1308,9 +1308,6 @@ impl YamuxMultiplexer {
 // 串行加解密上限。某载体异常断开时从活跃池剔除并自动重拨,其余载体
 // 上的存量流不受影响(消除单 TCP 物理拥塞丢包的全局队头阻塞)。
 
-/// 池推荐默认载体数(任务规格:K=4)。
-pub const YAMUX_POOL_DEFAULT_CARRIERS: usize = 4;
-
 /// 重拨配方:重新建立一条物理载体并包装为 YamuxMultiplexer(客户端侧;
 /// 服务端成员不可主动拨号,死亡即永久剔除)。
 pub type PoolRedial = Arc<
