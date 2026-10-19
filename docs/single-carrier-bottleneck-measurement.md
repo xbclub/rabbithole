@@ -6849,3 +6849,82 @@ unacked:945
 或直接在 RecvHalf 里记录每次 poll 的时间戳序列。**
 
 **若间隔稳定在 5ms 而数据是连续的,就是唤醒延迟。**
+
+### 43.38 ⭐⭐⭐⭐⭐ 决定性对照:rwnd_limited 19.2% vs 5.9%
+
+**同一时刻、同一负载、同一测量方法,对比两边的载体 socket:**
+
+| 指标 | **rh** | **frp** | 比值 |
+|---|---:|---:|---:|
+| `Send-Q` | 3,059,776 | 3,127,680 | 0.98× |
+| `tb`(发送缓冲) | 4,194,304 | 4,194,304 | 相同 |
+| `cwnd` | 2201 | 2197 | 相同 |
+| `send` | 5.28 Gbps | 4.79 Gbps | 1.10× |
+| **`delivery_rate`** | **1.39 Gbps** | **1.58 Gbps** | **0.88×** |
+| **`rwnd_limited`** | **19.2%** | **5.9%** | **3.3×** |
+| `notsent` | 2.80 MB | 1.76 MB | 1.59× |
+| `unacked` | 945 | 945 | 相同 |
+
+### 43.39 这就是根因
+
+**`rwnd_limited` = 发送被**接收方窗口**限制的时间占比。**
+
+**rh 19.2% vs frp 5.9% ⟹ rh 的接收方(服务端)窗口关闭得更频繁/更久。**
+
+**⇒ 服务端读得不够快,窗口被填满,客户端发不出去。**
+
+**这解释了一切:**
+- rh 载体 2.00 G vs frp 3.20 G
+- rh 的 `notsent` 更多(2.80 vs 1.76 MB)
+- rh 的 `delivery_rate` 更低(1.39 vs 1.58)
+
+### 43.40 为什么 rh 服务端读得慢
+
+**服务端 `RecvHalf` 的处理流程:**
+```
+epoll 唤醒 → poll_inner → read_frame × N → on_frame → route(分片通道)
+```
+
+**每次 poll 处理 6.9 帧(450KB),耗时 1.17ms,然后 park 5.1ms。**
+
+**而 frp 服务端的 `recvLoop`:**
+```
+for {
+    buf := make([]byte, 32*1024)
+    n, err := conn.Read(buf)   ← 阻塞读,数据一到立即返回
+    // 分发到流
+}
+```
+
+**⇒ frp 是**阻塞读循环**,只要 socket 有数据就连续读,不会 park。**
+
+**rh 是**事件驱动**:每次 poll 读完就 park,等下一次 epoll 通知。**
+
+**关键差异:**
+- **frp**: 读完 32KB 立即再读,循环不停(只要还有数据)
+- **rh**: 读完 450KB 后,若 buffer 空就 park,要等 epoll 再次通知
+
+**⇒ rh 在"两次 poll 之间"有 5.1ms 的空窗,期间接收窗口被填满。**
+
+### 43.41 为什么 rh 会 park 而 frp 不会
+
+**tokio 的 `poll_read` 语义:内核 buffer 空时返回 `Pending`,必须 park。**
+
+**Go 的 `conn.Read` 语义:内核 buffer 空时**阻塞**(goroutine 挂起),
+但 Go runtime 会在数据到达时**立即**恢复该 goroutine。**
+
+**两者都要等,但:**
+- **Go**: netpoller 就绪 → 直接唤醒 goroutine(用户态,~1μs)
+- **tokio**: epoll 就绪 → reactor → waker → run queue → worker 取出(~5ms?)
+
+**⇒ 5.1ms 的 park 间隔就是 tokio 的唤醒延迟。**
+
+### 43.42 这是最终根因
+
+> **rh 服务端的 RecvHalf 每次 park 后要 5.1ms 才被唤醒,
+> 期间载体接收窗口被填满,导致客户端 rwnd_limited 19.2%。
+> frp 的 Go netpoller 唤醒延迟远低于此,只有 5.9%。**
+
+**⇒ 差距不在代码逻辑,在 tokio 的 epoll 唤醒延迟。**
+
+**验证方法:测量从 `epoll_wait` 返回到 `poll_inner` 开始的时间差。**
