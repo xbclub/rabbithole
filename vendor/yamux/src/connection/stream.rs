@@ -318,6 +318,9 @@ impl Stream {
     /// 零拷贝读:取出接收缓冲链首一整块 [`bytes::Bytes`](引用计数切片)。
     /// 语义与 [`futures::stream::Stream`] 实现一致(含窗口更新与 EOF);
     /// `Ok(None)` = EOF/流复位。rabbithole vendor 转发路径专用。
+    ///
+    /// 回窗时机对齐 frp(round-31 项 2):**先取块、后判定回窗**,缓冲
+    /// 长度按取出之后计。修前先回窗后取块,授信恒少算一块已消费数据。
     pub fn poll_read_chunk(
         mut self: Pin<&mut Self>,
         cx: &mut Context,
@@ -339,6 +342,31 @@ impl Stream {
         }
         let mut shared = self.shared();
         if let Some(bytes) = shared.buffer.pop() {
+            // 取出后判定:缓冲已缩一块,额度按取出后的长度算(同 frp)。
+            if let Some(credit) = shared.pending_window_update() {
+                shared.commit_window_update(credit);
+                drop(shared);
+                // 快车道可用时直压 to_send;否则走流级 mpsc(容量已在
+                // 上面 poll_ready 确认,start_send 无失败)。
+                if self.conn_shared.is_some() && self.flag == Flag::None {
+                    let frame: Frame<Either<Data, WindowUpdate>> =
+                        Frame::window_update(self.id, credit).right();
+                    self.conn_shared
+                        .as_ref()
+                        .expect("checked is_some")
+                        .push_to_send(frame.into());
+                } else {
+                    let mut frame = Frame::window_update(self.id, credit).right();
+                    self.add_flag(frame.header_mut());
+                    if self
+                        .window_update_sender
+                        .start_send(StreamCommand::SendFrame(frame))
+                        .is_err()
+                    {
+                        return Poll::Ready(Err(self.write_zero_err()));
+                    }
+                }
+            }
             return Poll::Ready(Ok(Some(bytes)));
         }
         if !shared.state().can_read() {
@@ -482,8 +510,30 @@ pub struct StreamReadHalf {
     conn_shared: Option<Arc<ConnShared>>,
 }
 
+/// [`StreamReadHalf::poll_read_chunk`] 快车道单锁热路径的判定结果:
+/// 锁内一次算完"取块 / 回窗额度 / EOF / park",锁外只做帧压入与返回
+/// (压入是 infallible 的 to_send 快车道,不违反"记账后必发出")。
+enum ReadStep {
+    /// 取到一块数据;`credit` = 本轮同时授出的窗口额度。
+    Data(bytes::Bytes, Option<u32>),
+    /// 流已不可读且缓冲为空:EOF。
+    Eof,
+    /// 缓冲为空且可读:已注册 reader waker(并复查过 buffer),附带
+    /// park 时刻的 send_window(round-11 诊断用)与本轮应授出的额度。
+    Parked(Option<u32>, u32),
+}
+
 impl StreamReadHalf {
     /// 同 [`Stream::poll_read_chunk`]。
+    ///
+    /// 快车道(有 `ConnShared`)走**单次取锁热路径**:状态检查、取块、
+    /// 回窗判定、记账一次锁内完成(round-31 项 2+3)。修前每次取块取锁
+    /// 四次(`state.can_read` / `ack_pending` / `next_window_update` /
+    /// `buffer.pop`),且回窗判定用的是**取出之前**的缓冲长度——rh 先回窗
+    /// 后取块,frp 先取块后回窗(`benchmark/frp-yamux-src/stream.go`
+    /// `Read`:`s.recvBuf.Read(b)` 之后才 `s.sendWindowUpdate()`),同一
+    /// 窗口下 rh 的授信恒比 frp 少算一块已消费数据,对端在 BDP 边缘会多
+    /// 停一拍。
     pub fn poll_read_chunk(&mut self, cx: &mut Context) -> Poll<io::Result<Option<bytes::Bytes>>> {
         let __sd = crate::sched_diag::enabled();
         if __sd { crate::sched_diag::on_poll(); crate::sched_diag::begin_poll(); }
@@ -491,6 +541,97 @@ impl StreamReadHalf {
             if __sd { crate::sched_diag::end_poll(); }
             return Poll::Ready(Ok(None));
         }
+
+        // ── 快车道热路径:一次取锁 ───────────────────────────────────
+        // 只在"有 ConnShared(纯 WU 走 to_send 快车道,压入 infallible)"
+        // 且"无待补 ACK"时启用——带 ACK 的 0-credit WU 属带 flag 帧,必须
+        // 走旧 mpsc 通路保流内 FIFO(见 `send_window_update` 注释),那条
+        // 路要求**先确认容量再记账**,与单锁热路径不相容,保持原样为冷路径。
+        if self.conn_shared.is_some() {
+            let step = {
+                let mut shared = self.shared();
+                if shared.ack_pending {
+                    None
+                } else {
+                    let can_read = shared.state.can_read();
+                    let bytes = shared.buffer.pop();
+                    // 回窗判定:缓冲长度取**取出之后**(对齐 frp 的
+                    // `recvBuf.Read` → `sendWindowUpdate` 顺序)。快车道的
+                    // 压入无失败可能,故锁内记账安全(不会出现"已记账未发出")。
+                    let credit = if can_read {
+                        shared.pending_window_update()
+                    } else {
+                        None
+                    };
+                    if let Some(c) = credit {
+                        shared.commit_window_update(c);
+                    }
+                    match bytes {
+                        Some(bytes) => Some(ReadStep::Data(bytes, credit)),
+                        None if can_read => {
+                            // park:同一把锁内注册 waker + 复查 buffer
+                            // (round-11 丢唤醒防线,见原实现注释)
+                            shared.reader = Some(cx.waker().clone());
+                            match shared.buffer.pop() {
+                                Some(bytes) => {
+                                    shared.reader = None; // 撤销注册:本 poll 已直接交付
+                                    Some(ReadStep::Data(bytes, credit))
+                                }
+                                None => {
+                                    Some(ReadStep::Parked(
+                                        credit,
+                                        shared.flow_controller.send_window(),
+                                    ))
+                                }
+                            }
+                        }
+                        None => Some(ReadStep::Eof),
+                    }
+                }
+            };
+            match step {
+                Some(ReadStep::Data(bytes, credit)) => {
+                    if let Some(credit) = credit {
+                        // 快车道:纯 WU 帧直压 to_send(FlushTask 下一轮即取)
+                        let frame: Frame<Either<Data, WindowUpdate>> =
+                            Frame::window_update(self.id, credit).right();
+                        self.conn_shared
+                            .as_ref()
+                            .expect("hot lane requires ConnShared")
+                            .push_to_send(frame.into());
+                    }
+                    if __sd { crate::sched_diag::end_poll(); }
+                    return Poll::Ready(Ok(Some(bytes)));
+                }
+                Some(ReadStep::Eof) => {
+                    log::debug!("{}/{}: eof", self.conn, self.id);
+                    if __sd { crate::sched_diag::end_poll(); }
+                    return Poll::Ready(Ok(None));
+                }
+                Some(ReadStep::Parked(credit, send_window)) => {
+                    if let Some(credit) = credit {
+                        // 缓冲已空但仍越过半窗阈值(全量消费后回补):授信
+                        // 直压 to_send,使对端不必等下一次读即恢复发送。
+                        let frame: Frame<Either<Data, WindowUpdate>> =
+                            Frame::window_update(self.id, credit).right();
+                        self.conn_shared
+                            .as_ref()
+                            .expect("hot lane requires ConnShared")
+                            .push_to_send(frame.into());
+                    }
+                    if crate::sched_diag::enabled() {
+                        crate::sched_diag::on_park_with_window(send_window);
+                        crate::sched_diag::on_park();
+                    }
+                    if __sd { crate::sched_diag::end_poll(); }
+                    return Poll::Pending;
+                }
+                // ack_pending:落冷路径(带 ACK 的 WU 走旧 mpsc 通路)
+                None => {}
+            }
+        }
+
+        // ── 冷路径:待补 ACK / 无 ConnShared(Active 与单测直构形态) ──
         match self.send_window_update(cx) {
             Poll::Ready(Ok(())) => {}
             // C3:同 Stream::poll_read_chunk——缓冲优先于通道错误交付。
@@ -1081,6 +1222,17 @@ impl Shared {
 
     pub(crate) fn next_window_update(&mut self) -> Option<u32> {
         self.flow_controller.next_window_update(self.buffer.len())
+    }
+
+    /// 回窗额度判定(纯函数,不记账):缓冲长度取**当前**值。调用方须在
+    /// "取块之后"调用才与 frp 同语义(见 [`StreamReadHalf::poll_read_chunk`])。
+    pub(crate) fn pending_window_update(&self) -> Option<u32> {
+        self.flow_controller.pending_window_update(self.buffer.len())
+    }
+
+    /// 记账本轮授出的额度(须紧随无失败的帧压入)。
+    pub(crate) fn commit_window_update(&mut self, credit: u32) {
+        self.flow_controller.commit_window_update(credit);
     }
 
     /// Whether we are still waiting for the remote to acknowledge this stream.

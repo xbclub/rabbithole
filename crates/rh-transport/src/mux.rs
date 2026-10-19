@@ -335,6 +335,15 @@ pub mod pump_diag {
     /// 单次读等待 > 10ms 的次数
     pub static VERY_SLOW_READS: AtomicU64 = AtomicU64::new(0);
     pub static SLOW_WRITES: AtomicU64 = AtomicU64::new(0);
+    /// round-31:写路径时间再分解——`WRITE_NS` 里有多少花在**等限速器**
+    /// (`reserve`)上、多少花在**真正的 socket 写**上。跨机下行 1.7G
+    /// (上行 2.4G)时 `write_ms` 占 98%,必须区分"被限速器拖住"与
+    /// "socket 写不出去"两种完全不同的病因。
+    pub static RESERVE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static SOCKWRITE_NS: AtomicU64 = AtomicU64::new(0);
+    /// 单次 socket 写返回 0 或部分写(< 请求量)的次数:部分写是
+    /// 发送缓冲满的直接证据。
+    pub static PARTIAL_WRITES: AtomicU64 = AtomicU64::new(0);
     /// round-13:上一轮 read 返回到本轮 read 开始之间的间隔(循环开销)。
     pub static LOOP_GAP_NS: AtomicU64 = AtomicU64::new(0);
     pub static LOOP_GAP_N: AtomicU64 = AtomicU64::new(0);
@@ -387,6 +396,19 @@ rd_per_blk_ms={:.2} wr_per_blk_ms={:.2}",
             eprintln!(
                 "PUMP_RF {tag} ready_first={rf} pend_first={pf} ready_pct={:.1}%",
                 rf as f64 * 100.0 / tot as f64
+            );
+        }
+        // round-31:写时间分解——等限速器 vs 等 socket。
+        let rs = RESERVE_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        let sw = SOCKWRITE_NS.load(Ordering::Relaxed) as f64 / 1e6;
+        let pw = PARTIAL_WRITES.load(Ordering::Relaxed);
+        if wr_ns > 0 {
+            eprintln!(
+                "PUMP_WSPLIT {tag} reserve_ms={rs:.0}({:.0}%) sockwrite_ms={sw:.0}({:.0}%) \
+partial_writes={pw} sockwrite_per_blk_ms={:.2}",
+                if wr_ms > 0.0 { rs * 100.0 / wr_ms } else { 0.0 },
+                if wr_ms > 0.0 { sw * 100.0 / wr_ms } else { 0.0 },
+                if wr_cnt > 0 { sw / wr_cnt as f64 } else { 0.0 },
             );
         }
     }
@@ -645,21 +667,43 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         limiter: &Option<std::sync::Arc<dyn crate::ChunkLimiter>>,
     ) -> bool {
         use tokio::io::AsyncWriteExt as _;
+        let __d = pump_diag::enabled();
+        let __t0 = if __d { Some(std::time::Instant::now()) } else { None };
         let mut res = match limiter {
             Some(l) => Some(l.reserve(b.len()).await),
             None => None,
         };
+        if let Some(t) = __t0 {
+            pump_diag::RESERVE_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        let __t1 = if __d { Some(std::time::Instant::now()) } else { None };
         let mut off = 0usize;
+        let mut partial = 0u64;
         while off < b.len() {
             match w.write(&b[off..]).await {
                 Ok(0) => return false, // WriteZero:写侧不可用
                 Ok(k) => {
+                    if k < b.len() - off {
+                        partial += 1;
+                    }
                     off += k;
                     if let Some(r) = res.as_mut() {
                         r.consume(k);
                     }
                 }
                 Err(_) => return false,
+            }
+        }
+        if let Some(t) = __t1 {
+            pump_diag::SOCKWRITE_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if partial > 0 {
+                pump_diag::PARTIAL_WRITES.fetch_add(partial, std::sync::atomic::Ordering::Relaxed);
             }
         }
         true

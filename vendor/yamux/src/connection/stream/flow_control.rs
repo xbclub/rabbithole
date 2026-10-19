@@ -51,11 +51,16 @@ impl FlowController {
         }
     }
 
-    /// Calculate the number of additional window bytes the receiving side (local) should grant the
-    /// sending side (remote) via a window update message.
+    /// 计算本轮应授出的额度(**纯函数,无记账副作用**)。
     ///
     /// Returns `None` if too small to justify a window update message.
-    pub(crate) fn next_window_update(&mut self, buffer_len: usize) -> Option<u32> {
+    ///
+    /// 与 [`FlowController::commit_window_update`] 成对使用:先算后记,
+    /// 中间可以插入"帧能否发出"的判定(容量确认),从而把**记账**从
+    /// **决策**里拆出来。修前 `next_window_update` 计算与记账合一,任何
+    /// "先记账、后发现发不出去"的路径都会永久丢失窗口额度,这也是读路径
+    /// 必须把回窗判定拆成多次取锁(容量确认 → 记账 → 压帧)的根因。
+    pub(crate) fn pending_window_update(&self, buffer_len: usize) -> Option<u32> {
         self.assert_invariants(buffer_len);
 
         let bytes_received = self.max_receive_window - self.receive_window;
@@ -66,20 +71,34 @@ impl FlowController {
         if next_window_update < self.max_receive_window / 2 {
             return None;
         }
+        Some(next_window_update)
+    }
 
+    /// 记账:确认本轮额度**已确定授出**(调用方须保证紧随其后是无失败的
+    /// 帧压入/发送)。幂等于"额度 > 0"的 [`Self::pending_window_update`]。
+    pub(crate) fn commit_window_update(&mut self, credit: u32) {
         // round-E1:恒定窗——对齐 frp v0.2.0(窗口永不自增),此处只回补
         // 已耗额度;BDP 自增与连接预算钳制均已删除。
         // 预授信差额在建流时已授出(round-4/B1;排队失败的兜底路径则随
         // 本窗口更新授出)——标记消费与授出配套。
         self.pregrant_pending = false;
-        self.receive_window += next_window_update;
-
-        self.assert_invariants(buffer_len);
+        self.receive_window += credit;
 
         // round-22 诊断:统计实际发出的 WU credit 分布。
-        crate::sched_diag::on_wu_credit(next_window_update as u64);
+        crate::sched_diag::on_wu_credit(credit as u64);
+    }
 
-        Some(next_window_update)
+    /// 计算并立即记账(旧语义,供"记账后必有 infallible 压入"的调用点)。
+    ///
+    /// Calculate the number of additional window bytes the receiving side (local) should grant the
+    /// sending side (remote) via a window update message.
+    ///
+    /// Returns `None` if too small to justify a window update message.
+    pub(crate) fn next_window_update(&mut self, buffer_len: usize) -> Option<u32> {
+        let credit = self.pending_window_update(buffer_len)?;
+        self.commit_window_update(credit);
+        self.assert_invariants(buffer_len);
+        Some(credit)
     }
 
     /// 建流即授信(round-4/B1,对齐 frp OpenStream/AcceptStream 时机):
