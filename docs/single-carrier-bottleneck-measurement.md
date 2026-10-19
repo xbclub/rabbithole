@@ -7174,3 +7174,76 @@ READLOCK  (无输出 ⟹ miss=0)
 转发到 `TcpStream`,还是经过中间缓冲。**
 
 **若经过缓冲 ⟹ 缓冲空但内核有数据 ⟹ 需要检查缓冲的填充逻辑。**
+
+### 43.61 ⭐⭐⭐ 找到 `clear_page_orig` 的真正来源:每次读都清零 64KiB
+
+**`Staging::zeroed_spare`(`frame/io.rs:229`):**
+
+```rust
+fn zeroed_spare(&mut self, want: usize) -> &mut [u8] {
+    let len = self.buf.len();
+    let fill_from = self.zeroed;
+    let spare = self.buf.spare_capacity_mut();
+    let take = want.min(spare.len());     // ← want = usize::MAX ⟹ take = 全部空闲
+    let ptr = spare.as_mut_ptr();
+    if fill_from < len + take {
+        for b in &mut spare[fill_from - len..take] {
+            *b = std::mem::MaybeUninit::new(0);   // ← 逐字节清零!
+        }
+        self.zeroed = len + take;
+    }
+    ...
+}
+```
+
+**调用点(`frame/io.rs:589`):`let spare = this.read.zeroed_spare(usize::MAX);`**
+
+**⇒ 每次读之前,把整个空闲区(≥64KiB,由 `reserve(READ_RESERVE)` 保证)
+逐字节写 0。**
+
+### 43.62 这与 perf 数据吻合
+
+**`clear_page_orig` 6.67% —— 但 perf 显示它来自 `sendto` 路径(5.49%)。**
+
+**而这里的清零是**用户态**的 `for b in &mut spare { *b = 0 }`,
+在 perf 里应表现为用户态代码。**
+
+**⇒ 两个不同来源:**
+1. `sendto` 的 skb 分配(内核,5.49%)
+2. **`zeroed_spare` 的用户态清零(可能被编译器优化成 `memset`)**
+
+**perf 里 `libc.so.6 0x1a110a` 4.63% 很可能就是 `memset`。**
+
+### 43.63 这个清零是必要的吗
+
+**清零是为了满足 `AsyncRead` 的"缓冲区必须已初始化"契约。**
+
+**但 `poll_read` 只会写 `[0, n)` 字节,`[n, take)` 不会被读。**
+
+**⇒ 清零 `[0, take)` 中 `[n, take)` 部分是**浪费**。**
+
+**更优做法:用 `MaybeUninit` + `read_buf`(Rust 1.79+ 的
+`AsyncRead::poll_read_buf`),完全避免清零。**
+
+### 43.64 但这不是主因
+
+**即使清零 64KiB × 4168 次/s = 267 MB/s 的写入,
+在现代 CPU 上(memset ~10 GB/s)只需 27ms/s = 2.7% CPU。**
+
+**与 `clear_page_orig` 的 6.67% 同量级,但不足以解释 40% 的吞吐差距。**
+
+**⇒ 这是一个可优化项,但不是根因。**
+
+### 43.65 回到核心矛盾
+
+**`Recv-Q > 0`(44% 时间)但 `poll_read` 返回 Pending。**
+
+**锁不是原因(READLOCK=0)。**
+**`BoxedIo` 无中间缓冲(纯 trait 转发)。**
+**`ready!` 正确传播 waker。**
+
+**⇒ 剩下的可能:**
+1. `poll_read` 的 `spare` 为空,走 `wake_by_ref` 自唤醒路径(忙等)
+2. 内核 `Recv-Q` 与 `poll_read` 看到的不是同一个 socket
+
+**验证 1:统计 `spare.is_empty()` 的次数。**
