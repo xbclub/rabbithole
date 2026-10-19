@@ -9529,3 +9529,65 @@ pub fn auto_shard_workers(desired: Option<usize>) -> usize {
 - `stream.rs` 三处 `is_some()` + `expect()` → 改用 `if let Some(x)` /
   `.as_ref().filter(...)` 绑定一次;
 - `mux.rs` 一处 `rd_cnt % 256 == 0` → `is_multiple_of(256)`。
+
+---
+
+## 53. Round-34:P2 反压解耦与通道池 FIFO
+
+### 53.1 反压隔离:单分片阻塞不再拖垮全载体
+
+**修前** `RecvHalf::on_frame` 遇分片通道满即 `return Poll::Pending`,
+整个 Framer 停读(TCP 背压)。后果:**一个卡住的分片会冻结整条载体上
+所有流**,包括健康分片的流和连接级控制帧(PING / WU / GoAway)。
+
+**修后**:满通道的帧进**有严格上界的反压侧链**,Framer 继续解后续帧。
+
+```
+const PENDING_ROUTE_CAP: usize = 4 * SHARD_CHANNEL_CAP;   // 512
+pending_routes: VecDeque<PendingRoute>    // 全局 FIFO
+pending_by_shard: Vec<usize>              // 每分片滞留计数
+```
+
+三个关键点:
+
+1. **上界是硬约束。** 没有上界就是把背压换成 OOM。侧链满 → 回落旧
+   语义(整个 Framer park,TCP 停读)。
+2. **"推不进去"不等于"要停读"。** 这是本轮最容易写错的地方——我第一
+   版写成"侧链非空就 `return Pending`",测试立刻抓到:那等于没做隔离。
+   正确语义是**只有侧链满才停读**,否则继续解下一帧。
+3. **流内 FIFO 不能破。** 某分片已有帧滞留侧链时,该分片的新帧必须
+   直接入侧链排队(`pending_by_shard[index] > 0` 分支),不能抢在旧帧
+   前面投递。同分片帧在侧链内保持插入序,`drain_pending_routes` 逐条
+   重试、失败即挪队尾,相对次序不变。
+
+### 53.2 服务端通道池:LIFO → FIFO
+
+`TcpPool.ready` 从 `Vec` 改 `VecDeque`,取用从 `pop()` 改 `pop_front()`。
+
+修前 LIFO 的问题不只是不公平:每次取走的都是**最后建好**的那条,而
+先建好的通道长期沉底,直到会话 epoch 变更才被整体驱逐——等于池里
+大部分容量是"陈旧通道",真正被启用的永远是刚出炉的那条。
+
+**关于"负载感知"选项的取舍**:任务给了两个方案(FIFO,或按载体在途
+活跃字节做最小负载选择)。我选了 FIFO,原因是**池里的通道是透明的
+`BoxedIo`,不带 carrier 归属**,单条 yamux 流的在途字节数在服务端
+不可观测——要做真正的负载感知,得先把 carrier_id 一路透传到
+`TcpPool`,并给每条流挂字节计数,改动面远大于本轮范围且收益未经验证。
+FIFO 是任务明确认可的方案,且直接消除了"陈旧通道沉底"这个确定的问题。
+
+### 53.3 门禁
+
+| 门禁 | 结果 |
+|---|---|
+| yamux 全套 | **100 passed**(round-33 的 98 + 新增 2) |
+| `cargo test --workspace --lib` | **255 passed** |
+| `cargo test --workspace`(含集成) | 全绿 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **0 error** |
+
+### 53.4 新增测试
+
+| 测试 | 断言 |
+|---|---|
+| `full_shard_does_not_stall_healthy_shard` | 塞满分片 0 后,先喂一条属于分片 0 的帧(会阻塞)、再喂 16 条属于分片 1 的帧 → 分片 1 必须收到帧,且阻塞帧恰好 1 条滞留侧链。**这条测试在错误实现下会失败**(实测过) |
+| `pending_route_side_channel_is_bounded` | 喂 2×CAP 帧,滞留量必须 ≤ `PENDING_ROUTE_CAP` |
+| `tcp_pool_hands_out_channels_fifo` | 按 1/2/3 顺序入池,三次取用必须依次拿到 1/2/3 |

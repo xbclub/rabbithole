@@ -1285,9 +1285,9 @@ mod halves {
         /// 继续服务,对齐现行"发送半弃置后接收半仍可读/建流")。
         send_dropped: AtomicBool,
         /// Framer 路由终结宣告(复核修复,Worker fatal 排空的终结条件
-        /// 之一):RecvHalf 在冲洗完 pending_route(或 Drop 弃置)后
+        /// 之一):RecvHalf 在冲洗完反压侧链(或 Drop 弃置)后
         /// 置位,此后不再有新消息进入任何分片通道。若 Worker 凭错误
-        /// 标志即终结,RecvHalf 在对端错误唤醒后冲洗的 pending_route 帧
+        /// 标志即终结,RecvHalf 在对端错误唤醒后冲洗的侧链帧
         /// 会落入已终结 Worker 而丢失(§0.3-3 在途数据)。
         framer_flushed: AtomicBool,
         /// 错误粘性影子:set_error 即置位且永不清除。RecvHalf/SendHalf
@@ -1677,7 +1677,8 @@ mod halves {
                     next_syn_seq: 0,
                     pending_streams: std::collections::BTreeMap::new(),
                     next_deliver_seq: 0,
-                    pending_route: None,
+                    pending_routes: VecDeque::new(),
+                    pending_by_shard: vec![0; shard_n],
                     teardown: None,
                     flush_signaled: false,
                     finished: false,
@@ -1738,11 +1739,23 @@ mod halves {
         /// 交付水位:下一个期望交付的序号。SYN 被 Worker 拒绝时以
         /// [`shard::NewStream::Skipped`] 推进水位(否则永久卡死)。
         next_deliver_seq: u64,
-        /// 路由背压暂存:分片通道满时持有未路由帧,唤醒后最先重试
-        /// (不丢帧,§2.1 防线)。
-        pending_route: Option<(usize, shard::ShardMsg)>,
+        /// 反压侧链(round-34):分片通道满时,不立刻挂起 Framer,而是把
+        /// 该帧暂存到这里,继续解码后续帧。健康分片的帧与控制帧(PING /
+        /// 连接级 WU / GoAway / Pong)因此仍能推进——单分片阻塞不再拖垮
+        /// 全载体(队头阻塞隔离)。
+        ///
+        /// **严格上界**:总条数 ≤ [`PENDING_ROUTE_CAP`],超出即回落到旧
+        /// 语义(整个 Framer park,TCP 停读)。没有上界就是无界内存增长,
+        /// 等于把背压换成 OOM。
+        ///
+        /// 顺序契约:同一 sid 恒路由同一分片,故同流帧在侧链内保持相对
+        /// 顺序(FIFO + 该分片内按插入序重试),流内 FIFO 不被破坏。
+        pending_routes: VecDeque<PendingRoute>,
+        /// 各分片在侧链中的滞留条数:重试时优先健康分片,并用于判断
+        /// "某分片是否已积压"(避免对同一分片无限堆积)。
+        pending_by_shard: Vec<usize>,
         /// 终结排空态(§0.3-2/§0.3-3,复核修复):fatal 已决但尚未返回
-        /// ——先冲洗 pending_route、交付 Workers 的全部建流产出(含
+        /// ——先冲洗反压侧链、交付 Workers 的全部建流产出(含
         /// fatal 排空新建的),全部落地后才返回终结结果。基线单任务逐帧
         /// 同步处理完才见 EOF,分片后的等价语义。
         teardown: Option<TearDown>,
@@ -1759,6 +1772,19 @@ mod halves {
         Eof,
     }
 
+    /// 反压侧链总容量上界(round-34)。
+    ///
+    /// 取 4×单分片通道容量:侧链的职责是"吸收一段突发,让健康分片和
+    /// 控制帧继续推进",不是无限缓冲。一旦某分片持续阻塞到侧链也满,
+    /// 就必须回到真正的 TCP 停读——否则只是在消耗内存。
+    const PENDING_ROUTE_CAP: usize = 4 * shard::SHARD_CHANNEL_CAP;
+
+    /// 反压侧链条目:目标分片 + 帧。
+    struct PendingRoute {
+        index: usize,
+        msg: shard::ShardMsg,
+    }
+
     /// on_frame 的路由结果:Done = 已路由/已本地处理;Backpressured =
     /// 分片通道满(生产者 waker 已登记 + 复查),消息暂存由调用方 park。
     enum Routed {
@@ -1773,7 +1799,7 @@ mod halves {
         /// 的状态机语义)。
         ///
         /// 终结排空(§0.3-2/§0.3-3):fatal 决定后不立即返回——基线单任务
-        /// 逐帧同步处理完才见 EOF,分片后的等价语义是先冲洗 pending_route
+        /// 逐帧同步处理完才见 EOF,分片后的等价语义是先冲洗反压侧链
         /// (该帧已从载体读出)、交付 Workers 的全部建流产出(含其 fatal
         /// 排空新建的),全部落地后才返回终结结果。
         pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Stream>>> {
@@ -1804,17 +1830,11 @@ mod halves {
                     return Poll::Ready(None);
                 }
                 if self.teardown.is_some() {
-                    // 排空①:pending_route 冲洗。fatal 态 Worker 无条件
-                    // 排空分片通道,空间必恢复;try_route 已登记生产者
-                    // waker 并复查(§2.1 防线),park 必被推进。
-                    if let Some((index, msg)) = self.pending_route.take() {
-                        match self.try_route(index, msg, cx) {
-                            Ok(()) => {}
-                            Err((index, msg)) => {
-                                self.pending_route = Some((index, msg));
-                                return Poll::Pending;
-                            }
-                        }
+                    // 排空①:反压侧链冲洗。fatal 态 Worker 无条件排空分片
+                    // 通道,空间必恢复;try_route 已登记生产者 waker 并
+                    // 复查(§2.1 防线),park 必被推进。侧链为空才继续。
+                    if !self.drain_pending_routes(cx) {
+                        return Poll::Pending;
                     }
                     if !self.flush_signaled {
                         self.flush_signaled = true;
@@ -1893,7 +1913,7 @@ mod halves {
                 }
                 // 1) new_streams 交付:轮询 N 条接收器,有新流 → 立即交付
                 //    (空闲时各接收器登记本任务 waker,futures mpsc 自带)。
-                //    必须先于 pending_route 重试:D6 背压链——分片通道满
+                //    必须先于反压侧链重试:D6 背压链——分片通道满
                 //    (路由受阻)时 Worker 因 new_streams 满而门控,唯有
                 //    本任务消费建流通道释放容量后 Worker 才继续排空分片
                 //    通道;若先重试路由,满通道 park 永远到不了这里 → 互锁。
@@ -1917,19 +1937,20 @@ mod halves {
                         return Poll::Ready(Some(Ok(stream)));
                     }
                 }
-                // 2) 背压暂存重试(§2.4:唤醒后重试,不丢帧)
-                if let Some((index, msg)) = self.pending_route.take() {
-                    match self.try_route(index, msg, cx) {
-                        Ok(()) => continue, // 路由成功,回到常规循环
-                        Err((index, msg)) => {
-                            self.pending_route = Some((index, msg));
-                            self.shared.set_recv_waker(cx.waker());
-                            if self.shared.error.lock().is_some() || self.workers_gone() {
-                                continue;
-                            }
-                            return Poll::Pending; // 背压:TCP 停读
-                        }
+                // 2) 反压侧链重试(round-34:唤醒后逐条重试,不丢帧)。
+                //    侧链里全是"当时某分片满"的帧;现在再试一遍,能进就
+                //    消化掉。**推进不了不等于要停读**——只要侧链还有余量,
+                //    就继续解后续帧(健康分片照常推进);只有侧链真正满了,
+                //    才回落到 TCP 停读。
+                if !self.pending_routes.is_empty() && self.drain_pending_routes(cx) {
+                    continue; // 侧链已空,回到常规循环
+                }
+                if self.pending_routes.len() >= PENDING_ROUTE_CAP {
+                    self.shared.set_recv_waker(cx.waker());
+                    if self.shared.error.lock().is_some() || self.workers_gone() {
+                        continue;
                     }
+                    return Poll::Pending; // 侧链满:背压,TCP 停读
                 }
                 // 3) 载体读一帧(frame::Io 零拷贝路径不动):连接级帧本地
                 //    处理;流级帧按 sid % N 路由。注:连续路由不 yield
@@ -1943,13 +1964,19 @@ mod halves {
                         match self.on_frame(frame, cx) {
                         Ok(Routed::Done) => {}
                         Ok(Routed::Backpressured { index, msg }) => {
-                            self.pending_route = Some((index, msg));
-                            self.shared.set_recv_waker(cx.waker());
-                            // 复查(要点 1 防线):错误槽/Worker 消亡不丢唤醒
-                            if self.shared.error.lock().is_some() || self.workers_gone() {
-                                continue;
+                            // round-34:先进侧链,不立刻停读——健康分片的
+                            // 帧与控制帧(PING/WU)继续推进。只有侧链已满
+                            // (说明该分片持续阻塞、突发已超上界)才回落到
+                            // 真正的 TCP 停读。
+                            if !self.stash_pending_route(index, msg) {
+                                self.shared.set_recv_waker(cx.waker());
+                                // 复查(要点 1 防线):错误槽/Worker 消亡不丢唤醒
+                                if self.shared.error.lock().is_some() || self.workers_gone() {
+                                    continue;
+                                }
+                                return Poll::Pending; // 侧链满:背压,TCP 停读
                             }
-                            return Poll::Pending; // 背压:TCP 停读
+                            continue; // 继续解下一帧
                         }
                         Err(e) => {
                             self.begin_fatal(e, true);
@@ -2048,6 +2075,16 @@ mod halves {
                     } else {
                         shard::ShardMsg::Frame(frame)
                     };
+                    // 流内 FIFO:该分片已有帧滞留在侧链时,新帧必须排到
+                    // 它们后面(直接入侧链),不能抢在旧帧前投递。
+                    if self.pending_by_shard[index] > 0 {
+                        // 先判容量再 move(侧链满时 msg 要原样交回)
+                        if self.pending_routes.len() >= PENDING_ROUTE_CAP {
+                            return Ok(Routed::Backpressured { index, msg });
+                        }
+                        self.stash_pending_route(index, msg);
+                        return Ok(Routed::Done);
+                    }
                     self.route(index, msg, cx)
                 }
             }
@@ -2086,6 +2123,49 @@ mod halves {
                 }
             }
             None
+        }
+
+        /// 把一条路由受阻的帧放进反压侧链(round-34)。返回 false = 侧链
+        /// 已满,调用方必须回落到"整个 Framer park"(真正的 TCP 背压)。
+        fn stash_pending_route(&mut self, index: usize, msg: shard::ShardMsg) -> bool {
+            if self.pending_routes.len() >= PENDING_ROUTE_CAP {
+                return false;
+            }
+            self.pending_by_shard[index] += 1;
+            self.pending_routes.push_back(PendingRoute { index, msg });
+            true
+        }
+
+        /// 从侧链取出下一条可路由的帧并重试(round-34)。
+        ///
+        /// 轮转游标 `pending_cursor` 保证不饿死:每次从上次成功的位置往后
+        /// 扫,取第一条能进通道的。某分片仍满就跳过它、继续试别的——
+        /// 这正是"单分片阻塞不拖垮全载体"的落点。
+        ///
+        /// 返回 `true` = 侧链为空(全部投递完毕)。
+        fn drain_pending_routes(&mut self, cx: &mut Context<'_>) -> bool {
+            // 每个条目本轮到多试一次:成功即出链,失败即挪到队尾让后一条
+            // 先试。`budget` 防止在"所有分片都满"时空转。
+            let mut budget = self.pending_routes.len();
+            while budget > 0 {
+                budget -= 1;
+                let Some(entry) = self.pending_routes.pop_front() else {
+                    break;
+                };
+                match self.try_route(entry.index, entry.msg, cx) {
+                    Ok(()) => self.pending_by_shard[entry.index] -= 1,
+                    Err((index, msg)) => {
+                        self.pending_routes.push_back(PendingRoute { index, msg });
+                    }
+                }
+            }
+            self.pending_routes.is_empty()
+        }
+
+        /// 侧链中该分片的滞留条数(诊断/测试用)。
+        #[cfg(test)]
+        fn pending_for_shard(&self, index: usize) -> usize {
+            self.pending_by_shard.get(index).copied().unwrap_or(0)
         }
 
         /// 按到达序号交付下一条新流:从水位起连续推进,遇到空洞即停
@@ -2159,7 +2239,7 @@ mod halves {
         fn drop(&mut self) {
             // 要点 4:接收半弃置 → 共享错误置 Closed,唤醒发送侧与 Worker
             //(set_error 广播 worker_wakers + 粘性影子,Worker 收敛终结)。
-            // 未冲洗的 pending_route 随弃置丢弃(不再路由),路由终结宣告
+            // 未冲洗的反压侧链随弃置丢弃(不再路由),路由终结宣告
             // 必须补上——Worker fatal 排空的终结条件,否则 Worker 永挂。
             self.shared.set_error(ConnectionError::Closed);
             self.shared.framer_flushed.store(true, Ordering::Release);

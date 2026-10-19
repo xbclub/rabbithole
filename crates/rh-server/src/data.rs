@@ -8,6 +8,7 @@ use rh_protocol::message::udp_packet;
 use rh_protocol::message::{ChannelEntity, StartForward};
 use rh_protocol::{forward_flags, FrameType, ProxySpec};
 use rh_transport::{compress_stream, BoxedIo};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -61,10 +62,10 @@ async fn claim_pool(pool: &Arc<TcpPool>, sess: &Arc<Session>) {
     if sess.epoch > cur {
         pool.epoch.store(sess.epoch, Ordering::Relaxed);
         let mut ready = pool.ready.lock().await;
-        let mut keep = Vec::with_capacity(ready.len());
+        let mut keep = VecDeque::with_capacity(ready.len());
         for entry in ready.drain(..) {
             if entry.0 == sess.epoch {
-                keep.push(entry);
+                keep.push_back(entry);
             }
         }
         *ready = keep; // 旧会话条目在此丢弃,级联关闭通道
@@ -134,7 +135,7 @@ pub async fn tcp_on_channel(
                 // 接收端已放弃:通道回到池或关闭
                 let mut ready = pool.ready.lock().await;
                 if ready.len() < pool.size {
-                    ready.push((sess.epoch, request_id, stream));
+                    ready.push_back((sess.epoch, request_id, stream));
                 } else {
                     drop(stream);
                 }
@@ -143,7 +144,7 @@ pub async fn tcp_on_channel(
         None => {
             let mut ready = pool.ready.lock().await;
             if ready.len() < pool.size {
-                ready.push((sess.epoch, request_id, stream));
+                ready.push_back((sess.epoch, request_id, stream));
             } else {
                 // 超额:关闭
                 drop(stream);
@@ -163,7 +164,7 @@ pub async fn get_channel(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Optio
     {
         let mut ready = pool.ready.lock().await;
         let owner = pool.epoch.load(Ordering::Relaxed);
-        while let Some((epoch, _rid, s)) = ready.pop() {
+        while let Some((epoch, _rid, s)) = ready.pop_front() {
             if epoch == owner {
                 // 注意:必须先释放 ready 锁再 refill(内部会再取同锁)
                 drop(ready);
@@ -1293,6 +1294,35 @@ fn conv_proxy_proto(v: rh_protocol::ProxyProtoVersion) -> rh_protocol::message::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// round-34:池取用必须是 FIFO——先建好的通道先被取走。
+    ///
+    /// 修前用 `Vec::pop()`(LIFO):每次取走最后建好的那条,先建好的
+    /// 长期沉底直到过期。这既是公平性问题,也让"预热完成但尚未验证"
+    /// 的新通道总是被优先启用。
+    #[tokio::test]
+    async fn tcp_pool_hands_out_channels_fifo() {
+        use std::sync::atomic::Ordering;
+        let pool = TcpPool::new(4);
+        pool.epoch.store(7, Ordering::Relaxed);
+        // 按建立顺序压入 1、2、3(用内容区分身份)
+        for tag in 1u8..=3 {
+            let (a, b) = tokio::io::duplex(64);
+            drop(b);
+            pool.ready
+                .lock()
+                .await
+                .push_back((7, tag as u64, Box::new(a) as BoxedIo));
+        }
+        // 依次取三次:必须按 1、2、3 的顺序(标签即 request_id)
+        for expect in 1u64..=3 {
+            let mut ready = pool.ready.lock().await;
+            let (epoch, rid, _io) = ready.pop_front().expect("pool must not be empty");
+            assert_eq!(epoch, 7, "epoch 必须匹配");
+            assert_eq!(rid, expect, "FIFO:第 {expect} 次取用应拿到第 {expect} 条");
+        }
+        assert!(pool.ready.lock().await.is_empty(), "三次取用后池应清空");
+    }
 
     /// 会话失败计数用的独立 Metrics(与生产实例同构造)。
     fn test_metrics() -> Arc<crate::state::Metrics> {

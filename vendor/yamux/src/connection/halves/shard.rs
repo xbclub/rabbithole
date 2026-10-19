@@ -3005,6 +3005,96 @@ mod tests {
         assert_eq!(ids, sorted, "剩余交付仍须 seq 升序(保序不退化)");
     }
 
+    // ===== round-34 反压解耦(单分片阻塞不拖垮全载体)=====
+
+    /// round-34 T-B1(核心):某分片通道满时,Framer **不得**立刻停读——
+    /// 排在该帧之后、属于健康分片的帧必须继续被路由下去。
+    ///
+    /// 修前:`on_frame` 遇满即 `return Poll::Pending`(TCP 停读),一个卡住
+    /// 的分片会把整条载体的**所有**流一起拖住(队头阻塞)。修后该帧进
+    /// 侧链,后面的帧照常解。
+    ///
+    /// 构造要点:必须让"满分片的帧"排在"健康分片的帧"**之前**,否则测的
+    /// 就不是队头阻塞。N=2 下 `shard_index(4,2)=0`、`shard_index(2,2)=1`。
+    #[test]
+    fn full_shard_does_not_stall_healthy_shard() {
+        let mut cfg = Config::default();
+        cfg.set_shard_workers(2);
+        let mut f = Fixture::client(2, cfg);
+        // 塞满分片 0 的帧通道(cap 128),且**不驱动** Worker 0
+        let cap = super::shard_channel_cap();
+        {
+            let workers = f.shared.workers.lock();
+            for _ in 0..cap {
+                let h = Header::data(StreamId::new(4), 0);
+                if workers[0]
+                    .0
+                    .try_push(ShardMsg::Frame(Frame::new(h).into()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+        assert!(
+            f.workers[0].msg_rx.has_pending(),
+            "precondition: shard 0 channel must be full"
+        );
+        // 关键顺序:先 1 条"属于满分片 0"的帧(它会阻塞),再跟 16 条
+        // "属于健康分片 1"的帧。修前第一条就把 Framer 卡死,后 16 条
+        // 一帧都读不出来。
+        f.feed(data_block(4, b"blocked"));
+        for _ in 0..16 {
+            f.feed(data_block(2, b"healthy"));
+        }
+        // 只驱动 Framer,不驱动 Worker 0(保持满)
+        for _ in 0..64 {
+            let _ = f.recv.poll(&mut f.cx);
+        }
+        assert!(
+            f.workers[1].msg_rx.has_pending(),
+            "健康分片必须在另一分片阻塞时继续收到帧(队头阻塞隔离)"
+        );
+        assert_eq!(
+            f.recv.pending_for_shard(0),
+            1,
+            "阻塞的那条帧应滞留侧链,而不是让 Framer 整体停读"
+        );
+    }
+
+    /// round-34 T-B2:侧链有严格上界。持续阻塞时必须回落到 TCP 停读,
+    /// 不得无限堆积。
+    #[test]
+    fn pending_route_side_channel_is_bounded() {
+        let mut cfg = Config::default();
+        cfg.set_shard_workers(1);
+        let mut f = Fixture::client(1, cfg);
+        let cap = super::shard_channel_cap();
+        // 塞满唯一分片
+        {
+            let workers = f.shared.workers.lock();
+            for _ in 0..cap {
+                let h = Header::data(StreamId::new(2), 0);
+                if workers[0].0.try_push(ShardMsg::Frame(Frame::new(h).into())).is_err() {
+                    break;
+                }
+            }
+        }
+        // 喂远超侧链容量的帧
+        let feed_n = super::super::PENDING_ROUTE_CAP * 2;
+        for _ in 0..feed_n {
+            f.feed(data_block(2, b"x"));
+        }
+        for _ in 0..feed_n * 2 {
+            let _ = f.recv.poll(&mut f.cx);
+        }
+        let parked = f.recv.pending_for_shard(0);
+        assert!(
+            parked <= super::super::PENDING_ROUTE_CAP,
+            "侧链必须有界,实际滞留 {parked}"
+        );
+    }
+
     // ===== round-6 §5.2 SendWorker(单测,N=2 构造跨分片)=====
 
     /// T-S1(round-33 改写):注册路由——8 条出站流 → 驱动 SendWorker →
