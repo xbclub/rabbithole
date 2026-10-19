@@ -303,14 +303,27 @@ struct UpReader {
 }
 
 impl UpReader {
-    /// 非阻塞读:数据未就绪立即返回 `Ok(None)`,**不挂起**(round-55)。
+    /// 非阻塞读:数据未就绪立即返回 [`TryChunk::Empty`],**不挂起**。
     ///
     /// 用于上行批量收集:当前块已收下后,把"此刻已就绪"的后续块一并收进
-    /// 同一批。语义与 [`RhMuxStreamRead::try_read_chunk`] 一致(那边是 mux
-    /// 流自带 pending 队列;这里是通用 AsyncRead,靠单次 poll 判定)。
+    /// 同一批。
     ///
-    /// 单次 poll 会注册一次 waker:若随后没有数据到达,该 waker 可能指向
-    /// 已被丢弃的 future——这里刻意用一个 noop waker,避免悬挂唤醒。
+    /// # round-64:必须用调用者的真实 waker
+    ///
+    /// 修前这里用一个 `Waker::noop()` 构造 Context。理由写的是"避免悬挂
+    /// 唤醒",但实际代价是**丢唤醒**:
+    ///
+    /// 单次 `poll_read` 会把 tokio 的读就绪注册覆盖成传入的 waker。用
+    /// noop 覆盖之后,若紧接着 `read_chunk` 阻塞等待,而 IO 驱动认为
+    /// "已注册且未变"从而跳过重装,数据到达时没有任何任务被唤醒。
+    ///
+    /// 实测症状:上行 P=16 时服务端用户 socket 的 `Recv-Q` 积压到
+    /// **7.8MB**,而 8 个 tokio worker 合计只用 0.53 核、全部 park;
+    /// `PUMP_UP` 显示 `read_ms=100%`、`avg_batch` 只有 73KB(远小于
+    /// 256KB 的 cap),即"有大量数据却读得又慢又碎"。
+    ///
+    /// 现在改用 `poll_fn`,拿到的就是当前任务的真实 waker,语义与任何
+    /// 标准 `poll_fn` 一致:future 被 drop 时 tokio 自行处理注册。
     async fn try_read_chunk<R: tokio::io::AsyncRead + Unpin>(
         &mut self,
         r: &mut R,
@@ -321,30 +334,23 @@ impl UpReader {
             INIT_BUF_CAP
         };
         let mut bm = pool_get(cap);
-        let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(waker);
-        let n = {
+        let n = std::future::poll_fn(|cx| {
             let spare = bm.spare_capacity_mut();
             let limit = spare.len().min(cap);
             let mut rb = ReadBuf::uninit(&mut spare[..limit]);
-            match Pin::new(&mut *r).poll_read(&mut cx, &mut rb) {
-                Poll::Ready(Ok(())) => rb.filled().len(),
-                Poll::Ready(Err(e)) => return Err(e),
-                // 未就绪:本批到此为止(不等待)。
-                //
-                // 注意 noop waker 的代价:这次 poll 会把 tokio 的读就绪
-                // 注册覆盖成 noop,随后 `read_chunk` 重新 poll 时才装回真
-                // waker。因为调用方紧接着要么继续 `try_read_chunk` 直到
-                // Empty、要么落入 `read_chunk` 阻塞等,所以不会永久丢唤醒
-                // (read_chunk 的 poll 必然重装)。代价最多是每批多一次
-                // 无效 poll,不构成正确性问题。
-                Poll::Pending => return Ok(TryChunk::Empty),
+            match Pin::new(&mut *r).poll_read(cx, &mut rb) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok::<usize, io::Error>(rb.filled().len())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                // 未就绪:本批到此为止(不等待)。真实 waker 已注册,
+                // 后续 read_chunk 的 poll 会自然复用/更新它。
+                Poll::Pending => Poll::Ready(Ok::<usize, io::Error>(usize::MAX)),
             }
-        };
+        })
+        .await?;
+        if n == usize::MAX {
+            return Ok(TryChunk::Empty);
+        }
         if n == 0 {
-            // EOF 必须与"暂无数据"区分:否则批量收集会把 clean EOF 吞成
-            // "本批结束",下一轮 read_chunk 再 poll 一次虽然也能读到 0,
-            // 但会让 EOF 的发现推迟一个批次的时长。
             return Ok(TryChunk::Eof);
         }
         if n >= INIT_BUF_CAP {
@@ -1380,6 +1386,21 @@ pub(crate) fn detect_cpus() -> usize {
 /// 总预算按**核数**给(不再固定 4),并保证每载体至少
 /// [`MIN_SHARD_WORKERS_PER_CARRIER`]=2 个,使单载体也能读∥写并行。
 /// 上限仍受 [`MAX_SHARD_WORKERS`] 约束,避免 Worker 数随 K 爆炸。
+/// 每载体分片 Worker 数的显式覆盖(round-63,A/B 专用)。
+///
+/// `RH_SHARD_WORKERS_PER_CARRIER=N`(钳制 [1, MAX_SHARD_WORKERS])。
+/// 默认 None = 走下面的预算公式。仅影响 K>1;K=1 的单载体路径保持
+/// 既有行为不变。
+fn shard_workers_per_carrier_override() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RH_SHARD_WORKERS_PER_CARRIER")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, MAX_SHARD_WORKERS))
+    })
+}
+
 pub fn shard_workers_for_k(k: usize) -> usize {
     /// 每载体最少 Worker 数。取 2 的依据:1 个 Worker 时该载体的所有
     /// 流共用一个任务串行解帧,高并发下成为瓶颈(round-62 实测 P=16
@@ -1393,6 +1414,12 @@ pub fn shard_workers_for_k(k: usize) -> usize {
     // 且该配置已通过大量既有验收,不在此顺手改动。
     if k == 1 {
         return auto_shard_workers(None);
+    }
+    // 显式覆盖(round-63):`RH_SHARD_WORKERS_PER_CARRIER=N` 直接钉死
+    // K>1 时每载体的 Worker 数。仅用于 A/B——"分片数是不是上行高并发
+    // 的主因"需要用单调扫描来证伪,而不是靠单次前后对比。
+    if let Some(n) = shard_workers_per_carrier_override() {
+        return n;
     }
     // K>1:总预算按核数给(不再固定 4),并保证每载体至少
     // `MIN_SHARD_WORKERS_PER_CARRIER` 个。旧公式 `(4/k).max(1)` 在
