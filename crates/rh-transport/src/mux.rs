@@ -825,7 +825,7 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             rd_ns += t.elapsed().as_nanos() as u64;
             rd_cnt += 1;
             by_bytes += batch_bytes as u64;
-            if rd_cnt % 256 == 0 {
+            if rd_cnt.is_multiple_of(256) {
                 pump_diag::dump_local("down-mid", rd_ns, wr_ns, rd_cnt, wr_cnt, by_bytes, wr_slow);
                 yamux::sched_diag::dump("read");
                 yamux::sched_diag::dump_window("read");
@@ -1004,13 +1004,64 @@ fn mux_config(max_streams: usize) -> yamux::Config {
     mux_config_with_shards(max_streams, DEFAULT_SHARD_WORKERS)
 }
 
-/// 分片 Worker 默认数(vendor 默认,round-5 起被三机验收锁定)。
+/// 分片 Worker 默认数上限(vendor 默认,round-5 起被三机验收锁定)。
+/// round-33 起它只作为**上限**,真实值由 [`auto_shard_workers`] 按物理
+/// 核心数收敛——1 核机器不再无条件 spawn 4+4 个 Worker。
 pub const DEFAULT_SHARD_WORKERS: usize = 4;
 
+/// 分片 Worker 数上限(配置/环境显式指定时的钳制上界)。
+const MAX_SHARD_WORKERS: usize = 64;
+
+/// CPU 自适应分片数(round-33)。
+///
+/// 修前:`wrap_stream_as_server` / `wrap_stream_as_server_duplex` 无条件
+/// 硬编码 [`DEFAULT_SHARD_WORKERS`],1 核机器上每条连接照样 spawn
+/// 4 个 `ShardWorker` + 4 个 `SendWorker` + 2 个 driver(共 10 个基础
+/// 设施任务),协程调度切换内耗远大于其分摊收益。
+///
+/// 语义:
+/// - `Some(n)`:显式指定,钳到 `1..=MAX_SHARD_WORKERS`(不再与核数取
+///   min——显式即用户/池规模已算过的意图,见 [`shard_workers_for_k`])。
+/// - `None`:按物理核心数自适应,`cpus.clamp(1, DEFAULT_SHARD_WORKERS)`。
+///   1 核 → 1(消除一切跨 Worker 接力),2 核 → 2,≥4 核 → 4(round-5
+///   三机验收锁定的既有上限,零回退)。
+///
+/// 纯函数化:核数由 [`detect_cpus`] 注入,便于单测模拟 1/2/8 核。
+pub fn auto_shard_workers(desired: Option<usize>) -> usize {
+    auto_shard_workers_with(desired, detect_cpus())
+}
+
+/// [`auto_shard_workers`] 的纯函数内核(`cpus` 显式注入,便于单测)。
+pub(crate) fn auto_shard_workers_with(desired: Option<usize>, cpus: usize) -> usize {
+    if let Some(n) = desired {
+        return n.clamp(1, MAX_SHARD_WORKERS);
+    }
+    cpus.clamp(1, DEFAULT_SHARD_WORKERS)
+}
+
+/// 可用物理核心数(读不到时保守取 1——宁可少开 Worker,也不在低核机
+/// 上凭空放大调度压力)。`available_parallelism` 返回的是 OS 视角可并行
+/// 线程数(cgroup/cpuset 限制已计入),正是我们想要的"能真正并行跑
+/// 几个 Worker"。
+///
+/// 进程内只探测一次(`OnceLock`):每个连接都调一次
+/// `available_parallelism` 虽不贵,但建连热路径没必要重复探测,且
+/// 核数在进程生命周期内不变。
+pub(crate) fn detect_cpus() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    })
+}
+
 /// 池规模 → 每载体 shard 数(round-10):总 Worker 预算按 4 计,
-/// K 越大每载体分得越少;下限 1。K=1 必须仍为 4(红线:K=1 零回退)。
+/// K 越大每载体分得越少;下限 1。K=1 时取 [`auto_shard_workers`] 的
+/// 自适应值(round-33 起不再硬钉 4——1 核机 K=1 应为 1)。
 pub fn shard_workers_for_k(k: usize) -> usize {
-    (DEFAULT_SHARD_WORKERS / k.max(1)).max(1)
+    let budget = auto_shard_workers(None);
+    (budget / k.max(1)).max(1)
 }
 
 fn mux_config_with_shards(max_streams: usize, shard_workers: usize) -> yamux::Config {
@@ -2262,6 +2313,10 @@ async fn recv_driver<S>(
 /// max_streams:并发流硬顶,0 = 不限制。
 /// 锁路径(单载体 + SplitSocket/BiLock);双载体裸 TCP 走
 /// [`wrap_stream_as_server_duplex`]。
+///
+/// 分片数(round-33):[`auto_shard_workers`]`(None)`——按物理核心数
+/// 自适应(1 核 → 1 Worker,2 核 → 2,≥4 核 → 4)。修前硬编码 4,导致
+/// 1 核/2 核服务器上每条连接白起 8 个 Worker 任务。
 pub fn wrap_stream_as_server(
     io: BoxedIo,
     multiplex: bool,
@@ -2273,7 +2328,7 @@ pub fn wrap_stream_as_server(
                 io,
                 yamux::Mode::Server,
                 max_streams,
-                DEFAULT_SHARD_WORKERS,
+                auto_shard_workers(None),
             )),
         })
     } else {
@@ -2287,7 +2342,8 @@ pub fn wrap_stream_as_server(
 
 /// 服务端双载体变体(round-E2):read_io/write_io 为同一裸 TCP socket 的
 /// 两个 fd(tcp.rs verify 的 try_clone 产物),halves 零锁并行;
-/// 语义/背压与 [`wrap_stream_as_server`] 完全一致。
+/// 语义/背压与 [`wrap_stream_as_server`] 完全一致(含 round-33 的 CPU
+/// 自适应分片)。
 pub fn wrap_stream_as_server_duplex(
     read_io: BoxedIo,
     write_io: BoxedIo,
@@ -2299,13 +2355,16 @@ pub fn wrap_stream_as_server_duplex(
             write_io,
             yamux::Mode::Server,
             max_streams,
-            DEFAULT_SHARD_WORKERS,
+            auto_shard_workers(None),
         )),
     })
 }
 
 /// 客户端:同上(yamux 客户端)。锁路径;双载体裸 TCP 走
 /// [`wrap_stream_as_client_duplex`]。
+///
+/// 分片数(round-33):同服务端走 [`auto_shard_workers`]`(None)`。
+/// 单载体(K=1)在 1 核机器上同样退化为 1 个 Worker。
 pub fn wrap_stream_as_client(
     io: BoxedIo,
     multiplex: bool,
@@ -2317,7 +2376,7 @@ pub fn wrap_stream_as_client(
                 io,
                 yamux::Mode::Client,
                 max_streams,
-                DEFAULT_SHARD_WORKERS,
+                auto_shard_workers(None),
             )),
         })
     } else {
@@ -2342,7 +2401,7 @@ pub fn wrap_stream_as_client_duplex(
             write_io,
             yamux::Mode::Client,
             max_streams,
-            DEFAULT_SHARD_WORKERS,
+            auto_shard_workers(None),
         )),
     })
 }
@@ -3620,22 +3679,45 @@ mod tests {
         );
     }
 
-    // T-C5(round-10):池规模 → 每载体 shard 映射。K=1 必须回到 4
-    // (红线:K=1 路径零回退),K≥4 收敛到 1,总量 ≤ 4。
+    // T-C5(round-10;round-33 起改为按核数自适应):池规模 → 每载体
+    // shard 映射。K=1 取自适应预算,K≥预算 收敛到 1,总量 ≤ 预算。
     #[test]
     fn shard_workers_for_pool_size() {
-        assert_eq!(shard_workers_for_k(1), 4);
-        assert_eq!(shard_workers_for_k(2), 2);
-        assert_eq!(shard_workers_for_k(3), 1);
-        assert_eq!(shard_workers_for_k(4), 1);
-        assert_eq!(shard_workers_for_k(8), 1);
-        assert_eq!(shard_workers_for_k(0), 4, "0 按 1 处理,不 panic");
+        let budget = auto_shard_workers(None);
+        assert_eq!(shard_workers_for_k(1), budget, "K=1 取自适应预算");
+        assert_eq!(shard_workers_for_k(0), budget, "0 按 1 处理,不 panic");
         for k in 1..=8 {
+            let got = shard_workers_for_k(k);
             assert!(
-                (1..=DEFAULT_SHARD_WORKERS).contains(&shard_workers_for_k(k)),
-                "K={k} 的 shard 必须在 1..=4"
+                (1..=budget).contains(&got),
+                "K={k} 的 shard={got} 必须落在 1..={budget}"
             );
+            assert_eq!(got, (budget / k).max(1), "K={k} 的映射公式");
         }
+    }
+
+    // T-C5(round-33):CPU 自适应分片数。1 核必须退化为 1(消除跨 Worker
+    // 接力),2 核为 2,≥4 核回到 round-5 锁定的上限 4。
+    #[test]
+    fn auto_shard_workers_scales_with_cpu_count() {
+        assert_eq!(auto_shard_workers_with(None, 1), 1, "1 核 → 1 Worker");
+        assert_eq!(auto_shard_workers_with(None, 2), 2, "2 核 → 2 Worker");
+        assert_eq!(auto_shard_workers_with(None, 3), 3, "3 核 → 3 Worker");
+        assert_eq!(auto_shard_workers_with(None, 4), 4, "4 核 → 4 Worker");
+        assert_eq!(auto_shard_workers_with(None, 8), 4, "8 核 → 上限 4");
+        assert_eq!(auto_shard_workers_with(None, 64), 4, "64 核 → 上限 4");
+        assert_eq!(auto_shard_workers_with(None, 0), 1, "0 核按 1 兜底");
+        // 显式指定:原样生效,仅钳到 1..=64
+        assert_eq!(auto_shard_workers_with(Some(1), 8), 1, "显式 1 不被核数抬高");
+        assert_eq!(auto_shard_workers_with(Some(8), 1), 8, "显式 8 不被核数压低");
+        assert_eq!(auto_shard_workers_with(Some(0), 8), 1, "显式 0 钳到 1");
+        assert_eq!(auto_shard_workers_with(Some(999), 8), 64, "显式超限钳到 64");
+        // 真实探测路径必须落在合法区间(不硬编码本机核数)
+        let real = auto_shard_workers(None);
+        assert!(
+            (1..=DEFAULT_SHARD_WORKERS).contains(&real),
+            "自动分片 {real} 必须落在 1..={DEFAULT_SHARD_WORKERS}"
+        );
     }
 
     // T-C5:参数化入口必须真实生效——K=2 时两侧各 2 个 Worker,

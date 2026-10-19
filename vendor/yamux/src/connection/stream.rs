@@ -348,13 +348,11 @@ impl Stream {
                 drop(shared);
                 // 快车道可用时直压 to_send;否则走流级 mpsc(容量已在
                 // 上面 poll_ready 确认,start_send 无失败)。
-                if self.conn_shared.is_some() && self.flag == Flag::None {
+                if let Some(shared_conn) = self.conn_shared.as_ref().filter(|_| self.flag == Flag::None)
+                {
                     let frame: Frame<Either<Data, WindowUpdate>> =
                         Frame::window_update(self.id, credit).right();
-                    self.conn_shared
-                        .as_ref()
-                        .expect("checked is_some")
-                        .push_to_send(frame.into());
+                    shared_conn.push_to_send(frame.into());
                 } else {
                     let mut frame = Frame::window_update(self.id, credit).right();
                     self.add_flag(frame.header_mut());
@@ -547,7 +545,7 @@ impl StreamReadHalf {
         // 且"无待补 ACK"时启用——带 ACK 的 0-credit WU 属带 flag 帧,必须
         // 走旧 mpsc 通路保流内 FIFO(见 `send_window_update` 注释),那条
         // 路要求**先确认容量再记账**,与单锁热路径不相容,保持原样为冷路径。
-        if self.conn_shared.is_some() {
+        if let Some(conn_shared) = self.conn_shared.clone() {
             let step = {
                 let mut shared = self.shared();
                 if shared.ack_pending {
@@ -595,10 +593,7 @@ impl StreamReadHalf {
                         // 快车道:纯 WU 帧直压 to_send(FlushTask 下一轮即取)
                         let frame: Frame<Either<Data, WindowUpdate>> =
                             Frame::window_update(self.id, credit).right();
-                        self.conn_shared
-                            .as_ref()
-                            .expect("hot lane requires ConnShared")
-                            .push_to_send(frame.into());
+                        conn_shared.push_to_send(frame.into());
                     }
                     if __sd { crate::sched_diag::end_poll(); }
                     return Poll::Ready(Ok(Some(bytes)));
@@ -614,10 +609,7 @@ impl StreamReadHalf {
                         // 直压 to_send,使对端不必等下一次读即恢复发送。
                         let frame: Frame<Either<Data, WindowUpdate>> =
                             Frame::window_update(self.id, credit).right();
-                        self.conn_shared
-                            .as_ref()
-                            .expect("hot lane requires ConnShared")
-                            .push_to_send(frame.into());
+                        conn_shared.push_to_send(frame.into());
                     }
                     if crate::sched_diag::enabled() {
                         crate::sched_diag::on_park_with_window(send_window);

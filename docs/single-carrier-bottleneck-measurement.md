@@ -9417,3 +9417,115 @@ frp 侧的对比数据同样需要重测(本轮未做,用户要求不再重复�
 4. **跨机基准必须同时测原始 TCP 直连**作为容量分母,否则无法判断
    "还差多少"。
 5. 同机回环继续作为代码效率基准(排除网络变量)。
+
+---
+
+## 52. Round-33:分片 Worker 硬编码与偶数 Worker 闲置根治
+
+### 52.1 两个结构性缺陷
+
+**缺陷一:分片数与物理 CPU 脱节。**
+
+`wrap_stream_as_server` / `wrap_stream_as_server_duplex` 无条件传
+`DEFAULT_SHARD_WORKERS = 4`。1 核机器上每条连接照样 spawn
+4 个 `ShardWorker` + 4 个 `SendWorker` + 2 个 driver = **10 个基础
+设施任务**,协程调度切换内耗远大于分摊收益。
+
+**缺陷二:奇数 sid 模 4 导致一半 Worker 终生闲置。**
+
+yamux 流 ID 按 `+2` 步进(客户端 1,3,5,7…;服务端 2,4,6…)。
+`(sid as usize) % N` 在 N=4 时,奇数只可能落 `1` 或 `3` ——
+**Worker 0 和 Worker 2 永远收不到任何业务数据**。
+
+这条公式同时出现在四处,必须一起改:
+
+| 位置 | 作用 |
+|---|---|
+| `connection.rs::route_index` | 接收帧路由 |
+| `connection.rs::push_new_receiver` | 发送流命令注册 |
+| `halves/shard.rs::ShardWorker::owns` | opening 收编权 |
+| `halves/shard.rs::try_push_ctrl` | ctrl Remove 回送 |
+
+### 52.2 为什么不能只改公式(历史踩坑)
+
+此前直接改成 `((sid >> 1) as usize) % N` 时,
+`halves_syn_storm_256_streams` 崩了:
+
+```
+"handle #0 out of order"  left: StreamId(4)  right: StreamId(2)
+```
+
+**根因不是公式本身,而是公式同时决定了控制面。** 修前新流(SYN)由
+Worker 建好后经 `new_streams` 通道回流交付,交付顺序 = **Worker 完成
+顺序**。N=2 时所有入站偶 sid 都落 worker0,顺序恰好等于 wire 顺序;
+一旦剥掉奇偶位把相邻 SYN 分到不同 Worker,完成顺序就与到达顺序解耦,
+accept 线序随之崩坏。
+
+### 52.3 根治方案:控制面与数据面解耦
+
+**不改建流的归属(仍在 Worker 内闭环),改的是"谁负责排序"。**
+
+1. **Framer 分配到达序号**:`RecvHalf` 单线程顺序读帧,读到时给每条
+   带 SYN 的帧分配单调 `seq`(`next_syn_seq`),随 `ShardMsg::Syn`
+   一起下发给 Worker。这是唯一权威的到达顺序。
+2. **Worker 原样回传 seq**:建流成功后把 `NewStream::Stream(seq, stream)`
+   压回 `new_streams`;被拒(非法 sid / 重复 / 超上限 / 首帧超授信)
+   时回传 `NewStream::Skipped(seq)`。
+3. **RecvHalf 重排队列**:`BTreeMap<u64, Option<Stream>>` +
+   `next_deliver_seq` 水位。只交付等于水位的条目,遇到空洞即停,
+   等对应 Worker 补齐。顺序到达的流直接交付、不入表。
+4. **保序有了兜底,哈希才能自由**:此时 `shard_index` 才敢剥离奇偶位。
+
+**`Skipped` 是必需的,不是冗余设计。** 被拒的 SYN 已经占用了序号,
+若不回报,水位会永久卡在该 seq,其后所有新流都交付不出去。
+
+### 52.4 CPU 自适应分片
+
+```rust
+pub fn auto_shard_workers(desired: Option<usize>) -> usize {
+    if let Some(n) = desired { return n.clamp(1, 64); }
+    detect_cpus().clamp(1, DEFAULT_SHARD_WORKERS)   // 1→1, 2→2, ≥4→4
+}
+```
+
+- 四个 `wrap_stream_as_*` 入口全部改为 `auto_shard_workers(None)`。
+- `shard_workers_for_k` 的预算从硬编码 4 改为自适应值:
+  `(auto_shard_workers(None) / k.max(1)).max(1)` —— K=1 在 1 核机上
+  现在得到 1 而不是 4。
+- `detect_cpus` 用 `OnceLock` 缓存(核数进程内不变,建连热路径不必重探)。
+- 未引入 `num_cpus` 依赖:`std::thread::available_parallelism` 已覆盖
+  cgroup/cpuset 限制,且避免新增外部依赖(尝试加 `num_cpus` 时沙箱
+  拒绝写 cargo registry 缓存)。
+
+### 52.5 门禁结果
+
+| 门禁 | 结果 |
+|---|---|
+| `halves_syn_storm_256_streams` | **1 passed** |
+| yamux 全套 | **98 passed**(基线 93 + 新增 5) |
+| `cargo test --workspace --lib` | **253 passed** |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **0 error** |
+| `cargo test --workspace`(含集成) | 全绿 |
+
+### 52.6 新增测试(5 项)
+
+| 测试 | 断言 |
+|---|---|
+| `shard_index_spreads_odd_stream_ids_evenly` | [1,3,5,7] → [0,1,2,3];N=1/2/3/4 各 256 条,**无一片为 0**,极差 ≤ 1 |
+| `shard_index_spreads_even_stream_ids_evenly` | [2,4,6,8] → [1,2,3,0],服务端侧对称成立 |
+| `inbound_streams_deliver_in_wire_order_across_shards` | N=4 + 16 SYN 打散后,交付顺序仍严格等于 wire 顺序 |
+| `rejected_syn_does_not_stall_delivery` | 非法 sid 被拒后,后续合法流照常交付(水位不被卡死) |
+| `terminal_drain_delivers_despite_permanent_seq_hole` | Worker abort 留下永久空洞时,终结排空仍收敛且保持升序 |
+
+另改写 `send_worker_registration_routes_by_shard_index`(原
+`..._by_sid_mod_n`):修前断言"偶数分片收编 0 条"——**那正是本次要
+消灭的缺陷**,现改为断言 8 条出站流在两个分片各收编 4 条。
+
+### 52.7 顺带修掉的既有 lint
+
+`cargo clippy -D warnings` 在改动前就有 4 处失败(与本轮无关,但门禁
+要求零告警):
+
+- `stream.rs` 三处 `is_some()` + `expect()` → 改用 `if let Some(x)` /
+  `.as_ref().filter(...)` 绑定一次;
+- `mux.rs` 一处 `rd_cnt % 256 == 0` → `is_multiple_of(256)`。

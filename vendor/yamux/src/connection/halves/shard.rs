@@ -42,7 +42,39 @@ pub(super) enum ShardMsg {
     /// 无 SYN 的 Data/WindowUpdate/Ping(sid≠0)帧,原样转发。
     Frame(Frame<()>),
     /// 带 SYN 的 Data|SYN / WU|SYN:由 Worker 执行建流全流程。
-    Syn(Frame<()>),
+    /// `seq` 是 Framer 在**读到该帧时**分配的到达序号(连接内单调 +1)。
+    /// 建流本身仍归 Worker(校验/计数/授信/dup 检查全在分片内闭环),
+    /// 但交付给应用的**顺序**由 RecvHalf 按 `seq` 重排恢复——这样
+    /// 分片哈希可以自由剥离奇偶位而不破坏 accept 顺序(round-33)。
+    Syn { seq: u64, frame: Frame<()> },
+}
+
+/// Worker → RecvHalf 的建流产出(round-33)。
+///
+/// `Skipped` 是必需的:SYN 可能因协议错误(非法 sid / 重复 sid / 超
+/// `max_num_streams` / 首帧体超授信)被 Worker 拒绝而不产出流,但它的
+/// `seq` 已经占用——不回报就会让 RecvHalf 的重排水位永久卡在该序号,
+/// 后续所有新流都交付不出去。
+pub(super) enum NewStream {
+    Stream(u64, Stream),
+    Skipped(u64),
+}
+
+/// 分片索引(round-33):**全链路唯一**的 sid → Worker 映射。
+///
+/// 关键点:先剥掉最低位的奇偶标志位再取模。yamux 的流 ID 恒为
+/// `1,3,5,7,...`(客户端侧发起)/`2,4,6,...`(服务端侧发起),即每侧只
+/// 用一个奇偶性且步长为 2;直接 `sid % N` 在 N=4 时只会落 1 或 3,
+/// Worker 0/2 终生空转。`sid >> 1` 把 1,3,5,7 压成 0,1,2,3,恰好均匀
+/// 铺满任意 N(2/3/4 均无闲置分片)。
+///
+/// 本公式只决定**数据面**归属(帧路由、流命令注册、ctrl 删除回送、
+/// opening 收编权)。新流的**交付顺序**不依赖分片,由 RecvHalf 的
+/// 序号重排队列保证(见 `RecvHalf::poll_inner` 的交付段)。
+#[inline]
+pub(super) fn shard_index(sid: StreamId, shard_count: usize) -> usize {
+    debug_assert!(shard_count > 0, "shard_count must be >= 1");
+    ((sid.val() as usize) >> 1) % shard_count
 }
 
 /// SendHalf → Worker 的冷路径控制(仅流删除,§2.5-D ②路径)。
@@ -300,9 +332,10 @@ pub struct ShardWorker {
     msg_rx: ShardConsumer<ShardMsg>,
     ctrl_rx: ShardConsumer<ShardCtrl>,
     /// 建流交付通道(Worker→RecvHalf,D6:cap 16)。
-    new_streams: mpsc::Sender<Stream>,
-    /// new_streams 满时的暂存(不得丢句柄)。
-    pending_new: VecDeque<Stream>,
+    new_streams: mpsc::Sender<NewStream>,
+    /// new_streams 满时的暂存(不得丢句柄;round-33 起同时承载
+    /// [`NewStream::Skipped`] 的序号回报)。
+    pending_new: VecDeque<NewStream>,
     msg_buf: VecDeque<ShardMsg>,
     ctrl_buf: VecDeque<ShardCtrl>,
     finished: bool,
@@ -318,7 +351,7 @@ impl ShardWorker {
         shared: Arc<ConnShared>,
         msg_rx: ShardConsumer<ShardMsg>,
         ctrl_rx: ShardConsumer<ShardCtrl>,
-        new_streams: mpsc::Sender<Stream>,
+        new_streams: mpsc::Sender<NewStream>,
     ) -> Self {
         let mode = shared.mode;
         let config = shared.config.clone();
@@ -342,9 +375,9 @@ impl ShardWorker {
         }
     }
 
-    /// opening 条目是否归属本分片(与 Framer 路由 `sid % N` 同式)。
+    /// opening 条目是否归属本分片(与 Framer 路由同式,见 [`shard_index`])。
     fn owns(&self, id: StreamId) -> bool {
-        (id.val() as usize) % self.shard_count == self.index
+        shard_index(id, self.shard_count) == self.index
     }
 
     /// 排空本地流表:逐流 Closed + 唤醒 reader/writer + 摘表(§2.2/§2.6)。
@@ -535,10 +568,11 @@ impl ShardWorker {
     }
 
     fn process_msg(&mut self, msg: ShardMsg) {
-        let is_syn = matches!(msg, ShardMsg::Syn(_));
-        let frame = match msg {
-            ShardMsg::Frame(f) => f,
-            ShardMsg::Syn(f) => f,
+        // SYN 走建流全流程(round-33:交付顺序由 RecvHalf 按 seq 重排恢复,
+        // 分片只负责"这一帧归谁处理",不再承担控制面保序)。
+        let (seq, frame) = match msg {
+            ShardMsg::Frame(f) => (None, f),
+            ShardMsg::Syn { seq, frame } => (Some(seq), frame),
         };
         log::trace!("{}: received: {}", self.id, frame.header());
 
@@ -559,41 +593,44 @@ impl ShardWorker {
             }
         }
 
-        if is_syn {
-            self.on_syn(frame);
-        } else {
-            match frame.header().tag() {
-                Tag::Data => self.on_data(frame.into_data()),
-                Tag::WindowUpdate => self.on_window_update(frame.into_window_update()),
-                Tag::Ping => self.on_ping(frame.into_ping()),
-                // GoAway 由 Framer 本地 fatal,不路由至此(防御丢弃)
-                Tag::GoAway => {}
+        match (seq, frame.header().tag()) {
+            (Some(seq), Tag::Data) => self.on_syn_data(seq, frame.into_data()),
+            (Some(seq), Tag::WindowUpdate) => {
+                self.on_syn_window_update(seq, frame.into_window_update())
             }
+            (None, Tag::Data) => self.on_data(frame.into_data()),
+            (None, Tag::WindowUpdate) => self.on_window_update(frame.into_window_update()),
+            (_, Tag::Ping) => self.on_ping(frame.into_ping()),
+            // GoAway 由 Framer 本地 fatal,不路由至此(防御丢弃)
+            (_, Tag::GoAway) => {}
         }
     }
 
-    /// SYN 建流(§2.3 首行:Data|SYN / WU|SYN 建流全流程)。
-    fn on_syn(&mut self, frame: Frame<()>) {
-        match frame.header().tag() {
-            Tag::Data => self.on_syn_data(frame.into_data()),
-            Tag::WindowUpdate => self.on_syn_window_update(frame.into_window_update()),
-            // Framer 只路由 Data|SYN / WU|SYN(防御丢弃)
-            _ => {}
+    /// SYN 建流被拒时的序号回报:让 RecvHalf 的水位越过本序号(否则
+    /// 后续新流永久卡住)。压入建流通道失败(RecvHalf 已亡)即忽略——
+    /// 此时连接正在终结,无人等待交付顺序。
+    fn report_syn_skipped(&mut self, seq: u64) {
+        if self.new_streams.try_send(NewStream::Skipped(seq)).is_err() {
+            // 通道满:暂存到 pending_new 的队尾(FIFO 语义:该 SYN 已被
+            // 本帧消费完,其 Skipped 排在已建流的交付之后即可)。
+            self.pending_new.push_back(NewStream::Skipped(seq));
         }
     }
 
-    fn on_syn_data(&mut self, frame: Frame<crate::frame::header::Data>) {
+    fn on_syn_data(&mut self, seq: u64, frame: Frame<crate::frame::header::Data>) {
         let stream_id = frame.header().stream_id();
         let is_finish = frame.header().flags().contains(header::FIN); // half-close
         if !self.is_valid_remote_id(stream_id, Tag::Data) {
             log::error!("{}: invalid stream id {}", self.id, stream_id);
             self.push_goaway(Frame::protocol_error());
+            self.report_syn_skipped(seq);
             return;
         }
         // 存在性检查只需本地表(D1:同一 sid 恒路由本 Worker)
         if self.streams.contains_key(&stream_id) {
             log::error!("{}/{}: stream already exists", self.id, stream_id);
             self.push_goaway(Frame::protocol_error());
+            self.report_syn_skipped(seq);
             return;
         }
         // ② 全局计数器精确上界(跨分片精确,T-W4)
@@ -602,6 +639,7 @@ impl ShardWorker {
             self.rollback_stream_count();
             log::error!("{}: maximum number of streams reached", self.id);
             self.push_goaway(Frame::internal_error());
+            self.report_syn_skipped(seq);
             return;
         }
         if frame.body().len() > DEFAULT_CREDIT as usize {
@@ -612,6 +650,7 @@ impl ShardWorker {
                 stream_id
             );
             self.push_goaway(Frame::protocol_error());
+            self.report_syn_skipped(seq);
             return;
         }
         let stream = self.make_new_inbound_stream(stream_id, DEFAULT_CREDIT);
@@ -630,26 +669,29 @@ impl ShardWorker {
                 // 未入表:回滚计数(现行路径此分支为防御性死代码,结构等价)
                 self.rollback_stream_count();
                 self.push_goaway(Frame::protocol_error());
+                self.report_syn_skipped(seq);
                 return;
             }
             shared.buffer.push(frame.into_body());
         }
         self.streams.insert(stream_id, stream.clone_shared());
-        // ④ 帧句柄入 new_streams 待交付(不丢句柄)
-        self.pending_new.push_back(stream);
+        // ④ 建流句柄入 new_streams 待交付(不丢句柄;带 seq 供 RecvHalf 重排)
+        self.pending_new.push_back(NewStream::Stream(seq, stream));
     }
 
-    fn on_syn_window_update(&mut self, frame: Frame<crate::frame::header::WindowUpdate>) {
+    fn on_syn_window_update(&mut self, seq: u64, frame: Frame<crate::frame::header::WindowUpdate>) {
         let stream_id = frame.header().stream_id();
         let is_finish = frame.header().flags().contains(header::FIN); // half-close
         if !self.is_valid_remote_id(stream_id, Tag::WindowUpdate) {
             log::error!("{}: invalid stream id {}", self.id, stream_id);
             self.push_goaway(Frame::protocol_error());
+            self.report_syn_skipped(seq);
             return;
         }
         if self.streams.contains_key(&stream_id) {
             log::error!("{}/{}: stream already exists", self.id, stream_id);
             self.push_goaway(Frame::protocol_error());
+            self.report_syn_skipped(seq);
             return;
         }
         if self.shared.stream_count.fetch_add(1, Ordering::SeqCst) + 1 > self.config.max_num_streams
@@ -657,6 +699,7 @@ impl ShardWorker {
             self.rollback_stream_count();
             log::error!("{}: maximum number of streams reached", self.id);
             self.push_goaway(Frame::internal_error());
+            self.report_syn_skipped(seq);
             return;
         }
 
@@ -664,6 +707,7 @@ impl ShardWorker {
             self.rollback_stream_count();
             log::error!("{}: header contains invalid credit", self.id);
             self.push_goaway(Frame::protocol_error());
+            self.report_syn_skipped(seq);
             return;
         };
         let stream = self.make_new_inbound_stream(stream_id, credit);
@@ -674,7 +718,7 @@ impl ShardWorker {
                 .update_state(self.id, stream_id, State::RecvClosed);
         }
         self.streams.insert(stream_id, stream.clone_shared());
-        self.pending_new.push_back(stream);
+        self.pending_new.push_back(NewStream::Stream(seq, stream));
     }
 
     /// 非 SYN Data 帧(§2.3 "Data(其余)" 行:与现行 on_data 非 SYN 分支
@@ -2804,13 +2848,174 @@ mod tests {
         assert_eq!(shared.stream_count.load(Ordering::SeqCst), 0);
     }
 
+    // ===== round-33 分片均匀度 + 新流保序(专项)=====
+
+    /// round-33 T-U1:分片哈希均匀度。client 出站 sid 恒为奇数
+    /// (1,3,5,7,…),修前的 `sid % N` 在 N=4 时只落 {1,3} —— Worker
+    /// 0/2 终生闲置。剥离奇偶位后,任意 N 下每片都必须拿到份额。
+    #[test]
+    fn shard_index_spreads_odd_stream_ids_evenly() {
+        // N=4:1,3,5,7 必须分别落到 0,1,2,3
+        let got: Vec<usize> = [1u32, 3, 5, 7]
+            .iter()
+            .map(|v| super::shard_index(StreamId::new(*v), 4))
+            .collect();
+        assert_eq!(got, vec![0, 1, 2, 3], "奇数 sid 必须铺满 4 个分片");
+
+        // N=2 / N=3 / N=4 下各跑 256 条奇数流,每片份额必须均等且非零
+        for n in [1usize, 2, 3, 4] {
+            let mut counts = vec![0usize; n];
+            for k in 0..256u32 {
+                let sid = StreamId::new(2 * k + 1); // 1,3,5,...
+                counts[super::shard_index(sid, n)] += 1;
+            }
+            let total: usize = counts.iter().sum();
+            assert_eq!(total, 256, "N={n} 必须全部分派");
+            let max = *counts.iter().max().unwrap();
+            let min = *counts.iter().min().unwrap();
+            for (idx, c) in counts.iter().enumerate() {
+                assert!(
+                    *c > 0,
+                    "N={n} 的分片 {idx} 处理 0 条 = 僵尸 Worker;分布 {counts:?}"
+                );
+            }
+            // 均匀度:极差 ≤ 1(256 不一定被 N 整除,N=3 时为 86/85/85)
+            assert!(
+                max - min <= 1,
+                "N={n} 分片不均:极差 {} (分布 {counts:?})",
+                max - min
+            );
+        }
+    }
+
+    /// round-33 T-U2:服务端入站流(偶数 sid)同样均匀。分片公式对两侧
+    /// 对称成立,不依赖谁发起。
+    #[test]
+    fn shard_index_spreads_even_stream_ids_evenly() {
+        let got: Vec<usize> = [2u32, 4, 6, 8]
+            .iter()
+            .map(|v| super::shard_index(StreamId::new(*v), 4))
+            .collect();
+        assert_eq!(got, vec![1, 2, 3, 0], "偶数 sid 同样铺满 4 个分片");
+    }
+
+    /// round-33 T-U3(红线):新流交付保序——SYN 被分片哈希打散到不同
+    /// Worker 并发建流后,`accept` 看到的 StreamId 仍必须严格按 wire 到达
+    /// 顺序单调递增。
+    ///
+    /// 构造 N=4 + 16 条 SYN:修前若直接把 `sid>>1` 塞进路由而不重排,
+    /// 交付顺序会随 Worker 调度漂移(历史踩坑:`handle #0 out of order`,
+    /// left: StreamId(4) right: StreamId(2))。
+    #[test]
+    fn inbound_streams_deliver_in_wire_order_across_shards() {
+        let mut cfg = Config::default();
+        cfg.set_shard_workers(4);
+        let mut f = Fixture::client(4, cfg);
+        const N: u32 = 16;
+        for k in 1..=N {
+            f.feed(syn_data_block(2 * k, b"x"));
+        }
+        let mut streams = Vec::with_capacity(N as usize);
+        let mut guard = 0;
+        while (streams.len() as u32) < N {
+            guard += 1;
+            assert!(guard < 4096, "交付卡在 {} 条", streams.len());
+            match f.drive_recv() {
+                Poll::Ready(Some(Ok(s))) => streams.push(s),
+                Poll::Pending => {}
+                other => panic!("unexpected recv outcome: {other:?}"),
+            }
+        }
+        for (i, s) in streams.iter().enumerate() {
+            assert_eq!(
+                s.id(),
+                StreamId::new(2 * (i as u32 + 1)),
+                "新流交付必须严格按 wire 顺序(第 {i} 条乱序)"
+            );
+        }
+    }
+
+    /// round-33 T-U4:被拒的 SYN 不得卡死交付水位。第 2 条 SYN 用非法
+    /// sid(server 侧 sid 发到 client 上是协议错误)→ Worker 拒绝并发
+    /// GoAway;其 `Skipped(seq)` 必须推进水位,使后续合法 SYN 仍能交付。
+    #[test]
+    fn rejected_syn_does_not_stall_delivery() {
+        let mut cfg = Config::default();
+        cfg.set_shard_workers(2);
+        let mut f = Fixture::client(2, cfg);
+        f.feed(syn_data_block(2, b"a"));
+        f.feed(syn_data_block(1, b"bad")); // 奇数 sid:client 侧非法入站
+        f.feed(syn_data_block(4, b"c"));
+        let mut streams = Vec::new();
+        let mut guard = 0;
+        while streams.len() < 2 {
+            guard += 1;
+            assert!(guard < 4096, "被拒 SYN 卡住了交付水位");
+            match f.drive_recv() {
+                Poll::Ready(Some(Ok(s))) => streams.push(s),
+                Poll::Pending => {}
+                other => panic!("unexpected recv outcome: {other:?}"),
+            }
+        }
+        assert_eq!(streams[0].id(), StreamId::new(2), "第 1 条合法流");
+        assert_eq!(
+            streams[1].id(),
+            StreamId::new(4),
+            "非法 sid 被拒后,后续合法流必须照常交付"
+        );
+    }
+
+    /// round-33 T-U5:Worker 消亡(abort 防御路径)留下的永久空洞不得
+    /// 让终结排空死等——全部 Worker 终结后,剩余新流必须按 seq 升序
+    /// 直接交付。
+    #[test]
+    fn terminal_drain_delivers_despite_permanent_seq_hole() {
+        let mut cfg = Config::default();
+        cfg.set_shard_workers(2);
+        let mut f = Fixture::client(2, cfg);
+        // 20 条 SYN 全部读入并路由,但只驱动一次 Worker(建流未全完成)
+        for k in 1..=20u32 {
+            f.feed(syn_data_block(2 * k, b"m"));
+        }
+        let _ = f.recv.poll(&mut f.cx);
+        // 直接丢弃一个 Worker 模拟 abort:其名下的 seq 永无回报
+        f.workers.truncate(1);
+        f.st.borrow_mut().eof = true;
+        let mut ids = Vec::new();
+        let mut done = false;
+        for _ in 0..256 {
+            match f.recv.poll(&mut f.cx) {
+                Poll::Ready(Some(Ok(s))) => ids.push(s.id().val()),
+                // Worker 消亡按 §2.6 防御路径收敛为 Closed 错误(预期):
+                // 关键断言是它**必须收敛**,不能因永久空洞无限 Pending。
+                Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
+                    done = true;
+                    break;
+                }
+                Poll::Pending => {}
+            }
+            for w in f.workers.iter_mut() {
+                let _ = w.poll_unpin(&mut f.cx);
+            }
+        }
+        assert!(done, "终结排空必须收敛,不得因永久空洞死等");
+        assert!(!ids.is_empty(), "存活 Worker 的建流必须照常交付");
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "剩余交付仍须 seq 升序(保序不退化)");
+    }
+
     // ===== round-6 §5.2 SendWorker(单测,N=2 构造跨分片)=====
 
-    /// T-S1:注册路由——8 条出站流 → 驱动 SendWorker → 各 Worker 的
-    /// SelectAll 恰含 sid%N==k 的接收器;命令不丢(收编后首条命令经
-    /// 通道 FIFO 消费、帧上线)。
+    /// T-S1(round-33 改写):注册路由——8 条出站流 → 驱动 SendWorker →
+    /// 各 Worker 的 SelectAll 恰含 `shard_index(sid, N) == k` 的接收器;
+    /// 命令不丢(收编后首条命令经通道 FIFO 消费、帧上线)。
+    ///
+    /// 修前本测试断言"sid%N 下偶数分片收编 0 条"——那正是要消灭的缺陷
+    /// (client 出站 sid 恒为奇数,`% 2` 恒等于 1,Worker 0 终生空转)。
+    /// round-33 剥离奇偶位后,8 条流必须均分到两个分片。
     #[test]
-    fn send_worker_registration_routes_by_sid_mod_n() {
+    fn send_worker_registration_routes_by_shard_index() {
         let mut f = Fixture::client(2, Config::default());
         let mut outbound = Vec::new();
         for _ in 0..8 {
@@ -2820,18 +3025,24 @@ mod tests {
             };
             outbound.push(s);
         }
-        // client 出站 sid 恒奇数:1,3,…,15 → % 2 == 1 全归 SendWorker 1
+        // client 出站 sid 恒奇数 1,3,…,15 → (sid>>1)%2 交替落 0/1
         f.poll_send_workers();
         assert_eq!(
             f.send_workers[0].streams.len(),
-            0,
-            "even shard must adopt no receivers"
+            4,
+            "分片 0 必须收编一半接收器(不得闲置)"
         );
         assert_eq!(
             f.send_workers[1].streams.len(),
-            8,
-            "odd shard must adopt all 8 receivers"
+            4,
+            "分片 1 必须收编另一半"
         );
+        for (k, w) in f.send_workers.iter().enumerate() {
+            assert!(
+                !w.streams.is_empty(),
+                "分片 {k} 收编 0 条 = 僵尸 Worker(round-33 禁止)"
+            );
+        }
         // 命令不丢:收编后的首条写命令经通道 FIFO 消费、帧经 send_out 上线
         match Pin::new(&mut outbound[0]).poll_write(&mut f.cx, b"cmd") {
             Poll::Ready(Ok(3)) => {}

@@ -1441,7 +1441,10 @@ mod halves {
         /// Worker 收编早晚不影响——命令不丢、SYN 在首帧自带 flag,顺序由
         /// 通道 FIFO 保证。
         fn push_new_receiver(&self, id: StreamId, r: mpsc::Receiver<StreamCommand>) {
-            let index = (id.val() as usize) % self.send_regs.lock().len();
+            // round-33:与帧路由同式(剥奇偶位),否则 N=4 时 Worker 0/2
+            // 永远收不到任何流命令——即"偶数 Worker 终生闲置"的另一半。
+            let n = self.send_regs.lock().len();
+            let index = shard::shard_index(id, n);
             self.send_regs.lock()[index].push_back((id, r));
             if let Some(w) = self.send_worker_wakers.lock()[index].take() {
                 w.wake();
@@ -1671,6 +1674,9 @@ mod halves {
                     route_producers,
                     rtt: rtt.clone(),
                     new_streams_rxs,
+                    next_syn_seq: 0,
+                    pending_streams: std::collections::BTreeMap::new(),
+                    next_deliver_seq: 0,
                     pending_route: None,
                     teardown: None,
                     flush_signaled: false,
@@ -1718,7 +1724,20 @@ mod halves {
         rtt: rtt::Rtt,
         /// 各 Worker 的建流通道接收器(D6/§2.4:实施者定由 RecvHalf 直接
         /// 持有;空闲时各接收器登记本任务 waker,futures mpsc 自带唤醒)。
-        new_streams_rxs: Vec<mpsc::Receiver<Stream>>,
+        /// round-33:元素改为 [`shard::NewStream`](带到达序号),交付前经
+        /// [`Self::deliver_ordered`] 重排。
+        new_streams_rxs: Vec<mpsc::Receiver<shard::NewStream>>,
+        /// 下一条 SYN 的到达序号(每读到一条带 SYN 的帧 +1)。建流被分散
+        /// 到 N 个 Worker 并发执行,完成顺序与到达顺序无关;序号是恢复
+        /// accept 线序的唯一依据。
+        next_syn_seq: u64,
+        /// 已到达但还不能交付的新流/序号回报(按序号索引,`BTreeMap` 的
+        /// 首元素即当前水位)。只装"乱序先到"的那一小撮:顺序到达的流
+        /// 直接交付、不入表。
+        pending_streams: std::collections::BTreeMap<u64, Option<Stream>>,
+        /// 交付水位:下一个期望交付的序号。SYN 被 Worker 拒绝时以
+        /// [`shard::NewStream::Skipped`] 推进水位(否则永久卡死)。
+        next_deliver_seq: u64,
         /// 路由背压暂存:分片通道满时持有未路由帧,唤醒后最先重试
         /// (不丢帧,§2.1 防线)。
         pending_route: Option<(usize, shard::ShardMsg)>,
@@ -1808,15 +1827,39 @@ mod halves {
                     // 排空③:交付 Workers 的建流产出,直至全部接收器耗尽
                     // (sender close_channel/drop = 对应 Worker 已终结)
                     let mut exhausted = true;
-                    for rx in self.new_streams_rxs.iter_mut() {
-                        match rx.poll_next_unpin(cx) {
-                            Poll::Ready(Some(stream)) => {
-                                log::trace!("{}: new inbound {}", self.shared.id, stream);
-                                return Poll::Ready(Some(Ok(stream)));
+                    // 借用分离:接收器集合先整体取出,收完再放回(纯 move,
+                    // 无分配),否则 `absorb_new_stream(&mut self)` 与
+                    // 接收器借用冲突。
+                    let mut rxs = std::mem::take(&mut self.new_streams_rxs);
+                    for rx in rxs.iter_mut() {
+                        loop {
+                            match rx.poll_next_unpin(cx) {
+                                Poll::Ready(Some(msg)) => self.absorb_new_stream(msg),
+                                Poll::Ready(None) => break,
+                                Poll::Pending => {
+                                    exhausted = false;
+                                    break;
+                                }
                             }
-                            Poll::Ready(None) => {}
-                            Poll::Pending => exhausted = false,
                         }
+                    }
+                    self.new_streams_rxs = rxs;
+                    // 重排队列里可能还有"已到但被乱序卡住"的新流:必须
+                    // 先交付完再宣告终结,否则这些句柄会随 finished 丢失
+                    // (T-W13 的等价语义:已路由的建流全部落地后才终结)。
+                    //
+                    // 全部 Worker 已终结(exhausted)时不再可能有回报补齐
+                    // 空洞(Worker 被 abort 的防御路径:已路由的 SYN 永远
+                    // 不会有应答),此时按 seq 升序直接交付剩余条目——保序
+                    // 仍成立,且绝不会因永久空洞而死等。
+                    let next = if exhausted {
+                        self.drain_pending_any_order()
+                    } else {
+                        self.take_ordered_stream()
+                    };
+                    if let Some(stream) = next {
+                        log::trace!("{}: new inbound {}", self.shared.id, stream);
+                        return Poll::Ready(Some(Ok(stream)));
                     }
                     if exhausted {
                         self.finished = true;
@@ -1854,8 +1897,22 @@ mod halves {
                 //    (路由受阻)时 Worker 因 new_streams 满而门控,唯有
                 //    本任务消费建流通道释放容量后 Worker 才继续排空分片
                 //    通道;若先重试路由,满通道 park 永远到不了这里 → 互锁。
-                for rx in self.new_streams_rxs.iter_mut() {
-                    if let Poll::Ready(Some(stream)) = rx.poll_next_unpin(cx) {
+                //
+                // round-33:SYN 建流被分散到 N 个 Worker 并发执行,完成顺序
+                // 与到达顺序无关。故此处只把产出**收进重排队列**,再由
+                // `take_ordered_stream` 按到达序号交付——accept 线序与
+                // 分片哈希彻底解耦(这正是可以安全剥离奇偶位的前提)。
+                let mut absorbed = false;
+                let mut rxs = std::mem::take(&mut self.new_streams_rxs);
+                for rx in rxs.iter_mut() {
+                    while let Poll::Ready(Some(msg)) = rx.poll_next_unpin(cx) {
+                        self.absorb_new_stream(msg);
+                        absorbed = true;
+                    }
+                }
+                self.new_streams_rxs = rxs;
+                if absorbed || !self.pending_streams.is_empty() {
+                    if let Some(stream) = self.take_ordered_stream() {
                         log::trace!("{}: new inbound {}", self.shared.id, stream);
                         return Poll::Ready(Some(Ok(stream)));
                     }
@@ -1983,7 +2040,11 @@ mod halves {
                 Tag::Data | Tag::WindowUpdate => {
                     let index = self.route_index(frame.header().stream_id());
                     let msg = if frame.header().flags().contains(header::SYN) {
-                        shard::ShardMsg::Syn(frame)
+                        // 到达序号在这里分配(单线程顺序读,天然单调),
+                        // 交付顺序由它恢复,与分片无关。
+                        let seq = self.next_syn_seq;
+                        self.next_syn_seq += 1;
+                        shard::ShardMsg::Syn { seq, frame }
                     } else {
                         shard::ShardMsg::Frame(frame)
                     };
@@ -1995,7 +2056,56 @@ mod halves {
         /// round-8 优化项 2:直接按缓存句柄数取模,免 `shared.workers`
         /// 互斥锁——每帧数据路由的原热路径。
         fn route_index(&self, sid: StreamId) -> usize {
-            (sid.val() as usize) % self.route_producers.len()
+            shard::shard_index(sid, self.route_producers.len())
+        }
+
+        /// 收下一份建流产出进重排队列(round-33)。
+        ///
+        /// `Skipped` 记为 `None` 占位:该序号必须被"消耗"以推进水位,
+        /// 但不得产出流(Worker 已因协议错误拒绝该 SYN 并发过 GoAway)。
+        fn absorb_new_stream(&mut self, msg: shard::NewStream) {
+            match msg {
+                shard::NewStream::Stream(seq, stream) => {
+                    // 序号唯一(每帧分配一次),重复插入不可能;防御性覆盖
+                    self.pending_streams.insert(seq, Some(stream));
+                }
+                shard::NewStream::Skipped(seq) => {
+                    self.pending_streams.insert(seq, None);
+                }
+            }
+        }
+
+        /// 终结排空专用:全部 Worker 已终结,不可能再有回报补齐空洞,
+        /// 剩余条目按 seq 升序直接交付(`Skipped` 占位跳过)。保序仍成立
+        /// (升序 = wire 顺序),且不会因永久空洞而死等。
+        fn drain_pending_any_order(&mut self) -> Option<Stream> {
+            while let Some((seq, slot)) = self.pending_streams.pop_first() {
+                self.next_deliver_seq = self.next_deliver_seq.max(seq + 1);
+                if let Some(stream) = slot {
+                    return Some(stream);
+                }
+            }
+            None
+        }
+
+        /// 按到达序号交付下一条新流:从水位起连续推进,遇到空洞即停
+        /// (空洞对应的 Worker 还没处理完,继续等它)。
+        ///
+        /// 单调性保证:`next_deliver_seq` 只增不减,且只交付等于水位的
+        /// 条目,故对外交付的 StreamId 序列严格等于 wire 上的 SYN 到达
+        /// 顺序——即使分片哈希把相邻 SYN 分到不同 Worker 并发建流。
+        fn take_ordered_stream(&mut self) -> Option<Stream> {
+            loop {
+                let seq = self.next_deliver_seq;
+                let Some(slot) = self.pending_streams.remove(&seq) else {
+                    return None; // 空洞:等对应 Worker 交付
+                };
+                self.next_deliver_seq = seq + 1;
+                if let Some(stream) = slot {
+                    return Some(stream);
+                }
+                // Skipped:该序号不产出流,继续推进下一条
+            }
         }
 
         /// 路由一帧到 worker[index](§2.4):try_push 失败 → 登记生产者
