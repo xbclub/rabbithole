@@ -55,6 +55,12 @@ Thumbs.db
 # Benchmark measurement evidence (large raw artifacts, kept on disk only)
 benchmark/runs/
 
+# Raw measurement data (jsonl): per-run probe/instrumentation records, kept on
+# disk only. They are machine-generated, large, and may carry environment
+# specifics (internal host addresses) that should not enter version control.
+# Analysis conclusions belong in the markdown reports instead.
+*.jsonl
+
 # Python bytecode cache
 __pycache__/
 *.pyc
