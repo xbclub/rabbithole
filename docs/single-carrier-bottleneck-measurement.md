@@ -6616,3 +6616,64 @@ read_frame() → on_frame() → route() → try_push(分片通道)
 **⇒ 根因指向:`Bytes`/`BytesMut` 的内存分配与拷贝频率过高。**
 
 **下一轮:统计页分配次数,定位是哪个分配点。**
+
+### 43.23 ⭐⭐⭐ `clear_page_orig` 来自 `sendto` 的 skb 分配
+
+**`clear_page_orig`(6.21%)的调用栈:**
+
+```
+clear_page_orig
+  ← __sys_sendto → sock_sendmsg → inet_sendmsg → tcp_sendmsg
+     ← 分配 skb 时清零新页
+```
+
+**5.49% 的 `clear_page_orig` 来自 `sendto` 路径。**
+
+**⇒ 每发送数据就要分配并清零页(skb 的 4KB 数据页)。**
+
+### 43.24 这解释了两者差异
+
+| | rh | frp |
+|---|---|---|
+| 每次写字节 | 52 KB | 52 KB |
+| 写频率 | 4750/s | **7650/s** |
+| `clear_page_orig` | **6.67%** | 3.73% |
+| `free_unref_page` | 3.10% | 1.53% |
+
+**两者每次写的字节相同,但 rh 的页管理开销是 frp 的 1.8~2 倍。**
+
+**⇒ 同样的字节量,rh 触发了更多的页分配/释放。**
+
+**可能原因:rh 的 writev/sendto 分段方式导致 skb 分配更碎。**
+
+### 43.25 一个可验证的推论
+
+**若 rh 的 `sendto` 一次写 52KB 但内核需要拆成 13 个 skb,
+而 frp 的 `write` 也是 52KB 同样拆 13 个,那页开销应该相同。**
+
+**实测 rh 更高 ⟹ rh 的写入模式让内核更难复用页。**
+
+**可能:rh 用 `writev`(多 iov)时,内核要为每个 iov 单独分配 skb;
+而 `sendto`(单 iov)可以用连续页。**
+
+**§42.41 已测:rh 98% 是单段 `sendto`。所以这条不成立。**
+
+### 43.26 换个角度:页开销与"写频率"的关系
+
+**rh 4750 次/s × 52KB = 247 MB/s
+frp 7650 次/s × 52KB = 398 MB/s**
+
+**frp 写的字节更多(398 vs 247),但页开销更低。**
+
+**⇒ 页开销不是与字节量成正比,而是与**某种调用模式**相关。**
+
+**这个"调用模式"是什么,是下一个要查的。**
+
+**可能的线索:`sendto` vs `write` 的差异。**
+
+**Go 的 `write` 走 `tcp_sendmsg`;Rust 的 `sendto` 也走 `tcp_sendmsg`。
+两者应该相同。**
+
+**但 rh 用 `MSG_NOSIGNAL`?或不同的 flags?**
+
+**验证:strace 抓 rh 的 sendto flags。**
