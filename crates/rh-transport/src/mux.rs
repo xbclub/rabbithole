@@ -312,9 +312,16 @@ type MuxConn = yamux::Connection<YamuxCarrier>;
 /// chunk 中继读块上限(读缓冲 64KiB 红线:yamux 窗口更新按读步进,
 /// 超限会打破与对端发送窗的锁步节奏)。
 /// round-12:`RH_MUX_PREFETCH=1` 启用"写当前块 + 读下一块"并发。
+/// round-31:下行"写当前批 / 读下一块"并发开关。默认开——实测关掉时
+/// 冲刷后下一块还没到,收割循环一次即退出,聚合退化成 1 块/批
+/// (reads=256/writes=256 严格 1:1,wr_per_blk 77ms)。
 fn prefetch_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("RH_MUX_PREFETCH").map(|v| v == "1").unwrap_or(false))
+    *V.get_or_init(|| {
+        std::env::var("RH_MUX_PREFETCH")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 const CHUNK_CAP: usize = 64 * 1024;
@@ -631,21 +638,36 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// down 侧小块聚合的段数上限(round-8 优化项 4):一次冲刷的 writev
-/// 至多聚合这么多小块。128 段栈上 IoSlice ≈ 2KB,远低于 Linux
-/// IOV_MAX=1024;小块极端碎片化(每块 <512B)时由本上限先于字节上限
-/// 触发冲刷,保证 writev 段数组有界。
+/// down 侧聚合的段数上限:一次冲刷的 writev 至多聚合这么多段。
+/// 128 段栈上 IoSlice ≈ 2KB,远低于 Linux IOV_MAX=1024。
 const SMALL_CHUNK_SEGS: usize = 128;
 
-/// down 侧搬运:mux 块 → a 写。满块(≥64KiB)直写(零拷贝单次 syscall);
-/// 小块聚合(round-8 优化项 4:改向量写——小块以 `Bytes` 引用计数暂存
-/// `Vec<Bytes>` 收集数组,0 次内存拷贝;冲刷时构造 IoSlice 段数组经
-/// `write_vectored` 一次下发,彻底消除旧 `BytesMut::extend_from_slice`
-/// 聚合槽的用户态二次 memcpy),聚合上限 64KiB / 128 段先到先冲,
-/// 无后续就绪块即冲刷保延迟(节奏与旧 copy 路径一致:降低 syscall/
-/// 唤醒频率)。
+/// down 侧一次冲刷的**字节**上限(round-31 项 5)。修前小块路径用
+/// `CHUNK_CAP`(64KiB)做字节上限,满块则完全不聚合——转发主力全是
+/// 64KiB 满块,聚合路径因此从未生效。现在满块也入收集数组,字节上限
+/// 需能容纳多个满块,否则"聚合"退化为"1 块一批",与直写无异。
 ///
-/// 限速=送达计费(A3/A5):字节入收集数组不扣费;冲刷/直写前按写出量
+/// 取值 1MiB = 16 个满块。上界依据:用户侧 socket 的发送缓冲典型
+/// 数十 KB~数 MB,一次 writev 超过内核可接纳量只会被部分写掉(诊断
+/// 里 partial_writes 已占 86%),多出的部分仍要下一轮 await 补写;
+/// 1MiB 在 10GbE + 0.1ms RTT 下约等于 0.8ms 的在途量,既能摊薄
+/// syscall,又不会把单轮写拖成"写满整个发送缓冲"的长阻塞。
+const DOWN_BATCH_BYTES: usize = 1024 * 1024;
+
+/// down 侧搬运:mux 块 → a 写。
+///
+/// round-31 项 5 重构:满块与小块**统一**进 `Vec<Bytes>` 收集数组
+/// (Bytes 引用计数暂存,0 次内存拷贝),冲刷时构造 IoSlice 段数组经
+/// `write_vectored` 一次下发。修前满块走"一块一次 `write()`"直写、
+/// 只有小块聚合,而转发主力全是 64KiB 满块——聚合路径形同虚设,
+/// 跨机下 86% 的直写只写出去一部分,`write_ms` 占 pump 时间的 98%。
+///
+/// 收割策略:先无条件收下当前块,再用 `try_read_chunk`(不挂起)把
+/// **已经就绪**的后续块一并收进来,直到 [`DOWN_BATCH_BYTES`] 或
+/// [`SMALL_CHUNK_SEGS`] 触顶。没有就绪块时立即冲刷,不额外等 RTT
+/// (保延迟,不改变"有多少写多少"的节奏)。
+///
+/// 限速=送达计费(A3/A5):字节入收集数组不扣费;冲刷前按写出量
 /// 预留,按实际写出逐步消费——取消/部分写时未消费预留自动退还,
 /// 总扣费恒等于已送达字节(修前:聚合块先按 len 扣费,push_front 回退
 /// 余量后被再次扣费,×3 复现多扣 32768B)。
@@ -658,57 +680,6 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     limiter: &Option<std::sync::Arc<dyn crate::ChunkLimiter>>,
 ) -> bool {
     use std::io::IoSlice;
-
-    /// 预留 n 字节并写出 b,按实际写出消费;取消/写失败退款未消费部分。
-    /// 返回 false = 写侧不可用(本轮结束)。
-    async fn write_metered<W: tokio::io::AsyncWrite + Unpin>(
-        w: &mut W,
-        b: &Bytes,
-        limiter: &Option<std::sync::Arc<dyn crate::ChunkLimiter>>,
-    ) -> bool {
-        use tokio::io::AsyncWriteExt as _;
-        let __d = pump_diag::enabled();
-        let __t0 = if __d { Some(std::time::Instant::now()) } else { None };
-        let mut res = match limiter {
-            Some(l) => Some(l.reserve(b.len()).await),
-            None => None,
-        };
-        if let Some(t) = __t0 {
-            pump_diag::RESERVE_NS.fetch_add(
-                t.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
-        let __t1 = if __d { Some(std::time::Instant::now()) } else { None };
-        let mut off = 0usize;
-        let mut partial = 0u64;
-        while off < b.len() {
-            match w.write(&b[off..]).await {
-                Ok(0) => return false, // WriteZero:写侧不可用
-                Ok(k) => {
-                    if k < b.len() - off {
-                        partial += 1;
-                    }
-                    off += k;
-                    if let Some(r) = res.as_mut() {
-                        r.consume(k);
-                    }
-                }
-                Err(_) => return false,
-            }
-        }
-        if let Some(t) = __t1 {
-            pump_diag::SOCKWRITE_NS.fetch_add(
-                t.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            if partial > 0 {
-                pump_diag::PARTIAL_WRITES.fetch_add(partial, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        true
-        // res(若有未消费余量)在返回时 drop → 自动退还
-    }
 
     /// 多段向量写(优化项 4 核心):预留剩余总量,跨段推进部分写,按实际
     /// 写出逐步消费;取消/写失败退款未消费部分。返回 false = 写侧不可用。
@@ -783,17 +754,10 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         ok
     }
 
-    /// round-12 预取槽:写当前块期间并发读出的下一块。
-    enum Prefetched {
-        Chunk(Bytes),
-        Eof,
-        Err,
-    }
-    let mut prefetch_slot: Option<Prefetched> = None;
     let mut __last_read_end: Option<std::time::Instant> = None;
 
-    let mut smalls: Vec<Bytes> = Vec::new();
-    let mut smalls_bytes = 0usize;
+    // 上一轮写期间预取到的下一块(下一轮批的首块)。
+    let mut pending: Option<Bytes> = None;
     // 单流口径埋点(仅 RH_PUMP_STATS=1 时累加,关闭时零开销)
     let mut rd_ns: u64 = 0;
     let mut wr_ns: u64 = 0;
@@ -811,32 +775,56 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             pump_diag::LOOP_GAP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let __t0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
-        // round-12:优先消费预取结果(上一轮写时已读好),避免再次等待。
-        let chunk = if let Some(pf) = prefetch_slot.take() {
-            match pf {
-                Prefetched::Chunk(c) => c,
-                Prefetched::Eof => break 'outer true,
-                Prefetched::Err => break 'outer false,
+        // round-31 项 5 流水线:每轮"写当前收集批"与"填下一批"并发。
+        //
+        // 修前(round-30 及更早)满块走"一块一次 write()"直写,只有小块
+        // 聚合——转发主力全是 64KiB 满块,聚合路径形同虚设。跨机诊断:
+        // avg_chunk=65521(全满块)、partial_writes=3707/4325(86% 的写只
+        // 写出去一部分)、write_ms 占 pump 时间 98%、reserve_ms 占 0%。
+        //
+        // 只把满块并入收集数组还不够(实测仍 1 块/批、wr_per_blk 71ms):
+        // 冲刷后下一块往往还没到,收割循环一次即退出。必须让写阻塞在
+        // 内核发送缓冲上时读侧继续填充,回来时下一批已有料可聚合。
+        //
+        // 结构:用 `pending` 保存**本轮到期的首块**(上一轮预取的结果),
+        // 本轮先把它加上已就绪块组成批,然后 select("写这批" vs "读下一块")
+        // ——读先完成就把块存进 pending 供下一轮用,写先完成就进入下一轮。
+        // 写一旦失败立即返回(**收敛红线**:不能 join,写错后读可能永挂)。
+        let mut batch: Vec<Bytes> = Vec::new();
+        let mut batch_bytes = 0usize;
+        let mut batch_eof = false;
+
+        // 组装本轮批:首块(pending 或新读)+ 所有已就绪块,直到上限。
+        if let Some(first) = pending.take() {
+            batch_bytes += first.len();
+            batch.push(first);
+        }
+        while batch_bytes < DOWN_BATCH_BYTES && batch.len() < SMALL_CHUNK_SEGS {
+            match b_read.try_read_chunk().await {
+                Ok(Some(c)) if !c.is_empty() => {
+                    batch_bytes += c.len();
+                    batch.push(c);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => { batch_eof = true; break; }
             }
-        } else {
+        }
+        if batch.is_empty() {
+            // 本轮无料:阻塞等一块(这是唯一会等 RTT 的地方,EOF 在此收敛)
             match b_read.read_chunk().await {
-                Ok(Some(c)) => c,
+                Ok(Some(c)) => {
+                    batch_bytes += c.len();
+                    batch.push(c);
+                }
                 Ok(None) => break 'outer true,
                 Err(_) => break 'outer false,
             }
-        };
-        let __last_read_end = if pump_diag::enabled() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+        }
         if let Some(t) = __t0 {
             rd_ns += t.elapsed().as_nanos() as u64;
             rd_cnt += 1;
-            by_bytes += chunk.len() as u64;
-            // 循环内定期快照:短期负载下 pump 不会退出,退出点的 dump
-            // 拿不到样本(§17.10)。每 256 块(~16MiB)打印一次当前累计,
-            // 便于在测试进行中取窗口值。
+            by_bytes += batch_bytes as u64;
             if rd_cnt % 256 == 0 {
                 pump_diag::dump_local("down-mid", rd_ns, wr_ns, rd_cnt, wr_cnt, by_bytes, wr_slow);
                 yamux::sched_diag::dump("read");
@@ -853,75 +841,52 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                 yamux::sched_diag::dump_spare("down");
             }
         }
-        if chunk.len() >= CHUNK_CAP {
-            if !flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await {
-                break 'outer false;
-            }
-            let __w0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
-            // round-12 预取:写当前块与读下一块并发,打破"读→写→读"的串行。
-            // 只在满块直写路径生效(转发主力形态),小块聚合路径不变。
-            let __ok = if prefetch_enabled() {
-                let read_fut = b_read.read_chunk();
-                let write_fut = write_metered(a_w, &chunk, limiter);
-                let (nr, nw) = futures::join!(read_fut, write_fut);
-                prefetch_slot = match nr {
-                    Ok(Some(c)) => Some(Prefetched::Chunk(c)),
-                    Ok(None) => Some(Prefetched::Eof),
-                    Err(_) => Some(Prefetched::Err),
-                };
-                nw
-            } else {
-                write_metered(a_w, &chunk, limiter).await
-            };
-            if let Some(t) = __w0 {
-                let el = t.elapsed();
-                wr_ns += el.as_nanos() as u64;
-                wr_cnt += 1;
-                if el.as_millis() >= 1 {
-                    wr_slow += 1;
-                }
-            }
-            if !__ok {
-                break 'outer false;
-            }
-            continue;
-        }
-        if chunk.is_empty() {
-            continue;
-        }
-        // 小块:仅增加 Bytes 引用计数暂存(0 拷贝)
-        smalls_bytes += chunk.len();
-        smalls.push(chunk);
-        if smalls_bytes >= CHUNK_CAP || smalls.len() >= SMALL_CHUNK_SEGS {
-            if !flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await {
-                break 'outer false;
-            }
-            continue;
-        }
-        // 聚合后续立即就绪的块(入收集数组的字节冲刷时统一预留/消费)
-        loop {
-            match b_read.try_read_chunk().await {
-                Ok(Some(c)) if !c.is_empty() => {
-                    smalls_bytes += c.len();
-                    smalls.push(c);
-                    if smalls_bytes >= CHUNK_CAP || smalls.len() >= SMALL_CHUNK_SEGS {
-                        if !flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await {
-                            break 'outer false;
+        let __last_read_end = if pump_diag::enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        let __w0 = if pump_diag::enabled() { Some(std::time::Instant::now()) } else { None };
+        // 写这批;未达上限时并发读下一块(读结果进 pending,不阻塞写)。
+        let __ok = if prefetch_enabled() && batch_bytes < DOWN_BATCH_BYTES && !batch_eof {
+            let write_fut = flush(a_w, &mut batch, &mut batch_bytes, limiter);
+            futures::pin_mut!(write_fut);
+            let mut read_fut = Some(Box::pin(b_read.read_chunk()));
+            loop {
+                match read_fut.take() {
+                    Some(rf) => {
+                        futures::pin_mut!(rf);
+                        match futures::future::select(rf, write_fut.as_mut()).await {
+                            futures::future::Either::Left((nr, _)) => match nr {
+                                Ok(Some(c)) if !c.is_empty() => pending = Some(c),
+                                Ok(_) => batch_eof = true,
+                                Err(_) => batch_eof = true,
+                            },
+                            futures::future::Either::Right((ok, _)) => break ok,
                         }
-                        break;
                     }
-                }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => {
-                    if !flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await {
-                        break 'outer false;
-                    }
-                    break;
+                    None => break write_fut.await,
                 }
             }
+        } else {
+            flush(a_w, &mut batch, &mut batch_bytes, limiter).await
+        };
+        if let Some(t) = __w0 {
+            let el = t.elapsed();
+            wr_ns += el.as_nanos() as u64;
+            wr_cnt += 1;
+            if el.as_millis() >= 1 {
+                wr_slow += 1;
+            }
+        }
+        if !__ok {
+            break 'outer false;
+        }
+        if batch_eof && pending.is_none() {
+            break 'outer true;
         }
     };
-    let _ = flush(a_w, &mut smalls, &mut smalls_bytes, limiter).await;
     // 单流口径:本 pump 自己的累计(不是全局)
     pump_diag::dump_local("down", rd_ns, wr_ns, rd_cnt, wr_cnt, by_bytes, wr_slow);
     clean
