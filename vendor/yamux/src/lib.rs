@@ -93,6 +93,21 @@ pub struct Config {
     /// 见 [`Config::set_initial_stream_receive_window`])。默认
     /// [`DEFAULT_CREDIT`],即 upstream 原行为。
     initial_stream_receive_window: usize,
+    /// 每流**发送窗**初值(rabbithole round-59)。
+    ///
+    /// 修前发送窗初值在两个构造点都写死 `DEFAULT_CREDIT`(256KiB),
+    /// 与本字段(接收窗)无关:`new_outbound` 传 `DEFAULT_CREDIT`,
+    /// `make_new_inbound_stream` 也传 `DEFAULT_CREDIT`。于是**发送方**
+    /// 每 256KiB 就要等一次对端窗口更新的往返。
+    ///
+    /// 实测(上行 n=16):rh 1.29 G vs frp 2.05 G,差 36%;`PUMP_UP`
+    /// 显示每批只有 ~100KB(受 256KiB 窗与往返节奏钳制),而同条件
+    /// **下行**每批 ~574KB、吞吐 2.41 G——差别正是下行时我们是写入
+    /// 用户 socket(无 mux 窗口),上行时我们是写入 mux 流(受窗口)。
+    ///
+    /// 设为与 `initial_stream_receive_window` 同值(6MiB)后,发送方
+    /// 首窗即 6MiB,不再每 256KiB 等一次往返。
+    initial_stream_send_window: usize,
     /// 分片 Worker 数(halves 路径,round-5 §2.7)。≥1;默认 4;
     /// 未拆分路径(Active/Connection::poll_*)忽略该配置。
     shard_workers: usize,
@@ -106,6 +121,7 @@ impl Default for Config {
             read_after_close: true,
             split_send_size: DEFAULT_SPLIT_SEND_SIZE,
             initial_stream_receive_window: DEFAULT_CREDIT as usize,
+            initial_stream_send_window: DEFAULT_CREDIT as usize,
             shard_workers: 4,
         }
     }
@@ -230,6 +246,37 @@ impl Config {
         self
     }
 
+    /// 读取当前配置的每流发送窗初值。
+    pub(crate) fn initial_stream_send_window(&self) -> usize {
+        self.initial_stream_send_window
+    }
+
+    /// 设置每流**发送窗**初值(rabbithole round-59)。
+    ///
+    /// 语义:我方作为发送方时,对每条新流默认拥有的发送额度。yamux 规范
+    /// 把初始额度定为 256KiB(接收方必须按需补发窗口更新);把初值抬高
+    /// 等于**预授**额度,对端无需先发窗口更新即可写满该量。
+    ///
+    /// 约束与 `set_initial_stream_receive_window` 一致(>= 256KiB、
+    /// 必须 fit u32)。两侧必须相等或对端不小于本值,否则实际生效值
+    /// 由对端授信决定——抬高只是让我方在**收到对端窗口更新之前**就能
+    /// 继续写,不改变协议语义(对端仍可以只授 256KiB)。
+    ///
+    /// 注意:这**不是**绕过流控。真正的额度仍由对端授予;本项只是把
+    /// "首窗"从我方视角抬高到与接收窗对称,消除每 256KiB 一次往返。
+    pub fn set_initial_stream_send_window(&mut self, n: usize) -> &mut Self {
+        assert!(
+            n >= DEFAULT_CREDIT as usize,
+            "`initial_stream_send_window` must be `>= 256 KiB` (yamux spec floor)"
+        );
+        assert!(
+            n <= u32::MAX as usize,
+            "`initial_stream_send_window` must fit u32"
+        );
+        self.initial_stream_send_window = n;
+        self
+    }
+
     /// Set the number of stream-shard workers for the split-halves path
     /// (round-5 §2.7). Must be within `1..=64`; defaults to 4. The
     /// unsplit path (`Active` / `Connection::poll_*`) ignores this.
@@ -282,6 +329,8 @@ impl quickcheck::Arbitrary for Config {
             split_send_size: gr_usize(g, DEFAULT_SPLIT_SEND_SIZE, usize::MAX),
             // 随机配置保持 upstream 默认初窗(预授信行为由专项测试显式构造)
             initial_stream_receive_window: DEFAULT_CREDIT as usize,
+            // round-59:发送窗初值同样保持 upstream 默认
+            initial_stream_send_window: DEFAULT_CREDIT as usize,
             // 分片数保持默认(分片行为由专项测试显式构造)
             shard_workers: 4,
         }

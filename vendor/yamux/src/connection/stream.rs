@@ -174,7 +174,10 @@ impl Stream {
             flag: Flag::Syn,
             shared: Arc::new(Mutex::new(Shared::new(
                 DEFAULT_CREDIT,
-                DEFAULT_CREDIT,
+                // round-59:发送窗初值跟随配置(修前写死 DEFAULT_CREDIT,
+                // 与 initial_stream_receive_window 无关 ⟹ 发送方每 256KiB
+                // 就要等一次对端窗口更新往返)。
+                config.initial_stream_send_window() as u32,
                 config,
             ))),
             conn_shared,

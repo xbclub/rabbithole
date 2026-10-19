@@ -779,7 +779,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
                 );
                 return Action::Terminate(Frame::protocol_error());
             }
-            let stream = self.make_new_inbound_stream(stream_id, DEFAULT_CREDIT);
+            // round-59:发送窗初值跟随配置(修前写死 DEFAULT_CREDIT)。
+            let stream = self.make_new_inbound_stream(
+                stream_id,
+                self.config.initial_stream_send_window() as u32,
+            );
             {
                 let mut shared = stream.shared();
                 if is_finish {

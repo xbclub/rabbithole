@@ -1430,7 +1430,53 @@ fn mux_config_with_shards(max_streams: usize, shard_workers: usize) -> yamux::Co
     // 窗口恒定——不再受共享预算钳制、不再 BDP 自增(frp 对照与删除
     // 理由见上)。发送端初窗仍 256KiB——对端只见标准 WU,线路兼容。
     // 本改动只覆盖 yamux(mux 路径),不声称修复 nomux/QUIC/KCP。
+/// 每流发送窗初值覆盖(round-59,默认不覆盖)。
+///
+/// # 为什么默认不抬高
+///
+/// 发送窗初值是**协议层背压的起点**。抬到 6MiB 会让在途敞口从
+/// ~256KiB 涨到 ~6MiB,实测会让 KCP 的端到端背压测试
+/// (`b08_public_mux_stalled_reader_backpressure_and_recovery`,断言
+/// "停读必须造成写停顿")失效,并在 12MB 处提前触发连接关闭——说明
+/// 它改变了真实的可观测行为,不能作为无条件默认值。
+///
+/// # 为什么仍需要它
+///
+/// 上行(n=16)rh 1.29 G vs frp 2.05 G(差 36%)。`PUMP_UP` 显示每批
+/// 仅 ~100KB、read_ms 占 99%;同条件下**下行**每批 ~574KB、2.41 G。
+/// 差别在于下行写的是用户 socket(无 mux 窗口),上行写的是 mux 流,
+/// 每 256KiB 就要等一次对端窗口更新往返。
+///
+/// 因此做成**显式开关**:需要上行吞吐的场景(长连接大流量转发)可按需
+/// 开启并自行承担背压语义变化;默认行为与 upstream 一致。
+///
+/// `RH_MUX_SEND_WINDOW=<bytes>`(钳制 [256KiB, 64MiB])。
+fn send_window_override() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RH_MUX_SEND_WINDOW")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(256 * 1024, 64 * 1024 * 1024))
+    })
+}
+
     cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
+    // round-59:发送窗初值也设为 6MiB(修前 vendor 两处构造点都写死
+    // DEFAULT_CREDIT=256KiB,与上面的接收窗配置无关)。
+    //
+    // 上行(n=16)rh 1.29 G vs frp 2.05 G,差 36%;PUMP_UP 显示每批只有
+    // ~100KB、read_ms 占 99%,而同条件下行每批 ~574KB、2.41 G。差别正是:
+    // 下行我们写用户 socket(无 mux 窗口),上行我们写 mux 流(受发送窗)。
+    // 256KiB 的初窗意味着每 256KiB 就要等一次对端窗口更新往返。
+    //
+    // 抬高初窗不绕过流控:真实额度仍由对端授予,本项只消除"首窗过小"
+    // 带来的固定往返。对端若只授 256KiB,行为自动退回原状。
+    // round-59:发送窗初值默认仍 256KiB(yamux 规约),由 `RH_MUX_SEND_WINDOW`
+    // 显式启用放大——见下方 `send_window_override()` 的推导。
+    if let Some(n) = send_window_override() {
+        cfg.set_initial_stream_send_window(n);
+    }
     // 分片 Worker 数(round-5 §2.7 锁默认 4;round-10 起由调用方按池规模
     // 传入)。该值只作用于 halves 路径(本文件两路入口均走 halves),未
     // 拆分 Active 路径忽略。`shard_workers == DEFAULT_SHARD_WORKERS` 时与
