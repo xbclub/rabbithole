@@ -92,7 +92,11 @@ impl Pool {
         for i in 0..SHARDS {
             let idx = (start + i) & (SHARDS - 1);
             let mut g = self.lock_shard(idx);
-            let mut skipped: Vec<BytesMut> = Vec::new();
+            // round-30:用栈上固定数组替代 Vec,避免每次 get 一次堆分配。
+            // 片上限 MAX_IDLE/SHARDS = 32,故 32 槽足够容纳全部跳过项。
+            const SLOTS: usize = MAX_IDLE / SHARDS;
+            let mut skipped: [Option<BytesMut>; SLOTS] = [const { None }; SLOTS];
+            let mut n_skipped = 0usize;
             let mut found = None;
             while let Some(mut b) = g.pop() {
                 b.clear();
@@ -100,11 +104,19 @@ impl Pool {
                     found = Some(b);
                     break;
                 }
-                skipped.push(b);
+                if n_skipped < SLOTS {
+                    skipped[n_skipped] = Some(b);
+                    n_skipped += 1;
+                } else {
+                    // 理论不可达(片内条目 ≤ SLOTS);防御性放回,不丢缓冲
+                    g.push(b);
+                }
             }
             // 容量不足的条目放回原片(数量不变,不超片上限)
-            for b in skipped {
-                g.push(b);
+            for slot in skipped.iter_mut().take(n_skipped) {
+                if let Some(b) = slot.take() {
+                    g.push(b);
+                }
             }
             drop(g);
             if let Some(b) = found {
