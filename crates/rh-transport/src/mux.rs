@@ -1022,11 +1022,15 @@ const MAX_SHARD_WORKERS: usize = 64;
 /// 设施任务),协程调度切换内耗远大于其分摊收益。
 ///
 /// 语义:
-/// - `Some(n)`:显式指定,钳到 `1..=MAX_SHARD_WORKERS`(不再与核数取
-///   min——显式即用户/池规模已算过的意图,见 [`shard_workers_for_k`])。
+/// - `Some(n)`:显式指定,钳到 `1..=min(MAX_SHARD_WORKERS, cpus)`。
+///   **仍受物理核数约束**(round-46 修正:修前无视 `cpus`,`Some(999)`
+///   在 1 核机上也给 64,与下面的 None 分支语义矛盾)。显式值可以超过
+///   [`DEFAULT_SHARD_WORKERS`],但 Worker 多于核数没有并行收益。
 /// - `None`:按物理核心数自适应,`cpus.clamp(1, DEFAULT_SHARD_WORKERS)`。
 ///   1 核 → 1(消除一切跨 Worker 接力),2 核 → 2,≥4 核 → 4(round-5
 ///   三机验收锁定的既有上限,零回退)。
+///
+/// 两条分支的共同不变量:**结果永不超过物理核数**。
 ///
 /// 纯函数化:核数由 [`detect_cpus`] 注入,便于单测模拟 1/2/8 核。
 pub fn auto_shard_workers(desired: Option<usize>) -> usize {
@@ -1036,7 +1040,18 @@ pub fn auto_shard_workers(desired: Option<usize>) -> usize {
 /// [`auto_shard_workers`] 的纯函数内核(`cpus` 显式注入,便于单测)。
 pub(crate) fn auto_shard_workers_with(desired: Option<usize>, cpus: usize) -> usize {
     if let Some(n) = desired {
-        return n.clamp(1, MAX_SHARD_WORKERS);
+        // round-46:显式值也**必须**受核数约束。
+        //
+        // 修前是 `n.clamp(1, MAX_SHARD_WORKERS)`——完全无视 `cpus`,
+        // 于是 `Some(999)` 在 1 核机器上照样给 64 个 Worker,与 round-33
+        // 「1 核 → 1」的修复直接冲突(1 核上 64 个 Worker 只会互相抢
+        // 调度,分摊收益为零)。
+        //
+        // 现语义:显式值可以超过 [`DEFAULT_SHARD_WORKERS`](自动路径的
+        // 上限),但仍以**物理核数**为硬顶——Worker 多于核数没有并行收益。
+        // 下限 1、上限 `min(MAX_SHARD_WORKERS, cpus)`;`cpus.max(1)` 防
+        // 调用方传入 0(与 None 分支的 0 核兜底一致)。
+        return n.clamp(1, MAX_SHARD_WORKERS.min(cpus.max(1)));
     }
     cpus.clamp(1, DEFAULT_SHARD_WORKERS)
 }
@@ -3697,6 +3712,9 @@ mod tests {
 
     // T-C5(round-33):CPU 自适应分片数。1 核必须退化为 1(消除跨 Worker
     // 接力),2 核为 2,≥4 核回到 round-5 锁定的上限 4。
+    //
+    // round-46:补上「两条分支的结果都不得超过物理核数」这条不变量——
+    // 修前 Some 分支无视 cpus,1 核机器上 Some(999) 会 spawn 64 个 Worker。
     #[test]
     fn auto_shard_workers_scales_with_cpu_count() {
         assert_eq!(auto_shard_workers_with(None, 1), 1, "1 核 → 1 Worker");
@@ -3706,11 +3724,55 @@ mod tests {
         assert_eq!(auto_shard_workers_with(None, 8), 4, "8 核 → 上限 4");
         assert_eq!(auto_shard_workers_with(None, 64), 4, "64 核 → 上限 4");
         assert_eq!(auto_shard_workers_with(None, 0), 1, "0 核按 1 兜底");
-        // 显式指定:原样生效,仅钳到 1..=64
-        assert_eq!(auto_shard_workers_with(Some(1), 8), 1, "显式 1 不被核数抬高");
-        assert_eq!(auto_shard_workers_with(Some(8), 1), 8, "显式 8 不被核数压低");
-        assert_eq!(auto_shard_workers_with(Some(0), 8), 1, "显式 0 钳到 1");
-        assert_eq!(auto_shard_workers_with(Some(999), 8), 64, "显式超限钳到 64");
+        // 显式指定(round-46 修正):仍受物理核数约束,上限 =
+        // min(MAX_SHARD_WORKERS, cpus)。修前这里是「原样生效,仅钳到
+        // 1..=64」,`Some(8) @ 1 核` 会给 8 —— 与 None 分支的「1 核→1」
+        // 自相矛盾,也是 1 核机 spawn 64 Worker 的来源。
+        assert_eq!(
+            auto_shard_workers_with(Some(1), 8),
+            1,
+            "显式 1:核数充足时保持 1(不抬高)"
+        );
+        assert_eq!(
+            auto_shard_workers_with(Some(8), 1),
+            1,
+            "显式 8 @ 1 核:必须被核数压到 1(修前错误地给 8)"
+        );
+        assert_eq!(
+            auto_shard_workers_with(Some(8), 4),
+            4,
+            "显式 8 @ 4 核:压到核数 4,而非 8"
+        );
+        assert_eq!(
+            auto_shard_workers_with(Some(0), 8),
+            1,
+            "显式 0 钳到下限 1"
+        );
+        assert_eq!(
+            auto_shard_workers_with(Some(999), 8),
+            8,
+            "显式 999 @ 8 核:压到 8(修前给 64)"
+        );
+        assert_eq!(
+            auto_shard_workers_with(Some(999), 1),
+            1,
+            "显式 999 @ 1 核:必须给 1(修前给 64——本任务的核心缺陷)"
+        );
+        assert_eq!(
+            auto_shard_workers_with(Some(64), 64),
+            64,
+            "显式 64 @ 64 核:核数充足时可到 MAX_SHARD_WORKERS 上界"
+        );
+        assert_eq!(
+            auto_shard_workers_with(Some(999), 64),
+            64,
+            "显式超上限:即便核数充足也不得超过 MAX_SHARD_WORKERS"
+        );
+        assert_eq!(
+            auto_shard_workers_with(Some(8), 0),
+            1,
+            "cpus=0 按 1 兜底(与 None 分支一致)"
+        );
         // 真实探测路径必须落在合法区间(不硬编码本机核数)
         let real = auto_shard_workers(None);
         assert!(
