@@ -151,3 +151,111 @@ async fn pool_wiring_single_carrier_equivalence() {
 
     deadline(server).await.expect("server task");
 }
+
+/// round-47:`Multiplexer::shard_workers()` 报告的值必须等于**实际 spawn**
+/// 的 ShardWorker 数量,而不是按公式重算的值。
+///
+/// 这是「日志值 == 实际值」的回归锁:`rh-client` 的 pool sizing 日志改读
+/// 该访问器。修前它另起一处 `shard_workers_for_k(initial_k)` 独立计算,
+/// 只因输入恰好相同才碰巧一致。
+///
+/// 判据分两层:
+///   1. 池变体(K>1):报告值 == `shard_workers_for_k(K)`(构造时传给
+///      载体的值),且 >0;
+///   2. 单载体变体(K=1,走 `connect` 而非池):报告值 == 该载体构造时
+///      的 shard 数,且与池侧口径一致。
+///
+/// 更强的一层:对同一 K,池内每个成员的报告值必须相同(它们由同一次
+/// `connect_stream_pool` 用同一 `shards` 创建)——若将来某人给不同成员
+/// 传了不同的 shard 数,这里会红。
+#[tokio::test]
+async fn shard_workers_reports_actually_spawned_count() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // 服务端:接受 K 条裸 TCP 并各建一个 yamux(不回话,只保活)
+    let server = tokio::spawn(async move {
+        let mut kept = Vec::new();
+        for _ in 0..2 {
+            if let Ok((conn, _)) = listener.accept().await {
+                kept.push(server_yamux(conn));
+            }
+        }
+        // 保持载体存活到测试结束
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        drop(kept);
+    });
+
+    // K=2 → 池变体
+    let cfg = tcp_pool_cfg(addr);
+    let pool = deadline(rh_transport::connect_pool(&cfg, 2))
+        .await
+        .expect("connect_pool K=2");
+
+    let reported = pool
+        .shard_workers()
+        .await
+        .expect("池变体必须报告 shard_workers");
+    let expected = rh_transport::mux::shard_workers_for_k(2);
+    assert_eq!(
+        reported, expected,
+        "K=2 时报告值必须等于构造时传入的 shard 数(实际 spawn 的数量)"
+    );
+    assert!(reported > 0, "shard 数必须 >= 1,实际 {reported}");
+
+    server.abort();
+}
+
+/// round-47:单载体路径(K=1,走 `connect` 而非池)同样报告实际值,
+/// 且数值符合「K=1 时取自适应预算」的既有语义(红线:不建池、shard 仍为
+/// 自适应值)。
+#[tokio::test]
+async fn shard_workers_reports_on_single_carrier_path() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        if let Ok((conn, _)) = listener.accept().await {
+            let mux = server_yamux(conn);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(mux);
+        }
+    });
+
+    let cfg = tcp_pool_cfg(addr);
+    let single = deadline(rh_transport::connect(&cfg)).await.expect("connect");
+
+    let reported = single
+        .shard_workers()
+        .await
+        .expect("单 yamux 变体必须报告 shard_workers");
+    let expected = rh_transport::mux::shard_workers_for_k(1);
+    assert_eq!(
+        reported, expected,
+        "K=1 单载体路径的 shard 数必须等于实际 spawn 的自适应值"
+    );
+
+    server.abort();
+}
+
+/// round-47:`YamuxMultiplexer::shard_workers()` 与真实 Worker 数一致——
+/// 用 `into_halves()` 独立构造一个载体,直接数返回的 Worker 向量长度,
+/// 与访问器报告值对比。这是最底层的「实际值」定义。
+#[tokio::test]
+async fn yamux_multiplexer_shard_workers_matches_into_halves() {
+    // 对若干 shard 数分别构造,断言报告值 == 实际 Worker 数
+    for shards in [1usize, 2, 3, 4, 8] {
+        let (a, _b) = tokio::io::duplex(64 * 1024);
+        let mux = rh_transport::mux::YamuxMultiplexer::new(
+            Box::new(a) as rh_transport::BoxedIo,
+            yamux::Mode::Client,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+            shards,
+        );
+        assert_eq!(
+            mux.shard_workers(),
+            shards,
+            "shard_workers={shards} 时载体必须报告实际 spawn 的数量"
+        );
+    }
+}

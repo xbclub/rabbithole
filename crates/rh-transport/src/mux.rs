@@ -1159,6 +1159,14 @@ pub struct YamuxMultiplexer {
     open_tx: mpsc::Sender<oneshot::Sender<io::Result<yamux::Stream>>>,
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<yamux::Stream>>,
     dead: Arc<AtomicBool>,
+    /// 该载体**实际 spawn** 的每侧分片 Worker 数(round-47)。
+    ///
+    /// 取自 `conn.into_halves()` 返回的 `workers` 向量长度——那是真正
+    /// 交给 `tokio::spawn` 的 Worker 集合,不是事后按公式重算的值。
+    /// 诊断日志读这里,从而**不可能与实际不符**(修前 `rh-client` 另起
+    /// 一处 `shard_workers_for_k(initial_k)` 独立计算,只是当前输入恰好
+    /// 相同才碰巧一致)。
+    shard_workers: usize,
     /// 收发 driver 的句柄(round-9.1):仅 [`YamuxMultiplexer::shutdown`]
     /// 消费——Drop 仍保持"句柄丢弃即分离、driver 继续服务存量流"的既有
     /// 语义,不在此 abort(红线:正常路径零漂移)。
@@ -1245,6 +1253,9 @@ impl YamuxMultiplexer {
         let (open_tx, open_rx) = mpsc::channel::<oneshot::Sender<io::Result<yamux::Stream>>>(64);
         let (accept_tx, accept_rx) = mpsc::channel::<yamux::Stream>(256);
         let dead = Arc::new(AtomicBool::new(false));
+        // round-47:**在 spawn 之前**记录实际 Worker 数。取向量长度而非
+        // 重算公式——这是"日志值 == 实际值"的唯一可靠来源。
+        let shard_workers = workers.len();
         // 双侧 Worker 先于两半 spawn(与 RecvWorker 同批):消费侧未起即
         // 满 → 生产侧 park(RecvWorker 满 → Framer 停读;send_out 满 →
         // SendWorker 停止消费命令),顺序不影响正确性(丢唤醒防线保证
@@ -1261,6 +1272,7 @@ impl YamuxMultiplexer {
             open_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
             dead,
+            shard_workers,
             drivers: std::sync::Mutex::new(vec![send, recv]),
         }
     }
@@ -1287,6 +1299,16 @@ impl YamuxMultiplexer {
 
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
+    }
+
+    /// 该载体**实际 spawn** 的每侧分片 Worker 数(round-47)。
+    ///
+    /// 值在构造时从 `into_halves()` 返回的 Worker 向量长度取定,不是按
+    /// 公式重算。诊断/日志必须读这个,而不是调用
+    /// [`shard_workers_for_k`](crate::mux::shard_workers_for_k) 再算一遍
+    /// ——两处独立计算一旦输入漂移,日志就会与实际不符。
+    pub fn shard_workers(&self) -> usize {
+        self.shard_workers
     }
 
     /// 显式关停(round-9.1):中止收发 driver——物理连接随 socket drop
@@ -1992,6 +2014,21 @@ impl YamuxMultiplexerPool {
             .iter()
             .filter(|m| !m.mux.is_dead())
             .count()
+    }
+
+    /// 池内**实际生效**的每载体分片 Worker 数(round-47,诊断用)。
+    ///
+    /// 池内所有成员由同一次 `connect_stream_pool` 用同一 `shards` 值
+    /// 创建,故取首个成员的值即可;池为空时返回 `None`。
+    /// 注意这是**创建时固化**的值:收敛后摘除成员不会改变其余成员的
+    /// Worker 数(Worker 已 spawn,重建代价远超收益,见 README 定容段)。
+    pub async fn shard_workers(&self) -> Option<usize> {
+        self.inner
+            .members
+            .read()
+            .await
+            .first()
+            .map(|m| m.mux.shard_workers())
     }
 }
 

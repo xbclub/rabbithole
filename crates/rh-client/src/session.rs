@@ -434,7 +434,12 @@ pub async fn connect_and_run(
     // 生效值。从 initial_k>1 收敛到 1 时沿用初始 shard(max(1, 4/initial_k)):
     // 载体 Worker 已 spawn,重建会拆掉控制流所在的载体 0,代价远超收益
     // (README 定容段)。
-    let shard_workers = rh_transport::mux::shard_workers_for_k(initial_k);
+    // round-47:此处**不再**自行计算 shard 数。日志值改为从 `mux` 读实际
+    // spawn 的数量(`mux.shard_workers()`)，见下方 info!。修前这里另起
+    // 一处 `shard_workers_for_k(initial_k)`——与实际侧
+    // (`tcp.rs` 的 `shard_workers_for_k(carriers)`)是两次独立计算，
+    // 只因当前输入恰好相同才碰巧一致；一旦 `connect_pool` 的入参漂移
+    // (例如改用收敛后的 final_k)，日志就会与实际不符。
     if initial_k > 1 {
         // 先收缩分派集合,再摘除多余成员。待摘除集合 = 失败身份 ∪ 超出
         // 保留额的成功载体,见 [`plan_detach_set`]。`set_active_prefix` 同时
@@ -458,6 +463,10 @@ pub async fn connect_and_run(
             "pool carriers converged"
         );
     }
+    // round-47:shard_workers 取自 mux 的**实际 spawn 值**(唯一来源),
+    // 不再用本地公式重算。非 yamux 变体(裸模式/QUIC)没有分片 Worker,
+    // 记为 0 以免日志缺字段。
+    let shard_workers = mux.shard_workers().await.unwrap_or(0);
     info!(
         protocol = %tcfg.protocol,
         protocol_baseline = rh_transport::default_carriers(tcfg.protocol),

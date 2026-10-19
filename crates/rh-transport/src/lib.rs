@@ -560,6 +560,29 @@ impl Multiplexer {
         }
     }
 
+    /// **实际生效**的每载体分片 Worker 数(round-47,诊断/日志用)。
+    ///
+    /// - 池变体:取首个成员的值(池内成员由同一次
+    ///   [`connect_pool`] 用同一 `shards` 创建);
+    /// - 单载体 yamux 变体:该载体自身的值;
+    /// - 非 yamux 变体(裸模式 `AcceptSingle` / QUIC):`None`(无分片
+    ///   Worker 概念)。
+    ///
+    /// **调用方必须用这个值记日志,不要自己再调
+    /// [`mux::shard_workers_for_k`] 算一遍** —— 两处独立计算一旦输入
+    /// 漂移(例如 `connect_pool` 的参数从 `initial_k` 变成收敛后的 K),
+    /// 日志就会与实际 spawn 的 Worker 数不符,而这种错误极难发现。
+    ///
+    /// 值在载体构造时从 `into_halves()` 的 Worker 向量长度取定,是
+    /// 「实际 spawn」而非「按公式重算」。
+    pub async fn shard_workers(&self) -> Option<usize> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => p.shard_workers().await,
+            MultiplexerInner::Yamux(m) => Some(m.shard_workers()),
+            _ => None,
+        }
+    }
+
     /// 现有载体数(诊断/日志;非池变体返回 None)。只读,不改变池语义。
     pub async fn pool_live_carriers(&self) -> Option<usize> {
         match &self.inner {
