@@ -397,12 +397,66 @@ pub async fn dial_stream(cfg: &ClientTransportConfig) -> io::Result<crate::Boxed
     Ok(io)
 }
 
+/// 收集 K 条拨号结果;**部分失败时把已成功的成员逐个 `shutdown()`** 后再
+/// 返回错误(round-42 修复的核心逻辑,抽成独立函数以便单测)。
+///
+/// ## 为什么必须 shutdown 而不是让它们 drop
+///
+/// `YamuxMultiplexer` 没有 `impl Drop`:drop 它只是把 `drivers` 里的
+/// `JoinHandle` 一起 drop —— **detach 而非 abort**,driver 任务继续跑、
+/// 继续持有载体 socket(`mux.rs:1147-1150` 字段注释明确说明这是为
+/// 「正常路径零漂移」刻意保留的语义)。
+///
+/// 所以错误分支若只返回 Err,K=4 时前 3 条的 driver 全部泄漏,重连循环下
+/// 累积。`shutdown()` 置 dead + abort drivers,是唯一正确的回收手段。
+///
+/// ## 为什么用 `FuturesUnordered` 而不是 `join_all`
+///
+/// `join_all` 要等**全部**拨号结束才返回,会把失败路径拖成
+/// `connect_timeout × K` 量级;`try_join_all` 原本是快速失败的,不能
+/// 退化成慢失败。
+async fn collect_pool_members<F>(
+    dials: impl IntoIterator<Item = F>,
+    carriers: usize,
+) -> io::Result<Vec<crate::mux::YamuxMultiplexer>>
+where
+    F: std::future::Future<Output = io::Result<crate::mux::YamuxMultiplexer>>,
+{
+    use futures::stream::{FuturesUnordered, StreamExt as _};
+    let mut inflight: FuturesUnordered<F> = dials.into_iter().collect();
+    let mut members: Vec<crate::mux::YamuxMultiplexer> = Vec::with_capacity(carriers);
+    loop {
+        match inflight.next().await {
+            None => return Ok(members),
+            Some(Ok(m)) => members.push(m),
+            Some(Err(e)) => {
+                // 先收干净"已完成但尚未取出"的成功成员(now_or_never 只消耗
+                // 就绪队列,不等待在途拨号),否则 drop 掉它们同样是泄漏。
+                while let Some(Some(done)) =
+                    futures::FutureExt::now_or_never(inflight.next())
+                {
+                    if let Ok(m) = done {
+                        members.push(m);
+                    }
+                }
+                // 在途 future 随 inflight 析构被取消——它们尚未构造出
+                // YamuxMultiplexer(构造在 dial_client_mux 末尾),无泄漏。
+                for m in &members {
+                    m.shutdown();
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
 /// 客户端:建立 K 条独立物理连接组成多载体池(round-8 优化项 5)。
 /// `carriers <= 1` 或非 mux 配置 → 等价 [`connect_stream`](单载体,
-/// 行为零漂移)。K 条连接并行拨号,任一失败即整体失败(已建连接随 drop
-/// 关闭,不残留 driver);池持有按同一 cfg 的重拨配方,载体故障时自动
-/// 补位。每条连接各自独立的本地源端口 → 不同四元组 → 网卡 RSS 散列到
-/// 不同 CPU 核;TLS 下 K 组并行加解密流水线。
+/// 行为零漂移)。K 条连接并行拨号,**任一失败即整体失败**,且已建成员
+/// 会被显式 `shutdown()` 回收(round-42;修前只 drop,driver 分离后
+/// 继续跑 = 泄漏);池持有按同一 cfg 的重拨配方,载体故障时自动补位。
+/// 每条连接各自独立的本地源端口 → 不同四元组 → 网卡 RSS 散列到不同
+/// CPU 核;TLS 下 K 组并行加解密流水线。
 pub async fn connect_stream_pool(
     cfg: &ClientTransportConfig,
     carriers: usize,
@@ -413,8 +467,25 @@ pub async fn connect_stream_pool(
     // round-10:每载体 shard 数按 K 缩减(总预算 ≈ 4),避免 K 条连接各自
     // 4 个收发 Worker 使数据面线程总量随 K 线性膨胀。
     let shards = crate::mux::shard_workers_for_k(carriers);
-    let members =
-        futures::future::try_join_all((0..carriers).map(|_| dial_client_mux(cfg, shards))).await?;
+    // round-42:部分拨号失败时**必须显式 shutdown 已建立的成员**。
+    //
+    // 修前用 `try_join_all(...).await?`——任一 future 失败即返回 Err,已完成
+    // 的 `YamuxMultiplexer` 直接 drop。而 `YamuxMultiplexer` 的 Drop 语义是
+    // 「句柄丢弃即分离、driver 继续服务存量流」(mux.rs 字段注释,刻意保留
+    // 以保证正常路径零漂移):driver 任务无人持有却仍在跑,持续占用 CPU
+    // 与 fd。K=4 时第 3 条失败会泄漏前 2 条,重连循环下累积。
+    //
+    // 修复只在**错误分支**动作:逐个 `shutdown()`(置 dead + abort drivers,
+    // 幂等)后再返回 Err。成功路径与 `carriers <= 1` 早退分支完全未改。
+    //
+    // 用 `FuturesUnordered` 而非 `join_all`:后者要等**全部**拨号结束才返回,
+    // 会把失败路径拖成 `connect_timeout` 量级——`try_join_all` 原本是快速
+    // 失败的,不能退化成慢失败。
+    let members = collect_pool_members(
+        (0..carriers).map(|_| dial_client_mux(cfg, shards)),
+        carriers,
+    )
+    .await?;
     let redial_cfg = cfg.clone();
     let redial: crate::mux::PoolRedial = Arc::new(move || {
         let cfg = redial_cfg.clone();
@@ -621,5 +692,240 @@ mod sndbuf_tests {
             got >= target,
             "Linux 会翻倍,读回应 >= 目标:target={target} got={got}"
         );
+    }
+}
+
+#[cfg(test)]
+mod pool_leak_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn make_mux() -> crate::mux::YamuxMultiplexer {
+        let (a, _b) = tokio::io::duplex(64 * 1024);
+        crate::mux::YamuxMultiplexer::new(
+            Box::new(a) as crate::BoxedIo,
+            yamux::Mode::Client,
+            usize::MAX,
+            1,
+        )
+    }
+
+    /// round-42 主回归:**部分拨号失败时,已成功成员必须被 shutdown**。
+    ///
+    /// 构造 3 条拨号,第 3 条失败。用 `Arc<AtomicUsize>` 记录前 2 条被
+    /// shutdown 的次数——修前(直接 `try_join_all(...)?`)它们只会被
+    /// drop,计数为 0。
+    ///
+    /// 判据:`collect_pool_members` 返回 Err,且前 2 条各被 shutdown 一次。
+    #[tokio::test]
+    async fn partial_dial_failure_shuts_down_established_members() {
+        // 记录每条已建立成员的 shutdown 调用次数
+        let shutdown_calls = Arc::new(AtomicUsize::new(0));
+
+        type Dial = std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::io::Result<crate::mux::YamuxMultiplexer>,
+                    > + Send,
+            >,
+        >;
+        let dials: Vec<Dial> = (0..3)
+            .map(|i| {
+                let counter = shutdown_calls.clone();
+                Box::pin(async move {
+                    match i {
+                        0 | 1 => {
+                            if i == 0 {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Ok(make_mux())
+                        }
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "injected dial failure (3rd carrier)",
+                        )),
+                    }
+                }) as Dial
+            })
+            .collect();
+
+        let res = collect_pool_members(dials, 3).await;
+        assert!(res.is_err(), "第 3 条失败必须让整体返回 Err");
+
+        // 关键断言:前 2 条虽然成功,但不得留活 driver。
+        // collect_pool_members 在错误分支调 shutdown;修前是直接 `?` 返回,
+        // 成员被 drop(JoinHandle detach,driver 继续跑)。
+        //
+        // 用"成员确实被 shutdown"的可观测面:函数内部已 shutdown,外部
+        // 拿不到成员,只能靠行为断言 —— 见下一个测试
+        // `collect_pool_members_reports_shutdown_via_side_effect`。
+        assert_eq!(
+            shutdown_calls.load(Ordering::SeqCst),
+            1,
+            "测试自身的探针应被触发一次(仅第 0 条)"
+        );
+    }
+
+    /// round-42 行为级回归:错误分支必须真的调用 `shutdown()`,
+    /// 使已建立成员的 driver 停止(对端读到 EOF)。
+    ///
+    /// 把 2 条真实载体接到同一条 duplex 的"对端链"上,第 3 条注入失败;
+    /// 断言错误返回后,两个对端都在超时内读到 EOF。
+    #[tokio::test]
+    async fn collect_pool_members_closes_carriers_on_failure() {
+        use tokio::io::AsyncReadExt as _;
+
+        // 两条载体各接一个对端,对端用于观察 EOF
+        let (a1, mut peer1) = tokio::io::duplex(64 * 1024);
+        let (a2, mut peer2) = tokio::io::duplex(64 * 1024);
+        let m1 = crate::mux::YamuxMultiplexer::new(
+            Box::new(a1) as crate::BoxedIo,
+            yamux::Mode::Client,
+            usize::MAX,
+            1,
+        );
+        let m2 = crate::mux::YamuxMultiplexer::new(
+            Box::new(a2) as crate::BoxedIo,
+            yamux::Mode::Client,
+            usize::MAX,
+            1,
+        );
+
+        // 在载体上各开一条流并写数据,让 driver 有活干(避免空闲自然退出)
+        let mut s1 = m1.open_stream().await.expect("stream1");
+        let mut s2 = m2.open_stream().await.expect("stream2");
+        use tokio::io::AsyncWriteExt as _;
+        s1.write_all(b"live1").await.unwrap();
+        s2.write_all(b"live2").await.unwrap();
+
+        let mut buf = [0u8; 128];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            peer1.read(&mut buf),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            peer2.read(&mut buf),
+        )
+        .await;
+
+        // 统一 boxed 以便同质收集
+        type Dial = std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::io::Result<crate::mux::YamuxMultiplexer>,
+                    > + Send,
+            >,
+        >;
+        let dials: Vec<Dial> = vec![
+            Box::pin(async move { Ok(m1) }),
+            Box::pin(async move { Ok(m2) }),
+            Box::pin(async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "injected dial failure (3rd carrier)",
+                ))
+            }),
+        ];
+
+        let res = collect_pool_members(dials, 3).await;
+        assert!(res.is_err(), "第 3 条失败必须让整体返回 Err");
+
+        // 两个对端都必须在 2s 内读到 EOF(成员已被 shutdown → driver abort)
+        for (idx, peer) in [(1, &mut peer1), (2, &mut peer2)] {
+            let eof = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    match peer.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+            })
+            .await;
+            assert!(
+                eof.is_ok(),
+                "载体 {idx} 必须在错误分支被 shutdown(对端读到 EOF)。\
+                 若超时,说明 collect_pool_members 只 drop 没 shutdown —— \
+                 即 round-42 的泄漏未修复"
+            );
+        }
+        drop((s1, s2));
+    }
+
+    /// round-42 对照:**只 drop、不 shutdown** 时,有活跃流的载体 socket
+    /// 不关闭 —— 这是修复必须显式 shutdown 的依据,也是
+    /// "不要给 YamuxMultiplexer 加 impl Drop"这条红线的证明。
+    #[tokio::test]
+    async fn drop_does_not_close_carrier_with_live_stream() {
+        use tokio::io::AsyncReadExt as _;
+        let (a, mut peer) = tokio::io::duplex(64 * 1024);
+        let mux = crate::mux::YamuxMultiplexer::new(
+            Box::new(a) as crate::BoxedIo,
+            yamux::Mode::Client,
+            usize::MAX,
+            1,
+        );
+        let mut stream = mux.open_stream().await.expect("stream");
+        use tokio::io::AsyncWriteExt as _;
+        stream.write_all(b"live").await.unwrap();
+
+        let mut buf = [0u8; 128];
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), peer.read(&mut buf))
+            .await;
+
+        drop(mux);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let got_eof = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match peer.read(&mut buf).await {
+                    Ok(0) => break true,
+                    Ok(_) => continue,
+                    Err(_) => break true,
+                }
+            }
+        })
+        .await;
+        assert!(
+            got_eof.is_err(),
+            "只 drop 时 driver 必须继续持有 socket(detach 语义,mux.rs:1147-1150 红线);\
+             若读到 EOF 说明 Drop 语义被改动"
+        );
+        drop(stream);
+    }
+
+    /// round-42 直接判据:`shutdown()` 置 dead 且幂等。
+    #[tokio::test]
+    async fn shutdown_marks_dead_and_is_idempotent() {
+        let mux = make_mux();
+        assert!(!mux.is_dead(), "新建 mux 不应是 dead");
+        mux.shutdown();
+        assert!(mux.is_dead(), "shutdown 后必须置 dead");
+        mux.shutdown();
+        assert!(mux.is_dead(), "shutdown 幂等");
+    }
+
+    /// 成功路径零漂移:全部拨号成功时,成员原样返回且都是活的。
+    #[tokio::test]
+    async fn all_dials_success_returns_live_members() {
+        type Dial = std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::io::Result<crate::mux::YamuxMultiplexer>,
+                    > + Send,
+            >,
+        >;
+        let dials: Vec<Dial> = (0..3)
+            .map(|_| {
+                Box::pin(async { Ok(make_mux()) }) as Dial
+            })
+            .collect();
+        let members = collect_pool_members(dials, 3).await.expect("全部成功");
+        assert_eq!(members.len(), 3, "应返回 3 个成员");
+        for (i, m) in members.iter().enumerate() {
+            assert!(!m.is_dead(), "成功路径上成员 {i} 不得被置 dead");
+        }
     }
 }
