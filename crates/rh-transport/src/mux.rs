@@ -779,8 +779,10 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
     let mut slow_reads: u64 = 0;
     let mut slow_writes: u64 = 0;
 
-    // 上一轮写期间预取到的块(下一轮批的首块)。
-    let mut pending: Option<Bytes> = None;
+    // 上一轮写期间预取到的块(下一轮批的首批)。
+    // round-68:由 `Option<Bytes>` 改为 `Vec<Bytes>`——修前只预取一块,
+    // 同一时刻只有 1 个未完成读,每批都要等一次数据到达(RTT/2)。
+    let mut pending: Vec<Bytes> = Vec::new();
 
     loop {
         let t_read = std::time::Instant::now();
@@ -789,9 +791,9 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
         let mut batch_bytes = 0usize;
         let mut batch_eof = false;
 
-        if let Some(first) = pending.take() {
-            batch_bytes += first.len();
-            batch.push(first);
+        for c in pending.drain(..) {
+            batch_bytes += c.len();
+            batch.push(c);
         }
         while batch_bytes < UP_BATCH_BYTES && batch.len() < UP_BATCH_SEGS {
             match reader.try_read_chunk(a_r).await {
@@ -852,29 +854,52 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
             true
         };
 
+        // round-68:持续预取(不是"只抢一块就停")。
+        //
+        // 修前这个 select 循环里,读到一块就把它放进 `pending` 并**退出
+        // 循环**等写完成——即同一时刻只有 **1 个**未完成的读。上行单流
+        // 实测 1.08 G(直连 3.06 G),而 `PUMP_UP` 的 `rd_per_batch`
+        // 恒为 0.42~0.47ms ≈ 一次 RTT 的一半:这正是"每批等一次数据
+        // 到达"的特征。
+        //
+        // 现在改成:在写尚未完成期间,**持续**发起新读,把读到的块全部
+        // 堆进 `prefetched`,直到 `UP_BATCH_BYTES` 触顶。写完成后下一轮
+        // 直接从这里取,不再等 RTT。
+        let mut prefetched: Vec<Bytes> = Vec::new();
+        let mut prefetched_bytes = 0usize;
         let ok = if prefetch_enabled() && batch_bytes < UP_BATCH_BYTES && !batch_eof {
             let write_fut = write_all;
             futures::pin_mut!(write_fut);
-            let mut read_fut = Some(Box::pin(reader.read_chunk(a_r)));
             loop {
-                match read_fut.take() {
-                    Some(rf) => {
-                        futures::pin_mut!(rf);
-                        match futures::future::select(rf, write_fut.as_mut()).await {
-                            futures::future::Either::Left((nr, _)) => match nr {
-                                Ok(Some(c)) if !c.is_empty() => pending = Some(c),
-                                Ok(_) => batch_eof = true,
-                                Err(_) => batch_eof = true,
-                            },
-                            futures::future::Either::Right((ok, _)) => break ok,
+                // 预取已达上限:不再发起新读,专心等写完成。
+                if prefetched_bytes >= UP_BATCH_BYTES || prefetched.len() >= UP_BATCH_SEGS {
+                    break write_fut.await;
+                }
+                let read_fut = reader.read_chunk(a_r);
+                futures::pin_mut!(read_fut);
+                match futures::future::select(read_fut, write_fut.as_mut()).await {
+                    futures::future::Either::Left((nr, _)) => match nr {
+                        Ok(Some(c)) if !c.is_empty() => {
+                            prefetched_bytes += c.len();
+                            prefetched.push(c);
                         }
-                    }
-                    None => break write_fut.await,
+                        Ok(_) => {
+                            batch_eof = true;
+                            break write_fut.await;
+                        }
+                        Err(_) => {
+                            batch_eof = true;
+                            break write_fut.await;
+                        }
+                    },
+                    futures::future::Either::Right((ok, _)) => break ok,
                 }
             }
         } else {
             write_all.await
         };
+        // 预取结果整体转入 pending 队列,下一轮直接消费(不再等 RTT)。
+        pending.extend(prefetched);
 
         if diag {
             let el = t_write.elapsed().as_nanos() as u64;
@@ -889,7 +914,7 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
             }
             return false;
         }
-        if batch_eof && pending.is_none() {
+        if batch_eof && pending.is_empty() {
             if diag {
                 dump_up(read_ns, write_ns, slow_reads, slow_writes);
             }
