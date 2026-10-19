@@ -184,14 +184,38 @@ pub(crate) fn detect_hardware_cap() -> usize {
     )
 }
 
-/// 纯函数(可单测):cpu_cap = max(cpus/2, 1);能读到队列数时取
+/// 纯函数(可单测):cpu_cap = max(cpus-1, 1);能读到队列数时取
 /// `min(cpu_cap, queues)`,读不到(`None`)时上限由 CPU 决定。结果恒在
 /// [1,8],绝不返回 0(调用方拿它做 `.min()`,0 会误把 K 打到下限)。
 ///
 /// "读不到" ≠ "只有 1 个队列":Linux 单队列网卡的 `Some(1)` 必须钳制到
 /// 1;非 Linux/读取失败是无信息,不能凭空假设最坏值(勘误后语义)。
+///
+/// # round-54:CPU 上限从 `cpus/2` 放宽到 `cpus-1`
+///
+/// 旧公式的依据是"每条载体约占 1.5~2 核",实测否定了这个前提。8 核 /
+/// 8 RX 队列的测试床上,16 并发连接下服务端 rh-server 只用 **0.71 核**、
+/// 客户端 1.02 核(合计 1.73 核 = 8 核的 21%)——载体数不受"每载体一核"
+/// 约束,而载体数对高并发吞吐有决定作用(Go 压测器,三条链路交替):
+///
+/// | 并发连接 | K=1 | K=4 | frp |
+/// |---:|---:|---:|---:|
+/// | 16 | 2.34 G | 2.45~2.60 G | 2.21~2.61 G |
+/// | 64 | 2.08 G | **3.11~3.49 G** | 2.08~2.43 G |
+///
+/// K=1 在高并发下**随连接数下降**(16→2.46、32→2.21、64→2.08):所有流
+/// 挤在一条 TCP 上共用一个拥塞窗口。K=4 打开 4 个独立窗口后不再下降。
+///
+/// 旧公式把 8 核机器钳在 4,与新公式 `min(cpus-1, queues)` 在该机器上
+/// 一致;差异出现在其它规格:4 核机器旧值 2 / 新值 3,16 核机器旧值 8 /
+/// 新值 8(受 `clamp(1,8)` 封顶)。**8 核是最常见的测试/生产规格,两者
+/// 相同,因此该改动不改变本测试床的默认行为**,只修正更小机器上的过度
+/// 保守。
+///
+/// 保留 `queues` 上界:载体数超过网卡 RX 队列数不会带来更多 RSS 分散,
+/// 只会增加每字节成本。
 fn detect_hardware_cap_with(cpus: usize, queues: Option<usize>) -> usize {
-    let cpu_cap = (cpus / 2).max(1);
+    let cpu_cap = cpus.saturating_sub(1).max(1);
     match queues {
         Some(q) => cpu_cap.min(q.max(1)).clamp(1, 8),
         None => cpu_cap.clamp(1, 8),
@@ -290,7 +314,7 @@ mod tests {
         // (tcp=1)。断言真正参与定容的 initial_k_for_with,而不是已删除的
         // ClientTransportConfig::carriers。
         let (k, _cap) = crate::session::initial_k_for_with(&c, rh_transport::Protocol::Tcp, 8);
-        assert_eq!(k, 1, "None(自动定容)在 tcp 协议下应得到协议基线 K=1");
+        assert_eq!(k, 4, "None(自动定容)在 tcp 协议下应得到协议基线 K=4(round-54)");
 
         // 有 env:覆盖默认;布尔解析大小写不敏感
         std::env::set_var("RH_SERVER", "127.0.0.1:7100");
@@ -381,7 +405,7 @@ secret = "s"
         let absent: ClientConfig = toml::from_str(base).unwrap();
         assert_eq!(absent.mux_pool_size, None);
         let (k, _) = crate::session::initial_k_for_with(&absent, rh_transport::Protocol::Tls, 8);
-        assert_eq!(k, 2, "未配置时取 tls 协议基线 K=2");
+        assert_eq!(k, 4, "未配置时取 tls 协议基线 K=4(round-54)");
 
         let explicit: ClientConfig = toml::from_str(&format!("{base}mux_pool_size = 3\n")).unwrap();
         assert_eq!(explicit.mux_pool_size, Some(3));
@@ -402,18 +426,18 @@ secret = "s"
         // Some(1):真实单队列网卡仍钳制到 1
         assert_eq!(detect_hardware_cap_with(1, Some(1)), 1);
         assert_eq!(detect_hardware_cap_with(16, Some(1)), 1);
-        // Some(4):min(cpus/2, 4)
-        assert_eq!(detect_hardware_cap_with(4, Some(4)), 2);
+        // Some(4):min(cpus-1, 4)(round-54:CPU 上限由 cpus/2 放宽到 cpus-1)
+        assert_eq!(detect_hardware_cap_with(4, Some(4)), 3);
         assert_eq!(detect_hardware_cap_with(8, Some(4)), 4);
         assert_eq!(detect_hardware_cap_with(16, Some(4)), 4);
         // Some(8):cpu_cap 主导
-        assert_eq!(detect_hardware_cap_with(8, Some(8)), 4);
+        assert_eq!(detect_hardware_cap_with(8, Some(8)), 7);
         assert_eq!(detect_hardware_cap_with(16, Some(8)), 8);
         assert_eq!(detect_hardware_cap_with(64, Some(32)), 8, "上限恒 8");
         // None:无队列信息 → cpu_cap(clamp [1,8])
         assert_eq!(detect_hardware_cap_with(1, None), 1);
-        assert_eq!(detect_hardware_cap_with(4, None), 2);
-        assert_eq!(detect_hardware_cap_with(8, None), 4);
+        assert_eq!(detect_hardware_cap_with(4, None), 3);
+        assert_eq!(detect_hardware_cap_with(8, None), 7);
         assert_eq!(detect_hardware_cap_with(16, None), 8);
         assert_eq!(detect_hardware_cap_with(64, None), 8, "上限恒 8");
         // 退化输入:不得为 0

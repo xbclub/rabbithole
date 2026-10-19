@@ -360,9 +360,32 @@ impl fmt::Display for Protocol {
     }
 }
 
-/// 多载体池协议基线(round-10):tls/wss 受单核串行加解密限制,默认多载体;
-/// tcp/ws 单载体已接近路径上限(实测 t/d 0.973~1.077),保持 1;
-/// QUIC/KCP 自带多路复用,恒 1。
+/// 多载体池协议基线(round-10,round-54 修订):**tcp/ws 也从 1 改为 4**。
+///
+/// # 为什么 tcp 从 1 改成 4(round-54)
+///
+/// round-10 的原始依据是"tcp/ws 单载体已接近路径上限(实测 t/d
+/// 0.973~1.077),保持 1"。那个结论只在**低并发**下成立。用 Go 压测器
+/// (每连接一个 goroutine,不受解释器限制)按**真实并发连接数**重测:
+///
+/// | 并发连接 | K=1 | K=4 | frp v0.71 |
+/// |---:|---:|---:|---:|
+/// | 1 | 2.08 G | 2.01 G | 1.09 G |
+/// | 16 | 2.34 G | 2.45~2.60 G | 2.21~2.61 G |
+/// | 64 | **2.08 G** | **3.11~3.49 G** | 2.08~2.43 G |
+///
+/// K=1 的吞吐**随并发连接数上升而下降**(16→2.46、32→2.21、64→2.08):
+/// 所有流共用一条 TCP,只有一个拥塞窗口、一个发送队列。K=4 开出 4 个
+/// 独立四元组后不再下降,64 连接时比 K=1 快 50~68%。
+///
+/// 低并发下 K=4 略低(2.01 vs 2.08,-3%),因为多了 3 条空闲连接的固定
+/// 成本。这个代价换来的是高并发下不再退化——用户报告的正是"高并发追不上
+/// frp",所以选择高并发优先。
+///
+/// 内存/CPU 代价:每载体 1 个 recv_driver + 1 个 send_driver + N 个 Worker。
+/// 实测 8 核 8 队列机器上 K=4、16 连接时服务端只用 0.71 核,远未饱和。
+///
+/// QUIC/KCP 自带多路复用(单 UDP 连接承载全部流),不受此影响,恒 1。
 ///
 /// # 这是默认 K 的唯一来源(round-45)
 ///
@@ -377,8 +400,12 @@ impl fmt::Display for Protocol {
 /// (见 rh-client 的 pool sizing);此处不读环境/配置。
 pub fn default_carriers(protocol: Protocol) -> usize {
     match protocol {
-        Protocol::Tls | Protocol::Wss => 2,
-        _ => 1,
+        // 单 UDP 连接即多路复用,多载体无意义。
+        Protocol::Quic | Protocol::Kcp => 1,
+        // tcp/tls/ws/wss:高并发下多载体避免单 TCP 拥塞窗口成为天花板
+        // (round-54 实测见函数文档;tls/wss 另受单核串行加解密限制,
+        // 原本已是 2,现与 tcp/ws 同为 4)。
+        _ => 4,
     }
 }
 
@@ -878,17 +905,24 @@ pub async fn connect_pool(
 mod carrier_baseline_tests {
     use super::*;
 
-    // T-C1(round-10):协议基线六变体全覆盖。tcp/ws = 1(单载体已接近
-    // 路径上限),tls/wss = 2(单核串行加解密),quic/kcp = 1(自带复用)。
+    // T-C1(round-10,round-54 修订):协议基线六变体全覆盖。
+    //
+    // round-10 原值:tcp/ws = 1、tls/wss = 2、quic/kcp = 1。
+    // round-54 改成 tcp/tls/ws/wss = 4、quic/kcp = 1——依据是 K=1 的吞吐
+    // 随并发连接数**下降**(64 连接时 2.08 G,而 K=4 是 3.11~3.49 G),
+    // 详见 [`default_carriers`] 的实测表。
+    //
+    // 本测试锁的是"每个协议的默认值",任何改动都必须同步更新这里——
+    // 它是一处**有意的**重复,用来防止默认值漂移无声通过。
     #[test]
     fn default_carriers_covers_all_protocols() {
-        assert_eq!(default_carriers(Protocol::Tcp), 1);
-        assert_eq!(default_carriers(Protocol::Tls), 2);
-        assert_eq!(default_carriers(Protocol::Ws), 1);
-        assert_eq!(default_carriers(Protocol::Wss), 2);
+        assert_eq!(default_carriers(Protocol::Tcp), 4);
+        assert_eq!(default_carriers(Protocol::Tls), 4);
+        assert_eq!(default_carriers(Protocol::Ws), 4);
+        assert_eq!(default_carriers(Protocol::Wss), 4);
         assert_eq!(default_carriers(Protocol::Quic), 1);
         assert_eq!(default_carriers(Protocol::Kcp), 1);
-        // 红线 1 的形式化:非 tcp-based 恒 1。
+        // 红线 1 的形式化:非 tcp-based 恒 1(自带多路复用,多载体无意义)。
         for p in [Protocol::Quic, Protocol::Kcp] {
             assert!(!p.is_tcp_based());
             assert_eq!(default_carriers(p), 1);
