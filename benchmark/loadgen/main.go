@@ -43,6 +43,10 @@ const ioBufSize = 1 << 20
 // 给 10s 以免把"启动慢"误判为"连不上"。
 const dialTimeout = 10 * time.Second
 
+// sockBuf TCP 收发缓冲(4 MiB)。压测器必须比被测系统"更能吃",否则
+// 它通告的窗口会成为被测系统的天花板(实测未设时 rcv_space 仅 14KB)。
+const sockBuf = 4 << 20
+
 type result struct {
 	Role     string  `json:"role"`
 	Conns    int     `json:"conns"`
@@ -106,6 +110,15 @@ func runSink(port int, seconds float64, maxConns int) {
 		go func(c net.Conn) {
 			defer wg.Done()
 			defer c.Close()
+			// 放大接收缓冲(2026-10-20 修正)。
+			//
+			// 不设时内核自动调节的通告窗口偏低:实测一端 `rcv_space`
+			// 只有 14480 字节、`rcvmss` 只有 536,**发送方被对面通告的
+			// 窗口卡死**,测出来的是压测器的接收能力而不是被测系统。
+			// 这是本项目第二次被压测端反噬(Python GIL 那次之外)。
+			if tc, ok := c.(*net.TCPConn); ok {
+				_ = tc.SetReadBuffer(sockBuf)
+			}
 			// 到期后强制打断读阻塞:读端是长连接,发送端不会主动关。
 			go func() {
 				<-stop
@@ -168,6 +181,8 @@ func runSrc(addr string, seconds float64, conns int) {
 			defer conn.Close()
 			if tc, ok := conn.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
+				// 放大发送缓冲:避免阻塞在较小的内核默认值上。
+				_ = tc.SetWriteBuffer(sockBuf)
 			}
 			okCount.Add(1)
 
