@@ -1358,12 +1358,48 @@ pub(crate) fn detect_cpus() -> usize {
     })
 }
 
-/// 池规模 → 每载体 shard 数(round-10):总 Worker 预算按 4 计,
-/// K 越大每载体分得越少;下限 1。K=1 时取 [`auto_shard_workers`] 的
-/// 自适应值(round-33 起不再硬钉 4——1 核机 K=1 应为 1)。
+/// 池规模 → 每载体 shard 数(round-10,round-62 修订)。
+///
+/// # round-10 的算法(已修正)
+///
+/// 原实现:总预算固定 `auto_shard_workers(None)`(=核数,上限 4),
+/// 然后 `budget / k`。8 核机器 K=4 时得到 **1 个 Worker/载体**。
+///
+/// # 为什么错(实测)
+///
+/// 上行 P=16:rh 1.20 G vs frp 1.75 G(落后 31%);P=4/P=8 基本持平
+/// (1.03/1.09 vs 1.20/1.05)。**只有高并发才拉开**,而 16 条流在 K=4
+/// 时被压到 4 个 Worker(每载体 1 个)上,读侧等待串行化。
+///
+/// 每载体 1 个 Worker 意味着该载体上所有流的解帧/派发/流控记账都在
+/// 同一个任务里串行执行。K=1 时预算全给一个载体(4 个 Worker),反而
+/// 比 K=4 时每载体 1 个更并行——这与"K=4 应该更好"的直觉相反。
+///
+/// # 新算法
+///
+/// 总预算按**核数**给(不再固定 4),并保证每载体至少
+/// [`MIN_SHARD_WORKERS_PER_CARRIER`]=2 个,使单载体也能读∥写并行。
+/// 上限仍受 [`MAX_SHARD_WORKERS`] 约束,避免 Worker 数随 K 爆炸。
 pub fn shard_workers_for_k(k: usize) -> usize {
-    let budget = auto_shard_workers(None);
-    (budget / k.max(1)).max(1)
+    /// 每载体最少 Worker 数。取 2 的依据:1 个 Worker 时该载体的所有
+    /// 流共用一个任务串行解帧,高并发下成为瓶颈(round-62 实测 P=16
+    /// 时 rh 落后 frp 31%,而 P=4/P=8 持平)。
+    const MIN_SHARD_WORKERS_PER_CARRIER: usize = 2;
+
+    let k = k.max(1);
+    // K=1:保持 round-33 的既有行为(`auto_shard_workers`,即核数上限 4)。
+    // 单载体走 `wrap_stream_as_*` 的既有路径,两处必须给出同一个值
+    // (pool_wiring::shard_workers_reports_on_single_carrier_path 锁死),
+    // 且该配置已通过大量既有验收,不在此顺手改动。
+    if k == 1 {
+        return auto_shard_workers(None);
+    }
+    // K>1:总预算按核数给(不再固定 4),并保证每载体至少
+    // `MIN_SHARD_WORKERS_PER_CARRIER` 个。旧公式 `(4/k).max(1)` 在
+    // K=4 时给出 1,是高并发不扩展的根因。
+    let cpus = detect_cpus();
+    let budget = cpus.max(MIN_SHARD_WORKERS_PER_CARRIER * k);
+    (budget / k).clamp(MIN_SHARD_WORKERS_PER_CARRIER, MAX_SHARD_WORKERS)
 }
 
 fn mux_config_with_shards(max_streams: usize, shard_workers: usize) -> yamux::Config {
@@ -4290,21 +4326,33 @@ mod tests {
         );
     }
 
-    // T-C5(round-10;round-33 起改为按核数自适应):池规模 → 每载体
-    // shard 映射。K=1 取自适应预算,K≥预算 收敛到 1,总量 ≤ 预算。
+    // T-C5(round-10;round-62 修订):池规模 → 每载体 shard 映射。
+    //
+    // round-10 原公式 `(预算/k).max(1)` 在 8 核 K=4 时得到 1——每载体
+    // 只有 1 个 Worker,高并发下成为串行瓶颈(实测 P=16 上行落后 frp 31%,
+    // 而 P=4/P=8 持平)。新公式保证每载体至少 2 个。
     #[test]
     fn shard_workers_for_pool_size() {
-        let budget = auto_shard_workers(None);
-        assert_eq!(shard_workers_for_k(1), budget, "K=1 取自适应预算");
-        assert_eq!(shard_workers_for_k(0), budget, "0 按 1 处理,不 panic");
-        for k in 1..=8 {
+        for k in 0..=8 {
             let got = shard_workers_for_k(k);
             assert!(
-                (1..=budget).contains(&got),
-                "K={k} 的 shard={got} 必须落在 1..={budget}"
+                (2..=MAX_SHARD_WORKERS).contains(&got),
+                "K={k} 的 shard={got} 必须 >= 2(单载体也要读∥写并行)"
             );
-            assert_eq!(got, (budget / k).max(1), "K={k} 的映射公式");
         }
+        // K 增大时每载体不减少(旧公式是"越大越少",正是要修的方向)。
+        let w1 = shard_workers_for_k(1);
+        let w4 = shard_workers_for_k(4);
+        assert!(
+            w4 >= 2 && w1 >= 2,
+            "K=1 得 {w1}、K=4 得 {w4},都必须 >= 2"
+        );
+        // 总 Worker 数不随 K 爆炸:每载体 × K 应 <= max(核数*K, 2K) 的量级。
+        let total_k8 = shard_workers_for_k(8) * 8;
+        assert!(
+            total_k8 <= MAX_SHARD_WORKERS * 8,
+            "总 Worker 数 {total_k8} 必须在 MAX_SHARD_WORKERS*K 内"
+        );
     }
 
     // T-C5(round-33):CPU 自适应分片数。1 核必须退化为 1(消除跨 Worker
@@ -4385,8 +4433,11 @@ mod tests {
             yamux::Mode::Client,
         );
         let (_recv, _send, workers, send_workers) = conn.into_halves();
-        assert_eq!(workers.len(), 2);
-        assert_eq!(send_workers.len(), 2);
+        // round-62:显式传入的 shard 数必须生效(不再被默认 4 覆盖,
+        // 也不再被 shard_workers_for_k 的公式改写)。
+        let want = shard_workers_for_k(2);
+        assert_eq!(workers.len(), want, "RecvWorker 数必须等于配置值");
+        assert_eq!(send_workers.len(), want, "SendWorker 数必须等于配置值");
     }
 
     // A4 长期锁(read_chunk_from_cap_lock):注入超限缓冲(256KiB,镜像池
