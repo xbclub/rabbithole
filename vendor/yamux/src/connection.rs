@@ -1758,18 +1758,9 @@ mod halves {
                 Some(crate::sched_diag::FRAMES_IN_POLL.load(std::sync::atomic::Ordering::Relaxed))
             } else { None };
             let __r = self.poll_inner(cx);
-            // round-25 诊断:记录"上次 Pending 到本次 poll 开始"的间隔。
-            // 间隔长 ⟹ 唤醒慢(不是丢唤醒,是内核没数据)。
+            // round-25 诊断:记录 poll 的 Pending 次数与帧数,用于算唤醒间隔。
             if __diag {
-                let now = std::time::Instant::now();
-                if let Some(prev) = crate::sched_diag::last_pending() {
-                    crate::sched_diag::on_wakeup_gap(prev.elapsed());
-                }
-                if matches!(__r, Poll::Pending) {
-                    crate::sched_diag::set_last_pending(now);
-                } else {
-                    crate::sched_diag::clear_last_pending();
-                }
+                crate::sched_diag::on_poll_entry(matches!(__r, Poll::Pending));
             }
             if let (Some(t), Some(f0)) = (__t0, __frames_at_entry) {
                 crate::sched_diag::on_recv_poll(
