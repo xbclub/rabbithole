@@ -186,13 +186,6 @@ pub(crate) struct Io<T> {
     io: T,
     read: Staging,
     write_state: WriteState,
-    /// round-30 P0:批队列的常驻回收位。
-    ///
-    /// 批写穿后 `write_state` 回到 `Init`,原 `VecDeque` 原本被 drop,
-    /// 下一批首帧再 `with_capacity(MAX_BATCH_FRAMES)` 重建(每批一次
-    /// 分配+释放)。实测批频率约 100~200 次/s。这里在排空时把已清空的
-    /// 队列搬到这里保容量,下批首帧直接复用(容量不足时仍走原分配)。
-    spare_queue: Option<VecDeque<PendingFrame>>,
 }
 
 /// 接收 staging:批量读入 + 零拷贝帧体切片。
@@ -296,7 +289,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
             io,
             read: Staging::new(),
             write_state: WriteState::Init,
-            spare_queue: None,
         }
     }
 }
@@ -501,14 +493,7 @@ where
                     Poll::Ready(Err(e))
                 }
                 Poll::Ready(Ok(())) => {
-                    // round-30 P0:排空后把队列搬进 spare 复用,不 drop。
-                    if let WriteState::Batch { queue, .. } =
-                        std::mem::replace(&mut this.write_state, WriteState::Init)
-                    {
-                        let mut q = queue;
-                        q.clear();
-                        this.spare_queue = Some(q);
-                    }
+                    this.write_state = WriteState::Init;
                     Poll::Ready(Ok(()))
                 }
             },
@@ -534,11 +519,7 @@ where
         match &mut this.write_state {
             WriteState::Batch { queue, .. } => queue.push_back(frame),
             state => {
-                // round-30 P0:优先复用 spare 队列(已清空、容量保留)。
-                let mut queue = this
-                    .spare_queue
-                    .take()
-                    .unwrap_or_else(|| VecDeque::with_capacity(MAX_BATCH_FRAMES));
+                let mut queue = VecDeque::with_capacity(MAX_BATCH_FRAMES);
                 queue.push_back(frame);
                 *state = WriteState::Batch {
                     queue,
