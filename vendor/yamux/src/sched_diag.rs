@@ -440,3 +440,23 @@ pub fn dump_poll_gap(tag: &str) {
         POLL_GAP_GT1MS.load(Ordering::Relaxed)
     );
 }
+
+// ---- 读锁争用 ----
+pub static READ_LOCK_MISS: AtomicU64 = AtomicU64::new(0);
+pub static READ_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn on_read_lock_miss() {
+    READ_LOCK_MISS.fetch_add(1, Ordering::Relaxed);
+    READ_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn dump_lock(tag: &str) {
+    if !enabled() {
+        return;
+    }
+    let miss = READ_LOCK_MISS.load(Ordering::Relaxed);
+    if miss == 0 {
+        return;
+    }
+    eprintln!("READLOCK {tag} miss={miss}");
+}

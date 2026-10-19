@@ -1190,7 +1190,14 @@ mod halves {
             buf: &mut [u8],
         ) -> Poll<io::Result<usize>> {
             let this = self.get_mut();
-            let mut guard = ready!(this.io.poll_lock(cx));
+            // round-26 诊断:统计读半因拿不到锁而 Pending 的次数。
+            let mut guard = match this.io.poll_lock(cx) {
+                std::task::Poll::Ready(g) => g,
+                std::task::Poll::Pending => {
+                    crate::sched_diag::on_read_lock_miss();
+                    return std::task::Poll::Pending;
+                }
+            };
             Pin::new(&mut *guard).poll_read(cx, buf)
         }
     }
