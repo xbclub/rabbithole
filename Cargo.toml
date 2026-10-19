@@ -70,6 +70,11 @@ ssh-key = { version = "=0.7.0-rc.11", features = ["ed25519", "rand_core"] }
 base64 = "0.22"
 hickory-resolver = "0.26"
 
+# 全局内存分配器(round-35)。两个二进制统一使用 mimalloc:
+# 单 C 文件、无额外系统依赖、跨 Linux/macOS/Windows 同一份代码,
+# 且对"跨线程释放的小对象"最友好(帧体在本线程分配、在 Worker 释放)。
+mimalloc = { version = "0.1", default-features = false }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

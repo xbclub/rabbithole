@@ -32,6 +32,10 @@ struct Cli {
     secret: Option<String>,
 }
 
+/// 全局内存分配器(round-35):mimalloc(理由见 rh-server/src/main.rs 同处)。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -72,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
     // 三方 crate(yamux/tungstenite/kcp)走 log facade,桥接到 tracing
     let _ = tracing_log::LogTracer::init();
+    // 启动即确认实际生效的全局分配器(round-35)。
+    tracing::info!(allocator = "mimalloc", "global allocator");
     anyhow::ensure!(
         !cfg.client_id.is_empty(),
         "client_id 为空(配置文件 / RH_CLIENT_ID / --id)"

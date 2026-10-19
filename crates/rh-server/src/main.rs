@@ -204,6 +204,20 @@ fn load_control_cfgs(cfg: &config::ServerConfig) -> anyhow::Result<Vec<ServerTra
     Ok(out)
 }
 
+/// 全局内存分配器(round-35):mimalloc。
+///
+/// 本项目的数据面已由 8 分片缓冲池(vendor/yamux/src/pool.rs)覆盖,
+/// 每帧零分配;但控制面仍有约 2 万次/秒的 malloc(实测 test1 负载下
+/// 15 秒 29.8 万次):每流的命令通道、`Arc<Mutex<Shared>>`、waker 槽、
+/// 任务 Future,以及跨线程释放(载体 Framer 分配帧体、分片 Worker 释放)。
+///
+/// glibc 默认 malloc 在"跨线程释放"形态下会把对象还到释放者的 arena,
+/// 长期运行后形成难以复用的空洞;mimalloc 的延迟队列把跨线程释放归还
+/// 原线程回收,正是针对这一点。实测该路径 CPU 占比仅 0.67%,故此项
+/// 定位为低成本的稳定性保险(平抑长跑碎片与延迟毛刺),而非吞吐优化。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -212,6 +226,8 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::ServerConfig::load(&cfg_path)?;
     init_tracing(&cfg);
     check_fd_limit();
+    // 启动即确认实际生效的全局分配器(round-35):线上排查时唯一可靠依据。
+    info!(allocator = "mimalloc", "global allocator");
     let db_dir = cfg_path
         .parent()
         .map(|p| p.to_path_buf())

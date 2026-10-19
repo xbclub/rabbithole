@@ -9,6 +9,8 @@ name = "rh-client"
 path = "src/main.rs"
 
 [dependencies]
+# 全局分配器(round-35)
+mimalloc = { workspace = true }
 rh-protocol = { workspace = true }
 rh-transport = { workspace = true }
 rh-core = { workspace = true }
