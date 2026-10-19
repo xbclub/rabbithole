@@ -1057,7 +1057,7 @@ impl<T> Active<T> {
 /// Pong/GoAway 帧与 rtt ping 的发送优先级不低于未拆分路径(要点 2)。
 mod halves {
     use super::*;
-    use crate::frame::{MAX_BATCH_BYTES, MAX_BATCH_FRAMES};
+    use crate::frame::MAX_BATCH_FRAMES;
     use crate::{FrameDecodeError, Writev2};
     use futures::ready;
     use futures::{AsyncRead, AsyncWrite};
@@ -2246,7 +2246,7 @@ mod halves {
             let mut bytes = 0usize;
             let __diag = crate::sched_diag::enabled();
             let __t0 = if __diag { Some(std::time::Instant::now()) } else { None };
-            while frames < MAX_BATCH_FRAMES && bytes < MAX_BATCH_BYTES {
+            while frames < MAX_BATCH_FRAMES && bytes < crate::frame::max_batch_bytes() {
                 let Some(frame) = self.next_frame() else {
                     break;
                 };
@@ -2403,7 +2403,7 @@ mod halves {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{MAX_BATCH_BYTES, MAX_BATCH_FRAMES};
+    use crate::frame::MAX_BATCH_FRAMES;
     use futures::future::poll_fn;
     use std::cell::RefCell;
     use std::pin::Pin;
@@ -4620,7 +4620,7 @@ mod tests {
         let total_frames = 2 + 16;
         let total_bytes = 2 * header::HEADER_SIZE + 16 * (header::HEADER_SIZE + 4096);
         assert!(
-            total_frames <= MAX_BATCH_FRAMES && total_bytes < MAX_BATCH_BYTES,
+            total_frames <= MAX_BATCH_FRAMES && total_bytes < crate::frame::max_batch_bytes(),
             "caps must admit pong + rtt ping + 16 stream frames in one batch"
         );
         assert_eq!(
@@ -4657,7 +4657,7 @@ mod tests {
         // 上限一批可容纳的 64KiB 帧数(fill_batch 口径:取帧前检查累计
         // 线上字节 < 字节上限,故取满 n 帧 ⟺ 前 n−1 帧累计 < 上限,即
         // n = ceil(上限 / 单帧线上长);再受帧数上限封顶)。
-        let per_batch = MAX_BATCH_FRAMES.min(MAX_BATCH_BYTES.div_ceil(WIRE));
+        let per_batch = MAX_BATCH_FRAMES.min(crate::frame::max_batch_bytes().div_ceil(WIRE));
 
         let (socket, st) = TestSocket::new();
         let mut cfg = Config::default();

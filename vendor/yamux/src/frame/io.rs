@@ -70,6 +70,25 @@ pub(crate) const MAX_BATCH_FRAMES: usize = 64;
 /// (应用层 CHUNK_CAP 步进,转发主力形态)下完整容纳 16 满帧——单批覆盖
 /// 16 流;256KiB 上限下同形态 4 帧即止(帧数利用率 25%),16 流需 4 次
 /// writev。
+/// round-24:`RH_MAX_BATCH_BYTES` 可覆盖单批字节上限(默认 1MiB)。
+///
+/// 实测(§42.28):载体 `tb`(发送缓冲)仅 87KB,而单次 writev 写 65KiB
+/// 后缓冲只剩 22KB,下一次写必然 EAGAIN。strace 显示约 50% 的 writev
+/// 直接返回 EAGAIN —— 一半的写调用被浪费。
+///
+/// 用 env 验证较小上限(如 32KiB)能否降低 EAGAIN 率;默认保持 1MiB
+/// 以维持既有批量语义(测试断言 16×64KiB 合批)。
+pub(crate) fn max_batch_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RH_MAX_BATCH_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| (4 * 1024..=1024 * 1024).contains(n))
+            .unwrap_or(MAX_BATCH_BYTES)
+    })
+}
+
 pub(crate) const MAX_BATCH_BYTES: usize = 1024 * 1024;
 
 /// 一次 `poll_writev` 的段数上限(§3.2;round-7 随帧数上限扩至 129)。
