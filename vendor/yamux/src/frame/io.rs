@@ -592,6 +592,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
             if spare.is_empty() {
                 // reserve 后仍无空闲(理论不可达):自唤醒让出,避免
                 // 无 waker 的 Pending 挂死,也不自旋
+                crate::sched_diag::on_spare_empty();
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }

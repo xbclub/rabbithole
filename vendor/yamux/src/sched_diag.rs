@@ -460,3 +460,21 @@ pub fn dump_lock(tag: &str) {
     }
     eprintln!("READLOCK {tag} miss={miss}");
 }
+
+// ---- spare 为空(自唤醒忙等) ----
+pub static SPARE_EMPTY: AtomicU64 = AtomicU64::new(0);
+
+pub fn on_spare_empty() {
+    SPARE_EMPTY.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn dump_spare(tag: &str) {
+    if !enabled() {
+        return;
+    }
+    let n = SPARE_EMPTY.load(Ordering::Relaxed);
+    if n == 0 {
+        return;
+    }
+    eprintln!("SPARE_EMPTY {tag} count={n}");
+}

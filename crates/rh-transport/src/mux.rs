@@ -806,6 +806,7 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                 yamux::sched_diag::dump_push("down");
                 yamux::sched_diag::dump_poll_gap("down");
                 yamux::sched_diag::dump_lock("down");
+                yamux::sched_diag::dump_spare("down");
             }
         }
         if chunk.len() >= CHUNK_CAP {
