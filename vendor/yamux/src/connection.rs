@@ -2198,9 +2198,21 @@ mod halves {
                     Poll::Pending => false,
                 };
 
-                match self.socket.poll_flush_unpin(cx) {
-                    Poll::Ready(Ok(())) | Poll::Pending => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(self.fatal(e.into()))),
+                // round-30 优化:批未写穿(sink_idle == false)时跳过 flush。
+                //
+                // `FrameIo::poll_flush` 的第一行就是 `ready!(poll_ready_unpin)`,
+                // 而 `poll_ready` 在批未写穿时必返回 Pending ⟹ 此处调用只会
+                // **重入一次批状态机**(重新拼装最多 129 段的 writev 参数),
+                // 然后原样返回 Pending,不做任何实际 flush。
+                //
+                // 跳过不改变语义:`poll_ready` 已在上方返回 Pending 并武装了
+                // 载体写 waker,批写穿时会由该 waker 唤醒本任务重入,
+                // 届时 sink_idle == true 再走 flush。
+                if sink_idle {
+                    match self.socket.poll_flush_unpin(cx) {
+                        Poll::Ready(Ok(())) | Poll::Pending => {}
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(self.fatal(e.into()))),
+                    }
                 }
 
                 self.shared.set_send_waker(cx.waker());
