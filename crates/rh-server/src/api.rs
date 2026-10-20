@@ -915,11 +915,16 @@ async fn update_service(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-    Json(mut spec): Json<ProxySpec>,
+    Json(spec): Json<ProxySpec>,
 ) -> Response {
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }
+    update_service_inner(&state, id, spec).await
+}
+
+/// update 的实现本体(抽出以便单测直接驱动,A5)。
+async fn update_service_inner(state: &Arc<AppState>, id: i64, mut spec: ProxySpec) -> Response {
     spec.id = id as u64;
     // 名称校验与创建一致(名字是 visitor 目标解析的稳定键)
     if spec.name.is_empty()
@@ -973,6 +978,55 @@ async fn update_service(
     if spec.kind.uses_bind_port() && spec.bind_port == 0 {
         return err(3006, "bind_port 不能为 0(仅创建时支持自动分配)");
     }
+    // ★A5:enabled 由 true → false 必须**真的拆运行态**。
+    //
+    // 修前走下面 `!port_changed` 分支:只落库 enabled=0 + publish_spec_in_place
+    // (仅下发 Update 快照),既不 teardown 也不发 ServiceRemove。后果:
+    //   - 端口继续监听(用户以为已停用);
+    //   - `port_in_use` 只统计 enabled 运行态 → 该端口可被**新规则再次占用**,
+    //     形成双占冲突。
+    // 对照 disable 端点(api.rs 的 disable_service_inner)有完整 teardown。
+    //
+    // 这里直接复用 disable_service_inner 的语义(落库 + bump + teardown +
+    // ServiceRemove + 事件),避免两条路径再次分叉。
+    if old.enabled && !spec.enabled {
+        // 先把非 enabled 字段落库(用户同时改了 target 等),再走停用。
+        if let Err(e) = state.db.update_proxy(id, &spec, port_auto).await {
+            return err(500, &format!("{e}"));
+        }
+        let (code, msg) = disable_service_locked(state, id).await;
+        if code != 0 {
+            return err(code, &msg);
+        }
+        let rev = state
+            .db
+            .get_client(&client_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.config_revision.max(0) as u64)
+            .unwrap_or(0);
+        return ok(json!({"updated": true, "disabled": true, "revision": rev}));
+    }
+    // 同理:false → true 走 enable 的完整路径(重建运行态 + 下发)
+    if !old.enabled && spec.enabled {
+        if let Err(e) = state.db.update_proxy(id, &spec, port_auto).await {
+            return err(500, &format!("{e}"));
+        }
+        let (code, msg) = enable_service_locked(state, id).await;
+        if code != 0 {
+            return err(code, &msg);
+        }
+        let rev = state
+            .db
+            .get_client(&client_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.config_revision.max(0) as u64)
+            .unwrap_or(0);
+        return ok(json!({"updated": true, "enabled": true, "revision": rev}));
+    }
     // 非端口字段变更(§4.3):listener/池不动,原位发布快照 + 入队
     let port_changed =
         spec.kind != old.kind || spec.bind_port != old.bind_port || spec.bind_ip != old.bind_ip;
@@ -986,7 +1040,7 @@ async fn update_service(
                 Ok(r) => r,
                 Err(e) => return err(500, &format!("{e}")),
             };
-            crate::runtime::publish_spec_in_place(&state, &rt, &spec, rev).await;
+            crate::runtime::publish_spec_in_place(state, &rt, &spec, rev).await;
             return ok(json!({"updated": true, "revision": rev}));
         }
     }
@@ -1033,7 +1087,7 @@ async fn update_service(
             };
         if !trial_ok {
             let msg = bind_failure_message(
-                &state,
+                state,
                 "端口绑定失败",
                 spec.kind.as_str(),
                 new_ip,
@@ -1052,8 +1106,8 @@ async fn update_service(
         Err(e) => return err(500, &format!("{e}")),
     };
     // 端口/类型变更:重建运行态(在途连接由 rule_cancel 级联关闭)
-    crate::runtime::teardown_runtime(&state, id as u64).await;
-    crate::runtime::spawn_runtime(&state, &client_id, &spec, rev).await;
+    crate::runtime::teardown_runtime(state, id as u64).await;
+    crate::runtime::spawn_runtime(state, &client_id, &spec, rev).await;
     ok(json!({"updated": true, "revision": rev}))
 }
 
@@ -1408,6 +1462,12 @@ async fn enable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
+    enable_service_locked(state, id).await
+}
+
+/// 启用的实现本体,**要求调用方已持有 serial_lock**(理由同
+/// [`disable_service_locked`])。
+async fn enable_service_locked(state: &Arc<AppState>, id: i64) -> (i32, String) {
     let Some((_, client_id, mut spec, port_auto)) = state.db.get_proxy(id).await.ok().flatten()
     else {
         return (3001, "not found".into());
@@ -1450,11 +1510,23 @@ async fn enable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
 }
 
 async fn disable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
-    let Some((_, client_id, spec, _)) = state.db.get_proxy(id).await.ok().flatten() else {
+    let Some((_, client_id, _, _)) = state.db.get_proxy(id).await.ok().flatten() else {
         return (3001, "not found".into());
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
+    disable_service_locked(state, id).await
+}
+
+/// 停用的实现本体,**要求调用方已持有该客户端的 serial_lock**。
+///
+/// ★为什么必须拆出这一层(A5):`update_service_inner` 自己已经持锁,
+/// 若它直接调 [`disable_service_inner`] 会在同一把 `tokio::sync::Mutex`
+/// 上二次加锁 —— 直接死锁(不是 RwLock 的重入读,是写锁自锁)。
+async fn disable_service_locked(state: &Arc<AppState>, id: i64) -> (i32, String) {
+    let Some((_, client_id, spec, _)) = state.db.get_proxy(id).await.ok().flatten() else {
+        return (3001, "not found".into());
+    };
     state.db.set_proxy_enabled(id, false).await.ok();
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
     crate::runtime::teardown_runtime(state, id as u64).await;
@@ -2874,5 +2946,127 @@ mod tests {
             .classify_port_occupation("tcp", LO, stale)
             .await
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod update_disable_teardown_tests {
+    //! A5 回归:update_service 置 enabled=false 必须**真的拆运行态**。
+    //!
+    //! 修前走 `!port_changed` 分支:只落库 enabled=0 + publish_spec_in_place,
+    //! 既不 teardown 也不发 ServiceRemove。后果:
+    //!   - 端口继续监听(用户以为已停用);
+    //!   - `port_in_use` 只统计 enabled 运行态 → 同端口可被新规则再次占用。
+    //!
+    //! 对照 disable 端点有完整 teardown,两条路径曾经分叉。
+    use super::*;
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    const CID: &str = "a5-client";
+
+    async fn setup() -> (Arc<AppState>, i64) {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "a5", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        (state, 0)
+    }
+
+    fn spec_enabled(port: u16, enabled: bool) -> rh_protocol::ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": "a5",
+            "kind": "tcp",
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": port,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": enabled,
+        }))
+        .unwrap()
+    }
+
+    /// 核心断言:update 置 false 后,运行时必须已从表里移除(teardown 生效)。
+    #[tokio::test]
+    async fn update_to_disabled_tears_down_runtime() {
+        let (state, _) = setup().await;
+        // 直接建一条运行态(绕过 HTTP,聚焦 update 的语义)
+        let spec = spec_enabled(23456, true);
+        let id = state
+            .db
+            .insert_proxy(CID, &spec, false, "console")
+            .await
+            .unwrap();
+        // 直接注册运行态(不做真实 bind —— spawn_runtime 会占端口且需客户端在线)
+        let rt = std::sync::Arc::new(crate::state::ProxyRuntime::new(
+            id as u64,
+            CID.into(),
+            spec.clone(),
+        ));
+        state.proxies.runtimes.insert(id as u64, rt);
+        assert!(
+            state.proxies.get(id as u64).is_some(),
+            "前置:运行态应已注册"
+        );
+
+        // update 里置 enabled=false
+        let mut upd = spec_enabled(23456, false);
+        upd.name = "a5".into();
+        let resp = update_service_inner(&state, id, upd).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], 0, "update 应成功: {body}");
+
+        assert!(
+            state.proxies.get(id as u64).is_none(),
+            "A5:update 置 enabled=false 必须 teardown 运行态(修前端口仍在监听)"
+        );
+        // 落库也必须是 disabled
+        let got = state.db.get_proxy(id).await.unwrap().unwrap();
+        assert!(!got.2.enabled, "DB 里必须 enabled=false");
+    }
+
+    /// 端口占用随之释放:禁用后同端口可被新规则占用(修前会双占)。
+    #[tokio::test]
+    async fn disabled_after_update_releases_port() {
+        let (state, _) = setup().await;
+        let spec = spec_enabled(23457, true);
+        let id = state
+            .db
+            .insert_proxy(CID, &spec, false, "console")
+            .await
+            .unwrap();
+        let rt = std::sync::Arc::new(crate::state::ProxyRuntime::new(
+            id as u64,
+            CID.into(),
+            spec.clone(),
+        ));
+        state.proxies.runtimes.insert(id as u64, rt);
+
+        let mut upd = spec_enabled(23457, false);
+        upd.name = "a5".into();
+        let resp = update_service_inner(&state, id, upd).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], 0, "update 应成功: {body}");
+
+        // ① 运行态必须已从表里消失(这是 teardown 的直接证据)
+        assert!(
+            state.proxies.get(id as u64).is_none(),
+            "A5:update 置 false 后运行态必须被移除(修前只改 spec,端口继续监听)"
+        );
+        // ② 端口占用随之释放(port_in_use 只统计 enabled 运行态)
+        assert!(
+            !state
+                .proxies
+                .port_in_use("tcp", "127.0.0.1".parse().unwrap(), 23457, None, None)
+                .await,
+            "A5:teardown 后端口必须报告未占用(否则新规则可与之双占)"
+        );
     }
 }
