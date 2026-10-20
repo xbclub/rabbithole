@@ -1470,12 +1470,29 @@ pub fn shard_workers_for_k(k: usize) -> usize {
     if let Some(n) = shard_workers_per_carrier_override() {
         return n;
     }
-    // K>1:总预算按核数给(不再固定 4),并保证每载体至少
-    // `MIN_SHARD_WORKERS_PER_CARRIER` 个。旧公式 `(4/k).max(1)` 在
-    // K=4 时给出 1,是高并发不扩展的根因。
-    let cpus = detect_cpus();
-    let budget = cpus.max(MIN_SHARD_WORKERS_PER_CARRIER * k);
-    (budget / k).clamp(MIN_SHARD_WORKERS_PER_CARRIER, MAX_SHARD_WORKERS)
+    // K>1:每载体分片数(round-74 修订)。
+    //
+    // ## 不变量:开多载体不得降低每载体并行度
+    //
+    // round-62 的 `budget = cpus.max(2*k); (budget/k).clamp(2, MAX)` 在
+    // 8 核 K=4 时给出 **2**,比 K=1 的 4 **少一半**。即"开多载体"反而
+    // 让每条载体的解帧/派发/流控记账并行度掉一半——与多载体的初衷
+    // (提升并发能力)方向相反。
+    //
+    // 实测(round-73,严格交替配对,Go 压测器,4MiB 收发缓冲):
+    // - 下行 P=16:shard=2 输给 shard=4 共 7/10 轮
+    //
+    // ## 为什么不再按 `cpus/k` 分摊
+    //
+    // shard Worker 是 **async 任务**而非线程,一个 Worker 不占一个物理核:
+    // 它们在同一个 runtime 上由 tokio 调度,N 个 Worker 只是在 N 个任务
+    // 上分摊解帧,不是 N 条并行指令流。用"每核一个 Worker"去限制它们是
+    // 错误的类比——K=1 时给 4 个 Worker 并没有用掉 4 个核。
+    //
+    // 因此 per_carrier 直接取 K=1 的分片数(不再除以 K),总 Worker 数
+    // = k * per,对 K≤8 仍在数十个任务的量级,不构成调度负担。
+    // 上限仍受 MAX_SHARD_WORKERS 约束。
+    auto_shard_workers(None).clamp(MIN_SHARD_WORKERS_PER_CARRIER, MAX_SHARD_WORKERS)
 }
 
 fn mux_config_with_shards(max_streams: usize, shard_workers: usize) -> yamux::Config {
@@ -4402,11 +4419,15 @@ mod tests {
         );
     }
 
-    // T-C5(round-10;round-62 修订):池规模 → 每载体 shard 映射。
+    // T-C5(round-10;round-62 修订;round-73 再修):池规模 → 每载体 shard 映射。
     //
     // round-10 原公式 `(预算/k).max(1)` 在 8 核 K=4 时得到 1——每载体
-    // 只有 1 个 Worker,高并发下成为串行瓶颈(实测 P=16 上行落后 frp 31%,
-    // 而 P=4/P=8 持平)。新公式保证每载体至少 2 个。
+    // 只有 1 个 Worker。
+    //
+    // round-62 改成 `cpus.max(2k)/k`,8 核 K=4 得到 **2**——仍然比 K=1 的
+    // 4 少一半,等于"开多载体反而降低每条载体的并行度"。
+    //
+    // round-73 改为**每载体不低于 K=1 的分片数**(再受核数预算封顶)。
     #[test]
     fn shard_workers_for_pool_size() {
         for k in 0..=8 {
@@ -4416,14 +4437,25 @@ mod tests {
                 "K={k} 的 shard={got} 必须 >= 2(单载体也要读∥写并行)"
             );
         }
-        // K 增大时每载体不减少(旧公式是"越大越少",正是要修的方向)。
-        let w1 = shard_workers_for_k(1);
-        let w4 = shard_workers_for_k(4);
-        assert!(
-            w4 >= 2 && w1 >= 2,
-            "K=1 得 {w1}、K=4 得 {w4},都必须 >= 2"
-        );
-        // 总 Worker 数不随 K 爆炸:每载体 × K 应 <= max(核数*K, 2K) 的量级。
+        // **核心不变量(round-74)**:开多载体不得降低每载体并行度。
+        //
+        // 断言对**所有** K>1 成立,不加 `cpus/k` 之类的豁免条件——
+        // round-73 那一版正是因为写了 `if cpus/k >= single` 的豁免,
+        // 才让"8 核 K=4 仍得 2"这个 bug 通过测试(公式本身没生效)。
+        let single = shard_workers_for_k(1);
+        for k in 2..=8 {
+            let per = shard_workers_for_k(k);
+            assert_eq!(
+                per, single,
+                "K={k} 每载体 {per} 个分片,低于单载体的 {single}——\
+                 多载体不得以降低并行度为代价"
+            );
+            assert!(
+                per >= 2,
+                "K={k} 每载体至少 2 个(读∥写并行),实际 {per}"
+            );
+        }
+        // 总 Worker 数不随 K 爆炸:每载体 × K 应在核数预算量级内。
         let total_k8 = shard_workers_for_k(8) * 8;
         assert!(
             total_k8 <= MAX_SHARD_WORKERS * 8,
