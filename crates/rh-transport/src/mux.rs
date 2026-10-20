@@ -1088,7 +1088,17 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     let mut __last_read_end: Option<std::time::Instant> = None;
 
     // 上一轮写期间预取到的下一块(下一轮批的首块)。
-    let mut pending: Option<Bytes> = None;
+    //
+    // round-76:由 `Option<Bytes>` 改为持续预取队列。原实现写期间**只**
+    // 预取一块,下一轮批只剩 1 块起步,`flush()` 每批聚合到的字节受限于
+    // "上一轮恰好读到多少"。K>1 时单载体上的流更少、块到达更零散,
+    // 这条约束直接把平均 writev 从 589KiB 压到 384KiB(实测 syscw/GB
+    // 1658 → 2540~3163,多 1.5~1.9 倍)。见 §81。
+    //
+    // 现在与 `pump_up`(round-68)同构:写未完成期间**持续**发起新读,
+    // 把读到的块全部堆进本队列,直到 `DOWN_BATCH_BYTES` 触顶;下一轮
+    // 直接从队列取,不再每次只带一块。
+    let mut pending: std::collections::VecDeque<Bytes> = std::collections::VecDeque::new();
     // 单流口径埋点(仅 RH_PUMP_STATS=1 时累加,关闭时零开销)
     let mut rd_ns: u64 = 0;
     let mut wr_ns: u64 = 0;
@@ -1129,10 +1139,15 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         let mut batch_bytes = 0usize;
         let mut batch_eof = false;
 
-        // 组装本轮批:首块(pending 或新读)+ 所有已就绪块,直到上限。
-        if let Some(first) = pending.take() {
-            batch_bytes += first.len();
-            batch.push(first);
+        // 组装本轮批:先把预取队列整体并入(round-76),再抢收已就绪块,
+        // 直到上限。预取队列可能有多块——这正是与 round-31~75 的差别。
+        while let Some(c) = pending.pop_front() {
+            if batch_bytes >= DOWN_BATCH_BYTES || batch.len() >= SMALL_CHUNK_SEGS {
+                pending.push_front(c); // 放回,留给下一轮
+                break;
+            }
+            batch_bytes += c.len();
+            batch.push(c);
         }
         while batch_bytes < DOWN_BATCH_BYTES && batch.len() < SMALL_CHUNK_SEGS {
             match b_read.try_read_chunk().await {
@@ -1190,25 +1205,36 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         } else {
             None
         };
-        // 写这批;未达上限时并发读下一块(读结果进 pending,不阻塞写)。
+        // 写这批;写未完成期间**持续**预取新块进 pending(不阻塞写)。
+        //
+        // round-76:修前每轮只预取一块,写完成后下一轮批从 1 块起步,
+        // 平均 writev 被压到 384KiB(K=1 是 589KiB)。现在与 `pump_up`
+        // (round-68)同构:循环发起新读,直到 pending 触顶
+        // `DOWN_BATCH_BYTES` 或写完成。
         let __ok = if prefetch_enabled() && batch_bytes < DOWN_BATCH_BYTES && !batch_eof {
             let write_fut = flush(a_w, &mut batch, &mut batch_bytes, limiter);
             futures::pin_mut!(write_fut);
-            let mut read_fut = Some(Box::pin(b_read.read_chunk()));
             loop {
-                match read_fut.take() {
-                    Some(rf) => {
-                        futures::pin_mut!(rf);
-                        match futures::future::select(rf, write_fut.as_mut()).await {
-                            futures::future::Either::Left((nr, _)) => match nr {
-                                Ok(Some(c)) if !c.is_empty() => pending = Some(c),
-                                Ok(_) => batch_eof = true,
-                                Err(_) => batch_eof = true,
-                            },
-                            futures::future::Either::Right((ok, _)) => break ok,
+                // 预取已够下一轮用:不再发起新读,专心等写完成。
+                let pend_bytes: usize = pending.iter().map(|c| c.len()).sum();
+                if pend_bytes >= DOWN_BATCH_BYTES {
+                    break write_fut.await;
+                }
+                let read_fut = b_read.read_chunk();
+                futures::pin_mut!(read_fut);
+                match futures::future::select(read_fut, write_fut.as_mut()).await {
+                    futures::future::Either::Left((nr, _)) => match nr {
+                        Ok(Some(c)) if !c.is_empty() => pending.push_back(c),
+                        Ok(_) => {
+                            batch_eof = true;
+                            break write_fut.await;
                         }
-                    }
-                    None => break write_fut.await,
+                        Err(_) => {
+                            batch_eof = true;
+                            break write_fut.await;
+                        }
+                    },
+                    futures::future::Either::Right((ok, _)) => break ok,
                 }
             }
         } else {
@@ -1225,7 +1251,7 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         if !__ok {
             break 'outer false;
         }
-        if batch_eof && pending.is_none() {
+        if batch_eof && pending.is_empty() {
             break 'outer true;
         }
     };

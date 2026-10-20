@@ -12465,3 +12465,80 @@ pump_down 拿到的数据更碎 ⟹ `flush()` 每次聚合到的字节更少。
 3. **合并 accept 转发**:让池直接暴露底层成员的 accept 而不中转。
 
 本轮**未完成修复**,因此目标保持活跃。
+
+## 81. Round-76:最后一个假设站住了 —— 下行预取深度不足
+
+### 81.1 换一个抗漂移的指标
+
+§80 之后站点带宽开始漂移(直连基线从 3.15 G 掉到 2.4 G,链路口径
+10Gb/s、0.44ms RTT、零丢包),**绝对吞吐已不可比**。改用两个
+**每字节归一化**的指标,它们不随带宽变化:
+
+- `ticks/GB`(utime+stime / 传输 GB)
+- `syscw/GB`(/proc/<pid>/io 的写调用数 / 传输 GB)
+
+### 81.2 结果:两个指标都指向同一处
+
+| 指标 | K=1 | K=4 |
+|---|---:|---:|
+| ticks/GB(4 轮) | 341~378 | 387~416(**+11~12%**) |
+| syscw/GB(多轮) | 1534~1832 | 2293~3388(**+1.5~1.9×**) |
+| 平均单次 writev | **589 KiB** | **384 KiB** |
+
+`ticks/GB` 在 4/4 轮里都是 K=4 更高,**与带宽漂移无关,是稳定结论**。
+
+### 81.3 perf 定位到具体的 CPU 去向
+
+`perf record` 服务端(K=4,下行 P=16):
+
+```
+95.08%  do_syscall_64
+        48.48%  __x64_sys_writev → tcp_sendmsg
+                46.21%  copy_user_generic_unrolled   ← 用户/内核数据拷贝
+                45.64%  (self)
+        43.94%  __x64_sys_recvfrom → tcp_recvmsg
+                25.19%  __skb_datagram_iter → skb_copy_datagram_iter
+   17.61%  __alloc_pages → sk_page_frag_refill     ← 页分配
+   15.53%  clear_page_orig                          ← 新页清零
+```
+
+`copy_user_*` 45.6% + `clear_page_orig` 15.5% 说明:数据在同一趟里
+被拷贝/分配了更多次 —— 因为**每次 writev 承载的字节变少了**,
+每字节要付一次固定的 skb 分配+拷贝成本。
+
+### 81.4 根因:下行只预取一块
+
+`pump_down` 的预取变量是 `Option<Bytes>`,即**写期间只预取一块**:
+
+```rust
+let mut read_fut = Some(Box::pin(b_read.read_chunk()));
+loop {
+    match read_fut.take() {
+        Some(rf) => ... Ok(Some(c)) => pending = Some(c),   // 只存一块
+        None => break write_fut.await,                       // 存完就等写
+    }
+}
+```
+
+写完成后,下一轮批**从 1 块起步**,剩余靠 `try_read_chunk` 抢收。
+K>1 时单载体上的流更少、块到达更零散,抢收不到几块就进入写 ——
+于是平均 writev 从 589KiB 掉到 384KiB。
+
+`pump_up` 在 round-68 已经改成**持续预取**(`Vec<Bytes>`,边写边读直到
+触顶),但改动**只做在上行**,下行一直是旧形态。
+
+### 81.5 修复
+
+把 `pump_down` 的预取改成与 `pump_up` 同构:
+
+- `pending: Option<Bytes>` → `VecDeque<Bytes>`
+- 组装批时把队列**整体**并入(达上限的放回队首,留给下一轮)
+- 写期间**持续**发起新读直到 `pend_bytes >= DOWN_BATCH_BYTES`
+- EOF 判定 `pending.is_none()` → `pending.is_empty()`
+
+全量测试(139 rh-transport + 其余)绿,clippy 干净。
+
+### 81.6 待验证
+
+修复的实际效果尚未测量(构建中)。下一轮需给出:
+`syscw/GB` 与 `ticks/GB` 在修复前后的对比,以及是否回到 K=1 水平。
