@@ -17,10 +17,12 @@ pub struct ClientConfig {
     /// 仅对两端均裸 TCP(本地目标 + 裸模式明文载体)生效,其余自动回落。
     pub relay_mode: String,
     /// 多载体池规模(round-10)。三态语义:
-    /// - `None`(默认):自动定容 = 协议基线(tls/wss 2,其余 1)→ 硬件
-    ///   上限 → 服务端 `max_carriers`,最终钳制 [1,8];
-    /// - `Some(1)`:强制单载体(等价旧路径,不建池);
-    /// - `Some(n)`:显式期望 n(仍经硬件/服务端/8 钳制)。
+    /// - `None`(默认):自动定容 = 协议基线(**六个协议全部 1**,round-73)
+    ///   → 硬件上限 → 服务端 `max_carriers`,最终钳制 [1,8]。由于基线已
+    ///   回退为 1,**默认路径不建池**;
+    /// - `Some(1)`:强制单载体(与默认行为相同,但语义显式);
+    /// - `Some(n)`:显式期望 n(仍经硬件/服务端/8 钳制)——这是目前**唯一**
+    ///   能开到多载体的方式。
     ///
     /// QUIC/KCP 自带多路复用,忽略本参数(恒单载体);`multiplex=false`
     /// 同样恒单载体。`RH_MUX_POOL_SIZE` 覆盖写为 `Some(n)`。
@@ -314,7 +316,7 @@ mod tests {
         // (tcp=1)。断言真正参与定容的 initial_k_for_with,而不是已删除的
         // ClientTransportConfig::carriers。
         let (k, _cap) = crate::session::initial_k_for_with(&c, rh_transport::Protocol::Tcp, 8);
-        assert_eq!(k, 4, "None(自动定容)在 tcp 协议下应得到协议基线 K=4(round-54)");
+        assert_eq!(k, 1, "None(自动定容)在 tcp 协议下取协议基线 K=1(round-73)");
 
         // 有 env:覆盖默认;布尔解析大小写不敏感
         std::env::set_var("RH_SERVER", "127.0.0.1:7100");
@@ -400,12 +402,17 @@ client_id = "c"
 secret = "s"
 "#;
         // round-44:断言生效 K(initial_k_for_with)而不是已删除的
-        // ClientTransportConfig::carriers。三态的语义差异看 K:tls 协议基线
-        // 为 2,因此"未配置"落 2、"显式 3"落 3、"显式 1"落 1——三者可区分。
+        // ClientTransportConfig::carriers。
+        //
+        // round-73 起所有协议基线都是 1,因此"未配置"与"显式 1"在 K 上
+        // **不再可区分**(两者都是单载体)——三态的区分完全落在
+        // `mux_pool_size` 字段本身(None / Some(3) / Some(1)),下面逐条断言。
+        // 这是有意的:默认路径与"显式要求单载体"行为相同,但语义不同,
+        // 字段值必须能分别观察。
         let absent: ClientConfig = toml::from_str(base).unwrap();
-        assert_eq!(absent.mux_pool_size, None);
+        assert_eq!(absent.mux_pool_size, None, "未配置 = 自动定容");
         let (k, _) = crate::session::initial_k_for_with(&absent, rh_transport::Protocol::Tls, 8);
-        assert_eq!(k, 4, "未配置时取 tls 协议基线 K=4(round-54)");
+        assert_eq!(k, 1, "未配置时取协议基线 K=1(round-73)");
 
         let explicit: ClientConfig = toml::from_str(&format!("{base}mux_pool_size = 3\n")).unwrap();
         assert_eq!(explicit.mux_pool_size, Some(3));

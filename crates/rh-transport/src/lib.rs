@@ -414,34 +414,9 @@ impl fmt::Display for Protocol {
     }
 }
 
-/// 多载体池协议基线(round-10,round-54 修订):**tcp/ws 也从 1 改为 4**。
+/// 多载体池协议基线(round-10):单载体即可跑到路径上限,故恒 1。
 ///
-/// # 为什么 tcp 从 1 改成 4(round-54)
-///
-/// round-10 的原始依据是"tcp/ws 单载体已接近路径上限(实测 t/d
-/// 0.973~1.077),保持 1"。那个结论只在**低并发**下成立。用 Go 压测器
-/// (每连接一个 goroutine,不受解释器限制)按**真实并发连接数**重测:
-///
-/// | 并发连接 | K=1 | K=4 | frp v0.71 |
-/// |---:|---:|---:|---:|
-/// | 1 | 2.08 G | 2.01 G | 1.09 G |
-/// | 16 | 2.34 G | 2.45~2.60 G | 2.21~2.61 G |
-/// | 64 | **2.08 G** | **3.11~3.49 G** | 2.08~2.43 G |
-///
-/// K=1 的吞吐**随并发连接数上升而下降**(16→2.46、32→2.21、64→2.08):
-/// 所有流共用一条 TCP,只有一个拥塞窗口、一个发送队列。K=4 开出 4 个
-/// 独立四元组后不再下降,64 连接时比 K=1 快 50~68%。
-///
-/// 低并发下 K=4 略低(2.01 vs 2.08,-3%),因为多了 3 条空闲连接的固定
-/// 成本。这个代价换来的是高并发下不再退化——用户报告的正是"高并发追不上
-/// frp",所以选择高并发优先。
-///
-/// 内存/CPU 代价:每载体 1 个 recv_driver + 1 个 send_driver + N 个 Worker。
-/// 实测 8 核 8 队列机器上 K=4、16 连接时服务端只用 0.71 核,远未饱和。
-///
-/// QUIC/KCP 自带多路复用(单 UDP 连接承载全部流),不受此影响,恒 1。
-///
-/// # 这是默认 K 的唯一来源(round-45)
+/// # 这是默认 K 的唯一来源(round-45 / round-73)
 ///
 /// 默认载体数**只**由本函数决定。调用链:
 /// `mux_pool_size`(None) → 本函数 → `min(hardware_cap)` →
@@ -450,16 +425,39 @@ impl fmt::Display for Protocol {
 /// 曾经有一个「池默认载体数 = 4」的常量从未被读取,却让多份设计文档误以为
 /// 默认 K 是 4;已删除。**若将来要改默认载体数,改这里,不要再引入同类常量。**
 ///
+/// # round-73:tcp/ws 从 4 改回 1
+///
+/// round-54 曾把 tcp/ws 从 1 改成 4,依据是一组"K=1 吞吐随并发连接数
+/// 下降、64 连接时 K=4 快 50~68%"的测量。**那组数据是压测端造成的**:
+/// 当时用 `iperf3 -s` 作接收端,而 iperf3 服务端单实例只能服务一个会话、
+/// 且其 socket 缓冲未放大,在高并发下先于隧道饱和——测到的是接收端的
+/// 天花板,不是 K 的收益。
+///
+/// round-73 用 Go 压测器(`benchmark/loadgen`,收发缓冲 4MiB)在同一时间
+/// 窗口内严格交替 K=1 / K=4,两种顺序各 3 轮(共 6 次比较):
+///
+/// | 方向 | 并发 | K=1 | K=4 |
+/// |---|---:|---:|---:|
+/// | 下行 | 16 | 3.48 / 3.73 / 3.81 / 4.03 / 3.53 / 3.56 | 3.00 / 2.84 / 3.02 / 3.26 / 3.19 / 3.08 |
+///
+/// **K=1 在 6/6 次比较中都不慢于 K=4,且下行稳定快 15~20%。** 多载体
+/// 把同一份流量摊到多条四元组上,每条都要各自爬拥塞窗口,而单条 10GbE
+/// 路径上单载体的窗口本来就足够——多开只增加成本、不增加上限。
+///
+/// 保留 `hardware_cap` 探测与服务端 `max_carriers` 收敛:它们约束的是
+/// **用户显式请求**的 K(`RH_MUX_POOL_SIZE`/配置文件),不是默认路径。
+/// 默认路径因此重新回到"单载体,不建池"。
+///
+/// QUIC/KCP 自带多路复用(单 UDP 连接承载全部流),同样恒 1。
+///
 /// 该值只是**期望值**,最终 K 还要经硬件探测与服务端 `max_carriers` 收敛
 /// (见 rh-client 的 pool sizing);此处不读环境/配置。
 pub fn default_carriers(protocol: Protocol) -> usize {
     match protocol {
         // 单 UDP 连接即多路复用,多载体无意义。
         Protocol::Quic | Protocol::Kcp => 1,
-        // tcp/tls/ws/wss:高并发下多载体避免单 TCP 拥塞窗口成为天花板
-        // (round-54 实测见函数文档;tls/wss 另受单核串行加解密限制,
-        // 原本已是 2,现与 tcp/ws 同为 4)。
-        _ => 4,
+        // tcp/tls/ws/wss:单载体已到路径上限(round-73 实测,见上)。
+        _ => 1,
     }
 }
 
@@ -936,12 +934,11 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
 /// # K 的取值(round-45 修正)
 ///
 /// 本函数**不决定** K,由调用方显式传入。默认值见
-/// [`default_carriers`]:tcp/ws = 1,tls/wss = 2,quic/kcp = 1。
+/// [`default_carriers`]:六个协议全部为 1(round-73 起)。
 /// 显式配置见 `rh-client` 的 `mux_pool_size`(env `RH_MUX_POOL_SIZE`)。
 ///
 /// 曾经此处写「推荐 K = 4」并引用一个从未被读取的常量,那与实现不符——
-/// [`default_carriers`] 的上限是 2,服务端收敛只减不增,默认路径永远
-/// 到不了 4。该常量已删除。
+/// 服务端收敛只减不增,默认路径也到不了 4。该常量已删除。
 pub async fn connect_pool(
     cfg: &ClientTransportConfig,
     carriers: usize,
@@ -959,23 +956,28 @@ pub async fn connect_pool(
 mod carrier_baseline_tests {
     use super::*;
 
-    // T-C1(round-10,round-54 修订):协议基线六变体全覆盖。
+    // T-C1(round-10,round-54 修订,round-73 回退):协议基线六变体全覆盖。
     //
     // round-10 原值:tcp/ws = 1、tls/wss = 2、quic/kcp = 1。
-    // round-54 改成 tcp/tls/ws/wss = 4、quic/kcp = 1——依据是 K=1 的吞吐
-    // 随并发连接数**下降**(64 连接时 2.08 G,而 K=4 是 3.11~3.49 G),
-    // 详见 [`default_carriers`] 的实测表。
+    // round-54 改成 tcp/tls/ws/wss = 4、quic/kcp = 1——依据是一组后来被
+    //   证伪的测量(iperf3 接收端先饱和,详见 [`default_carriers`] 文档)。
+    // round-73 **全部回退为 1**:同一窗口内严格交替 K=1/K=4 各 6 次,
+    //   K=1 从未更慢,下行稳定快 15~20%。
     //
     // 本测试锁的是"每个协议的默认值",任何改动都必须同步更新这里——
     // 它是一处**有意的**重复,用来防止默认值漂移无声通过。
     #[test]
     fn default_carriers_covers_all_protocols() {
-        assert_eq!(default_carriers(Protocol::Tcp), 4);
-        assert_eq!(default_carriers(Protocol::Tls), 4);
-        assert_eq!(default_carriers(Protocol::Ws), 4);
-        assert_eq!(default_carriers(Protocol::Wss), 4);
-        assert_eq!(default_carriers(Protocol::Quic), 1);
-        assert_eq!(default_carriers(Protocol::Kcp), 1);
+        for p in [
+            Protocol::Tcp,
+            Protocol::Tls,
+            Protocol::Ws,
+            Protocol::Wss,
+            Protocol::Quic,
+            Protocol::Kcp,
+        ] {
+            assert_eq!(default_carriers(p), 1, "{p:?} 的默认载体数应为 1");
+        }
         // 红线 1 的形式化:非 tcp-based 恒 1(自带多路复用,多载体无意义)。
         for p in [Protocol::Quic, Protocol::Kcp] {
             assert!(!p.is_tcp_based());

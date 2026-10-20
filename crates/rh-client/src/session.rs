@@ -913,36 +913,38 @@ mod sizing_tests {
     //! `plan_convergence` 的纯逻辑,不依赖真实网络即可锁定。
     use super::*;
 
-    // T-E2(round-54 修订):tcp 默认基线 4 → initial_k=4,建池。
+    // T-E2(round-73 回退):tcp 默认基线 1 → initial_k=1,不建池。
     //
-    // round-10 时 tcp 基线是 1(单载体已接近路径上限)。round-54 用 Go
-    // 压测器按真实并发连接数重测,发现 K=1 的吞吐**随连接数下降**
-    // (64 连接时 2.08 G,K=4 是 3.11~3.49 G),故 tcp 基线改为 4。
+    // round-10 时 tcp 基线就是 1(单载体已接近路径上限)。round-54 曾改成
+    // 4,依据是"K=1 吞吐随连接数下降(64 连接时 2.08 G,K=4 是 3.11~3.49 G)"
+    // ——那组数据来自 iperf3 接收端先饱和,已证伪。round-73 在同一窗口严格
+    // 交替 K=1/K=4 各 6 次,K=1 从未更慢、下行快 15~20%,故回退为 1。
     //
     // initial_k_for_with 注入硬件上限:本套件不得依赖跑测机器的核数。
     #[test]
-    fn baseline_four_for_tcp() {
+    fn baseline_single_for_tcp() {
         let cfg = ClientConfig::default();
         let (k, _hw) = initial_k_for_with(&cfg, rh_transport::Protocol::Tcp, 8);
-        assert_eq!(k, 4, "tcp 默认必须 4 载体(round-54)");
-        // 服务端允许 8 条时收敛到 4;服务端只允许 2 条时收敛到 2。
-        // 空 server_caps(旧服务端不回 ACK)按 1 处理,是有意的保守行为,
-        // 因此这里必须显式给服务端上限,不能传 &[]。
-        let (final_k, drops) = plan_convergence(k, &[8, 8, 8]);
-        assert_eq!(final_k, 4, "服务端允许 8 时保持 K=4");
+        assert_eq!(k, 1, "tcp 默认必须单载体(round-73)");
+        // 显式请求多载体时收敛逻辑不变(基线回退不影响显式路径)。
+        let (final_k, drops) = plan_convergence(4, &[8, 8, 8]);
+        assert_eq!(final_k, 4, "显式 K=4 且服务端允许 8 时保持 4");
         assert!(drops.is_empty(), "K=4 <= 服务端 8,无成员可摘");
-        let (capped, _) = plan_convergence(k, &[2]);
+        let (capped, _) = plan_convergence(4, &[2]);
         assert_eq!(capped, 2, "服务端只允许 2 时收敛到 2");
     }
 
-    // 硬件上限仍能压住基线:1 核机器上 tcp 必须退化为单载体。
+    // 硬件上限仍能压住显式请求:1 核机器上必须退化为单载体。
     #[test]
-    fn hardware_cap_clamps_tcp_baseline() {
-        let cfg = ClientConfig::default();
+    fn hardware_cap_clamps_explicit_k() {
+        let cfg = ClientConfig {
+            mux_pool_size: Some(4),
+            ..ClientConfig::default()
+        };
         assert_eq!(
             initial_k_for_with(&cfg, rh_transport::Protocol::Tcp, 1).0,
             1,
-            "硬件上限 1 时 tcp 基线必须被压到 1"
+            "硬件上限 1 时显式 K=4 必须被压到 1"
         );
         assert_eq!(
             initial_k_for_with(&cfg, rh_transport::Protocol::Tcp, 2).0,
@@ -951,38 +953,24 @@ mod sizing_tests {
         );
     }
 
-    // 红线 1(round-54 修订):tcp-based 协议基线统一 4(硬件上限足够时);
-    // quic/kcp 恒 1(自带多路复用)。
-    // 硬件上限 1(≤2 逻辑核)时任何协议都被压到 1——公式前置条件。
+    // 红线 1(round-73 回退):**全部六个协议**的默认基线都是 1。
+    // 只有显式配置才可能多载体;硬件上限 1 时任何协议都是单载体。
     #[test]
-    fn baseline_four_for_tcp_based() {
+    fn baseline_single_for_all_protocols() {
         let cfg = ClientConfig::default();
-        assert_eq!(
-            initial_k_for_with(&cfg, rh_transport::Protocol::Tls, 8).0,
-            4
-        );
-        assert_eq!(
-            initial_k_for_with(&cfg, rh_transport::Protocol::Wss, 8).0,
-            4
-        );
-        assert_eq!(
-            initial_k_for_with(&cfg, rh_transport::Protocol::Ws, 8).0,
-            4
-        );
-        assert_eq!(
-            initial_k_for_with(&cfg, rh_transport::Protocol::Quic, 4).0,
-            1
-        );
-        assert_eq!(
-            initial_k_for_with(&cfg, rh_transport::Protocol::Kcp, 4).0,
-            1
-        );
         for p in [
+            rh_transport::Protocol::Tcp,
             rh_transport::Protocol::Tls,
+            rh_transport::Protocol::Ws,
             rh_transport::Protocol::Wss,
             rh_transport::Protocol::Quic,
             rh_transport::Protocol::Kcp,
         ] {
+            assert_eq!(
+                initial_k_for_with(&cfg, p, 8).0,
+                1,
+                "{p:?} 默认基线必须为 1(硬件上限充足时)"
+            );
             assert_eq!(
                 initial_k_for_with(&cfg, p, 1).0,
                 1,
@@ -1033,7 +1021,7 @@ mod sizing_tests {
         assert_eq!(
             initial_k_for_with(&cfg, rh_transport::Protocol::Tls, 4).0,
             1,
-            "显式单载体必须压过 tls 基线 2"
+            "显式单载体必须压过任何协议基线"
         );
     }
 
