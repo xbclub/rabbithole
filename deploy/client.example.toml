@@ -5,15 +5,17 @@ server_addr = "203.0.113.10:7100"
 protocol = "tls"               # 与服务端监听协议一致
 multiplex = true
 
-# 多载体池规模(round-10 自动定容)。三态语义:
-#   缺省(不写)  = 自动:协议基线 → 硬件上限 → 服务端 max_carriers,最终钳制 [1,8]
-#                  协议基线:tls/wss = 2,tcp/ws = 1;QUIC/KCP 恒 1
-#                  硬件上限(探测失败时按 CPU):min(CPU 核数/2, 网卡 RX 队列数)
+# 多载体池规模。三态语义:
+#   缺省(不写)  = 自动:按实测 RTT 选载体数
+#                  RTT < 5ms   → 1(局域网,单 TCP 窗口已够,多开只增开销)
+#                  RTT 5~15ms  → 2
+#                  RTT >= 15ms → 4(单窗口成为瓶颈,多载体有净收益)
+#                  再经硬件上限与服务端 max_carriers 收敛,最终钳制 [1,8]
 #   mux_pool_size = 1  = 强制单载体(严格等价旧路径,不建池)
 #   mux_pool_size = n  = 显式期望 n(仍受硬件上限、服务端上限与 8 钳制)
 # 环境变量 RH_MUX_POOL_SIZE 仅在配置文件未显式设置时生效(正整数,非法报错)。
-# 优先级:配置文件 mux_pool_size > RH_MUX_POOL_SIZE > 自动。
-# QUIC/KCP 自带多路复用,忽略本参数。
+# 显式配置优先于 RTT 自适应(设了就不探测)。
+# QUIC/KCP 自带多路复用,恒单载体,忽略本参数。
 # mux_pool_size = 4
 
 client_id = "00000000-0000-0000-0000-000000000000"
