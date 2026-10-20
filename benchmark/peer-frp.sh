@@ -127,7 +127,7 @@ frp_client() {  # <a_ip>
   wait_port 127.0.0.1 "$T_TCP" 15 || { err "目标服务未就绪"; cat "$PEER_DIR/target.log"; return 1; }
 
   if [ "$THP_TOOL" = "loadgen" ]; then
-    "$LOADGEN_BIN" sink "$T_IPERF" 7200 4096 >"$PEER_DIR/iperf.log" 2>&1 &
+    "$LOADGEN_BIN" sink "$T_IPERF" 7200 200000 >"$PEER_DIR/iperf.log" 2>&1 &
   else
     iperf3 -s -p "$T_IPERF" >"$PEER_DIR/iperf.log" 2>&1 &
   fi
