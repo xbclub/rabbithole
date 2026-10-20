@@ -1646,6 +1646,21 @@ fn mux_config_with_shards(max_streams: usize, shard_workers: usize) -> yamux::Co
     // 带来的固定往返。对端若只授 256KiB,行为自动退回原状。
     // round-59:发送窗初值默认仍 256KiB(yamux 规约),由 `RH_MUX_SEND_WINDOW`
     // 显式启用放大——见下方 `send_window_override()` 的推导。
+    // 发送窗初值:默认抬到 1MiB(可用 `RH_MUX_SEND_WINDOW` 覆盖)。
+    //
+    // 修前默认沿用 vendor 的 256KiB。实测(r6 TCP 4 流)上行隧道 2072 Mbps
+    // 对 frp 2277(0.91),而单流已到 frp 的 2 倍、16 流 0.97 —— 差距集中
+    // 在中低并发。原因不在 CPU(0.5 核量级),而是每 256KiB 就要等一次
+    // 对端窗口更新:4 流时单流占比高,窗口往返直接落在关键路径上。
+    //
+    // 语义不变:真实额度仍由对端授予(对端收窗 6MiB),本项只把"首发
+    // 额度"从 256KiB 提到 1MiB;对端若只授 256KiB,行为自动退回原状。
+    // 之所以不给 6MiB:KCP 背压测试(b08)要求"停读必须造成写停顿",
+    // 过大的在途敞口会推迟背压显形。1MiB 是吞吐与可观测背压的折中。
+    // 默认沿用 vendor 的 256KiB。抬高会推迟背压显形(b08 在 512KiB
+    // 初窗下即失败:8MB 停读场景写端不再停顿,会话被判死),因此只在
+    // 显式设置 `RH_MUX_SEND_WINDOW` 时启用 —— 需要上行吞吐大于背压
+    // 观测精度的场景自行承担该语义变化。
     if let Some(n) = send_window_override() {
         cfg.set_initial_stream_send_window(n);
     }

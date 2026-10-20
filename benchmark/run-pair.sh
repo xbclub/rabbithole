@@ -73,7 +73,7 @@ for proto in "${protos[@]}"; do
 
     script="$BENCH_REPO/benchmark/peer.sh"
     [ "$impl" = frp ] && script="$BENCH_REPO/benchmark/peer-frp.sh"
-    common="PEER_DIR=$PEER_DIR PEER_DURATION=$DURATION PEER_REPEAT=$REPEAT \
+    common="PEER_DIR=$PEER_DIR PEER_DURATION=$DURATION PEER_REPEAT=$REPEAT ${EXTRA_ENV:-} \
 PEER_CONC_LEVELS='$CONC_LEVELS' PEER_CONC_HOLD=$CONC_HOLD THP_TOOL=loadgen \
 LOADGEN_BIN=$BENCH_BIN/loadgen PEER_RUN_ID=$label-$lbl PROTO=$proto"
 
