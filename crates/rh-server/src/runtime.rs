@@ -361,11 +361,15 @@ async fn tcp_bind_and_serve(
         rt.bound.store(true, Ordering::Relaxed);
         let st2 = state.clone();
         let rt2 = rt.clone();
+        // ★A6:共享 serve loop 的退出条件必须是**组级** serve_cancel。
+        //
+        // 修前这里传的是 rt2(属主成员),而 tcp_serve_loop 内部 select 的是
+        // `rt.rule_cancel` —— 属主被禁用/改端口即无条件 cancel,监听 fd 释放,
+        // 但 listener_bound 仍为 true → 其余成员 spawn 时跳过重绑 →
+        // 组端口永久拒绝连接。组监听属于组,不属于任何单个成员。
+        let group_cancel = token.clone();
         tokio::spawn(async move {
-            tokio::select! {
-                _ = crate::data::tcp_serve_loop(st2, rt2, l) => {}
-                _ = token.cancelled() => {}
-            }
+            crate::data::tcp_serve_loop_group(st2, rt2, l, group_cancel).await;
         });
         return Ok(());
     }
@@ -375,9 +379,11 @@ async fn tcp_bind_and_serve(
     *rt.tcp_listener.lock().await = marker_listener();
     let rt2 = rt.clone();
     let st2 = state.clone();
-    tokio::spawn(async move {
+    // A6 顺带:记录句柄,供下次重建前收敛(避免 EADDRINUSE 窗口)。
+    let h = tokio::spawn(async move {
         crate::data::tcp_serve_loop(st2, rt2, l).await;
     });
+    *rt.serve_handle.lock().await = Some(h);
     Ok(())
 }
 
@@ -457,6 +463,19 @@ pub async fn teardown_runtime(state: &Arc<AppState>, proxy_id: u64) {
             state.proxies.leave_group(&k, proxy_id).await;
         }
         rt.rule_cancel.cancel();
+        // A6 顺带:等 serve loop 真正退出(带超时),再让调用方去重建。
+        // 否则旧 loop 尚未释放监听 fd,新绑定偶发 EADDRINUSE。
+        if let Some(h) = rt.serve_handle.lock().await.take() {
+            if tokio::time::timeout(std::time::Duration::from_secs(2), h)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    proxy = proxy_id,
+                    "serve loop did not converge within 2s during teardown"
+                );
+            }
+        }
         crate::data::close_proxy_channels(&rt).await;
         // 失效该规则在途 CREATE 请求:迟到回显不得进入新运行时(§4.5 代次隔离)
         if let Some(sess) = state.sessions.get(&rt.client_id) {

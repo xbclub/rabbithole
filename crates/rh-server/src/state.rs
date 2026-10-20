@@ -809,6 +809,12 @@ pub struct ProxyRuntime {
     pub rule_cancel: CancellationToken,
     /// tcp/tcpmux(独享或组内成员):Listener 由本运行时或 Group 持有。
     pub tcp_listener: Mutex<Option<TcpListener>>,
+    /// 本规则的独享 serve loop 句柄(A6 顺带项)。
+    ///
+    /// teardown→spawn 重建同一端口时,旧 serve loop 可能还没把监听 fd 释放,
+    /// 新绑定就撞 `EADDRINUSE`(api.rs 拆完立刻重建的路径实测偶发)。
+    /// 重建前带超时 await 它收敛,消除这个窗口。
+    pub serve_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub udp_socket: Mutex<Option<Arc<UdpSocket>>>,
     pub pool: Mutex<Option<Arc<TcpPool>>>,
     /// UDP pump 通道投递。
@@ -839,6 +845,7 @@ impl ProxyRuntime {
             conns_current: AtomicI64::new(0),
             http_cache: std::sync::Mutex::new(HttpCache::default()),
             tcp_listener: Mutex::new(None),
+            serve_handle: Mutex::new(None),
             udp_socket: Mutex::new(None),
             pool: Mutex::new(None),
             udp_new_channel_tx: Mutex::new(None),

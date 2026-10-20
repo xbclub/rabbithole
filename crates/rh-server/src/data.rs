@@ -966,13 +966,42 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountedUserIo<T
 
 /// TCP 监听服务循环(独享端口或组成员共享)。
 pub async fn tcp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, listener: TcpListener) {
+    // 独享端口:随本规则的 rule_cancel 退出(既有语义)。
+    tcp_serve_loop_inner(state, rt.clone(), listener, rt.rule_cancel.clone()).await
+}
+
+/// 共享监听(组)版本:退出条件由**组级** `serve_cancel` 决定。
+///
+/// ★A6:修前共享 serve loop 选的是**属主成员**的 `rule_cancel`
+/// (runtime.rs 里把 `rt2` 传进来,本函数 select 它的 rule_cancel)。
+/// 属主被禁用/改端口 → teardown 无条件 cancel → 监听 fd 释放,但
+/// `listener_bound` 仍是 true → 之后所有成员 spawn 时看到 true 就跳过重绑
+/// → 组端口**永久拒绝连接**。
+///
+/// 组监听的生命周期应属于组,不属于任何一个成员。
+pub async fn tcp_serve_loop_group(
+    state: Arc<AppState>,
+    rt: Arc<ProxyRuntime>,
+    listener: TcpListener,
+    group_cancel: tokio_util::sync::CancellationToken,
+) {
+    tcp_serve_loop_inner(state, rt, listener, group_cancel).await;
+}
+
+/// 两个入口共用的实现:`cancel` 是唯一的退出条件。
+async fn tcp_serve_loop_inner(
+    state: Arc<AppState>,
+    rt: Arc<ProxyRuntime>,
+    listener: TcpListener,
+    cancel: tokio_util::sync::CancellationToken,
+) {
     let local = listener.local_addr().ok();
     loop {
         tokio::select! {
             acc = listener.accept() => {
                 match acc {
                     Ok((sock, peer)) => {
-                                        let st = state.clone();
+                        let st = state.clone();
                         let rt2 = rt.clone();
                         tokio::spawn(serve_tcp_user(st, rt2, sock, peer, local));
                     }
@@ -982,7 +1011,7 @@ pub async fn tcp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, listene
                     }
                 }
             }
-            _ = rt.rule_cancel.cancelled() => return,
+            _ = cancel.cancelled() => return,
         }
     }
 }
@@ -2577,6 +2606,130 @@ mod udp_pump_survives_reconnect_tests {
         tokio::time::timeout(Duration::from_secs(2), h)
             .await
             .expect("rule_cancel 后泵必须退出(否则是泄漏)")
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod group_listener_ownership_tests {
+    //! A6 回归:组共享监听的生死属于**组**,不属于属主成员。
+    //!
+    //! 修前 `tcp_serve_loop` select 的是传入 `rt` 的 `rule_cancel`,而
+    //! runtime.rs 传的正是**属主成员**。属主被禁用/改端口 → teardown
+    //! 无条件 cancel → 监听 fd 释放,但 `listener_bound` 仍为 true →
+    //! 其余成员 spawn 时看到 true 跳过重绑 → 组端口**永久拒绝连接**。
+    //!
+    //! 修后:共享 loop 走 `tcp_serve_loop_group`,只由组级 `serve_cancel`
+    //! 退出;属主自己的 rule_cancel 取消不影响它。
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::state::ProxyRuntime;
+
+    fn group_spec(port: u16, group: &str) -> rh_protocol::ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": "g1",
+            "kind": "tcp",
+            "client_id": "cid",
+            "bind_ip": "127.0.0.1",
+            "bind_port": port,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "group": group,
+        }))
+        .unwrap()
+    }
+
+    /// 接线断言:runtime 给**组**绑定监听时,必须走 `tcp_serve_loop_group`
+    /// (组级 cancel),不能走随属主 `rule_cancel` 退出的独享版本。
+    ///
+    /// 这条是源码级检查 —— 前一版测试直接调 `tcp_serve_loop_group`,把接线
+    /// 回退成 `tcp_serve_loop` 后仍然通过,完全抓不住回归。接线才是缺陷所在。
+    #[test]
+    fn runtime_wires_group_listener_to_group_cancel() {
+        let src = include_str!("runtime.rs");
+        let marker = "let group_cancel = token.clone();";
+        let start = src
+            .find(marker)
+            .expect("共享监听分支必须用组级 cancel(见 A6)");
+        let rest = &src[start..];
+        let end = rest
+            .find("return Ok(());")
+            .expect("分支应以 return Ok 结束");
+        let branch = &rest[..end];
+        assert!(
+            branch.contains("tcp_serve_loop_group"),
+            "A6:共享监听必须走 tcp_serve_loop_group(组级 cancel);当前:\n{branch}"
+        );
+        assert!(
+            !branch.contains("crate::data::tcp_serve_loop("),
+            "A6:不得回退到随属主 rule_cancel 退出的独享版本;当前:\n{branch}"
+        );
+    }
+
+    /// 核心断言:属主 rule_cancel 取消后,共享 serve loop **仍能 accept**;
+    /// 只有组级 serve_cancel 才让它退出。
+    #[tokio::test]
+    async fn shared_listener_survives_owner_cancel() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::default(), db));
+        let spec = group_spec(0, "gA6");
+        let rt = Arc::new(ProxyRuntime::new(1, "cid".into(), spec));
+
+        // 绑定一个真实监听(端口 0 由系统分配)
+        let std_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_l.set_nonblocking(true).unwrap();
+        let addr = std_l.local_addr().unwrap();
+        let l = TcpListener::from_std(std_l).unwrap();
+
+        let group_cancel = tokio_util::sync::CancellationToken::new();
+        let h = tokio::spawn(tcp_serve_loop_group(
+            state.clone(),
+            rt.clone(),
+            l,
+            group_cancel.clone(),
+        ));
+
+        // 属主取消(teardown 会做的事)
+        rt.rule_cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !h.is_finished(),
+            "A6:属主 rule_cancel 取消后共享 serve loop 不得退出(组监听属于组)"
+        );
+
+        // 仍能建立 TCP 连接(监听 fd 还在)
+        let conn =
+            tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr))
+                .await
+                .expect("A6:属主取消后组端口必须仍可连接")
+                .expect("connect");
+        drop(conn);
+
+        // 只有组级取消才退出
+        group_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("组级 serve_cancel 后必须退出")
+            .unwrap();
+    }
+
+    /// 对照:独享端口的 serve loop 仍随自己的 rule_cancel 退出(语义未变)。
+    #[tokio::test]
+    async fn exclusive_listener_exits_on_own_rule_cancel() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::default(), db));
+        let spec = group_spec(0, ""); // 无组 = 独享
+        let rt = Arc::new(ProxyRuntime::new(2, "cid".into(), spec));
+
+        let std_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_l.set_nonblocking(true).unwrap();
+        let l = TcpListener::from_std(std_l).unwrap();
+
+        let h = tokio::spawn(tcp_serve_loop(state.clone(), rt.clone(), l));
+        rt.rule_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("独享端口必须随 rule_cancel 退出")
             .unwrap();
     }
 }
