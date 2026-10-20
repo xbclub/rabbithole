@@ -46,7 +46,18 @@ pub async fn close_proxy_channels(rt: &Arc<ProxyRuntime>) {
         let mut ready = p.ready.lock().await;
         ready.clear();
     }
-    *rt.udp_new_channel_tx.lock().await = None;
+    // ★A2:UDP 通道 sender **不置 None**。
+    //
+    // 置 None 会让 udp_serve_loop 的 `new_rx.recv()` 立刻返回 None,泵直接
+    // return;而泵只在 spawn_runtime / bind_error_retry 时启动,客户端重连
+    // 不会重建运行时 —— 于是重连后 UDP 规则永久收不到包(且 udp_on_channel
+    // 见 None 时**静默丢流**,线上完全没有痕迹)。
+    //
+    // 正确语义:泵的生死与**规则运行态**(rule_cancel)绑定,与会话在线解耦。
+    // 队列里可能残留旧会话的通道(对端已失效),但那由 pump 首帧读写失败
+    // 自然淘汰,不需要在这里主动清空 —— 主动清空反而会丢掉刚抵达的新通道。
+    //
+    // 注意:这里刻意只做"什么都不改"。字段保留 Some(sender),泵继续等下一个。
 }
 
 /// copy 路径读缓冲下/上限(R3 红线 2 常量锁:上限 64KiB 不得放宽)。
@@ -1163,8 +1174,24 @@ pub async fn udp_on_channel(
     // 克隆 sender 后立即放锁:send 可能因 pump 忙而阻塞,
     // 不得让锁跨 await(close_proxy_channels 会被卡死)
     let tx = rt.udp_new_channel_tx.lock().await.clone();
-    if let Some(tx) = tx {
-        let _ = tx.send(stream).await;
+    match tx {
+        Some(tx) => {
+            if tx.send(stream).await.is_err() {
+                // 接收端已退出(泵没了):这条通道无法转发,必须留痕。
+                tracing::warn!(
+                    proxy = proxy_id,
+                    "udp channel arrived but pump receiver is gone; dropping channel"
+                );
+            }
+        }
+        None => {
+            // A2:泵未注册 sender。正常路径不该发生(泵在 spawn 时就写入),
+            // 一旦发生就是"UDP 规则静默不工作"——必须可见。
+            tracing::warn!(
+                proxy = proxy_id,
+                "udp channel arrived but no pump registered (tx=None); dropping channel"
+            );
+        }
     }
 }
 
@@ -1192,7 +1219,22 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
     loop {
         // 等待第一条/重建通道
         let stream = tokio::select! {
-            s = new_rx.recv() => match s { Some(s) => s, None => return },
+            s = new_rx.recv() => match s {
+                Some(s) => s,
+                None => {
+                    // A2:发送端全部 drop 不代表规则该退出(规则仍 enabled,
+                    // 只是在等客户端重连后的新通道)。继续等 rule_cancel ——
+                    // 真正的退出条件只有规则取消 / 进程关闭。
+                    tracing::debug!(
+                        proxy = rt.id,
+                        "udp pump: channel senders gone, waiting for rule teardown"
+                    );
+                    tokio::select! {
+                        _ = rt.rule_cancel.cancelled() => return,
+                        _ = state.shutdown.cancelled() => return,
+                    }
+                }
+            },
             _ = rt.rule_cancel.cancelled() => return,
             _ = state.shutdown.cancelled() => return,
         };
@@ -2446,6 +2488,95 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(45), &mut parent)
             .await
             .expect("数据送达后 relay 必须收敛")
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod udp_pump_survives_reconnect_tests {
+    //! A2 回归:服务端 UDP 泵在客户端重连后**不得**永久失效。
+    //!
+    //! 修前 `close_proxy_channels` 把 `udp_new_channel_tx` 置 None →
+    //! `udp_serve_loop` 的 `new_rx.recv()` 立刻返回 None → 泵 return。
+    //! 泵只在 spawn_runtime / bind_error_retry 启动,客户端重连不重建运行时,
+    //! 于是重连后 UDP 规则永久不工作,且 `udp_on_channel` 见 None 时静默丢流。
+    //!
+    //! 修后:泵的生死只由 `rule_cancel` / `state.shutdown` 决定,sender 保留。
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::state::ProxyRuntime;
+
+    /// ProxySpec 无 Default;沿用 api.rs 测试里的 serde 构造法。
+    fn udp_spec() -> rh_protocol::ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": "udp-a2",
+            "kind": "udp",
+            "client_id": "cid",
+            "bind_ip": "127.0.0.1",
+            "bind_port": 0,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+        }))
+        .unwrap()
+    }
+
+    fn make_rt() -> Arc<ProxyRuntime> {
+        Arc::new(ProxyRuntime::new(1001, "cid".to_string(), udp_spec()))
+    }
+
+    /// 契约 1:close 之后 sender 仍在(旧实现会变成 None)。
+    #[tokio::test]
+    async fn close_proxy_channels_keeps_udp_sender() {
+        let rt = make_rt();
+        // 模拟泵启动时注册 sender
+        let (tx, _rx) = mpsc::channel::<BoxedIo>(4);
+        *rt.udp_new_channel_tx.lock().await = Some(tx);
+        assert!(rt.udp_new_channel_tx.lock().await.is_some());
+
+        close_proxy_channels(&rt).await;
+
+        assert!(
+            rt.udp_new_channel_tx.lock().await.is_some(),
+            "A2:close_proxy_channels 不得把 sender 置 None —— 否则泵退出后\
+             客户端重连也不会重建(泵只在 spawn_runtime 时启),UDP 永久失效"
+        );
+    }
+
+    /// 契约 2:发送端全 drop 后泵仍存活,只由 rule_cancel 退出。
+    #[tokio::test]
+    async fn pump_outlives_sender_drop_and_exits_on_rule_cancel() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::default(), db));
+        let rt = make_rt();
+        let sock = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind local udp"),
+        );
+        let h = tokio::spawn(udp_serve_loop(state.clone(), rt.clone(), sock));
+
+        // 等泵注册好 sender,然后丢掉它(模拟 close 之后没有新通道抵达)
+        for _ in 0..50 {
+            if rt.udp_new_channel_tx.lock().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        *rt.udp_new_channel_tx.lock().await = None;
+
+        // 旧实现:recv() 立即 None → return → 这里会 finished
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !h.is_finished(),
+            "A2:发送端 drop 后泵必须继续存活(等待重连后的新通道),\
+             不得因 recv()=None 就退出"
+        );
+
+        // 真正的退出条件:规则取消
+        rt.rule_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("rule_cancel 后泵必须退出(否则是泄漏)")
             .unwrap();
     }
 }

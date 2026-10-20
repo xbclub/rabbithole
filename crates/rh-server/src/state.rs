@@ -548,6 +548,28 @@ impl AppState {
         }
     }
 
+    /// A3:未认证名额的 RAII 守卫。
+    ///
+    /// 名额本是"认证窗口"的并发上限,但修前 `exit_unauth` 放在
+    /// `auth_and_run(...).await` **之后**,而该函数以 `run_session_loop`
+    /// 结尾 —— 于是一个已认证的会话会把名额**终身占住**。同一 NAT 出口
+    /// 第 65 个客户端永远收到 `too many pending auth`,而 config 注释声称
+    /// "不限制已认证业务并发",实现与之相反。
+    ///
+    /// 用守卫把配对关系交给 Drop:认证成功点显式 `disarm()`(名额立即归还),
+    /// 其余任何早退路径(读失败、认证失败、版本不符…)由 Drop 归还。
+    /// 手写 enter/exit 在两处 twenty 多条 return 路径上极易漏。
+    pub fn enter_unauth_guard(self: &Arc<Self>, ip: IpAddr) -> Option<UnauthGuard> {
+        if !self.enter_unauth(&ip) {
+            return None;
+        }
+        Some(UnauthGuard {
+            state: self.clone(),
+            ip,
+            armed: true,
+        })
+    }
+
     /// 每客户端串行域锁(创建/更新/启停/恢复共用)。
     pub fn serial_lock(&self, client_id: &str) -> Arc<Mutex<()>> {
         self.client_locks
@@ -575,6 +597,14 @@ pub struct Metrics {
     /// label reason 为固定小集合(见 data.rs 调用点),无逐连接标签;
     /// 正常 EOF 与规则取消不计,避免淹没 1/N 信号。
     pub session_failures_total: prometheus::IntCounterVec,
+    /// A1:控制回包队列满时的丢弃计数。
+    ///
+    /// 心跳回执(PONG)绝不能阻塞控制读循环 —— 那个循环同时是队列的**唯一
+    /// 消费者**,一旦它 park 在 `send().await` 上等自己消费,就是自锁:
+    /// 队列永满、select 不再回顶、心跳超时与 `sess.cancel` 全部失联。
+    /// 故 PONG 改为 `try_send`,满即丢(丢 PONG 只让客户端那一次探测超时,
+    /// 下一拍自愈;远比整会话卡死轻)。
+    pub dropped_pong: prometheus::IntCounter,
     /// 汇总(控制台 overview)。原子化:数据面每块字节都要经过这里,
     /// 全局互斥锁曾是所有转发连接的串行点。
     pub conns_current: std::sync::atomic::AtomicI64,
@@ -624,7 +654,13 @@ impl Metrics {
         let _ = registry.register(Box::new(bytes_in_total.clone()));
         let _ = registry.register(Box::new(bytes_out_total.clone()));
         let _ = registry.register(Box::new(relay_path_total.clone()));
+        let dropped_pong = IntCounter::new(
+            "rabbithole_dropped_pong_total",
+            "PONG replies dropped because the control reply queue was full (A1 self-lock guard)",
+        )
+        .unwrap();
         let _ = registry.register(Box::new(session_failures_total.clone()));
+        let _ = registry.register(Box::new(dropped_pong.clone()));
         Self {
             registry,
             connections,
@@ -633,6 +669,7 @@ impl Metrics {
             bytes_out_total,
             relay_path_total,
             session_failures_total,
+            dropped_pong,
             conns_current: std::sync::atomic::AtomicI64::new(0),
             console_bytes_in: std::sync::atomic::AtomicU64::new(0),
             console_bytes_out: std::sync::atomic::AtomicU64::new(0),
@@ -1320,5 +1357,35 @@ impl AppState {
             }
         }
         out
+    }
+}
+
+/// A3:未认证名额守卫(见 [`AppState::enter_unauth_guard`])。
+///
+/// `Drop` 时若仍 `armed`,归还名额;认证成功点 `disarm()` 后名额已立即归还,
+/// Drop 不再动作。这样"名额生命周期"与"认证窗口"严格一致,与会话寿命无关。
+pub struct UnauthGuard {
+    state: Arc<AppState>,
+    ip: IpAddr,
+    armed: bool,
+}
+
+impl UnauthGuard {
+    /// 归还名额并解除武装(幂等)。认证成功的瞬间必须调用。
+    pub fn disarm(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.state.exit_unauth(&self.ip);
+        }
+    }
+}
+
+impl Drop for UnauthGuard {
+    fn drop(&mut self) {
+        self.release();
     }
 }

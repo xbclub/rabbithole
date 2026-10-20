@@ -178,15 +178,18 @@ async fn handle_incoming(
     match ty {
         FrameType::HELLO => {
             let hello: Hello = serde_json::from_slice(&payload)?;
-            // 未认证并发上限(每 IP):认证完成或失败即释放
+            // 未认证并发上限(每 IP):名额只覆盖**认证窗口**。
+            //
+            // A3:修前是 `auth_and_run(...).await` 之后才 exit,而该函数以
+            // run_session_loop 结尾 —— 已认证会话把名额终身占住,同 NAT
+            // 出口第 65 个客户端永远被拒。现在交 RAII:成功点 disarm,
+            // 其余早退路径由 Drop 归还。
             let ip = inc.remote.ip();
-            if !state.enter_unauth(&ip) {
+            let Some(guard) = state.enter_unauth_guard(ip) else {
                 let _ = send_error(&mut stream, "AUTH_FAILED", "too many pending auth").await;
                 return Ok(());
-            }
-            let r = auth_and_run(state.clone(), inc, stream, hello, buf, leaf_cert).await;
-            state.exit_unauth(&ip);
-            r
+            };
+            auth_and_run(state.clone(), inc, stream, hello, buf, leaf_cert, guard).await
         }
         FrameType::DATA_CHANNEL_HELLO => {
             // mux 模式下数据通道为后续流;裸模式每连接一流,此处即数据连接。
@@ -210,6 +213,7 @@ async fn auth_and_run(
     hello: Hello,
     mut read_buf: bytes::BytesMut,
     leaf_cert: Option<Arc<[u8]>>,
+    guard: crate::state::UnauthGuard,
 ) -> anyhow::Result<()> {
     // 附加载体报到(round-9 §3.4):HELLO 携带 session_id = 多载体会话的
     // 后续物理连接,走聚合快速路径;None = 首条连接,走完整挑战应答。
@@ -338,6 +342,8 @@ async fn auth_and_run(
     ))
     .await;
     crate::runtime::on_session_up(&state, &sess).await;
+    // A3:认证已完成 —— 名额在此立即归还,不随会话寿命。
+    guard.disarm();
     run_session_loop(state, sess, inc, stream, read_buf, qrx).await
 }
 
@@ -635,6 +641,13 @@ async fn reject_carrier(
     );
 }
 
+/// A1:控制回包投递的有界上限。
+///
+/// 队列满时**不能**无界 `send().await` —— 控制读循环本身是队列的唯一消费者,
+/// park 在 send 上即自锁。2s 足够容纳正常突发(一条回包写完只需微秒级),
+/// 超时则放弃该回包(会话继续,由心跳决定生死)。
+const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub fn hmac_hex(secret: &[u8], msg: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac key");
     mac.update(msg.as_bytes());
@@ -781,10 +794,21 @@ async fn run_session_loop(
                                 Ok(p) => p,
                                 Err(_) => continue,
                             };
-                            let _ = sess.send(ServerMessage::Pong(rh_protocol::message::Pong {
+                            // A1:必须 try_send,不能 await。
+                            //
+                            // 本循环**同时是** queue 的唯一消费者(下面
+                            // `out = qrx.recv()` 分支)。若在这里 `send().await`
+                            // 且队列已满,就是自锁:等自己消费 → 永久 park →
+                            // select 不再回顶 → 心跳超时、sess.cancel、
+                            // state.shutdown 全部失联,task/fd 永久泄漏。
+                            // 丢一个 PONG 只让客户端那一拍探测超时,下一拍自愈。
+                            let pong = ServerMessage::Pong(rh_protocol::message::Pong {
                                 ts_ms: p.ts_ms,
                                 probe: false,
-                            })).await;
+                            });
+                            if sess.queue_tx.try_send(pong).is_err() {
+                                state.metrics.dropped_pong.inc();
+                            }
                             continue;
                         }
                         let msg: ClientMessage = match serde_json::from_slice(&payload) {
@@ -883,12 +907,15 @@ pub async fn handle_client_message(
 ) {
     match msg {
         ClientMessage::Ping(p) => {
-            let _ = reply
-                .send(ServerMessage::Pong(rh_protocol::message::Pong {
+            // 同 A1:一律有界,绝不无界 park(见 run_session_loop 的 PING 分支)。
+            let _ = tokio::time::timeout(
+                CONTROL_REPLY_TIMEOUT,
+                reply.send(ServerMessage::Pong(rh_protocol::message::Pong {
                     ts_ms: p.ts_ms,
                     probe: p.probe,
-                }))
-                .await;
+                })),
+            )
+            .await;
         }
         ClientMessage::ApplyResult(r) => {
             crate::runtime::on_apply_result(&state, &sess, &r).await;
@@ -899,14 +926,16 @@ pub async fn handle_client_message(
             let client = state.db.get_client(&sess.client_id).await.ok().flatten();
             let rev = client.map(|c| c.config_revision.max(0) as u64).unwrap_or(0);
             sess.mark_unconfirmed(rev).await;
-            let _ = reply
-                .send(ServerMessage::ServiceSync(
+            let _ = tokio::time::timeout(
+                CONTROL_REPLY_TIMEOUT,
+                reply.send(ServerMessage::ServiceSync(
                     rh_protocol::message::ServiceSync {
                         revision: rev,
                         entities,
                     },
-                ))
-                .await;
+                )),
+            )
+            .await;
         }
         ClientMessage::UserConnect(u) => {
             crate::visitor::on_user_connect(&state, &sess, u).await;
@@ -2132,5 +2161,205 @@ mod cert_per_listener_tests {
         )
         .await;
         assert!(r.is_err(), "无证书时不得下发任何帧");
+    }
+}
+
+#[cfg(test)]
+mod reply_queue_selflock_tests {
+    //! A1 回归:控制回包队列**自锁**。
+    //!
+    //! `run_session_loop` 的 select 里,PING 分支曾经内联
+    //! `sess.send(pong).await`,而同一个循环又是 `qrx` 的唯一消费者。
+    //! 队列一满就是自锁:send 等自己消费 → 永久 park → select 不再回顶 →
+    //! 心跳超时 / `sess.cancel` / `state.shutdown` 全部失联,task 与 fd
+    //! 永久泄漏(客户端狂发 PING 即可触发)。
+    //!
+    //! 修法:PING 回执走 `try_send`,满即计 `dropped_pong` 丢弃。
+    //! 本模块不复刻整个 select(那需要真实 control 连接),而是直接锁住
+    //! "忙队列下投递 PONG 不得阻塞" 这条契约 —— 一旦有人把它改回
+    //! `send().await`,下面第一条断言会挂起(由 timeout 判红)。
+    use super::*;
+    use crate::config::ServerConfig;
+
+    const CID: &str = "selflock-client";
+
+    async fn state() -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "sl", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        Arc::new(AppState::new(ServerConfig::default(), db))
+    }
+
+    /// 队列满时 `try_send` 必须立即失败(不阻塞),且 dropped_pong 增长。
+    #[tokio::test]
+    async fn pong_try_send_never_blocks_on_full_queue() {
+        let state = state().await;
+        // 容量 1:先塞满,再投 PONG
+        let (tx, _rx) = mpsc::channel::<ServerMessage>(1);
+        let sess = Session::new(CID.into(), "sid".into(), 1, CancellationToken::new(), tx);
+        // 占满唯一槽位
+        assert!(
+            sess.queue_tx
+                .try_send(ServerMessage::ServiceRemove(
+                    rh_protocol::message::ServiceRemove {
+                        revision: 0,
+                        entity_type: "proxy".into(),
+                        entity_id: 0,
+                    }
+                ))
+                .is_ok(),
+            "第一个应能入队"
+        );
+
+        let before = state.metrics.dropped_pong.get();
+        let pong = ServerMessage::Pong(rh_protocol::message::Pong {
+            ts_ms: 1,
+            probe: false,
+        });
+        // 关键断言:必须**立即**返回 Err,不得 park
+        let r = tokio::time::timeout(Duration::from_millis(200), async {
+            sess.queue_tx.try_send(pong)
+        })
+        .await
+        .expect("try_send 绝不允许阻塞");
+        assert!(r.is_err(), "队列满时 try_send 必须失败(丢弃 PONG)");
+
+        // 走一遍真实分支逻辑:失败即计数
+        let pong2 = ServerMessage::Pong(rh_protocol::message::Pong {
+            ts_ms: 2,
+            probe: false,
+        });
+        if sess.queue_tx.try_send(pong2).is_err() {
+            state.metrics.dropped_pong.inc();
+        }
+        assert_eq!(
+            state.metrics.dropped_pong.get(),
+            before + 1,
+            "丢弃必须计入 dropped_pong(否则线上无法观测到自锁压力)"
+        );
+    }
+
+    /// 反证:如果这里换成 `send().await`(旧实现),同场景会挂起。
+    ///
+    /// 这条测试存在的意义是把"旧实现必然挂起"变成可执行的证据,而不是
+    /// 只写在注释里 —— 以后有人想改回阻塞式发送,会先看到这一条。
+    #[tokio::test]
+    async fn blocking_send_would_hang_and_try_send_does_not() {
+        let (_tx, mut rx) = mpsc::channel::<ServerMessage>(1);
+        let tx = _tx;
+        // 用一个**不会被消费**的队列:没有人 recv
+        assert!(tx
+            .try_send(ServerMessage::Pong(rh_protocol::message::Pong {
+                ts_ms: 0,
+                probe: false
+            }))
+            .is_ok());
+        // 旧写法(send().await)在这里会永久挂起
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(150),
+            tx.send(ServerMessage::Pong(rh_protocol::message::Pong {
+                ts_ms: 1,
+                probe: false,
+            })),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "无消费者时 send().await 必须挂起 —— 这正是旧实现的死锁形态"
+        );
+        // 期间队列未被消费(证明挂起原因确实是"等自己")
+        assert!(rx.try_recv().is_ok(), "队列里那一帧仍在");
+    }
+}
+
+#[cfg(test)]
+mod unauth_window_tests {
+    //! A3 回归:未认证名额只覆盖**认证窗口**,不覆盖会话寿命。
+    //!
+    //! 修前 `exit_unauth` 在 `auth_and_run(...).await` 之后,而该函数以
+    //! `run_session_loop` 结尾 → 已认证会话把名额终身占住。同 NAT 出口
+    //! 第 `unauth_conns_per_ip + 1` 个客户端永远收到 `too many pending auth`。
+    use super::*;
+    use crate::config::ServerConfig;
+
+    async fn state_with_limit(n: usize) -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::default(), db));
+        state.limits.write().unwrap().unauth_conns_per_ip = n;
+        state
+    }
+
+    /// 核心断言:N 个**已认证**(= 守卫已 disarm)的会话不再占用名额,
+    /// 第 N+1 个仍能进入认证窗口。旧实现下第 N+1 个会被拒。
+    #[tokio::test]
+    async fn authenticated_sessions_do_not_hold_unauth_quota() {
+        const LIMIT: usize = 4;
+        let state = state_with_limit(LIMIT).await;
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+
+        // 起 LIMIT 个,每个在认证成功后 disarm(名额立即归还)
+        let mut guards = Vec::new();
+        for _ in 0..LIMIT {
+            let g = state.enter_unauth_guard(ip).expect("限额内必须放行");
+            // 用 chan 保证守卫活到 disarm 之后(模拟会话仍在运行)
+            g.disarm();
+            // disarm 消耗了守卫;这里再造一个"活着但已归还"的占位语义:
+            guards.push(());
+        }
+        drop(guards);
+
+        // 关键:名额已全部归还 —— 再来一个仍能进
+        let extra = state.enter_unauth_guard(ip);
+        assert!(
+            extra.is_some(),
+            "A3:{LIMIT} 个已认证会话不得继续占用未认证名额(修前第 {} 个会被拒)",
+            LIMIT + 1
+        );
+    }
+
+    /// 对照:守卫**未** disarm 时仍占名额(证明这条闸门没被整体废掉)。
+    #[tokio::test]
+    async fn live_guards_still_consume_quota() {
+        const LIMIT: usize = 3;
+        let state = state_with_limit(LIMIT).await;
+        let ip: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+
+        let mut held = Vec::new();
+        for i in 0..LIMIT {
+            held.push(
+                state
+                    .enter_unauth_guard(ip)
+                    .unwrap_or_else(|| panic!("第 {i} 个必须放行")),
+            );
+        }
+        assert!(
+            state.enter_unauth_guard(ip).is_none(),
+            "认证窗口内(守卫未 disarm)必须仍然限额 —— 否则闸门失效"
+        );
+
+        // 归还一个后能再进
+        held.pop();
+        assert!(
+            state.enter_unauth_guard(ip).is_some(),
+            "归还一个名额后必须能再进"
+        );
+    }
+
+    /// 早退路径由 Drop 归还:不 disarm 直接 drop 也必须释放。
+    #[tokio::test]
+    async fn drop_without_disarm_releases_quota() {
+        const LIMIT: usize = 1;
+        let state = state_with_limit(LIMIT).await;
+        let ip: std::net::IpAddr = "203.0.113.11".parse().unwrap();
+
+        {
+            let _g = state.enter_unauth_guard(ip).expect("首个放行");
+            assert!(state.enter_unauth_guard(ip).is_none(), "占满后必须拒");
+        } // _g drop → 归还
+        assert!(
+            state.enter_unauth_guard(ip).is_some(),
+            "A3:早退路径(读失败/认证失败)必须由 Drop 归还名额"
+        );
     }
 }

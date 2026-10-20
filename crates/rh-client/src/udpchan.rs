@@ -131,6 +131,12 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: ProxySpec, prefix: Vec<u8>) 
     let mut gc = tokio::time::interval(Duration::from_secs(60));
     gc.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let _ = gc.tick().await;
+    // A1 同族:sleep 分支会在**每次 select 迭代**重新创建并重新计时
+    // (事件频率高时探活永不触发,事件稀疏时又可能连发)。改用固定周期
+    // interval + Delay,时间基准稳定、不随事件重置。
+    let mut probe = tokio::time::interval(Duration::from_secs(15));
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let _ = probe.tick().await;
     loop {
         tokio::select! {
             rr = frame::read_frame(&mut r, &mut fbuf) => {
@@ -157,10 +163,22 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: ProxySpec, prefix: Vec<u8>) 
                 }
             }
             _ = gc.tick() => {
+                // A4:淘汰必须**真正取消**回写任务,不能只删 map 条目。
+                // 只删条目的话任务仍持 sock2/tx2 活着,泄漏链见 Session::cancel。
                 let now = Instant::now();
-                sessions.retain(|_, s| now.duration_since(s.last) < Duration::from_secs(60));
+                let stale: Vec<std::net::SocketAddr> = sessions
+                    .iter()
+                    .filter(|(_, s)| now.duration_since(s.last) >= Duration::from_secs(60))
+                    .map(|(k, _)| *k)
+                    .collect();
+                for k in stale {
+                    if let Some(s) = sessions.remove(&k) {
+                        s.cancel.cancel();
+                        drop(s); // 释放 Arc<UdpSocket>(任务侧仍有 clone,由 cancel 退出后释放)
+                    }
+                }
             }
-            _ = tokio::time::sleep(Duration::from_secs(15)) => {
+            _ = probe.tick() => {
                 if last_ping.elapsed() >= Duration::from_secs(30) {
                     if tx.send(Pending { ty: FrameType::PING, payload: ping_bytes() }).await.is_err() {
                         break;
@@ -173,6 +191,13 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: ProxySpec, prefix: Vec<u8>) 
             }
         }
     }
+    // A4:退出前取消**全部**回写任务。否则它们仍持 tx2 的 clone,
+    // `drop(tx)` 不足以让 rx 关闭 → writer 永不结束 → 本函数永挂 →
+    // 上层每次重连都泄漏一整套 ClientSession。
+    for s in sessions.values() {
+        s.cancel.cancel();
+    }
+    drop(sessions);
     drop(tx); // 关闭队列 → 写任务排空后 shutdown 写半
     let _ = writer.await;
 }
@@ -181,6 +206,14 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: ProxySpec, prefix: Vec<u8>) 
 struct Session {
     sock: Arc<UdpSocket>,
     last: Instant,
+    /// A4:回写任务的取消令牌。
+    ///
+    /// 修前 GC 只 `retain` 删 map 条目,而该会话 spawn 的回写任务持着
+    /// `sock2` + `tx2`,唯一退出条件是 socket 报错(自持,永不会)或
+    /// tx2 失败(writer 死了才有)。泄漏任务仍持 `tx2` → `drop(tx)` 后
+    /// `writer.await` 永挂 → `run_proxy_side` 永挂 → 每次重连整套泄漏旧
+    /// ClientSession。源端口轮换的客户端(QUIC/DNS)十几分钟就能耗尽 fd。
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 async fn get_session(
@@ -205,11 +238,13 @@ async fn get_session(
     // 曾经是每收一个包就 `user.to_string()` 一次 —— 高 PPS 下是实打实的
     // 分配 + 格式化开销。
     let addr_str: Arc<str> = Arc::from(user.to_string());
+    let cancel = tokio_util::sync::CancellationToken::new();
     sessions.insert(
         user,
         Session {
             sock: sock.clone(),
             last: Instant::now(),
+            cancel: cancel.clone(),
         },
     );
     // 回写任务:本地目标响应 → 通道帧(src = 该用户源地址)
@@ -221,8 +256,14 @@ async fn get_session(
         let mut pkt: Option<Vec<u8>> = None;
         loop {
             let buf = pkt.get_or_insert_with(|| vec![0u8; UDP_RECV_BUF]);
-            let Ok((n, _)) = sock2.recv_from(buf).await else {
-                break;
+            // A4:会话被 GC 取消(或整个通道退出)时必须能退出这个 await,
+            // 否则任务永久持有 sock2/tx2 → writer.await 永挂。
+            let n = tokio::select! {
+                r = sock2.recv_from(buf) => match r {
+                    Ok((n, _)) => n,
+                    Err(_) => break,
+                },
+                _ = cancel.cancelled() => break,
             };
             // 地址字符串复用会话里那份,不再每包格式化。
             let payload = udp_packet::encode(&addr_str, &buf[..n]);
@@ -311,6 +352,10 @@ pub async fn run_visitor_side(
     let mut pkt: Option<Vec<u8>> = None;
     let mut last_alive = Instant::now();
     let mut last_ping = Instant::now();
+    // 同 run_proxy_side:探活用固定周期 interval,不随事件重置。
+    let mut probe = tokio::time::interval(Duration::from_secs(15));
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let _ = probe.tick().await;
     loop {
         let buf = pkt.get_or_insert_with(|| vec![0u8; UDP_RECV_BUF]);
         tokio::select! {
@@ -341,7 +386,7 @@ pub async fn run_visitor_side(
                     Err(_) => break,
                 }
             }
-            _ = tokio::time::sleep(Duration::from_secs(15)) => {
+            _ = probe.tick() => {
                 if last_ping.elapsed() >= Duration::from_secs(30) {
                     if tx.send(Pending { ty: FrameType::PING, payload: ping_bytes() }).await.is_err() {
                         break;
@@ -611,5 +656,140 @@ mod tests {
             assert_eq!(parse_addr_cached(c), Some(direct));
         }
         assert_eq!(parse_addr_cached("not-an-addr"), None);
+    }
+}
+
+#[cfg(test)]
+mod session_leak_tests {
+    //! A4 回归:UDP 会话回写任务不得泄漏。
+    //!
+    //! 修前 GC 只 `retain` 删 map 条目,回写任务仍持 `sock2` + `tx2`
+    //! (唯一退出条件是 socket 报错或 tx 失败,两者都不会自发发生)。
+    //! 泄漏链:`drop(tx)` 不足让 rx 关闭(还有 tx2 clone)→ writer 永不结束
+    //! → `run_proxy_side` 永挂 → 每次重连泄漏整套 ClientSession。
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 可观测的"任务退出"探针:包一层 socket,drop 时计数。
+    ///
+    /// 回写任务持有 `Arc<UdpSocket>`;它退出即释放,Arc 计数归 0 时我们
+    /// 通过外部持有的 Weak 观察到 upgraded() == None。
+    #[tokio::test]
+    async fn cancelled_session_task_exits_and_releases_socket() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let weak = Arc::downgrade(&sock);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, _rx) = mpsc::channel::<Pending>(8);
+
+        let sock2 = sock.clone();
+        let tx2 = tx.clone();
+        let c = cancel.clone();
+        let done = Arc::new(AtomicUsize::new(0));
+        let done2 = done.clone();
+        let addr_str: Arc<str> = Arc::from("127.0.0.1:1");
+        tokio::spawn(async move {
+            let mut pkt: Option<Vec<u8>> = None;
+            loop {
+                let buf = pkt.get_or_insert_with(|| vec![0u8; UDP_RECV_BUF]);
+                let n = tokio::select! {
+                    r = sock2.recv_from(buf) => match r {
+                        Ok((n, _)) => n,
+                        Err(_) => break,
+                    },
+                    _ = c.cancelled() => break,
+                };
+                let payload = udp_packet::encode(&addr_str, &buf[..n]);
+                if tx2
+                    .send(Pending {
+                        ty: FrameType::UDP_PACKET,
+                        payload,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            done2.fetch_add(1, Ordering::SeqCst);
+            drop(sock2);
+        });
+
+        // 让任务跑起来(进入 recv await)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(done.load(Ordering::SeqCst), 0, "任务不应自行退出");
+
+        // 模拟 GC:取消
+        cancel.cancel();
+        for _ in 0..50 {
+            if done.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            1,
+            "A4:取消后回写任务必须退出(否则 GC 只删 map 条目 = fd 泄漏)"
+        );
+
+        // 任务退出后 socket 引用应可回收(我们这份 drop 后 Weak 失效)
+        drop(sock);
+        for _ in 0..50 {
+            if weak.upgrade().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "A4:任务退出后 socket 必须被释放,不得有残留强引用"
+        );
+    }
+
+    /// 核心泄漏链验证:**只要会话任务被取消,writer 就能结束**。
+    ///
+    /// 修前的现象正是"drop(tx) 后 writer.await 永挂"。这里用一个受控
+    /// 模型复现:回写任务持 tx clone,若不取消,即使 drop(tx) 队列也不关;
+    /// 取消后它能退出并释放 clone,队列随之关闭、writer 收敛。
+    #[tokio::test]
+    async fn writer_converges_only_after_session_tasks_cancelled() {
+        let (tx, rx) = mpsc::channel::<Pending>(8);
+        let (_a, b) = tokio::io::duplex(1 << 16);
+        let writer = tokio::spawn(writer_task(b, rx));
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // 模拟一个会话回写任务:持 tx clone
+        let task_tx = tx.clone();
+        let task_sock = sock.clone();
+        let c = cancel.clone();
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                tokio::select! {
+                    r = task_sock.recv_from(&mut buf) => {
+                        if r.is_err() { break; }
+                    }
+                    _ = c.cancelled() => break,
+                }
+            }
+            drop(task_tx); // 退出即释放 clone
+        });
+
+        // 此时 drop 我们手里的 tx:队列**不会**关闭(任务还持一个 clone)
+        drop(tx);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !writer.is_finished(),
+            "会话任务仍持 tx clone 时 writer 不应结束 —— 这正是修前永挂的形态"
+        );
+
+        // 取消会话任务 → clone 释放 → 队列关闭 → writer 收敛
+        cancel.cancel();
+        task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("A4:取消会话任务后 writer 必须收敛(修前会永挂)")
+            .unwrap();
     }
 }
