@@ -297,7 +297,11 @@ mod online_gauge_tests {
         );
         // 再注册一个不同客户端:2
         reg.register(sess("c2", 2));
-        assert_eq!(last.load(AtomicOrdering::SeqCst), 2, "第二个客户端上线后为 2");
+        assert_eq!(
+            last.load(AtomicOrdering::SeqCst),
+            2,
+            "第二个客户端上线后为 2"
+        );
     }
 
     // T-G2:同一客户端重连(替换)不改变在线数。

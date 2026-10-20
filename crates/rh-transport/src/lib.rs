@@ -103,7 +103,10 @@ pub fn split_boxed_io(io: BoxedIo) -> Result<(BoxedIo, BoxedIo), BoxedIo> {
     let (r, w) = (*ts).into_split();
     // OwnedReadHalf/OwnedWriteHalf 各自只实现单方向 trait,用专用包装
     // 补齐另一方向(运行时永远不会走到,纯为满足 `Io` 的 supertrait)。
-    Ok((Box::new(HalfRead(r)) as BoxedIo, Box::new(HalfWrite(w)) as BoxedIo))
+    Ok((
+        Box::new(HalfRead(r)) as BoxedIo,
+        Box::new(HalfWrite(w)) as BoxedIo,
+    ))
 }
 
 /// 取消信号(共享):完成即结束转发。规则禁用/删除级联用;
@@ -547,7 +550,10 @@ pub fn carriers_for_rtt(rtt: std::time::Duration) -> usize {
 /// (5ms / 15ms 两档),只用来区分"局域网级"与"广域网级",不追求精确。
 ///
 /// 返回 `None` = 无法判定(拨号失败),调用方退回保守默认。
-pub async fn probe_rtt(addr: SocketAddr, timeout: std::time::Duration) -> Option<std::time::Duration> {
+pub async fn probe_rtt(
+    addr: SocketAddr,
+    timeout: std::time::Duration,
+) -> Option<std::time::Duration> {
     let start = std::time::Instant::now();
     let conn = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
         .await

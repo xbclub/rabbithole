@@ -962,8 +962,16 @@ fn dump_up(read_ns: u64, write_ns: u64, slow_reads: u64, slow_writes: u64) {
 read_ms={rd_ms:.0}({:.0}%) write_ms={wr_ms:.0}({:.0}%) \
 rd_per_batch_ms={:.2} wr_per_batch_ms={:.2} slow_reads={slow_reads} slow_writes={slow_writes}",
         bytes as f64 / batches as f64,
-        if total > 0.0 { rd_ms * 100.0 / total } else { 0.0 },
-        if total > 0.0 { wr_ms * 100.0 / total } else { 0.0 },
+        if total > 0.0 {
+            rd_ms * 100.0 / total
+        } else {
+            0.0
+        },
+        if total > 0.0 {
+            wr_ms * 100.0 / total
+        } else {
+            0.0
+        },
         rd_ms / batches as f64,
         wr_ms / batches as f64,
     );
@@ -1585,36 +1593,36 @@ fn mux_config_with_shards(max_streams: usize, shard_workers: usize) -> yamux::Co
     // 窗口恒定——不再受共享预算钳制、不再 BDP 自增(frp 对照与删除
     // 理由见上)。发送端初窗仍 256KiB——对端只见标准 WU,线路兼容。
     // 本改动只覆盖 yamux(mux 路径),不声称修复 nomux/QUIC/KCP。
-/// 每流发送窗初值覆盖(round-59,默认不覆盖)。
-///
-/// # 为什么默认不抬高
-///
-/// 发送窗初值是**协议层背压的起点**。抬到 6MiB 会让在途敞口从
-/// ~256KiB 涨到 ~6MiB,实测会让 KCP 的端到端背压测试
-/// (`b08_public_mux_stalled_reader_backpressure_and_recovery`,断言
-/// "停读必须造成写停顿")失效,并在 12MB 处提前触发连接关闭——说明
-/// 它改变了真实的可观测行为,不能作为无条件默认值。
-///
-/// # 为什么仍需要它
-///
-/// 上行(n=16)rh 1.29 G vs frp 2.05 G(差 36%)。`PUMP_UP` 显示每批
-/// 仅 ~100KB、read_ms 占 99%;同条件下**下行**每批 ~574KB、2.41 G。
-/// 差别在于下行写的是用户 socket(无 mux 窗口),上行写的是 mux 流,
-/// 每 256KiB 就要等一次对端窗口更新往返。
-///
-/// 因此做成**显式开关**:需要上行吞吐的场景(长连接大流量转发)可按需
-/// 开启并自行承担背压语义变化;默认行为与 upstream 一致。
-///
-/// `RH_MUX_SEND_WINDOW=<bytes>`(钳制 [256KiB, 64MiB])。
-fn send_window_override() -> Option<usize> {
-    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RH_MUX_SEND_WINDOW")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .map(|n| n.clamp(256 * 1024, 64 * 1024 * 1024))
-    })
-}
+    /// 每流发送窗初值覆盖(round-59,默认不覆盖)。
+    ///
+    /// # 为什么默认不抬高
+    ///
+    /// 发送窗初值是**协议层背压的起点**。抬到 6MiB 会让在途敞口从
+    /// ~256KiB 涨到 ~6MiB,实测会让 KCP 的端到端背压测试
+    /// (`b08_public_mux_stalled_reader_backpressure_and_recovery`,断言
+    /// "停读必须造成写停顿")失效,并在 12MB 处提前触发连接关闭——说明
+    /// 它改变了真实的可观测行为,不能作为无条件默认值。
+    ///
+    /// # 为什么仍需要它
+    ///
+    /// 上行(n=16)rh 1.29 G vs frp 2.05 G(差 36%)。`PUMP_UP` 显示每批
+    /// 仅 ~100KB、read_ms 占 99%;同条件下**下行**每批 ~574KB、2.41 G。
+    /// 差别在于下行写的是用户 socket(无 mux 窗口),上行写的是 mux 流,
+    /// 每 256KiB 就要等一次对端窗口更新往返。
+    ///
+    /// 因此做成**显式开关**:需要上行吞吐的场景(长连接大流量转发)可按需
+    /// 开启并自行承担背压语义变化;默认行为与 upstream 一致。
+    ///
+    /// `RH_MUX_SEND_WINDOW=<bytes>`(钳制 [256KiB, 64MiB])。
+    fn send_window_override() -> Option<usize> {
+        static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("RH_MUX_SEND_WINDOW")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .map(|n| n.clamp(256 * 1024, 64 * 1024 * 1024))
+        })
+    }
 
     cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
     // round-59:发送窗初值也设为 6MiB(修前 vendor 两处构造点都写死
@@ -4476,10 +4484,7 @@ mod tests {
                 "K={k} 每载体 {per} 个分片,低于单载体的 {single}——\
                  多载体不得以降低并行度为代价"
             );
-            assert!(
-                per >= 2,
-                "K={k} 每载体至少 2 个(读∥写并行),实际 {per}"
-            );
+            assert!(per >= 2, "K={k} 每载体至少 2 个(读∥写并行),实际 {per}");
         }
         // 总 Worker 数不随 K 爆炸:每载体 × K 应在核数预算量级内。
         let total_k8 = shard_workers_for_k(8) * 8;

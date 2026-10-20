@@ -607,13 +607,10 @@ async fn listen_stream_honors_configured_alpn() {
     let tcp = TcpStream::connect(addr).await.expect("connect");
     let connector = TlsConnector::from(Arc::new(client));
     let name = ServerName::try_from("localhost").unwrap();
-    let stream = tokio::time::timeout(
-        Duration::from_secs(5),
-        connector.connect(name, tcp),
-    )
-    .await
-    .expect("handshake deadline")
-    .expect("handshake must succeed when server offers http/1.1");
+    let stream = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+        .await
+        .expect("handshake deadline")
+        .expect("handshake must succeed when server offers http/1.1");
     assert_eq!(
         stream.get_ref().1.alpn_protocol(),
         Some(&b"http/1.1"[..]),
@@ -640,8 +637,10 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
         _m: &[u8],
         _c: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
         _d: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error>
-    {
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
         Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn verify_tls13_signature(
@@ -649,8 +648,10 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
         _m: &[u8],
         _c: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
         _d: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error>
-    {
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
         Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {

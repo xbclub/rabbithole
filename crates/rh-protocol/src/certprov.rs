@@ -136,7 +136,10 @@ mod tests {
     fn tampered_ciphertext_rejected() {
         let mut sealed = seal_cert(SECRET, [2u8; 12], CERT).unwrap();
         sealed.ciphertext[0] ^= 0x01;
-        assert!(open_cert(SECRET, &sealed).is_none(), "篡改必须被 GCM tag 拒绝");
+        assert!(
+            open_cert(SECRET, &sealed).is_none(),
+            "篡改必须被 GCM tag 拒绝"
+        );
     }
 
     #[test]

@@ -87,10 +87,7 @@ impl ClientSession {
 /// round-77:自动路径改为按**实测 RTT** 决定 K(而不是恒 1)。依据是
 /// 低延迟下 K=1 快 8%、而 20ms 下 K=4 快 16%(§82),阈值见
 /// [`rh_transport::carriers_for_rtt`]。
-async fn initial_k_for(
-    cfg: &ClientConfig,
-    protocol: rh_transport::Protocol,
-) -> (usize, usize) {
+async fn initial_k_for(cfg: &ClientConfig, protocol: rh_transport::Protocol) -> (usize, usize) {
     initial_k_for_async(cfg, protocol, crate::config::detect_hardware_cap()).await
 }
 
@@ -332,9 +329,7 @@ async fn verify_server_cert(
     if ty != FrameType::SERVER_CERT {
         // 同理:声明了 secret 验证就不能接受"帧不存在"。旧服务端会在这里
         // 被明确拒绝(而不是静默降级),升级时客户端会看到明确原因。
-        anyhow::bail!(
-            "期望服务端证书下发帧,实际收到 {ty:?}:无法验证对端身份,拒绝连接"
-        );
+        anyhow::bail!("期望服务端证书下发帧,实际收到 {ty:?}:无法验证对端身份,拒绝连接");
     }
     let msg: rh_protocol::message::ServerCert = serde_json::from_slice(&payload)?;
     let nonce_raw = base64::engine::general_purpose::STANDARD
@@ -348,9 +343,9 @@ async fn verify_server_cert(
         .decode(msg.cert_der_b64.as_bytes())
         .map_err(|e| anyhow::anyhow!("证书下发帧密文非法: {e}"))?;
     let sealed = rh_protocol::certprov::SealedCert { nonce, ciphertext };
-    let seen = peer_cert.get().ok_or_else(|| {
-        anyhow::anyhow!("未能取得本次 TLS 会话的对端证书,无法完成比对——拒绝连接")
-    })?;
+    let seen = peer_cert
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("未能取得本次 TLS 会话的对端证书,无法完成比对——拒绝连接"))?;
     compare_announced_cert(cfg.secret.as_bytes(), &sealed, seen)?;
     tracing::debug!("服务端证书比对通过");
     Ok(())

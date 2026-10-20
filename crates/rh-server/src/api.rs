@@ -2045,10 +2045,7 @@ async fn put_server_config(
                 if item.is_empty() || item.len() > 255 {
                     return err(1002, "alpn 每项须为 1-255 字节");
                 }
-                if !item
-                    .bytes()
-                    .all(|b| (0x21..=0x7e).contains(&b))
-                {
+                if !item.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
                     return err(1002, &format!("alpn 含非法字符(须为可见 ASCII):{item}"));
                 }
             }

@@ -352,7 +352,9 @@ mod tests {
         let cfg = server_config_with_alpn(&opts, &want).unwrap();
         assert_eq!(
             cfg.alpn_protocols,
-            want.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>(),
+            want.iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
             "服务端 ALPN 列表必须完整进入配置且顺序不变"
         );
 
@@ -368,7 +370,9 @@ mod tests {
         .0;
         assert_eq!(
             c.alpn_protocols,
-            want.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>(),
+            want.iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
             "客户端 ALPN 列表必须完整进入配置"
         );
 
