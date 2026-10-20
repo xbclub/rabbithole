@@ -262,9 +262,18 @@ peer_client() {  # <a_addr> <client_id> <secret>
   echo $! > "$PEER_DIR/target.pid"
   wait_port 127.0.0.1 "$T_TCP" 15 || { err "目标服务未就绪"; cat "$PEER_DIR/target.log"; return 1; }
 
-  "$IPERF3_BIN" -s -p "$T_IPERF" >"$PEER_DIR/iperf.log" 2>&1 &
-  echo $! > "$PEER_DIR/iperf.pid"
-  wait_port 127.0.0.1 "$T_IPERF" 10 || { err "iperf3 未就绪"; return 1; }
+  if [ "$THP_TOOL" = "loadgen" ]; then
+    # loadgen sink 只读不答(推送式压测),与 iperf3 的请求/响应协议不兼容,
+    # 故换工具时 B 侧必须成对切换。端口沿用 T_IPERF,drive 无需感知。
+    # 秒数给足:过期后 sink 静默退出会让后续样本全为 0。
+    "$LOADGEN_BIN" sink "$T_IPERF" 7200 4096 >"$PEER_DIR/iperf.log" 2>&1 &
+    echo $! > "$PEER_DIR/iperf.pid"
+    wait_port 127.0.0.1 "$T_IPERF" 15 || { err "loadgen sink 未就绪"; cat "$PEER_DIR/iperf.log"; return 1; }
+  else
+    "$IPERF3_BIN" -s -p "$T_IPERF" >"$PEER_DIR/iperf.log" 2>&1 &
+    echo $! > "$PEER_DIR/iperf.pid"
+    wait_port 127.0.0.1 "$T_IPERF" 10 || { err "iperf3 未就绪"; cat "$PEER_DIR/iperf.log"; return 1; }
+  fi
 
   gen_client_config "$PEER_DIR" "$a_addr" "$PROTO" "$cid" "$secret" "relay_mode = \"$RELAY\""
   "$BENCH_BIN/rh-client" --config "$PEER_DIR/client.toml" >"$PEER_DIR/client.log" 2>&1 &
