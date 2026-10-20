@@ -77,6 +77,10 @@ T_HTTP="${T_HTTP:-19104}"
 THP_TOOL="${THP_TOOL:-iperf3}"
 IPERF3_BIN="${IPERF3_BIN:-iperf3}"
 LOADGEN_BIN="${LOADGEN_BIN:-/tmp/rh-bin/loadgen}"
+# 必须 export:run_iperf 在 `$(...)` 子 shell 里执行,未导出的普通变量
+# 在那里不可见 —— 会导致 THP_TOOL 回落成 iperf3,而解析分支仍按 loadgen
+# 判断(空 JSON → 全部 INVALID(exit=0))。这个不一致极难从输出看出来。
+export THP_TOOL LOADGEN_BIN
 if [ "$THP_TOOL" = "loadgen" ]; then
   [ -x "$LOADGEN_BIN" ] || die "THP_TOOL=loadgen 但 LOADGEN_BIN 不可执行: $LOADGEN_BIN"
 else
