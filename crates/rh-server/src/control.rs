@@ -121,6 +121,15 @@ impl Default for ChallengeTable {
 
 /// 控制端口 accept 循环。
 pub async fn serve_transport(state: Arc<AppState>, cfg: rh_transport::ServerTransportConfig) {
+    // 本监听器的叶子证书:与 `rh_transport::listen` 用的是同一份 TLS 选项
+    // (同源:显式 cert 或 persist_prefix 落盘的 .crt),故与握手实际出示的
+    // 证书逐字节相同。
+    //
+    // **必须按监听器各自解析**。多监听器(`[[extra_listeners]]`)各有独立的
+    // 自签证书;曾经这里是 AppState 上的全局单值、只由首个监听器注入,
+    // 客户端连第 2 个及以后的加密监听器时会收到别人的证书,比对必然失败,
+    // 而且报错文案是"可能存在中间人"——把安全问题排查引向错误方向。
+    let leaf_cert: Option<Arc<[u8]>> = rh_transport::tls::leaf_der_of(&cfg.tls).map(Arc::from);
     let listener = match rh_transport::listen(&cfg, state.mux_streams.clone()).await {
         Ok(l) => l,
         Err(e) => {
@@ -140,16 +149,23 @@ pub async fn serve_transport(state: Arc<AppState>, cfg: rh_transport::ServerTran
             }
         };
         let st = state.clone();
+        let leaf = leaf_cert.clone();
         tokio::spawn(async move {
             let remote = inc.remote;
-            if let Err(e) = handle_incoming(st, inc).await {
+            if let Err(e) = handle_incoming(st, inc, leaf).await {
                 tracing::debug!(error = %e, %remote, "incoming closed");
             }
         });
     }
 }
 
-async fn handle_incoming(state: Arc<AppState>, inc: Incoming) -> anyhow::Result<()> {
+/// `leaf_cert`:本监听器的叶子证书 DER(见 [`serve_transport`])。随连接一路
+/// 传到 [`send_server_cert`],保证"客户端连哪个端口就下发哪个证书"。
+async fn handle_incoming(
+    state: Arc<AppState>,
+    inc: Incoming,
+    leaf_cert: Option<Arc<[u8]>>,
+) -> anyhow::Result<()> {
     // 首流(或裸连接本体)
     let stream = tokio::time::timeout(Duration::from_secs(5), inc.mux.accept()).await??;
     // 首帧 5s
@@ -168,7 +184,7 @@ async fn handle_incoming(state: Arc<AppState>, inc: Incoming) -> anyhow::Result<
                 let _ = send_error(&mut stream, "AUTH_FAILED", "too many pending auth").await;
                 return Ok(());
             }
-            let r = auth_and_run(state.clone(), inc, stream, hello, buf).await;
+            let r = auth_and_run(state.clone(), inc, stream, hello, buf, leaf_cert).await;
             state.exit_unauth(&ip);
             r
         }
@@ -193,6 +209,7 @@ async fn auth_and_run(
     mut stream: BoxedIo,
     hello: Hello,
     mut read_buf: bytes::BytesMut,
+    leaf_cert: Option<Arc<[u8]>>,
 ) -> anyhow::Result<()> {
     // 附加载体报到(round-9 §3.4):HELLO 携带 session_id = 多载体会话的
     // 后续物理连接,走聚合快速路径;None = 首条连接,走完整挑战应答。
@@ -295,7 +312,14 @@ async fn auth_and_run(
     // 证书下发:仅加密协议。客户端解密后与 TLS 对端证书比对,不一致即断开。
     // 失败只 warn(不影响会话):客户端在缺失该帧时退回改动前的行为。
     if inc.protocol.is_encrypted() {
-        if let Err(e) = send_server_cert(&state, &mut stream, &latest.id, &latest.secret).await {
+        if let Err(e) = send_server_cert(
+            &mut stream,
+            &latest.id,
+            &latest.secret,
+            leaf_cert.as_deref(),
+        )
+        .await
+        {
             warn!(client = %latest.id, error = %e, "下发服务端证书失败");
         }
     }
@@ -626,12 +650,12 @@ pub fn hmac_hex(secret: &[u8], msg: &str) -> String {
 /// 证书缺失(纯明文控制面 / 尚未注入)时静默跳过:此帧是附加证明,
 /// 不是认证前提,缺了不应导致连接失败。
 async fn send_server_cert(
-    state: &Arc<AppState>,
     stream: &mut BoxedIo,
     client_id: &str,
     secret: &str,
+    leaf: Option<&[u8]>,
 ) -> anyhow::Result<()> {
-    let Some(leaf) = state.control_leaf_cert.get() else {
+    let Some(leaf) = leaf else {
         return Ok(());
     };
     let nonce = rh_protocol::certprov::random_nonce()
@@ -1960,5 +1984,153 @@ mod carrier_attach_concurrency_tests {
             sess.mux_pool.lock().await.is_none(),
             "cap=1 时不得建池、不得聚合任何附加载体"
         );
+    }
+}
+
+#[cfg(test)]
+mod cert_per_listener_tests {
+    //! 证书下发必须"连哪个端口就下发哪个证书"。
+    //!
+    //! 多监听器(`[[extra_listeners]]`)各有独立的自签证书。曾经
+    //! `AppState.control_leaf_cert` 是全局单值、只由首个监听器注入,于是
+    //! 客户端连第 2 个及以后的加密监听器时会收到别人的证书,逐字节比对
+    //! 必然失败,还报"可能存在中间人"——把安全问题排查引向错误方向。
+    //!
+    //! 本模块锁住两点:
+    //! 1. [`rh_transport::tls::leaf_der_of`] 对两份不同证书解析出不同结果;
+    //! 2. [`send_server_cert`] 使用的就是**传入的那份**,而非任何全局状态。
+    use super::*;
+    use base64::Engine as _;
+
+    /// 造一份独立的 PEM 自签证书,返回 (leaf DER, PEM)。
+    fn make_cert() -> (Vec<u8>, Vec<u8>) {
+        let (pem, _key) = rh_transport::tls::auto_cert(&Default::default()).unwrap();
+        let der = rh_transport::tls::leaf_der_pem(&pem).unwrap();
+        (der, pem)
+    }
+
+    /// 两份独立证书必须解析出两份不同的 DER —— 这是"多监听器证书不同"
+    /// 这个前提本身,也是本缺陷成立的根因。
+    #[test]
+    fn two_listeners_yield_different_leaf_certs() {
+        let (der_a, pem_a) = make_cert();
+        let (der_b, pem_b) = make_cert();
+        assert_ne!(der_a, der_b, "两次生成的自签证书必须不同");
+
+        // leaf_der_of 走"显式 cert_pem"分支,与应用 acceptor 同源
+        let opts_a = rh_transport::TlsServerOptions {
+            cert_pem: Some(pem_a),
+            ..Default::default()
+        };
+        let opts_b = rh_transport::TlsServerOptions {
+            cert_pem: Some(pem_b),
+            ..Default::default()
+        };
+        assert_eq!(
+            rh_transport::tls::leaf_der_of(&opts_a).as_deref(),
+            Some(der_a.as_slice()),
+            "监听器 A 必须解析出自己的证书"
+        );
+        assert_eq!(
+            rh_transport::tls::leaf_der_of(&opts_b).as_deref(),
+            Some(der_b.as_slice()),
+            "监听器 B 必须解析出自己的证书"
+        );
+    }
+
+    /// `leaf_der_of` 也必须能走 persist_prefix 分支(生产路径:证书落盘在
+    /// `<配置目录>/certs/rh-<proto>-<port>.crt`,启动时从磁盘读)。
+    #[test]
+    fn leaf_der_of_reads_persisted_cert() {
+        let dir = std::env::temp_dir().join(format!(
+            "rh-leaf-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("rh-tls-1234");
+        let opts = rh_transport::TlsServerOptions {
+            persist_prefix: Some(prefix.clone()),
+            ..Default::default()
+        };
+        let (pem, _key) = rh_transport::tls::auto_cert(&opts).unwrap();
+        let expect = rh_transport::tls::leaf_der_pem(&pem).unwrap();
+        // 此时 cert_pem 仍是 None,只能从落盘读
+        let got = rh_transport::tls::leaf_der_of(&opts).expect("必须能从 .crt 读出");
+        assert_eq!(got, expect, "落盘分支必须与 auto_cert 的证书一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **核心回归**:`send_server_cert` 下发的必须是"传进来的那份"证书。
+    ///
+    /// 修前它读 `state.control_leaf_cert` 全局单值,与连接实际来自哪个
+    /// 监听器无关;修后由 `serve_transport` 按 `cfg.tls` 解析并逐层传参。
+    /// 这里用两份不同证书分别调用,断言解出来的就是各自那份。
+    #[tokio::test]
+    async fn send_server_cert_uses_the_passed_leaf() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        let (der_a, _pem_a) = make_cert();
+        let (der_b, _pem_b) = make_cert();
+        assert_ne!(der_a, der_b);
+
+        for (label, leaf) in [("A", &der_a), ("B", &der_b)] {
+            let (server, mut client) = tokio::io::duplex(64 * 1024);
+            let mut server: BoxedIo = Box::new(server);
+            let leaf_for_task = leaf.clone();
+            let task = tokio::spawn(async move {
+                send_server_cert(&mut server, "cid", secret, Some(&leaf_for_task))
+                    .await
+                    .unwrap();
+            });
+
+            let mut buf = bytes::BytesMut::with_capacity(4096);
+            let (ty, payload) =
+                tokio::time::timeout(Duration::from_secs(2), read_frame(&mut client, &mut buf))
+                    .await
+                    .expect("读帧超时")
+                    .expect("读帧失败");
+            task.await.unwrap();
+
+            assert_eq!(ty, FrameType::SERVER_CERT, "{label}: 帧类型");
+            let msg: rh_protocol::message::ServerCert = serde_json::from_slice(&payload).unwrap();
+            let nonce: [u8; 12] = base64::engine::general_purpose::STANDARD
+                .decode(msg.nonce_b64.as_bytes())
+                .unwrap()
+                .as_slice()
+                .try_into()
+                .unwrap();
+            let ct = base64::engine::general_purpose::STANDARD
+                .decode(msg.cert_der_b64.as_bytes())
+                .unwrap();
+            let sealed = rh_protocol::certprov::SealedCert {
+                nonce,
+                ciphertext: ct,
+            };
+            let opened = rh_protocol::certprov::open_cert(secret.as_bytes(), &sealed)
+                .expect("必须能用 secret 解开");
+            assert_eq!(
+                opened.as_slice(),
+                leaf.as_slice(),
+                "{label}: 下发的必须是本监听器的证书,不能是别人的"
+            );
+        }
+    }
+
+    /// 没有证书(纯明文控制面)时静默跳过,不得报错、不得发帧。
+    #[tokio::test]
+    async fn send_server_cert_skips_without_leaf() {
+        let (server, mut client) = tokio::io::duplex(4096);
+        let mut server: BoxedIo = Box::new(server);
+        send_server_cert(&mut server, "cid", "s", None)
+            .await
+            .expect("无证书不是错误");
+        let mut buf = bytes::BytesMut::with_capacity(512);
+        let r = tokio::time::timeout(
+            Duration::from_millis(200),
+            read_frame(&mut client, &mut buf),
+        )
+        .await;
+        assert!(r.is_err(), "无证书时不得下发任何帧");
     }
 }

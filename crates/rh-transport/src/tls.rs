@@ -302,6 +302,24 @@ pub fn leaf_der_pem(cert_pem: &[u8]) -> io::Result<Vec<u8>> {
     Ok(leaf.as_ref().to_vec())
 }
 
+/// 从服务端 TLS 选项取叶子证书 DER(证书下发的载荷)。
+///
+/// 与 [`server_config_with_alpn`] 同源:显式 cert 优先,否则读
+/// `persist_prefix` 落盘的 `.crt`。返回 `None` 表示该监听器没有可用证书
+/// (例如纯明文控制面),调用方据此跳过下发。
+///
+/// **必须按监听器各自解析,不能全局只取一份**:多监听器
+/// (`[[extra_listeners]]`)各有独立的自签证书,下发错的那份会让客户端
+/// 的逐字节比对必然失败,并被误报成"可能存在中间人"。
+pub fn leaf_der_of(opts: &TlsServerOptions) -> Option<Vec<u8>> {
+    let pem = match (&opts.cert_pem, &opts.persist_prefix) {
+        (Some(p), _) => p.clone(),
+        (None, Some(prefix)) => std::fs::read(prefix.with_extension("crt")).ok()?,
+        (None, None) => return None,
+    };
+    leaf_der_pem(&pem).ok()
+}
+
 /// 32 字节指纹 → 小写 hex(64 字符,与 `pin_sha256` 同格式)。
 pub fn hex32(v: &[u8; 32]) -> String {
     v.iter().map(|x| format!("{x:02x}")).collect()

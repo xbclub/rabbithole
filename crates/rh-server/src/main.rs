@@ -208,20 +208,6 @@ fn alpn_list(configured: &[String]) -> Vec<String> {
     }
 }
 
-/// 取该 TLS 配置的叶子证书 DER(与 acceptor 同源:都来自同一份 PEM)。
-///
-/// 注入 AppState 后由认证路径加密下发给客户端。取不到返回 None,
-/// 客户端会跳过比对(退回改动前行为),不会导致连接失败。
-fn leaf_der_of(tls: &TlsServerOptions) -> Option<Vec<u8>> {
-    let pem = match (&tls.cert_pem, &tls.persist_prefix) {
-        (Some(p), _) => p.clone(),
-        (None, Some(prefix)) => std::fs::read(prefix.with_extension("crt")).ok()?,
-        (None, None) => return None,
-    };
-    let der = rh_transport::tls::leaf_der_pem(&pem).ok()?;
-    Some(der)
-}
-
 fn load_control_cfgs(cfg: &config::ServerConfig) -> anyhow::Result<Vec<ServerTransportConfig>> {
     let cfg_dir = cfg
         .config_path
@@ -340,15 +326,11 @@ async fn main() -> anyhow::Result<()> {
     bootstrap_initial_admin(&state).await;
     // 启动恢复:双方 enabled 的规则重新绑定。
     recovery::recover_all(&state).await;
-    // 控制面监听。同时把首个 TLS 监听的叶子证书注入 AppState:
-    // 认证后要把它加密下发给客户端,供其与 TLS 对端证书比对。
+    // 控制面监听。每个监听器的叶子证书**随监听器**交给 serve_transport:
+    // 多监听器各有独立自签证书,认证后必须下发"客户端连的那个端口"的证书,
+    // 否则逐字节比对必然失败并被误报为中间人。
     let control_cfgs = load_control_cfgs(&cfg)?;
-    for (i, tc) in control_cfgs.iter().enumerate() {
-        if i == 0 && tc.protocol.is_encrypted() {
-            if let Some(leaf) = leaf_der_of(&tc.tls) {
-                let _ = state.control_leaf_cert.set(leaf);
-            }
-        }
+    for tc in control_cfgs.iter() {
         info!(addr = %tc.bind_addr, proto = ?tc.protocol, "control listener starting");
         tokio::spawn(control::serve_transport(state.clone(), tc.clone()));
     }

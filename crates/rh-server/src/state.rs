@@ -26,12 +26,6 @@ pub type RelayPairMap = HashMap<(String, u64), tokio::sync::oneshot::Sender<Boxe
 pub struct AppState {
     pub cfg: Arc<ServerConfig>,
     pub db: Db,
-    /// 控制面 TLS 叶子证书(DER)。认证成功后加密下发给客户端,供其与
-    /// TLS 握手实际看到的对端证书比对。None = 无 TLS 控制面(纯明文部署)。
-    ///
-    /// 由 `main` 在构建 acceptor 的同一处解析并注入,保证与握手实际使用
-    /// 的证书同源;不在此处重新读文件(证书轮换后会不一致)。
-    pub control_leaf_cert: Arc<std::sync::OnceLock<Vec<u8>>>,
     pub events: EventBus,
     pub challenge: Arc<crate::control::ChallengeTable>,
     pub sessions: Arc<SessionRegistry>,
@@ -222,7 +216,6 @@ impl Clone for AppState {
         Self {
             cfg: self.cfg.clone(),
             db: self.db.clone(),
-            control_leaf_cert: self.control_leaf_cert.clone(),
             events: self.events.clone(),
             challenge: self.challenge.clone(),
             sessions: self.sessions.clone(),
@@ -321,7 +314,6 @@ impl AppState {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         Self {
-            control_leaf_cert: Arc::new(std::sync::OnceLock::new()),
             challenge: Arc::new(crate::control::ChallengeTable::new()),
             cfg,
             db,
