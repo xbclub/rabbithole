@@ -103,17 +103,24 @@ pub(crate) async fn initial_k_for_async(
     protocol: rh_transport::Protocol,
     hardware_cap: usize,
 ) -> (usize, usize) {
+    let proto_baseline = rh_transport::default_carriers(protocol);
     let baseline = match cfg.mux_pool_size {
         // 显式配置最高优先:不再探测 RTT(用户已明确表态)。
-        Some(_) => rh_transport::default_carriers(protocol),
+        Some(_) => proto_baseline,
         None => {
-            match cfg.server_addr.parse::<std::net::SocketAddr>() {
+            let rtt_k = match cfg.server_addr.parse::<std::net::SocketAddr>() {
                 Ok(addr) => {
                     rh_transport::auto_carriers(addr, std::time::Duration::from_secs(2)).await
                 }
                 // 地址是域名或非法:无法探测,退回保守基线。
-                Err(_) => rh_transport::default_carriers(protocol),
-            }
+                Err(_) => proto_baseline,
+            };
+            // RTT 自适应给的是**下限意义上的建议**,不是上限:
+            // 低 RTT(<5ms)返回 1,但 2026-10-20 三机实测单载体在
+            // 2.1-2.2G 封顶且与流数无关(瓶颈是单 TCP 拥塞窗 + yamux
+            // 单 FlushTask 串行),K=2 可测提升 6-10%。故取两者较大者,
+            // 让协议基线抬高下限、RTT 仍能在高 BDP 下继续上调。
+            rtt_k.max(proto_baseline)
         }
     };
     let desired = cfg.mux_pool_size.unwrap_or(baseline);

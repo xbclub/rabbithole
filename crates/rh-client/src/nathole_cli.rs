@@ -171,7 +171,15 @@ async fn replay_waiting(
     };
     let vspec = sess.visitors.lock().await.get(&visitor_id).cloned();
     let Some(vspec) = vspec else { return };
-    match crate::visitor_run::xtcp_direct_stream_pub(sess, &mux, &vspec, m.user_conn_id, conn).await
+    match crate::visitor_run::xtcp_direct_stream_pub(
+        sess,
+        &mux,
+        &vspec,
+        m.auth.clone(),
+        m.user_conn_id,
+        conn,
+    )
+    .await
     {
         None => {
             // A7:凭据与 mux 同步登记,后续连接复用同一凭据。

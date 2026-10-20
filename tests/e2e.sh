@@ -1403,9 +1403,11 @@ if [ -n "$POOL_SPORTS" ]; then
   # shellcheck disable=SC2086  # 源端口按空格分隔展开为独立参数
   PORTS_AFTER=$(ctl_estab_peer_ports "$CTL_PORT" "$SRV_PID" $POOL_SPORTS)
 fi
-# T-E2(round-10):tcp 默认(无 mux_pool_size)= 协议基线 1 → 只应有一条
-# 物理载体;定容日志同样要给出 initial_k=final_k=1。日志带 ANSI 颜色,
-# 先剥转义再匹配。上线判定早于客户端写定容日志(服务端先记账),轮询等它。
+# T-E2(round-10,2026-10-20 修订):tcp 默认(无 mux_pool_size)= 协议基线 2
+# → 应有两条物理载体;定容日志同样要给出 initial_k=final_k=2。
+# (单载体在 2.1-2.2G 封顶且与流数无关,故 tcp 族默认 K=2。)
+# 日志带 ANSI 颜色,先剥转义再匹配。上线判定早于客户端写定容日志
+# (服务端先记账),轮询等它。
 SIZING_DEFAULT=""
 for _ in $(seq 1 20); do
   SIZING_DEFAULT=$(sed -E 's/\x1b\[[0-9;]*m//g' "$WORK/client.log" 2>/dev/null \
@@ -1413,10 +1415,10 @@ for _ in $(seq 1 20); do
   [ -n "$SIZING_DEFAULT" ] && break
   sleep 0.5
 done
-if printf '%s' "$SIZING_DEFAULT" | grep -qE "initial_k=1 .*final_k=1|final_k=1 .*initial_k=1"; then
-  ok "T-E2: tcp 默认定容 initial_k=final_k=1"
+if printf '%s' "$SIZING_DEFAULT" | grep -qE "initial_k=2 .*final_k=2|final_k=2 .*initial_k=2"; then
+  ok "T-E2: tcp 默认定容 initial_k=final_k=2"
 else
-  bad "T-E2: tcp 默认定容日志缺失或 K≠1(实际: $SIZING_DEFAULT)"
+  bad "T-E2: tcp 默认定容日志缺失或 K≠2(实际: $SIZING_DEFAULT)"
 fi
 # 按客户端 PID 计数:控制端口上还有 env-only 客户端,服务端侧聚合计数
 # 无法归因到本进程。ss/lsof 按 pid 过滤;netstat 无法按 pid,直接 NA。
@@ -1472,10 +1474,10 @@ PYEOF
 )
 if [ "$CLI_CONNS" = "NA" ]; then
   echo "SKIP: T-E2 物理载体数断言(ss/lsof 均不可用)"
-elif [ "$CLI_CONNS" = "1" ]; then
-  ok "T-E2: tcp 默认 K=1,客户端控制口物理连接数 = 1"
+elif [ "$CLI_CONNS" = "2" ]; then
+  ok "T-E2: tcp 默认 K=2,客户端控制口物理连接数 = 2"
 else
-  bad "T-E2: tcp 默认 K=1,实际物理连接数 = $CLI_CONNS"
+  bad "T-E2: tcp 默认 K=2,实际物理连接数 = $CLI_CONNS"
 fi
 if [ "$CTL_BASE" = "NA" ] || [ "$CTL_POOL" = "NA" ] || [ "$CTL_AFTER" = "NA" ]; then
   echo "SKIP: 会话替换后旧载体连接收敛计数(ss/netstat 均不可用)"

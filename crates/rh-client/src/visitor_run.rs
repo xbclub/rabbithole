@@ -86,8 +86,15 @@ async fn handle_user_conn(
     // xtcp:已有直连 mux 则直接开流
     if spec.kind == VisitorKind::Xtcp {
         let mux = sess.punched.lock().await.get(&visitor_id).cloned();
+        let auth = sess
+            .punched_auth
+            .lock()
+            .await
+            .get(&visitor_id)
+            .cloned()
+            .unwrap_or_default();
         if let Some(mux) = mux {
-            match xtcp_direct_stream(&sess, &mux, &spec, user_conn_id, conn).await {
+            match xtcp_direct_stream(&sess, &mux, &spec, auth, user_conn_id, conn).await {
                 Some(conn_back) => {
                     // 直连失败:移除失效 mux(与其凭据同生命周期),落入常规路径
                     sess.punched.lock().await.remove(&visitor_id);
@@ -128,6 +135,7 @@ async fn xtcp_direct_stream(
     sess: &Arc<ClientSession>,
     mux: &Arc<rh_transport::Multiplexer>,
     spec: &VisitorSpec,
+    xtcp_auth: String,
     _user_conn_id: u64,
     conn: tokio::net::TcpStream,
 ) -> Option<tokio::net::TcpStream> {
@@ -136,14 +144,7 @@ async fn xtcp_direct_stream(
         // 开流失败(mux 已死):返还连接,由调用方移除失效 mux 并走常规路径
         Err(_) => return Some(conn),
     };
-    // A7:直连首帧凭据(与已缓存的 punched mux 同源,由 NAT_HOLE_CONNECT 下发)。
-    let xtcp_auth = sess
-        .punched_auth
-        .lock()
-        .await
-        .get(&spec.id)
-        .cloned()
-        .unwrap_or_default();
+    // A7:直连首帧凭据由调用方按 visitor_id 从 punched_auth 取。
     let fwd = StartForward {
         proxy_id: 0,
         user_src: String::new(),
@@ -173,10 +174,11 @@ pub async fn xtcp_direct_stream_pub(
     sess: &Arc<ClientSession>,
     mux: &Arc<rh_transport::Multiplexer>,
     spec: &VisitorSpec,
+    auth: String,
     user_conn_id: u64,
     conn: tokio::net::TcpStream,
 ) -> Option<tokio::net::TcpStream> {
-    xtcp_direct_stream(sess, mux, spec, user_conn_id, conn).await
+    xtcp_direct_stream(sess, mux, spec, auth, user_conn_id, conn).await
 }
 
 /// 中继通道配对交付(session.rs 调用)。
