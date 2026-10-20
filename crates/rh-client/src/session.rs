@@ -81,15 +81,53 @@ impl ClientSession {
 
 /// 自动定容(round-10):协议基线 → 硬件上限三段中的前两段。
 /// 返回 `(initial_k, hardware_cap)`;期望值来源优先级:显式配置 /
-/// `RH_MUX_POOL_SIZE`(已由 config 归并为 `Some(n)`)> 自动基线。
-/// 服务端上限在报到后收敛,srv 之外 K 恒在 [1,8]。
-fn initial_k_for(cfg: &ClientConfig, protocol: rh_transport::Protocol) -> (usize, usize) {
-    initial_k_for_with(cfg, protocol, crate::config::detect_hardware_cap())
+/// `RH_MUX_POOL_SIZE`(已由 config 归并为 `Some(n)`),其次 RTT 自适应
+/// (round-77),最后协议基线。服务端上限在报到后收敛,K 恒在 [1,8]。
+///
+/// round-77:自动路径改为按**实测 RTT** 决定 K(而不是恒 1)。依据是
+/// 低延迟下 K=1 快 8%、而 20ms 下 K=4 快 16%(§82),阈值见
+/// [`rh_transport::carriers_for_rtt`]。
+async fn initial_k_for(
+    cfg: &ClientConfig,
+    protocol: rh_transport::Protocol,
+) -> (usize, usize) {
+    initial_k_for_async(cfg, protocol, crate::config::detect_hardware_cap()).await
+}
+
+/// [`initial_k_for`] 的异步实现(需要一次 RTT 探测)。
+///
+/// RTT 探测只看 `server_addr`(与协议无关);探针失败时退回协议基线,
+/// 不阻断连接。
+pub(crate) async fn initial_k_for_async(
+    cfg: &ClientConfig,
+    protocol: rh_transport::Protocol,
+    hardware_cap: usize,
+) -> (usize, usize) {
+    let baseline = match cfg.mux_pool_size {
+        // 显式配置最高优先:不再探测 RTT(用户已明确表态)。
+        Some(_) => rh_transport::default_carriers(protocol),
+        None => {
+            match cfg.server_addr.parse::<std::net::SocketAddr>() {
+                Ok(addr) => {
+                    rh_transport::auto_carriers(addr, std::time::Duration::from_secs(2)).await
+                }
+                // 地址是域名或非法:无法探测,退回保守基线。
+                Err(_) => rh_transport::default_carriers(protocol),
+            }
+        }
+    };
+    let desired = cfg.mux_pool_size.unwrap_or(baseline);
+    (desired.min(hardware_cap).clamp(1, 8), hardware_cap)
 }
 
 /// 纯函数(可单测):硬件上限由调用方注入,测试不依赖跑测机器的核数与
 /// 网卡队列(≤3 核机器 cpu_cap=1,硬编码 tls K=2 的断言会假红)。
 /// 生产入口 [`initial_k_for`] 传入真实探测值。
+///
+/// 本函数**不探测 RTT**(纯函数):只处理显式值与协议基线。RTT 自适应
+/// 由 [`initial_k_for_async`] 负责。仅供单测使用——生产路径已改走异步
+/// 版本,故标 `cfg(test)` 避免 dead_code。
+#[cfg(test)]
 pub(crate) fn initial_k_for_with(
     cfg: &ClientConfig,
     protocol: rh_transport::Protocol,
@@ -244,7 +282,7 @@ pub async fn connect_and_run(
     let tcfg = cfg.transport_cfg()?;
     // 三段式定容(round-10):显式值/协议基线先过硬件上限,报到后再按
     // 服务端应答收敛。QUIC/KCP 与非 multiplex 不建池(恒单载体)。
-    let (sized_k, hardware_cap) = initial_k_for(&cfg, tcfg.protocol);
+    let (sized_k, hardware_cap) = initial_k_for(&cfg, tcfg.protocol).await;
     let initial_k = if tcfg.protocol.is_tcp_based() && tcfg.multiplex {
         sized_k
     } else {

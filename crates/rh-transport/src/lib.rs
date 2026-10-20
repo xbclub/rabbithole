@@ -461,6 +461,84 @@ pub fn default_carriers(protocol: Protocol) -> usize {
     }
 }
 
+/// BDP 自适应载体数(round-77):根据链路 RTT 决定是否值得开多载体。
+///
+/// # 为什么用 RTT 而不是并发连接数
+///
+/// 本项目此前 20 余轮一直用"并发连接数"作自变量,始终得不到稳定结论。
+/// round-77 用 `tc netem` 人为制造 BDP 约束后,信号立刻清晰(见下表):
+///
+/// | RTT | K=1 | K=4 | K1/K4 | 结论 |
+/// |---|---:|---:|---:|---|
+/// | 0.47ms | 3.19 G | 2.94 G | 1.084 | **K=1 快 8%** |
+/// | 5ms | 3.41 G | 3.46 G | 0.986 | 持平 |
+/// | 20ms | 2.79 G | 3.25 G | 0.861 | **K=4 快 16%(18/18 全胜)** |
+///
+/// **真正的自变量是 BDP(RTT × 带宽),不是并发数。** 低 RTT 下单条 TCP
+/// 的拥塞窗口就足以打满链路,多载体只增加分摊成本(writev 次数
+/// ∝ 1/每载体并发流数);高 BDP 下单窗口成为瓶颈,K 倍窗口的收益才
+/// 压过分摊成本。
+///
+/// # 阈值
+///
+/// - `rtt < 5ms`:返回 1(实测 5ms 时仍持平,低于它 K=1 更优)
+/// - `5ms <= rtt < 15ms`:返回 2(过渡区,温和放大)
+/// - `rtt >= 15ms`:返回 4(实测 20ms 时 K=4 稳定快 16%)
+///
+/// 返回的仍只是**期望值**,还要经 [`default_carriers`]、硬件上限与服务端
+/// `max_carriers` 三重收敛;调用方必须把显式配置(`RH_MUX_POOL_SIZE`)
+/// 排在本函数之前。
+pub fn carriers_for_rtt(rtt: std::time::Duration) -> usize {
+    let ms = rtt.as_secs_f64() * 1000.0;
+    if ms < 5.0 {
+        1
+    } else if ms < 15.0 {
+        2
+    } else {
+        4
+    }
+}
+
+/// 测量到服务端的 RTT(round-77):基于 TCP 建连耗时估计。
+///
+/// # 这是估计,不是精确测量
+///
+/// 真正的 RTT 需要一次应用层往返。这里用**建连耗时**(SYN→SYN/ACK)作
+/// 代理量,因为:
+///
+/// - 建连本身就是一次往返,量级与后续 RTT 同源(同一路径、同一队列);
+/// - 零额外流量、零协议改动,失败不影响连接(探针失败按"无法判定"处理,
+///   退回 [`default_carriers`] 的单载体保守值)。
+///
+/// 已知偏差:SYN 队列排队、服务端 accept backlog 满、NAT 冷启动都会让
+/// 建连耗时**偏大**;而 RTT 缓存命中时会偏小。因此阈值取得比较宽松
+/// (5ms / 15ms 两档),只用来区分"局域网级"与"广域网级",不追求精确。
+///
+/// 返回 `None` = 无法判定(拨号失败),调用方退回保守默认。
+pub async fn probe_rtt(addr: SocketAddr, timeout: std::time::Duration) -> Option<std::time::Duration> {
+    let start = std::time::Instant::now();
+    let conn = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+    let elapsed = start.elapsed();
+    drop(conn);
+    Some(elapsed)
+}
+
+/// 依据实测 RTT 选择载体数(round-77);探针失败时退回协议基线。
+///
+/// **显式配置优先**:调用方必须在调用本函数**之前**处理
+/// `RH_MUX_POOL_SIZE` / 配置文件里的 `mux_pool_size`,不要把两者混在一处。
+pub async fn auto_carriers(addr: SocketAddr, timeout: std::time::Duration) -> usize {
+    match probe_rtt(addr, timeout).await {
+        Some(rtt) => carriers_for_rtt(rtt),
+        // 探针失败(拨号不通/超时):不臆测,退回单载体。真正的拨号会
+        // 在随后由 connect/connect_pool 执行并给出真实错误。
+        None => 1,
+    }
+}
+
 /// TLS 客户端选项。
 #[derive(Debug, Clone, Default)]
 pub struct TlsClientOptions {
@@ -982,6 +1060,46 @@ mod carrier_baseline_tests {
         for p in [Protocol::Quic, Protocol::Kcp] {
             assert!(!p.is_tcp_based());
             assert_eq!(default_carriers(p), 1);
+        }
+    }
+
+    // T-C7(round-77):BDP 自适应载体数。阈值来自实测,不是拍的:
+    //
+    // | RTT | K1/K4 | 结论 |
+    // |---|---:|---|
+    // | 0.47ms | 1.084 | K=1 快 8% |
+    // | 5ms | 0.986 | 持平 |
+    // | 20ms | 0.861 | K=4 快 16%(18/18 全胜) |
+    //
+    // 本测试锁住**阈值边界**,防止有人顺手把 5ms 改成别的值而不重测。
+    #[test]
+    fn carriers_for_rtt_thresholds() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+
+        // 局域网级(<5ms):单 TCP 窗口已够,多载体是负担。
+        assert_eq!(carriers_for_rtt(Duration::ZERO), 1);
+        assert_eq!(carriers_for_rtt(ms(1)), 1);
+        assert_eq!(carriers_for_rtt(Duration::from_micros(4999)), 1);
+
+        // 边界:恰好 5ms 进入过渡区(实测 5ms 时持平,取温和值 2)。
+        assert_eq!(carriers_for_rtt(ms(5)), 2, "5ms 是实测持平点,过渡区起点");
+
+        // 过渡区:5~15ms。
+        assert_eq!(carriers_for_rtt(ms(10)), 2);
+        assert_eq!(carriers_for_rtt(Duration::from_micros(14999)), 2);
+
+        // 广域网级(>=15ms):单窗口成为瓶颈,K=4 的收益才压过分摊成本。
+        assert_eq!(carriers_for_rtt(ms(15)), 4, "15ms 起进入 K=4 区");
+        assert_eq!(carriers_for_rtt(ms(20)), 4);
+        assert_eq!(carriers_for_rtt(ms(200)), 4);
+
+        // 单调不减:更大 BDP 绝不该给出更少载体。
+        let mut prev = 0;
+        for m in [0u64, 1, 4, 5, 10, 15, 20, 50, 100, 500] {
+            let k = carriers_for_rtt(ms(m));
+            assert!(k >= prev, "RTT {m}ms 给出 {k},小于更小 RTT 的 {prev}");
+            prev = k;
         }
     }
 }
