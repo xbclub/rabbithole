@@ -1124,7 +1124,9 @@ mod sizing_tests {
     fn baseline_single_for_tcp() {
         let cfg = ClientConfig::default();
         let (k, _hw) = initial_k_for_with(&cfg, rh_transport::Protocol::Tcp, 8);
-        assert_eq!(k, 1, "tcp 默认必须单载体(round-73)");
+        // 2026-10-20 三机复测:K=2 把 4/16 流从 2.07/2.18G 提到 2.21/2.31G
+        // (K=1 单载体封顶与流数无关)。详见 default_carriers 文档。
+        assert_eq!(k, 2, "tcp 默认载体数为 2");
         // 显式请求多载体时收敛逻辑不变(基线回退不影响显式路径)。
         let (final_k, drops) = plan_convergence(4, &[8, 8, 8]);
         assert_eq!(final_k, 4, "显式 K=4 且服务端允许 8 时保持 4");
@@ -1162,19 +1164,21 @@ mod sizing_tests {
             rh_transport::Protocol::Tls,
             rh_transport::Protocol::Ws,
             rh_transport::Protocol::Wss,
-            rh_transport::Protocol::Quic,
-            rh_transport::Protocol::Kcp,
         ] {
             assert_eq!(
                 initial_k_for_with(&cfg, p, 8).0,
-                1,
-                "{p:?} 默认基线必须为 1(硬件上限充足时)"
+                2,
+                "{p:?} 默认载体数为 2(硬件上限充足时)"
             );
             assert_eq!(
                 initial_k_for_with(&cfg, p, 1).0,
                 1,
                 "硬件上限 1 时任何协议都必须单载体"
             );
+        }
+        // QUIC/KCP 自带多路复用(且 KCP 背压语义依赖单通道),恒 1。
+        for p in [rh_transport::Protocol::Quic, rh_transport::Protocol::Kcp] {
+            assert_eq!(initial_k_for_with(&cfg, p, 8).0, 1, "{p:?} 必须单载体");
         }
     }
 

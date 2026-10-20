@@ -340,7 +340,7 @@ mod tests {
         // (tcp=1)。断言真正参与定容的 initial_k_for_with,而不是已删除的
         // ClientTransportConfig::carriers。
         let (k, _cap) = crate::session::initial_k_for_with(&c, rh_transport::Protocol::Tcp, 8);
-        assert_eq!(k, 1, "None(自动定容)在 tcp 协议下取协议基线 K=1(round-73)");
+        assert_eq!(k, 2, "None(自动定容)在 tcp 协议下取协议基线 K=2");
 
         // 有 env:覆盖默认;布尔解析大小写不敏感
         std::env::set_var("RH_SERVER", "127.0.0.1:7100");
@@ -436,7 +436,7 @@ secret = "s"
         let absent: ClientConfig = toml::from_str(base).unwrap();
         assert_eq!(absent.mux_pool_size, None, "未配置 = 自动定容");
         let (k, _) = crate::session::initial_k_for_with(&absent, rh_transport::Protocol::Tls, 8);
-        assert_eq!(k, 1, "未配置时取协议基线 K=1(round-73)");
+        assert_eq!(k, 2, "未配置时取协议基线 K=2");
 
         let explicit: ClientConfig = toml::from_str(&format!("{base}mux_pool_size = 3\n")).unwrap();
         assert_eq!(explicit.mux_pool_size, Some(3));

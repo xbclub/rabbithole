@@ -459,20 +459,49 @@ pub const DEFAULT_ALPN: &str = "h2";
 /// 把同一份流量摊到多条四元组上,每条都要各自爬拥塞窗口,而单条 10GbE
 /// 路径上单载体的窗口本来就足够——多开只增加成本、不增加上限。
 ///
-/// 保留 `hardware_cap` 探测与服务端 `max_carriers` 收敛:它们约束的是
-/// **用户显式请求**的 K(`RH_MUX_POOL_SIZE`/配置文件),不是默认路径。
-/// 默认路径因此重新回到"单载体,不建池"。
+/// # 2026-10-20:默认改回 2(推翻 round-73)
 ///
-/// QUIC/KCP 自带多路复用(单 UDP 连接承载全部流),同样恒 1。
+/// round-73 的结论只覆盖**低 RTT** 实验床,且当时对照的是 K=1 vs K=4
+/// (4 条载体在低 BDP 下分摊成本高)。本轮三机复测(直连 2.6-2.9 G、
+/// 单载体隧道封顶 2.1-2.2 G 且**与流数无关**)重新给出可测缺口:
+///
+/// | 方向×流 | K=1 | K=2 | K=4 | frp |
+/// |---|---:|---:|---:|---:|
+/// | up×4 | 2072 | 2213 | 2184 | 2095-2354 |
+/// | up×16 | 2178 | 2306 | 2323 | 2248-2386 |
+/// | dn×16 | 2206 | 2418 | 2390 | 2133-2279 |
+///
+/// 单载体封顶的机理不是 CPU(服务端均值 0.26 核),而是**单条 TCP 流的
+/// 拥塞窗 + yamux 单 FlushTask 串行**。K=2 恰好把这个串行点劈成两条,
+/// K=4 不再有额外收益(只增加每条连接的爬窗成本)。
+///
+/// 保留 `hardware_cap` 探测与服务端 `max_carriers` 收敛。
+///
+/// QUIC/KCP 自带多路复用(单 UDP 连接承载全部流);KCP 的端到端背压
+/// 语义还依赖单通道(见 `b08_public_mux_stalled_reader_backpressure_and_recovery`),
+/// 二者同样恒 1。
 ///
 /// 该值只是**期望值**,最终 K 还要经硬件探测与服务端 `max_carriers` 收敛
 /// (见 rh-client 的 pool sizing);此处不读环境/配置。
 pub fn default_carriers(protocol: Protocol) -> usize {
+    // 2026-10-20 三机 A/B(deep-review-r3,Go loadgen,5×15s 取中位):
+    //
+    //   K=1  TCP 4 流 2072 / 16 流 2178;16 流对 frp 0.95-0.97
+    //   K=2  TCP 4 流 2213 / 16 流 2306;4 流 1.06 / 16 流 0.97-1.07
+    //   K=4  与 K=2 持平(2184 / 2323),只增成本
+    //
+    // 单载体在 2.1-2.2 G 封顶且**与流数无关**——瓶颈是 yamux 发送侧
+    // 单 FlushTask 串行 + 单 TCP 流的拥塞窗上限,不是 CPU(服务端 0.26 核
+    // 平均)。K=2 用两条物理连接各持一套发送侧,把该串行点劈开。
+    //
+    // 之前"单载体已到路径上限"的结论来自 round-73 的低 RTT 实验床;
+    // 本轮直连可到 2.6-2.9 G,隧道 2.2 G,上限并未触及。
+    //
+    // QUIC/KCP 自带多路复用(单 UDP 连接承载全部流),且 KCP 的端到端
+    // 背压语义依赖单通道,保持 1。
     match protocol {
-        // 单 UDP 连接即多路复用,多载体无意义。
         Protocol::Quic | Protocol::Kcp => 1,
-        // tcp/tls/ws/wss:单载体已到路径上限(round-73 实测,见上)。
-        _ => 1,
+        _ => 2,
     }
 }
 
@@ -1067,7 +1096,7 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
 /// # K 的取值(round-45 修正)
 ///
 /// 本函数**不决定** K,由调用方显式传入。默认值见
-/// [`default_carriers`]:六个协议全部为 1(round-73 起)。
+/// [`default_carriers`]:tcp/tls/ws/wss 为 2,quic/kcp 为 1。
 /// 显式配置见 `rh-client` 的 `mux_pool_size`(env `RH_MUX_POOL_SIZE`)。
 ///
 /// 曾经此处写「推荐 K = 4」并引用一个从未被读取的常量,那与实现不符——
@@ -1089,27 +1118,23 @@ pub async fn connect_pool(
 mod carrier_baseline_tests {
     use super::*;
 
-    // T-C1(round-10,round-54 修订,round-73 回退):协议基线六变体全覆盖。
+    // T-C1(round-10 → round-54 → round-73 → 2026-10-20):协议基线六变体全覆盖。
     //
     // round-10 原值:tcp/ws = 1、tls/wss = 2、quic/kcp = 1。
     // round-54 改成 tcp/tls/ws/wss = 4、quic/kcp = 1——依据是一组后来被
-    //   证伪的测量(iperf3 接收端先饱和,详见 [`default_carriers`] 文档)。
-    // round-73 **全部回退为 1**:同一窗口内严格交替 K=1/K=4 各 6 次,
-    //   K=1 从未更慢,下行稳定快 15~20%。
+    //   证伪的测量(iperf3 接收端先饱和)。
+    // round-73 全部回退为 1——低 RTT 床上 K=1/K=4 交替 6 次,K=1 不慢。
+    // 2026-10-20 三机复测(Go loadgen,直连 2.6-2.9G):单载体隧道封顶
+    //   2.1-2.2G 且与流数无关,K=2 把 4/16 流提到 frp 水平,K=4 无额外
+    //   收益。故 tcp-base 默认改为 2;QUIC/KCP 仍为 1(自带多路复用,
+    //   KCP 的背压语义还依赖单通道)。
     //
     // 本测试锁的是"每个协议的默认值",任何改动都必须同步更新这里——
     // 它是一处**有意的**重复,用来防止默认值漂移无声通过。
     #[test]
     fn default_carriers_covers_all_protocols() {
-        for p in [
-            Protocol::Tcp,
-            Protocol::Tls,
-            Protocol::Ws,
-            Protocol::Wss,
-            Protocol::Quic,
-            Protocol::Kcp,
-        ] {
-            assert_eq!(default_carriers(p), 1, "{p:?} 的默认载体数应为 1");
+        for p in [Protocol::Tcp, Protocol::Tls, Protocol::Ws, Protocol::Wss] {
+            assert_eq!(default_carriers(p), 2, "{p:?} 的默认载体数应为 2");
         }
         // 红线 1 的形式化:非 tcp-based 恒 1(自带多路复用,多载体无意义)。
         for p in [Protocol::Quic, Protocol::Kcp] {
