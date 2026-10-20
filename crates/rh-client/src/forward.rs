@@ -260,6 +260,19 @@ pub async fn resolve(host: &str, port: u16) -> anyhow::Result<std::net::SocketAd
 /// poll_shutdown 永久 Pending 时不得扣住 IO。clean EOF 不受此限(红线)。
 const ERROR_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// 无锁拆分命中计数(仅测试用):断言 splice 在裸 TCP 上确实走了
+/// `split_boxed_io` 而非共享一把 Mutex 的 `tokio::io::split`。
+///
+/// 是**进程级全局**计数,故两条探针测试用 [`SPLIT_PROBE_LOCK`] 串行,
+/// 否则并行执行时彼此的 splice 会污染对方的差值(实测必 flaky)。
+#[cfg(test)]
+static LOCKLESS_SPLITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 探针测试串行锁(见 [`LOCKLESS_SPLITS`])。用 tokio Mutex:守卫要跨
+/// `await` 持有(std MutexGuard 跨 await 会被 clippy 判为错误)。
+#[cfg(test)]
+static SPLIT_PROBE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 双向搬运(保持半关闭:一边 EOF 只关闭另一边的写方向)。
 /// A1(d):父任务取消(本 future 被 drop)→ 守卫 Drop → abort 双向子泵,
 /// 不再随 await 移动句柄而 detach(与服务端 copy_relay_pair 同形态)。
@@ -271,8 +284,47 @@ const ERROR_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(1)
 /// 对端永不回 FIN 时 socket 永久停 `FIN-WAIT-2`/`CLOSING`;等对向自然
 /// 结束的语义保留,只是把上限交给 halfclose_grace(默认 30s)。
 pub async fn splice(a: BoxedIo, b: BoxedIo, bucket: Option<Arc<rh_core::ratelimit::TokenBucket>>) {
-    let (mut ar, mut aw) = tokio::io::split(a);
-    let (mut br, mut bw) = tokio::io::split(b);
+    // round-69 同款:先试无锁拆分(裸 TcpStream → into_split,读写各一 fd、
+    // 零共享锁),不支持时回落 `tokio::io::split`。
+    //
+    // 为什么必须换:`tokio::io::split` 的两半共享**一把 `std::sync::Mutex`**
+    // (`tokio/src/io/split.rs` 的 `with_lock` 直接 `lock().unwrap()`),
+    // poll_read/poll_write 整段在锁内。一端在内核态(`recvfrom`/`copy_user`)
+    // 持锁时,另一端 `lock()` 会**阻塞整个 OS 线程**而不是让出。
+    // 实测(mux_relay,上行 P=16、strace -c):futex 占 75.0% 的 syscall 时间
+    // (39.85s/53.13s),同期 recvfrom 仅 10.9%、writev 8.1% —— 绝大部分时间
+    // 在等锁而非收发。
+    //
+    // 这条路径承接:所有 use_compression=true 的规则、relay_mode=copy 的
+    // A/B 对照、全部插件规则、全部 visitor 流量(stcp/xtcp)。
+    let (mut ar, mut aw): (
+        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    ) = match rh_transport::split_boxed_io(a) {
+        Ok((r, w)) => {
+            #[cfg(test)]
+            LOCKLESS_SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (Box::new(r), Box::new(w))
+        }
+        Err(io) => {
+            let (r, w) = tokio::io::split(io);
+            (Box::new(r), Box::new(w))
+        }
+    };
+    let (mut br, mut bw): (
+        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    ) = match rh_transport::split_boxed_io(b) {
+        Ok((r, w)) => {
+            #[cfg(test)]
+            LOCKLESS_SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (Box::new(r), Box::new(w))
+        }
+        Err(io) => {
+            let (r, w) = tokio::io::split(io);
+            (Box::new(r), Box::new(w))
+        }
+    };
     let bucket2 = bucket.clone();
     // 本向以错误(非 EOF)结束时置位:对向数据通路已死,不得永存
     let up_errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -797,6 +849,159 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(45), &mut parent)
             .await
             .expect("数据送达后 relay 必须收敛")
+            .unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // 无锁拆分(round-69 同款):`tokio::io::split` 的两半共享一把
+    // `std::sync::Mutex`,一端在内核态持锁时另一端会阻塞整个 OS 线程。
+    // splice() 改为优先 `rh_transport::split_boxed_io`(裸 TcpStream →
+    // into_split,读写各一 fd、零共享锁),包装类型回落旧路径。
+    //
+    // 以下两条测试用**真实 TcpStream**(而非 duplex —— duplex 不是
+    // TcpStream,永远走回落分支,测不到目标路径)。
+    // ------------------------------------------------------------------
+
+    /// 起一对回环 TcpStream(连接已建立)。
+    async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let accept = tokio::spawn(async move { l.accept().await.unwrap().0 });
+        let cli = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let srv = accept.await.unwrap();
+        (cli, srv)
+    }
+
+    /// 核心验收:splice 两条真实 TcpStream,双向各传 1 MiB,内容必须完整。
+    /// 同时断言**确实走了无锁分支**(探针计数增加)。
+    #[tokio::test]
+    async fn splice_lockless_split_bidirectional_1mib() {
+        // 探针是进程级全局:与 splice_falls_back_for_non_tcp 串行,避免并行
+        // 测试互相污染计数差值。
+        let _serial = SPLIT_PROBE_LOCK.lock().await;
+        const N: usize = 1024 * 1024;
+
+        // 外侧两端(测试自己持有),中间两条交给 splice 对接。
+        // 外侧各自 into_split:读写要在不同任务里并发进行。
+        let (out_a, a) = tcp_pair().await; // out_a ↔ a
+        let (mut out_a_r, mut out_a_w) = out_a.into_split();
+        let (out_b, b) = tcp_pair().await; // out_b ↔ b
+        let (mut out_b_r, mut out_b_w) = out_b.into_split();
+
+        let before = LOCKLESS_SPLITS.load(Ordering::Relaxed);
+        let relay = tokio::spawn(splice(Box::new(a), Box::new(b), None));
+        // 无锁分支必须在 splice 起步后立刻命中两次(a、b 各一)
+        for _ in 0..200 {
+            if LOCKLESS_SPLITS.load(Ordering::Relaxed) >= before + 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let after = LOCKLESS_SPLITS.load(Ordering::Relaxed);
+        assert!(
+            after >= before + 2,
+            "splice 必须对两条裸 TcpStream 都走无锁拆分(实际命中 {} 次)",
+            after - before
+        );
+
+        // 内容用可校验的模式填(避免全 0 掩盖截断/错位)
+        let up: Vec<u8> = (0..N).map(|i| (i % 251) as u8).collect();
+        let dn: Vec<u8> = (0..N).map(|i| ((i * 7 + 3) % 241) as u8).collect();
+
+        // 双向并发:每一侧同时写自己那份、读对方那份,制造两个方向同时在途
+        // (正是旧实现里两个 poll 争同一把 Mutex 的现场)。
+        // a 侧写 up、读 dn;b 侧写 dn、读 up。
+        let up_a = up.clone();
+        let dn_b = dn.clone();
+        let side_a = tokio::spawn(async move {
+            let ((), r) = tokio::join!(
+                async {
+                    out_a_w.write_all(&up_a).await.unwrap();
+                    out_a_w.shutdown().await.unwrap();
+                },
+                async {
+                    let mut v = Vec::with_capacity(N);
+                    out_a_r.read_to_end(&mut v).await.unwrap();
+                    v
+                }
+            );
+            r
+        });
+        let side_b = tokio::spawn(async move {
+            let ((), r) = tokio::join!(
+                async {
+                    out_b_w.write_all(&dn_b).await.unwrap();
+                    out_b_w.shutdown().await.unwrap();
+                },
+                async {
+                    let mut v = Vec::with_capacity(N);
+                    out_b_r.read_to_end(&mut v).await.unwrap();
+                    v
+                }
+            );
+            r
+        });
+
+        let got_dn = side_a.await.unwrap();
+        let got_up = side_b.await.unwrap();
+
+        assert_eq!(got_up.len(), N, "a→b 方向字节数必须完整");
+        assert_eq!(got_dn.len(), N, "b→a 方向字节数必须完整");
+        assert_eq!(got_up, up, "a→b 方向内容必须逐字节一致");
+        assert_eq!(got_dn, dn, "b→a 方向内容必须逐字节一致");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), relay)
+            .await
+            .expect("双向 clean EOF 后 splice 必须收敛")
+            .unwrap();
+    }
+
+    /// 非 TcpStream(包装/内存流)必须安全回落到 `tokio::io::split`,
+    /// 且功能不受影响 —— 无锁拆分是优化,不是功能前提。
+    #[tokio::test]
+    async fn splice_falls_back_for_non_tcp() {
+        let _serial = SPLIT_PROBE_LOCK.lock().await;
+        let (mut a_peer, a_local) = tokio::io::duplex(64 * 1024);
+        let (mut b_peer, b_local) = tokio::io::duplex(64 * 1024);
+
+        let before = LOCKLESS_SPLITS.load(Ordering::Relaxed);
+        let relay = tokio::spawn(splice(Box::new(a_local), Box::new(b_local), None));
+        // duplex 不是 TcpStream:不得命中无锁分支
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            LOCKLESS_SPLITS.load(Ordering::Relaxed),
+            before,
+            "duplex 必须回落到 tokio::io::split,不得误判为裸 TCP"
+        );
+
+        a_peer.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            b_peer.read_exact(&mut buf),
+        )
+        .await
+        .expect("回落路径必须仍能转发")
+        .unwrap();
+        assert_eq!(&buf, b"ping");
+
+        b_peer.write_all(b"pong").await.unwrap();
+        let mut buf2 = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            a_peer.read_exact(&mut buf2),
+        )
+        .await
+        .expect("回落路径反向也必须能转发")
+        .unwrap();
+        assert_eq!(&buf2, b"pong");
+
+        // 收尾:两侧 shutdown 让 splice 自然结束
+        drop(a_peer);
+        drop(b_peer);
+        tokio::time::timeout(std::time::Duration::from_secs(10), relay)
+            .await
+            .expect("回落路径也必须收敛")
             .unwrap();
     }
 }
