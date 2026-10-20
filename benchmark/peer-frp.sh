@@ -229,16 +229,21 @@ PYEOF
     printf '%s' "$out"
   }
 
-  hdr "吞吐 (${THP_TOOL}, 每档 ${PEER_DURATION}s)"
+  # 重复配对次数,与 peer.sh 的 PEER_REPEAT 同语义、同默认值 —— 两侧轮数
+  # 不一致会让"取中位数"与"单次采样"混比,对比失效。
+  local repeat="${PEER_REPEAT:-3}" sample
+  hdr "吞吐 (${THP_TOOL}, 每档 ${PEER_DURATION}s × ${repeat} 次配对)"
+  for sample in $(seq 1 "$repeat"); do
   for spec in "1:upload:" "1:download:-R" "4:upload:" "4:download:-R" "16:upload:" "16:download:-R"; do
     local streams dir rev mbps
     streams="${spec%%:*}"; rest="${spec#*:}"; dir="${rest%%:*}"; rev="${rest#*:}"
     mbps="$(thp "$b_ip" "$T_IPERF" "$streams" "$rev")"
-    rec "{\"metric\":\"throughput\",\"path\":\"direct\",\"dir\":\"$dir\",\"streams\":$streams,\"mbps\":$mbps,\"proto\":\"frp-$PROTO\"}"
-    log "  直连  ${streams}s $dir: ${mbps} Mbps"
+    rec "{\"metric\":\"throughput\",\"path\":\"direct\",\"dir\":\"$dir\",\"streams\":$streams,\"mbps\":$mbps,\"sample\":$sample,\"proto\":\"frp-$PROTO\"}"
+    log "  直连  ${streams}s $dir 第${sample}次: ${mbps} Mbps"
     mbps="$(thp "$a_ip" "$P_IPERF" "$streams" "$rev")"
-    rec "{\"metric\":\"throughput\",\"path\":\"tunnel\",\"dir\":\"$dir\",\"streams\":$streams,\"mbps\":$mbps,\"proto\":\"frp-$PROTO\"}"
-    log "  隧道  ${streams}s $dir: ${mbps} Mbps"
+    rec "{\"metric\":\"throughput\",\"path\":\"tunnel\",\"dir\":\"$dir\",\"streams\":$streams,\"mbps\":$mbps,\"sample\":$sample,\"proto\":\"frp-$PROTO\"}"
+    log "  隧道  ${streams}s $dir 第${sample}次: ${mbps} Mbps"
+  done
   done
 
   # ---------- 延迟 ----------
