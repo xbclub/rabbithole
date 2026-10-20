@@ -36,6 +36,23 @@ kill_role() {  # <host> <pattern> <dir>
 }
 json_field() { python3 -c "import json,sys;print(json.load(sys.stdin).get('output',''))"; }
 
+# wait_drive <label> —— 轮询 drive.out 直到出现 "== 完成 ==" 或进程消失。
+# drive 是 setsid 常驻(本地 termark exec 超时会切断客户端连接但不会杀远端
+# 进程),因此必须显式等待,不能依赖 exec 返回。
+wait_drive() {
+  local lbl="$1" i
+  for i in $(seq 1 240); do   # 240 × 20s = 80min 上限
+    local st
+    st="$(tex "$HOST_C" "grep -q '== 完成 ==' /tmp/peer-results-$lbl/drive.out 2>/dev/null && echo DONE || (pgrep -f 'peer.* drive ' >/dev/null && echo RUN || echo GONE)" 30 | json_field)"
+    case "$st" in
+      DONE) echo "  drive $lbl 完成"; return 0 ;;
+      GONE) echo "  drive $lbl 进程已退出(未见完成标记)"; return 1 ;;
+    esac
+    sleep 20
+  done
+  echo "  drive $lbl 轮询超时"; return 1
+}
+
 echo "== 同步仓库/二进制就绪检查"
 for h in "$HOST_A" "$HOST_B" "$HOST_C"; do
   tex "$h" "cd $BENCH_REPO && git rev-parse --short HEAD && ls -l $BENCH_BIN/rh-server $BENCH_BIN/rh-client $BENCH_BIN/loadgen | wc -l" 60 \
@@ -80,7 +97,8 @@ LOADGEN_BIN=$BENCH_BIN/loadgen PEER_RUN_ID=$label-$lbl PROTO=$proto"
       token="$(tex "$HOST_C" "curl -s -m 10 -X POST http://$A_IP:18080/api/auth/login -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"peer-Pass-1\"}'" 30 | json_field | python3 -c "import json,sys;print(json.loads(sys.stdin.read()).get('data',{}).get('accessToken',''))")"
       [ -n "$token" ] || { echo "!! 登录失败"; continue; }
       echo "== [$lbl] drive"
-      tex "$HOST_C" "cd $BENCH_REPO/benchmark && PEER_DIR=/tmp/peer-results-$lbl PEER_DURATION=$DURATION PEER_REPEAT=$REPEAT PEER_CONC_LEVELS='$CONC_LEVELS' PEER_CONC_HOLD=$CONC_HOLD THP_TOOL=loadgen LOADGEN_BIN=$BENCH_BIN/loadgen PEER_RUN_ID=$label-$lbl PROTO=$proto RELAY=splice MUX=1 setsid bash $script drive $A_IP $B_IP 18080 $token $cid $lbl > /tmp/peer-results-$lbl/drive.out 2>&1 < /dev/null; echo DRIVE_EXIT=\$?" 3600 | json_field
+      tex "$HOST_C" "cd $BENCH_REPO/benchmark && PEER_DIR=/tmp/peer-results-$lbl PEER_DURATION=$DURATION PEER_REPEAT=$REPEAT PEER_CONC_LEVELS='$CONC_LEVELS' PEER_CONC_HOLD=$CONC_HOLD THP_TOOL=loadgen LOADGEN_BIN=$BENCH_BIN/loadgen PEER_RUN_ID=$label-$lbl PROTO=$proto RELAY=splice MUX=1 setsid bash $script drive $A_IP $B_IP 18080 $token $cid $lbl > /tmp/peer-results-$lbl/drive.out 2>&1 < /dev/null; echo STARTED" 120 | json_field
+      wait_drive "$lbl" || true
     else
       echo "== [$lbl] 起 frps"
       tex "$HOST_A" "cd $BENCH_REPO/benchmark && $common setsid bash $script server > $PEER_DIR/srv.out 2>&1 < /dev/null & sleep 2; tail -5 $PEER_DIR/srv.out" 60 | json_field
@@ -89,7 +107,8 @@ LOADGEN_BIN=$BENCH_BIN/loadgen PEER_RUN_ID=$label-$lbl PROTO=$proto"
       tex "$HOST_B" "cd $BENCH_REPO/benchmark && $common setsid bash $script client $A_IP > $PEER_DIR/cli.out 2>&1 < /dev/null & sleep 2; tail -5 $PEER_DIR/cli.out" 60 | json_field
       sleep 3
       echo "== [$lbl] drive"
-      tex "$HOST_C" "cd $BENCH_REPO/benchmark && PEER_DIR=/tmp/peer-results-$lbl PEER_DURATION=$DURATION PEER_REPEAT=$REPEAT THP_TOOL=loadgen LOADGEN_BIN=$BENCH_BIN/loadgen PROTO=$proto setsid bash $script drive $A_IP $B_IP $lbl > /tmp/peer-results-$lbl/drive.out 2>&1 < /dev/null; echo DRIVE_EXIT=\$?" 3600 | json_field
+      tex "$HOST_C" "cd $BENCH_REPO/benchmark && PEER_DIR=/tmp/peer-results-$lbl PEER_DURATION=$DURATION PEER_REPEAT=$REPEAT THP_TOOL=loadgen LOADGEN_BIN=$BENCH_BIN/loadgen PROTO=$proto setsid bash $script drive $A_IP $B_IP $lbl > /tmp/peer-results-$lbl/drive.out 2>&1 < /dev/null; echo STARTED" 120 | json_field
+      wait_drive "$lbl" || true
     fi
 
     echo "== [$lbl] 回收结果"
