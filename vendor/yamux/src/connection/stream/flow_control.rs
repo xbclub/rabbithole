@@ -1,187 +1,140 @@
-use std::{cmp, sync::Arc};
+use std::sync::Arc;
 
-use parking_lot::Mutex;
-use web_time::Instant;
+use crate::{Config, ConnectionError, DEFAULT_CREDIT};
 
-use crate::{connection::rtt::Rtt, Config, ConnectionError, DEFAULT_CREDIT};
-
+/// 恒定单流接收窗流控(round-E1,对齐 frp v0.2.0):
+/// - MaxStreamWindowSize 恒定(fatedier/yamux stream.go L284
+///   `max := config.MaxStreamWindowSize`),窗口永不自增;
+/// - 无连接级共享预算、无 BDP/auto-tune(全源码无此逻辑)。
+///
+/// `max_receive_window` 恒等于配置初窗
+/// ([`Config::initial_stream_receive_window`],下限 [`DEFAULT_CREDIT`]),
+/// 不随流数收缩、不随吞吐自增;(初窗 − DEFAULT_CREDIT)差额由建流授信
+/// ([`FlowController::take_creation_grant`],round-4/B1,对齐 frp
+/// OpenStream/AcceptStream 的 sendWindowUpdate 时机)一次性授出;读路径
+/// [`FlowController::next_window_update`] 只在半窗阈值过后回补已耗额度,
+/// 不增窗。
+///
+/// 内存护栏:聚合在途敞口 = 并发流数 × max_receive_window,唯一护栏是
+/// [`Config::max_num_streams`](rh-server 的 limits.mux_streams;0=不限时
+/// 敞口无界,与 frp 行为一致,生产建议显式配置流上限)。
 #[derive(Debug)]
 pub(crate) struct FlowController {
     config: Arc<Config>,
-    last_window_update: Instant,
-    /// See [`Connection::rtt`].
-    rtt: Rtt,
-    /// See [`Connection::accumulated_max_stream_windows`].
-    accumulated_max_stream_windows: Arc<Mutex<usize>>,
     receive_window: u32,
     max_receive_window: u32,
     send_window: u32,
-    /// round-2 预授信:建流抬高的 (max − DEFAULT_CREDIT) 差额尚未经
-    /// 窗口更新帧授出前为 `true`。此差额不是实测接收吞吐,在它授出
-    /// (本流首个窗口更新)之前不进入 BDP 自增窗——否则首个 WU 会以
-    /// "建流瞬间消耗了初窗" 的假速率立刻翻倍。
+    /// 建流授信(round-2 预授信 / round-4/B1):建流抬高的
+    /// (max − DEFAULT_CREDIT) 差额尚未经窗口更新帧授出前为 `true`。
+    /// round-4/B1 起该差额在流创建时即由 [`FlowController::take_creation_grant`]
+    /// 授出(排队失败的兜底会回滚本标记,差额回落由读路径授出)。
+    /// round-E1 起无 BDP 自增,本标记只服务 take/restore 的幂等与回滚。
     pregrant_pending: bool,
 }
 
-/// 连接级"超出规约保底"的窗口总预算:
-/// `max_connection_receive_window − 256KiB × max_num_streams`(None =
-/// 不限)。所有减法/乘法饱和运算:`max_num_streams` 上限 usize::MAX 时
-/// 乘积封顶,预算归 0(预授信/自增窗退回规约保底,不 panic、不回绕)。
-fn connection_budget(config: &Config) -> usize {
-    config
-        .max_connection_receive_window
-        .unwrap_or(usize::MAX)
-        .saturating_sub(
-            config
-                .max_num_streams
-                .saturating_mul(DEFAULT_CREDIT as usize),
-        )
-}
-
 impl FlowController {
-    pub(crate) fn new(
-        receive_window: u32,
-        send_window: u32,
-        accumulated_max_stream_windows: Arc<Mutex<usize>>,
-        rtt: Rtt,
-        config: Arc<Config>,
-    ) -> Self {
-        // 预授信初窗(round-2):max_receive_window 从配置初窗起步(默认
-        // DEFAULT_CREDIT = upstream 原行为)。receive_window 仍按规约从
-        // DEFAULT_CREDIT 开始——首个窗口更新 poll 会以普通 WU 帧把
-        // (初窗 − 256KiB) 的差额授给对端(max − receive_window ≥ max/2
-        // 恒成立,半窗阈值天然放行),对端任何版本都只见到标准 WU。
-        //
-        // 预授信必须先吃连接预算的剩余额度:预算
-        // (max_connection_receive_window − 256KiB×max_num_streams)是
-        // 所有流共享的"超出保底"总额,N 条流各自预授信不得穿底——
-        // 否则 next_window_update 的连接限额减法下溢(修前:无条件入账,
-        // 累计值可超预算),且 4096 流会预留不受控的额外信用。额度不足
-        // 时退回规约保底 DEFAULT_CREDIT(每流保底仍由 yamux 断言保证)。
-        let wanted = (config.initial_stream_receive_window as u32).max(DEFAULT_CREDIT) as usize;
-        let mut accumulated = accumulated_max_stream_windows.lock();
-        let room = connection_budget(&config).saturating_sub(*accumulated);
-        let extra = room.min(wanted - DEFAULT_CREDIT as usize);
-        let max_receive_window = u32::try_from(DEFAULT_CREDIT as usize + extra)
-            .expect("DEFAULT_CREDIT + budget extra fits u32 (both <= u32::MAX checked)");
-        // 记账:assert_invariants 与 Drop 都按 (max − DEFAULT_CREDIT) 计
-        // 入/扣回累计计数器,起步差额必须在此入账(与 Drop 守恒)。
-        *accumulated += (max_receive_window - DEFAULT_CREDIT) as usize;
-        drop(accumulated);
+    pub(crate) fn new(receive_window: u32, send_window: u32, config: Arc<Config>) -> Self {
+        // 恒定窗(round-E1):max_receive_window = max(配置初窗, DEFAULT_CREDIT),
+        // 不再随连接预算收缩——连接级共享预算已删除(对齐 frp,无此概念)。
+        // receive_window 仍按规约从 DEFAULT_CREDIT 开始——(初窗 − 256KiB)
+        // 的差额自 round-4/B1 起由 take_creation_grant 在建流时以带初始
+        // flag 的 WU 帧授给对端(排队失败的兜底回落读路径
+        // next_window_update:max − receive_window ≥ max/2 恒成立,半窗
+        // 阈值同样放行),对端任何版本都只见到标准 WU。
+        let max_receive_window = (config.initial_stream_receive_window as u32).max(DEFAULT_CREDIT);
         Self {
             receive_window,
             send_window,
             config,
-            rtt,
-            accumulated_max_stream_windows,
             max_receive_window,
-            last_window_update: Instant::now(),
             pregrant_pending: max_receive_window > DEFAULT_CREDIT,
         }
     }
 
-    /// Calculate the number of additional window bytes the receiving side (local) should grant the
-    /// sending side (remote) via a window update message.
+    /// 计算本轮应授出的额度(**纯函数,无记账副作用**)。
     ///
     /// Returns `None` if too small to justify a window update message.
-    pub(crate) fn next_window_update(&mut self, buffer_len: usize) -> Option<u32> {
+    ///
+    /// 与 [`FlowController::commit_window_update`] 成对使用:先算后记,
+    /// 中间可以插入"帧能否发出"的判定(容量确认),从而把**记账**从
+    /// **决策**里拆出来。修前 `next_window_update` 计算与记账合一,任何
+    /// "先记账、后发现发不出去"的路径都会永久丢失窗口额度,这也是读路径
+    /// 必须把回窗判定拆成多次取锁(容量确认 → 记账 → 压帧)的根因。
+    pub(crate) fn pending_window_update(&self, buffer_len: usize) -> Option<u32> {
         self.assert_invariants(buffer_len);
 
         let bytes_received = self.max_receive_window - self.receive_window;
-        let mut next_window_update =
+        let next_window_update =
             bytes_received.saturating_sub(buffer_len.try_into().unwrap_or(u32::MAX));
 
         // Don't send an update in case half or more of the window is still available to the sender.
         if next_window_update < self.max_receive_window / 2 {
             return None;
         }
-
-        log::trace!(
-            "received {} mb in {} seconds ({} mbit/s)",
-            next_window_update as f64 / crate::MIB as f64,
-            self.last_window_update.elapsed().as_secs_f64(),
-            next_window_update as f64 / crate::MIB as f64 * 8.0
-                / self.last_window_update.elapsed().as_secs_f64()
-        );
-
-        // Auto-tuning `max_receive_window`
-        //
-        // The ideal `max_receive_window` is equal to the bandwidth-delay-product (BDP), thus
-        // allowing the remote sender to exhaust the entire available bandwidth on a single stream.
-        // Choosing `max_receive_window` too small prevents the remote sender from exhausting the
-        // available bandwidth. Choosing `max_receive_window` to large is wasteful and delays
-        // backpressure from the receiver to the sender on the stream.
-        //
-        // In case the remote sender has exhausted half or more of its credit in less than 2
-        // round-trips, try to double `max_receive_window`.
-        //
-        // For simplicity `max_receive_window` is never decreased.
-        //
-        // This implementation is heavily influenced by QUIC. See document below for rational on the
-        // above strategy.
-        //
-        // https://docs.google.com/document/d/1F2YfdDXKpy20WVKJueEf4abn_LVZHhMUMS5gX6Pgjl4/edit?usp=sharing
-        if !self.pregrant_pending
-            && self
-                .rtt
-                .get()
-                .map(|rtt| self.last_window_update.elapsed() < rtt * 2)
-                .unwrap_or(false)
-        {
-            let mut accumulated_max_stream_windows = self.accumulated_max_stream_windows.lock();
-
-            // Ideally one can just double it:
-            let new_max = self.max_receive_window.saturating_mul(2);
-
-            // But one has to consider the configured connection limit:
-            let new_max = {
-                // 饱和运算:预算减法在 accumulated 已吃满时归 0(修前为
-                // usize 下溢,debug panic / release 回绕成超大窗口),
-                // 再叠回当前 max 即得本流可达上限。
-                let room =
-                    connection_budget(&self.config).saturating_sub(*accumulated_max_stream_windows);
-                let connection_limit = (self.max_receive_window as usize).saturating_add(room);
-
-                cmp::min(new_max, connection_limit.try_into().unwrap_or(u32::MAX))
-            };
-
-            // Account for the additional credit on the accumulated connection counter.
-            *accumulated_max_stream_windows += (new_max - self.max_receive_window) as usize;
-            drop(accumulated_max_stream_windows);
-
-            log::debug!(
-                "old window_max: {} mb, new window_max: {} mb",
-                self.max_receive_window as f64 / crate::MIB as f64,
-                new_max as f64 / crate::MIB as f64
-            );
-
-            self.max_receive_window = new_max;
-
-            // Recalculate `next_window_update` with the new `max_receive_window`.
-            let bytes_received = self.max_receive_window - self.receive_window;
-            next_window_update =
-                bytes_received.saturating_sub(buffer_len.try_into().unwrap_or(u32::MAX));
-        }
-
-        self.last_window_update = Instant::now();
-        // 预授信差额已随本窗口更新授出:自此的窗口消耗才是实测接收
-        // 吞吐,下一个满足时延条件的更新可进入 BDP 自增窗。
-        self.pregrant_pending = false;
-        self.receive_window += next_window_update;
-
-        self.assert_invariants(buffer_len);
-
         Some(next_window_update)
+    }
+
+    /// 记账:确认本轮额度**已确定授出**(调用方须保证紧随其后是无失败的
+    /// 帧压入/发送)。幂等于"额度 > 0"的 [`Self::pending_window_update`]。
+    pub(crate) fn commit_window_update(&mut self, credit: u32) {
+        // round-E1:恒定窗——对齐 frp v0.2.0(窗口永不自增),此处只回补
+        // 已耗额度;BDP 自增与连接预算钳制均已删除。
+        // 预授信差额在建流时已授出(round-4/B1;排队失败的兜底路径则随
+        // 本窗口更新授出)——标记消费与授出配套。
+        self.pregrant_pending = false;
+        self.receive_window += credit;
+
+        // round-22 诊断:统计实际发出的 WU credit 分布。
+        crate::sched_diag::on_wu_credit(credit as u64);
+    }
+
+    /// 计算并立即记账(旧语义,供"记账后必有 infallible 压入"的调用点)。
+    ///
+    /// Calculate the number of additional window bytes the receiving side (local) should grant the
+    /// sending side (remote) via a window update message.
+    ///
+    /// Returns `None` if too small to justify a window update message.
+    pub(crate) fn next_window_update(&mut self, buffer_len: usize) -> Option<u32> {
+        let credit = self.pending_window_update(buffer_len)?;
+        self.commit_window_update(credit);
+        self.assert_invariants(buffer_len);
+        Some(credit)
+    }
+
+    /// 建流即授信(round-4/B1,对齐 frp OpenStream/AcceptStream 时机):
+    /// 把预授差额(max_receive_window − DEFAULT_CREDIT)在流创建时一次性授出,
+    /// 不再等读路径首个窗口更新 poll。返回授出额度(0 = 无预授或已授出)。
+    /// 记账与读路径 next_window_update 同构:consume pregrant_pending、
+    /// receive_window += delta;不动 max(恒定窗,无 Drop 守恒记账)。
+    pub(crate) fn take_creation_grant(&mut self) -> u32 {
+        let delta = self.max_receive_window - DEFAULT_CREDIT;
+        if !self.pregrant_pending || delta == 0 {
+            // 无预授或已授出:返回 0;差额为 0 时也把 pregrant_pending
+            // 置 false(读路径无需再守)。
+            self.pregrant_pending = false;
+            return 0;
+        }
+        self.pregrant_pending = false;
+        self.receive_window += delta;
+        delta
+    }
+
+    /// [`FlowController::take_creation_grant`] 的回滚入口(建流授信帧排队
+    /// 失败的兜底专用):复原 take 时刻的记账,使差额重新交由读路径
+    /// [`FlowController::next_window_update`] 授出。仅在流构造路径调用
+    /// (`Shared` 尚未共享,receive_window 减法无并发、不会下溢)。
+    pub(crate) fn restore_creation_grant(&mut self, delta: u32) {
+        if delta == 0 {
+            return;
+        }
+        self.receive_window -= delta;
+        self.pregrant_pending = true;
     }
 
     fn assert_invariants(&self, buffer_len: usize) {
         if !cfg!(debug_assertions) {
             return;
         }
-
-        let config = &self.config;
-        let rtt = self.rtt.get();
-        let accumulated_max_stream_windows = *self.accumulated_max_stream_windows.lock();
 
         assert!(
             buffer_len <= self.max_receive_window as usize,
@@ -191,26 +144,13 @@ impl FlowController {
             self.receive_window <= self.max_receive_window,
             "The current window never exceeds the maximum."
         );
-        assert!(
-            (self.max_receive_window - DEFAULT_CREDIT) as usize <= connection_budget(config),
-            "The maximum never exceeds its maximum portion of the configured connection limit."
+        // round-E1:恒定窗——max 恒等于配置初窗(不再随预算收缩/自增变动;
+        // 修前此处为"无 RTT 时 ≤ 初窗"的弱形式 + 两条预算断言)。
+        assert_eq!(
+            self.max_receive_window,
+            (self.config.initial_stream_receive_window as u32).max(DEFAULT_CREDIT),
+            "The maximum receive window is constant at the configured initial window."
         );
-        assert!(
-            (self.max_receive_window - DEFAULT_CREDIT) as usize
-                <= accumulated_max_stream_windows,
-            "The amount by which the stream maximum exceeds DEFAULT_CREDIT is tracked in accumulated_max_stream_windows."
-        );
-        if rtt.is_none() {
-            // 自动增窗仍要求 RTT 测量;配置初窗本身是合法起步值,但预授信
-            // 受连接预算钳制:无 RTT 时 max ≤ min(配置初窗, 保底+剩余预算)
-            //(round-2 预授信:见 Config::set_initial_stream_receive_window)。
-            assert!(
-                self.max_receive_window
-                    <= (self.config.initial_stream_receive_window as u32).max(DEFAULT_CREDIT),
-                "The maximum is only increased beyond the configured initial window iff an rtt \
-                 measurement is available."
-            );
-        }
     }
 
     pub(crate) fn send_window(&self) -> u32 {
@@ -242,25 +182,10 @@ impl FlowController {
     }
 }
 
-impl Drop for FlowController {
-    fn drop(&mut self) {
-        let mut accumulated_max_stream_windows = self.accumulated_max_stream_windows.lock();
-
-        debug_assert!(
-            *accumulated_max_stream_windows >= (self.max_receive_window - DEFAULT_CREDIT) as usize,
-            "{accumulated_max_stream_windows} {}",
-            self.max_receive_window
-        );
-
-        *accumulated_max_stream_windows -= (self.max_receive_window - DEFAULT_CREDIT) as usize;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use quickcheck::QuickCheck;
-    use web_time::Duration;
 
     // quickcheck 1 的 Gen 不暴露底层 rng(上游用 quickcheck-ext 提供此扩展),
     // 这里以 u64::arbitrary 取模近似,仅用于测试模糊生成。
@@ -280,14 +205,6 @@ mod tests {
         (u32::arbitrary(g) % (hi - lo)) + lo
     }
 
-    fn gr_u64(g: &mut quickcheck::Gen, lo: u64, hi: u64) -> u64 {
-        if hi <= lo {
-            return lo;
-        }
-        use quickcheck::Arbitrary;
-        u64::arbitrary(g) % (hi - lo) + lo
-    }
-
     #[derive(Debug)]
     struct Input {
         controller: FlowController,
@@ -300,11 +217,6 @@ mod tests {
             Self {
                 controller: FlowController {
                     config: self.controller.config.clone(),
-                    accumulated_max_stream_windows: Arc::new(Mutex::new(
-                        *self.controller.accumulated_max_stream_windows.lock(),
-                    )),
-                    rtt: self.controller.rtt.clone(),
-                    last_window_update: self.controller.last_window_update,
                     receive_window: self.controller.receive_window,
                     max_receive_window: self.controller.max_receive_window,
                     send_window: self.controller.send_window,
@@ -318,41 +230,19 @@ mod tests {
     impl quickcheck::Arbitrary for Input {
         fn arbitrary(g: &mut quickcheck::Gen) -> Self {
             let config = Arc::new(Config::arbitrary(g));
-            let rtt = Rtt::arbitrary(g);
 
-            let max_connection_minus_default =
-                config.max_connection_receive_window.unwrap_or(usize::MAX)
-                    - (config.max_num_streams * (DEFAULT_CREDIT as usize));
-
-            let max_receive_window = if rtt.get().is_none() {
-                DEFAULT_CREDIT
-            } else {
-                gr_u32(
-                    g,
-                    DEFAULT_CREDIT,
-                    (DEFAULT_CREDIT as usize)
-                        .saturating_add(max_connection_minus_default)
-                        .try_into()
-                        .unwrap_or(u32::MAX)
-                        .saturating_add(1),
-                )
-            };
+            // round-E1:生成域与新不变量一致——max == 配置初窗
+            //(Config::arbitrary 恒取 upstream 默认初窗,即 DEFAULT_CREDIT),
+            // 窗口不自增;max_connection_receive_window 派生约束已随
+            // 连接预算删除。
+            let max_receive_window =
+                (config.initial_stream_receive_window as u32).max(DEFAULT_CREDIT);
             let receive_window = gr_u32(g, 0, max_receive_window);
             let buffer_len = gr_usize(g, 0, max_receive_window as usize);
-            let accumulated_max_stream_windows = Arc::new(Mutex::new(gr_usize(
-                g,
-                (max_receive_window - DEFAULT_CREDIT) as usize,
-                max_connection_minus_default.saturating_add(1),
-            )));
-            let last_window_update =
-                Instant::now() - Duration::from_secs(gr_u64(g, 0, 60 * 60 * 24));
             let send_window = gr_u32(g, 0, u32::MAX);
 
             Self {
                 controller: FlowController {
-                    accumulated_max_stream_windows,
-                    rtt,
-                    last_window_update,
                     config,
                     receive_window,
                     max_receive_window,
@@ -380,132 +270,84 @@ mod tests {
         QuickCheck::new().quickcheck(property as fn(_))
     }
 
-    // ---- round-2 预授信回归(预算钳制 / 溢出 / 守恒 / 首 WU 不倍增)----
+    // ---- round-E1 恒定窗回归 ----
 
-    use crate::connection::rtt::Rtt;
-    use web_time::Duration as WDuration;
-
-    fn make_controller(
-        config: Arc<Config>,
-        accumulated: Arc<Mutex<usize>>,
-        rtt: Rtt,
-    ) -> FlowController {
-        FlowController::new(DEFAULT_CREDIT, DEFAULT_CREDIT, accumulated, rtt, config)
+    fn make_controller(config: Arc<Config>) -> FlowController {
+        FlowController::new(DEFAULT_CREDIT, DEFAULT_CREDIT, config)
     }
 
-    // 预算钳制:N 条流瓜分"超出保底"预算,后到的流退回保底;
-    // 预算耗尽不 panic(next_window_update 的连接限额减法不下溢)。
+    // 恒定窗:连续多轮"整窗耗尽 → 回补",max 恒等于配置初窗。
+    //(重写自 first_pregrant_window_update_does_not_double:BDP 自增已删,
+    // 窗口在任意轮次后都不得越过配置初窗;修前时延条件满足时每轮翻倍。)
     #[test]
-    fn pregrant_respects_connection_budget() {
-        let mut config = Config::default();
-        config.set_max_num_streams(8);
-        // 预算 = 窗口 − 8×256KiB = 512KiB
-        config.set_max_connection_receive_window(Some(8 * DEFAULT_CREDIT as usize + 512 * 1024));
-        config.set_initial_stream_receive_window(2 * 1024 * 1024);
-        let config = Arc::new(config);
-        let accumulated = Arc::new(Mutex::new(0usize));
-        let rtt = Rtt::new(); // 无 RTT 测量
-
-        // 流 1:剩余预算 512KiB,预授信被钳到 256KiB+512KiB
-        let s1 = make_controller(config.clone(), accumulated.clone(), rtt.clone());
-        assert_eq!(s1.max_receive_window, DEFAULT_CREDIT + 512 * 1024);
-        assert_eq!(*accumulated.lock(), 512 * 1024);
-
-        // 流 2/3:预算耗尽,退回规约保底,零额外信用
-        let s2 = make_controller(config.clone(), accumulated.clone(), rtt.clone());
-        let s3 = make_controller(config.clone(), accumulated.clone(), rtt.clone());
-        assert_eq!(s2.max_receive_window, DEFAULT_CREDIT);
-        assert_eq!(s3.max_receive_window, DEFAULT_CREDIT);
-        assert_eq!(*accumulated.lock(), 512 * 1024);
-
-        // 预算耗尽状态下驱动窗口更新(模拟数据到达):不得 panic
-        // (修前:连接限额减法 usize 下溢,debug 直接 panic)。
-        let mut s2 = s2;
-        s2.consume_receive_window(64 * 1024).unwrap();
-        let _ = s2.next_window_update(0);
-
-        drop(s1); // 守恒:释放的额度回到池子
-        assert_eq!(*accumulated.lock(), 0);
-        let s4 = make_controller(config, accumulated.clone(), rtt);
-        assert_eq!(s4.max_receive_window, DEFAULT_CREDIT + 512 * 1024);
-        drop(s2);
-        drop(s3);
-        drop(s4);
-        assert_eq!(*accumulated.lock(), 0, "全部流释放后预算必须归零(守恒)");
-    }
-
-    // u32/usize 溢出组合:max_num_streams 巨大(保底乘积封顶 usize::MAX)
-    // + 不限总额(None):预算饱和归 0,预授信退保底,全程不 panic。
-    #[test]
-    fn pregrant_overflow_combinations_saturate() {
-        let mut config = Config::default();
-        // 先解除总额(None 对默认 512 流断言成立),再抬流数到极限;
-        // 反序:有限 1GiB 默认窗 × usize::MAX 流保底,断言正确拒绝。
-        config.set_max_connection_receive_window(None);
-        config.set_max_num_streams(usize::MAX);
-        config.set_initial_stream_receive_window(u32::MAX as usize); // 最大合法初窗
-        let config = Arc::new(config);
-        let accumulated = Arc::new(Mutex::new(0usize));
-        let rtt = Rtt::new();
-
-        let s = make_controller(config.clone(), accumulated.clone(), rtt.clone());
-        // 256KiB × usize::MAX 饱和 = usize::MAX → 预算 = MAX − MAX = 0
-        assert_eq!(s.max_receive_window, DEFAULT_CREDIT);
-        assert_eq!(*accumulated.lock(), 0);
-
-        // 自增窗路径同样不得下溢/回绕(rtt 未测得 → 不进增窗;再以
-        // 已测得 RTT 的控制器验证增窗在零预算下收敛到当前 max)。
-        let mut s2 = make_controller(config, accumulated, rtt_with_measurement());
-        s2.consume_receive_window(DEFAULT_CREDIT).unwrap();
-        let update = s2.next_window_update(0).expect("整窗耗尽必有更新");
-        assert_eq!(update, DEFAULT_CREDIT, "零预算下更新只回授已耗额度");
-        assert_eq!(s2.max_receive_window, DEFAULT_CREDIT, "零预算下不得增窗");
-    }
-
-    // 首 WU 不触发 BDP 倍增:预授信差额不是实测接收吞吐。
-    // 修前:last_window_update 建流置 now,首个更新在 rtt 已测得时
-    // elapsed≈0 < 2×rtt 恒真 → 首个 WU 即把窗口翻倍(假速率)。
-    fn rtt_with_measurement() -> Rtt {
-        let mut rtt = Rtt::new();
-        let ping = rtt.next_ping().expect("初始 ping 立即可发");
-        std::thread::sleep(WDuration::from_millis(30));
-        let action = rtt.handle_pong(ping.id());
-        assert!(matches!(action, crate::connection::Action::None));
-        assert!(rtt.get().is_some());
-        rtt
-    }
-
-    #[test]
-    fn first_pregrant_window_update_does_not_double() {
+    fn window_never_grows_beyond_config_initial() {
         let mut config = Config::default();
         config.set_initial_stream_receive_window(2 * 1024 * 1024);
-        // 预算充裕(默认 1GiB − 512×256KiB = 896MiB)
         let config = Arc::new(config);
-        let accumulated = Arc::new(Mutex::new(0usize));
 
-        let mut s = make_controller(config, accumulated, rtt_with_measurement());
+        let mut s = make_controller(config);
         assert_eq!(s.max_receive_window, 2 * 1024 * 1024);
 
-        // 对端写满 64KiB(消耗授信)→ 首个窗口更新授出预授信差额
-        s.consume_receive_window(64 * 1024).unwrap();
+        // 首个窗口更新(兜底路径形态):授出建流预授差额,max 不动
         let update = s.next_window_update(0).expect("半窗阈值已过,必有更新");
         assert_eq!(
             update,
-            2 * 1024 * 1024 - DEFAULT_CREDIT + 64 * 1024,
-            "首 WU 授出全额预授信差额+已耗额度"
+            2 * 1024 * 1024 - DEFAULT_CREDIT,
+            "首 WU 授出全额预授信差额"
         );
         assert_eq!(
             s.max_receive_window,
             2 * 1024 * 1024,
-            "首 WU 不得把 max 翻倍(预授信≠实测吞吐;修前此处变 4MiB)"
+            "窗口不得自增(修前:时延条件满足时首 WU 即翻倍)"
         );
         assert!(!s.pregrant_pending, "预授信差额已授出");
 
-        // 之后真实消耗驱动的更新仍可正常自增窗(机制未被关死):
-        // consume 到剩余窗口 < max/2 再触发一次,若时延条件满足即翻倍。
-        s.consume_receive_window(2 * 1024 * 1024 - DEFAULT_CREDIT - 64 * 1024)
-            .unwrap(); // receive 已授额度全部耗尽
-        let _ = s.next_window_update(0);
-        assert!(s.max_receive_window >= 2 * 1024 * 1024);
+        // 连续多轮:整窗耗尽 → 回补,max 恒等于配置初窗
+        for round in 0..8 {
+            s.consume_receive_window(s.max_receive_window).unwrap();
+            let update = s.next_window_update(0).expect("整窗耗尽必有更新");
+            assert_eq!(
+                update,
+                2 * 1024 * 1024,
+                "回补额度 == 已耗额度(round {round})"
+            );
+            assert_eq!(
+                s.max_receive_window,
+                2 * 1024 * 1024,
+                "窗口不得自增(修前:时延条件满足时每轮翻倍;round {round})"
+            );
+        }
+    }
+
+    // round-E1(红→绿):同一连接的每条流都拿到完整配置初窗,与流数无关。
+    // 旧语义(256MiB 共享预算):预算 = 总窗 − 256KiB×流数 = 256MiB,
+    // 每流预授差额 6MiB−256KiB = 5.75MiB,44 条流吃满后第 45 条被钳到
+    // 256KiB+3MiB、第 46 条起冻结在 256KiB 规约保底(红证:修前产品代码
+    // 上运行本测试,第 45 条流断言 FAILED,left=3407872 right=6291456)。
+    // 控制器须全部同时存活(旧 Drop 会归还预算,逐个构造-析构测不出耗尽)。
+    // 下方 set_max_connection_receive_window 镜像 mux.rs 旧接线,锁
+    // "配置了有限连接总窗也不得钳流" 的回归(新语义下该字段无消费者)。
+    #[test]
+    fn every_stream_gets_full_window_regardless_of_count() {
+        let mut config = Config::default();
+        config.set_max_connection_receive_window(Some(
+            4096 * DEFAULT_CREDIT as usize + 256 * 1024 * 1024,
+        ));
+        config.set_max_num_streams(4096);
+        config.set_initial_stream_receive_window(6 * 1024 * 1024);
+        let config = Arc::new(config);
+
+        let mut streams = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            streams.push(make_controller(config.clone()));
+        }
+        for (i, s) in streams.iter().enumerate() {
+            assert_eq!(
+                s.max_receive_window,
+                6 * 1024 * 1024,
+                "第 {} 条流必须拿到完整 6MiB 初窗(旧语义:第 46 条起冻结 256KiB)",
+                i + 1
+            );
+        }
     }
 }

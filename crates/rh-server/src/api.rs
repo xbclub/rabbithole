@@ -841,7 +841,7 @@ async fn create_service_inner(
                 };
             if !trial_ok {
                 let msg = bind_failure_message(
-                    &state,
+                    state,
                     "端口绑定失败:端口已被占用",
                     proto,
                     bind_ip,
@@ -2585,8 +2585,10 @@ mod tests {
 
         // 格3:vhost http(与控制面同 bind_addr;0=关闭不占用,>0 才保留)
         let (h, hold) = hold_tcp();
-        let mut cfg = ServerConfig::default();
-        cfg.bind_addr = "127.0.0.1".into();
+        let mut cfg = ServerConfig {
+            bind_addr: "127.0.0.1".into(),
+            ..Default::default()
+        };
         cfg.vhost.http_port = h;
         let state = diag_state(cfg).await;
         let v = create(&state, spec("tcp", "diag-vhost", h)).await;
@@ -2737,17 +2739,19 @@ mod tests {
         let q = free_port();
         let hs = free_port();
         let tm = free_port();
-        let mut cfg = ServerConfig::default();
-        cfg.bind_addr = "127.0.0.1".into();
-        cfg.bind_protocol = "kcp".into();
-        cfg.bind_port = k;
-        cfg.extra_listeners = vec![crate::config::ListenerConfig {
-            protocol: "quic".into(),
-            bind_port: q,
-            bind_addr: Some("127.0.0.1".into()),
-            multiplex: None,
-            tls: None,
-        }];
+        let mut cfg = ServerConfig {
+            bind_addr: "127.0.0.1".into(),
+            bind_protocol: "kcp".into(),
+            bind_port: k,
+            extra_listeners: vec![crate::config::ListenerConfig {
+                protocol: "quic".into(),
+                bind_port: q,
+                bind_addr: Some("127.0.0.1".into()),
+                multiplex: None,
+                tls: None,
+            }],
+            ..Default::default()
+        };
         cfg.vhost.https_port = hs;
         cfg.vhost.tcpmux_port = tm;
         let state = diag_state(cfg).await;

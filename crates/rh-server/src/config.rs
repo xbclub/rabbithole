@@ -4,7 +4,7 @@ use rh_core::net::PortsRange;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
     pub bind_addr: String,
@@ -30,6 +30,47 @@ pub struct ServerConfig {
     pub nathole: NatholeConfig,
     pub metrics: MetricsConfig,
     pub log: LogConfig,
+    /// 多载体池允许的最大载体数(含首载体,round-10)。客户端报到时经
+    /// `CARRIER_ATTACH_ACK` 回写该值;客户端按 min(期望, 硬件, 该值) 定容。
+    /// 取用点钳制 [1,8],默认 8。0 按 1 处理(语义:不允许附加载体)。
+    pub max_carriers: usize,
+}
+
+/// 载体数上限(与客户端钳制一致;`0` 视为 1)。
+pub const MAX_CARRIERS_CAP: usize = 8;
+
+impl ServerConfig {
+    /// 生效的载体上限:钳制 [1, MAX_CARRIERS_CAP],0 → 1。
+    pub fn max_carriers(&self) -> usize {
+        self.max_carriers.clamp(1, MAX_CARRIERS_CAP)
+    }
+}
+
+impl Default for ServerConfig {
+    /// 逐字段与 `#[derive(Default)]` 等价,唯一例外是 `max_carriers = 8`
+    /// (derive 会给 0,而 0 会被 `max_carriers()` 钳成 1,等于默认关闭
+    /// 多载体)。`#[serde(default)]` 让旧配置文件缺该字段时也落到这里。
+    fn default() -> Self {
+        Self {
+            bind_addr: String::new(),
+            bind_protocol: String::new(),
+            bind_port: 0,
+            config_path: std::path::PathBuf::new(),
+            extra_listeners: Vec::new(),
+            multiplex: false,
+            relay_mode: String::new(),
+            tls: None,
+            web: WebConfig::default(),
+            vhost: VhostConfig::default(),
+            ports: PortsConfig::default(),
+            limits: LimitsConfig::default(),
+            ssh_gateway: SshGatewayConfig::default(),
+            nathole: NatholeConfig::default(),
+            metrics: MetricsConfig::default(),
+            log: LogConfig::default(),
+            max_carriers: MAX_CARRIERS_CAP,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -252,5 +293,33 @@ impl ServerConfig {
                 end: 25000,
             }],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // round-10:默认必须给 8(derive 会给 0 → 被钳成 1 = 关闭多载体),
+    // 旧配置文件缺字段也落到 8;显式值与越界钳制可判。
+    #[test]
+    fn max_carriers_defaults_and_clamps() {
+        assert_eq!(ServerConfig::default().max_carriers, 8);
+        assert_eq!(ServerConfig::default().max_carriers(), 8);
+
+        let cfg: ServerConfig = toml::from_str("bind_addr = \"127.0.0.1\"\n").unwrap();
+        assert_eq!(cfg.max_carriers, 8, "旧配置缺字段必须默认 8");
+
+        let cfg: ServerConfig =
+            toml::from_str("bind_addr = \"127.0.0.1\"\nmax_carriers = 3\n").unwrap();
+        assert_eq!(cfg.max_carriers(), 3);
+
+        let cfg: ServerConfig =
+            toml::from_str("bind_addr = \"127.0.0.1\"\nmax_carriers = 0\n").unwrap();
+        assert_eq!(cfg.max_carriers(), 1, "0 视为不允许附加载体");
+
+        let cfg: ServerConfig =
+            toml::from_str("bind_addr = \"127.0.0.1\"\nmax_carriers = 99\n").unwrap();
+        assert_eq!(cfg.max_carriers(), 8, "上限钳制 8(红线 5)");
     }
 }

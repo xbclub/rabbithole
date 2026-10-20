@@ -11,7 +11,10 @@
 pub mod compress;
 pub mod kcp;
 pub mod mux;
-pub use mux::{wrap_stream_as_client, wrap_stream_as_server, MUX_STREAMS_UNLIMITED};
+pub use mux::{
+    wrap_stream_as_client, wrap_stream_as_server, PoolRedial, YamuxMultiplexer,
+    YamuxMultiplexerPool, MUX_STREAMS_UNLIMITED,
+};
 pub mod proxy_dial;
 pub mod quic;
 #[cfg(target_os = "linux")]
@@ -34,6 +37,26 @@ pub trait Io: AsyncRead + AsyncWrite + Send + Unpin {
     fn as_any(&self) -> &dyn std::any::Any;
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
     fn into_any_box(self: Box<Self>) -> Box<dyn std::any::Any>;
+
+    /// 无锁拆成独立的读半/写半(round-69)。
+    ///
+    /// # 为什么需要
+    ///
+    /// `tokio::io::split` 用**一把 `std::sync::Mutex`** 包住整个 stream
+    /// (`tokio/src/io/split.rs:59` 的 `with_lock` 直接 `lock().unwrap()`)。
+    /// 在 async 任务里用同步锁的后果:一端在 poll 期间持锁,另一端要
+    /// `lock()` 就会**阻塞整个 OS 线程**(不是让出,是 futex 等待)。
+    ///
+    /// 实测(上行 P=16,服务端 12s):`strace -c` 显示
+    /// **`futex` 占 75.0% 的 syscall 时间(39.85s/53.13s),3690 次调用,
+    /// 平均每次 10.8ms** ——这就是那把锁。
+    ///
+    /// 同一时刻只有一个读者和一个写者,poll 本身不会长期持锁;但当
+    /// `poll_read` 内部走到内核态(recvfrom 0.36ms、copy 12.7%)时,
+    /// 写者会被阻塞同一时长,反之亦然。高并发下这些阻塞叠加。
+    ///
+    /// 默认返回 `None`(调用方回落到 `tokio::io::split`)。
+    fn into_halves(self: Box<Self>) -> Option<(BoxedIo, BoxedIo)>;
 }
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Io for T {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -45,9 +68,43 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Io for T {
     fn into_any_box(self: Box<T>) -> Box<dyn std::any::Any> {
         self
     }
+    fn into_halves(self: Box<Self>) -> Option<(BoxedIo, BoxedIo)> {
+        None
+    }
 }
 
 pub type BoxedIo = Box<dyn Io>;
+
+/// 把 `BoxedIo` 无锁拆成独立读写半(round-69);不支持时返回 `None`。
+///
+/// 仅裸 `TcpStream` 支持(`into_split` 产出两个独立 fd,各有一条 tokio
+/// IO 注册,读写之间无共享锁)。任何包装类型返回 `None`,调用方回落到
+/// [`tokio::io::split`]。
+///
+/// 之所以用**自由函数 + downcast**而不是 trait 方法:泛型
+/// `impl<T: AsyncRead+AsyncWrite> Io for T` 已经覆盖所有类型,再加一个
+/// 针对 `TcpStream` 的 impl 会冲突;而 `into_any_box` 只能在 `Box<Self>`
+/// 上调用,无法从 `Box<dyn Io>` 直接透传到具体类型。
+/// 探测 + 拆分(round-69)。不支持时把 IO 原样还回 `Err`。
+pub fn split_boxed_io(io: BoxedIo) -> Result<(BoxedIo, BoxedIo), BoxedIo> {
+    // 先探测(GET 语义,不消费):`as_any` 落到 `dyn Io` 的 vtable,
+    // 对 `TcpStream` 返回 Some。
+    let is_tcp = {
+        let dynio: &dyn Io = &*io;
+        dynio.as_any().is::<tokio::net::TcpStream>()
+    };
+    if !is_tcp {
+        return Err(io);
+    }
+    let any = io.into_any_box();
+    let ts = any
+        .downcast::<tokio::net::TcpStream>()
+        .expect("probed above: concrete type is TcpStream");
+    let (r, w) = (*ts).into_split();
+    // OwnedReadHalf/OwnedWriteHalf 各自只实现单方向 trait,用专用包装
+    // 补齐另一方向(运行时永远不会走到,纯为满足 `Io` 的 supertrait)。
+    Ok((Box::new(HalfRead(r)) as BoxedIo, Box::new(HalfWrite(w)) as BoxedIo))
+}
 
 /// 取消信号(共享):完成即结束转发。规则禁用/删除级联用;
 /// splice 泵与 mux chunk 中继共用同一形态。
@@ -116,10 +173,46 @@ impl std::future::Future for AbortOnDropHandle {
     }
 }
 
-/// 中继父任务收尾(全部 relay 共用):双向子泵 join,附加两条收敛保证:
+/// 半关闭的**有界兜底**上限(round-40)。
+///
+/// `clean EOF` 路径本应无界等待完整半关闭(红线:不硬加短超时,否则
+/// FIN 尚未写穿即放弃会截断半关闭)。但实测存在**对端永不回 FIN** 的
+/// 情形,此时 socket 永久停在 `FIN-WAIT-2`/`CLOSING`,流与 IO 都不释放:
+///
+/// * 复现:`-P8` 连跑 10 轮,客户端侧 `ss -tan` 到本地目标的连接出现
+///   `22 CLOSING + 22 FIN-WAIT-2`,且 20 秒后仍不消失(约 2.2 条/轮);
+/// * 对照(同参数直连、不经隧道):只有 `TIME-WAIT`,零残留;
+/// * 后果:长跑后连接数单调增长,吞吐从 2.4 G 逐轮衰减到 0.5 G,
+///   最终耗尽 fd。
+///
+/// 取值 30s 的理由:远大于任何正常 RTT(跨机实测 0.1~0.5ms)与 TCP
+/// 重传窗口(RTO 下限 200ms,3 次重传 ≈ 1.4s),不会误伤正常半关闭;
+/// 又远小于"永不发生"的量级,能及时回收。可用环境变量
+/// `RH_HALFCLOSE_GRACE_SECS` 覆盖(0 = 关闭兜底,回到旧的无界等待)。
+const DEFAULT_HALFCLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 半关闭兜底上限(env 可覆盖,进程内只解析一次)。
+pub(crate) fn halfclose_grace() -> std::time::Duration {
+    static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        match std::env::var("RH_HALFCLOSE_GRACE_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            Some(0) => std::time::Duration::MAX,
+            Some(s) => std::time::Duration::from_secs(s.min(3600)),
+            None => DEFAULT_HALFCLOSE_GRACE,
+        }
+    })
+}
+
+/// 中继父任务收尾(全部 relay 共用):双向子泵 join,附加三条收敛保证:
 /// * 单向 panic → 立即返回(守卫 Drop → abort 对向泵)——单向故障不得
 ///   让对向泵永存(对向可能在等一个永远不来的 EOF);
-/// * 双向正常 → 等两向各自自然结束(半关闭语义:一向 EOF 后对向继续服务)。
+/// * 双向正常 → 等两向各自自然结束(半关闭语义:一向 EOF 后对向继续服务);
+/// * **半关闭有界兜底(round-40)**:对向在 [`halfclose_grace`] 内仍未结束
+///   即放弃等待并 abort——见 [`halfclose_grace`] 的实测依据(对端永不回
+///   FIN 时 socket 永久停 FIN-WAIT-2,10 轮累积 22 条,吞吐 2.4G→0.5G)。
 ///
 /// 父任务取消(本 future 被 drop)→ 守卫 Drop → 双向 abort(A1 语义不变)。
 pub async fn join_relay_pumps(g1: &mut AbortOnDropHandle, g2: &mut AbortOnDropHandle) {
@@ -131,8 +224,27 @@ pub async fn join_relay_pumps(g1: &mut AbortOnDropHandle, g2: &mut AbortOnDropHa
         // panic 侧守卫已完成(不再 abort);对向守卫随本函数返回被 drop → abort
         return;
     }
-    // 先完成的一向是正常结束:等对向自然结束(已完成的立即返回)
-    let _ = tokio::join!(g1, g2);
+    // 先完成的一向是正常结束:等对向自然结束(已完成的立即返回),
+    // 外加半关闭有界兜底。
+    let grace = halfclose_grace();
+    if grace == std::time::Duration::MAX {
+        let _ = tokio::join!(g1, g2);
+        return;
+    }
+    let both = async {
+        let _ = futures::join!(&mut *g1, &mut *g2);
+    };
+    if tokio::time::timeout(grace, both).await.is_err() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                "half-close timeout: peer never completed close handshake; \
+                 aborting relay to release the stream (round-40 leak fix)"
+            );
+        });
+        // 守卫随本函数返回被 drop → abort 双向子泵 → fd 释放
+    }
 }
 
 /// chunk 中继限速预留(预留/消费/退款三态;goal-repair A5 送达计费合同):
@@ -302,6 +414,151 @@ impl fmt::Display for Protocol {
     }
 }
 
+/// 多载体池协议基线(round-10):单载体即可跑到路径上限,故恒 1。
+///
+/// # 这是默认 K 的唯一来源(round-45 / round-73)
+///
+/// 默认载体数**只**由本函数决定。调用链:
+/// `mux_pool_size`(None) → 本函数 → `min(hardware_cap)` →
+/// `final_k = initial_k.min(server_cap)`(服务端收敛只减不增)。
+///
+/// 曾经有一个「池默认载体数 = 4」的常量从未被读取,却让多份设计文档误以为
+/// 默认 K 是 4;已删除。**若将来要改默认载体数,改这里,不要再引入同类常量。**
+///
+/// # round-73:tcp/ws 从 4 改回 1
+///
+/// round-54 曾把 tcp/ws 从 1 改成 4,依据是一组"K=1 吞吐随并发连接数
+/// 下降、64 连接时 K=4 快 50~68%"的测量。**那组数据是压测端造成的**:
+/// 当时用 `iperf3 -s` 作接收端,而 iperf3 服务端单实例只能服务一个会话、
+/// 且其 socket 缓冲未放大,在高并发下先于隧道饱和——测到的是接收端的
+/// 天花板,不是 K 的收益。
+///
+/// round-73 用 Go 压测器(`benchmark/loadgen`,收发缓冲 4MiB)在同一时间
+/// 窗口内严格交替 K=1 / K=4,两种顺序各 3 轮(共 6 次比较):
+///
+/// | 方向 | 并发 | K=1 | K=4 |
+/// |---|---:|---:|---:|
+/// | 下行 | 16 | 3.48 / 3.73 / 3.81 / 4.03 / 3.53 / 3.56 | 3.00 / 2.84 / 3.02 / 3.26 / 3.19 / 3.08 |
+///
+/// **K=1 在 6/6 次比较中都不慢于 K=4,且下行稳定快 15~20%。** 多载体
+/// 把同一份流量摊到多条四元组上,每条都要各自爬拥塞窗口,而单条 10GbE
+/// 路径上单载体的窗口本来就足够——多开只增加成本、不增加上限。
+///
+/// 保留 `hardware_cap` 探测与服务端 `max_carriers` 收敛:它们约束的是
+/// **用户显式请求**的 K(`RH_MUX_POOL_SIZE`/配置文件),不是默认路径。
+/// 默认路径因此重新回到"单载体,不建池"。
+///
+/// QUIC/KCP 自带多路复用(单 UDP 连接承载全部流),同样恒 1。
+///
+/// 该值只是**期望值**,最终 K 还要经硬件探测与服务端 `max_carriers` 收敛
+/// (见 rh-client 的 pool sizing);此处不读环境/配置。
+pub fn default_carriers(protocol: Protocol) -> usize {
+    match protocol {
+        // 单 UDP 连接即多路复用,多载体无意义。
+        Protocol::Quic | Protocol::Kcp => 1,
+        // tcp/tls/ws/wss:单载体已到路径上限(round-73 实测,见上)。
+        _ => 1,
+    }
+}
+
+/// BDP 自适应载体数(round-77/78):根据链路 RTT 决定开几条载体。
+///
+/// # 为什么用 RTT 而不是并发连接数
+///
+/// 本项目此前 20 余轮一直用"并发连接数"作自变量,始终得不到稳定结论。
+/// 用 `tc netem` 人为制造 BDP 约束后,信号立刻清晰。
+///
+/// **真正的自变量是 BDP(RTT × 带宽),不是并发数。** 低 RTT 下单条 TCP
+/// 的拥塞窗口就足以打满链路,多载体只增加分摊成本(writev 次数
+/// ∝ 1/每载体并发流数);高 BDP 下单窗口成为瓶颈,K 倍窗口的收益才
+/// 压过分摊成本。
+///
+/// # 实测曲线(round-78,下行 P=16,中位 Gbps)
+///
+/// | RTT | K=1 | K=2 | K=4 | K=8 | 最优 |
+/// |---|---:|---:|---:|---:|---|
+/// | 0.4ms | **3.19** | — | 2.94 | — | K=1 |
+/// | 10ms | 3.52 | 3.32 | 3.59 | — | K=1/4 持平 |
+/// | 50ms | 1.82 | 2.24 | 2.50 | **2.60** | K=8 |
+/// | 100ms | 1.20 | 1.72 | **2.10** | 1.96 | K=4 |
+/// | 300ms | 0.70 | 0.84 | **0.75~0.83** | 0.50 | K=4 |
+///
+/// # 为什么上限是 4 而不是继续涨到 8
+///
+/// 直觉上"RTT 越大越该多开",但 300ms 实测否定了它:**K=8 只有 0.50,
+/// 而 K=4 是 0.75~0.83,K=8 反而比 K=4 慢约 40%,甚至不如 K=2。**
+///
+/// 原因:载体数增加到一定程度后,每条载体分到的并发流太少,`writev`
+/// 次数按 1/每载体流数 上升;同时每条 TCP 自己也要重新爬慢启动。
+/// 在 16 条流、8 核的测试规格下,**K=4 是收益/成本的最优点**;
+/// 继续加载体不再买到带宽,只买到开销。
+///
+/// 300ms 时 K=8 比 K=4 差也可能与测试规格(16 条流摊到 8 条载体 =
+/// 每条仅 2 条流)有关——**流数远多于 16 时,K=8 或许不劣**。这一点
+/// 未验证,故阈值取保守的 4。
+///
+/// # 阈值
+///
+/// - `rtt < 5ms`:`1` —— 实测 0.4ms 时 K=1 快 8%,5ms 持平
+/// - `5ms <= rtt < 15ms`:`2` —— 过渡区(10ms 实测与 K=1 持平,
+///   取 2 是保守折中,不追求该区间的精确最优)
+/// - `rtt >= 15ms`:`4` —— 50/100/300ms 三点实测,K=4 都在最优点
+///   4% 以内(50ms 时 K=8 略好 4%,但 100/300ms 时 K=4 明显更优)
+///
+/// 返回的仍只是**期望值**,还要经 [`default_carriers`]、硬件上限与服务端
+/// `max_carriers` 三重收敛;调用方必须把显式配置(`RH_MUX_POOL_SIZE`)
+/// 排在本函数之前。
+pub fn carriers_for_rtt(rtt: std::time::Duration) -> usize {
+    let ms = rtt.as_secs_f64() * 1000.0;
+    if ms < 5.0 {
+        1
+    } else if ms < 15.0 {
+        2
+    } else {
+        4
+    }
+}
+
+/// 测量到服务端的 RTT(round-77):基于 TCP 建连耗时估计。
+///
+/// # 这是估计,不是精确测量
+///
+/// 真正的 RTT 需要一次应用层往返。这里用**建连耗时**(SYN→SYN/ACK)作
+/// 代理量,因为:
+///
+/// - 建连本身就是一次往返,量级与后续 RTT 同源(同一路径、同一队列);
+/// - 零额外流量、零协议改动,失败不影响连接(探针失败按"无法判定"处理,
+///   退回 [`default_carriers`] 的单载体保守值)。
+///
+/// 已知偏差:SYN 队列排队、服务端 accept backlog 满、NAT 冷启动都会让
+/// 建连耗时**偏大**;而 RTT 缓存命中时会偏小。因此阈值取得比较宽松
+/// (5ms / 15ms 两档),只用来区分"局域网级"与"广域网级",不追求精确。
+///
+/// 返回 `None` = 无法判定(拨号失败),调用方退回保守默认。
+pub async fn probe_rtt(addr: SocketAddr, timeout: std::time::Duration) -> Option<std::time::Duration> {
+    let start = std::time::Instant::now();
+    let conn = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+    let elapsed = start.elapsed();
+    drop(conn);
+    Some(elapsed)
+}
+
+/// 依据实测 RTT 选择载体数(round-77);探针失败时退回协议基线。
+///
+/// **显式配置优先**:调用方必须在调用本函数**之前**处理
+/// `RH_MUX_POOL_SIZE` / 配置文件里的 `mux_pool_size`,不要把两者混在一处。
+pub async fn auto_carriers(addr: SocketAddr, timeout: std::time::Duration) -> usize {
+    match probe_rtt(addr, timeout).await {
+        Some(rtt) => carriers_for_rtt(rtt),
+        // 探针失败(拨号不通/超时):不臆测,退回单载体。真正的拨号会
+        // 在随后由 connect/connect_pool 执行并给出真实错误。
+        None => 1,
+    }
+}
+
 /// TLS 客户端选项。
 #[derive(Debug, Clone, Default)]
 pub struct TlsClientOptions {
@@ -325,6 +582,12 @@ pub struct TlsServerOptions {
 }
 
 /// 客户端传输配置。
+///
+/// **本结构体不承载载体数 K**。K 由调用方(`rh-client`)按「显式
+/// `mux_pool_size` / 协议基线 → 硬件上限 → 服务端 `max_carriers` 收敛」三段式
+/// 算出,再作为参数传给 [`connect_pool`](crate::connect_pool)。曾经存在的
+/// `carriers` 字段被赋值却从未被生产代码读取,已删除(round-44)——
+/// 改它不会改变载体数,只会造成误判。
 #[derive(Debug, Clone)]
 pub struct ClientTransportConfig {
     pub protocol: Protocol,
@@ -411,10 +674,216 @@ pub(crate) enum MultiplexerInner {
         stream: tokio::sync::Mutex<Option<BoxedIo>>,
     },
     Yamux(mux::YamuxMultiplexer),
+    /// 多物理载体连接池(round-8 优化项 5):K 条独立 TCP/TLS 连接各跑
+    /// 一套 yamux,开流按全局原子计数轮转分派,载体故障自动剔除+重拨。
+    YamuxPool(mux::YamuxMultiplexerPool),
     Quic(quic::QuicConnection),
 }
 
 impl Multiplexer {
+    /// 多载体客户端池(round-8 优化项 5):members 为 K 条已建立连接的
+    /// 客户端 yamux(≥1),redial 为载体故障时的重拨配方。
+    pub fn yamux_pool_client(
+        members: Vec<mux::YamuxMultiplexer>,
+        redial: Option<mux::PoolRedial>,
+    ) -> Arc<Multiplexer> {
+        Arc::new(Multiplexer {
+            inner: MultiplexerInner::YamuxPool(mux::YamuxMultiplexerPool::new_client(
+                members, redial,
+            )),
+        })
+    }
+
+    /// 多载体服务端池(round-8 优化项 5):members 为同一客户端会话的 K
+    /// 条已 accept 连接的服务端 yamux;accept 自全部成员合流。
+    pub fn yamux_pool_server(members: Vec<mux::YamuxMultiplexer>) -> Arc<Multiplexer> {
+        Arc::new(Multiplexer {
+            inner: MultiplexerInner::YamuxPool(mux::YamuxMultiplexerPool::new_server(members)),
+        })
+    }
+
+    /// 取出单载体 yamux(供上层把多条独立 accept 的连接聚合进服务端池)。
+    /// 非 yamux 单载体(裸模式/QUIC/已是池)返回 None,连接随 self 析构关闭
+    /// ——聚合调用方只应对 yamux 连接调用。
+    pub fn into_yamux(self) -> Option<mux::YamuxMultiplexer> {
+        match self.inner {
+            MultiplexerInner::Yamux(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// **带容量裁决**的载体附加(round-48):「判断成员数」与「入表」在池的
+    /// 同一把 `members` 写锁内完成,消除并发报到的短暂超限。
+    ///
+    /// `cap` = 池内成员总数上限(调用方负责把首载体占的名额折算进去)。
+    /// 返回 [`mux::AttachOutcome::RejectedFull`] 时**未入表**,该载体由
+    /// 调用方负责拒绝/关闭。
+    ///
+    /// 非池变体返回 `None`(调用方据此走原有拒绝路径)。
+    pub async fn attach_yamux_carrier_with_cap(
+        &self,
+        mux: mux::YamuxMultiplexer,
+        cap: usize,
+    ) -> Option<mux::AttachOutcome> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => Some(p.attach_carrier_with_cap(mux, cap).await),
+            _ => None,
+        }
+    }
+
+    /// [`Self::attach_yamux_carrier_with_cap`] 的**交还载体**变体(round-53)。
+    ///
+    /// cap 裁决语义完全相同(同一把 `members` 写锁内判定),区别是被拒时
+    /// 把载体 `Err(mux)` 交还给调用方,而不是丢弃。用途:调用方还要在被拒
+    /// 载体上写 `ok:false` ACK,写完并冲刷后才能关——所以载体必须先在
+    /// 拒绝后继续存活。
+    ///
+    /// 为什么不直接用前者的"丢弃"语义:`YamuxMultiplexer` 没有 `impl Drop`,
+    /// drop 只 detach driver 而不关连接,拒绝就等于泄漏一条无人驱动的载体
+    /// (实测 probe 流 3s 读不到 EOF)。
+    ///
+    /// 非池变体返回 `None`(与 [`Self::attach_yamux_carrier_with_cap`] 同口径:
+    /// 调用方据此走 `NOT_POOLED` 拒绝路径,不涉及载体交接)。
+    pub async fn attach_yamux_carrier_with_cap_gated(
+        &self,
+        mux: mux::YamuxMultiplexer,
+        cap: usize,
+    ) -> Option<Result<mux::AttachOutcome, mux::YamuxMultiplexer>> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => Some(p.attach_carrier_with_cap_gated(mux, cap).await),
+            // 非池变体:无 accept 语义,按原约定返回 None。载体 `mux` 随本
+            // 参数被 drop——与修前 `attach_yamux_carrier_with_cap` 的 `_`
+            // 分支同行为(该分支根本不消费 mux,由调用方后续处置)。
+            _ => None,
+        }
+    }
+
+    /// 运行中把一条已 accept 的服务端 yamux 载体附加进本多路复用器
+    /// (round-9 服务端会话聚合)。仅 [`MultiplexerInner::YamuxPool`] 变体
+    /// 支持(返回 true);其余变体返回 false,载体由调用方处置。
+    pub async fn attach_yamux_carrier(&self, mux: mux::YamuxMultiplexer) -> bool {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => {
+                p.attach_carrier(mux).await;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 显式关停多载体池(round-9.1):中止全部载体 driver 与 accept 转发
+    /// 任务,物理连接随之关闭。仅 [`MultiplexerInner::YamuxPool`] 有动作,
+    /// 其余变体 no-op(单载体路径关停由 Session 拆除/连接释放负责,语义
+    /// 零漂移)。幂等且可在同步上下文调用(池 Drop 兜底亦走同一路径)。
+    ///
+    /// 命名区别于 stream 的 `shutdown`:本方法关的是池/连接,不是某条流。
+    pub fn shutdown_pool(&self) {
+        if let MultiplexerInner::YamuxPool(p) = &self.inner {
+            p.shutdown();
+        }
+    }
+
+    /// **实际生效**的每载体分片 Worker 数(round-47,诊断/日志用)。
+    ///
+    /// - 池变体:取首个成员的值(池内成员由同一次
+    ///   [`connect_pool`] 用同一 `shards` 创建);
+    /// - 单载体 yamux 变体:该载体自身的值;
+    /// - 非 yamux 变体(裸模式 `AcceptSingle` / QUIC):`None`(无分片
+    ///   Worker 概念)。
+    ///
+    /// **调用方必须用这个值记日志,不要自己再调
+    /// [`mux::shard_workers_for_k`] 算一遍** —— 两处独立计算一旦输入
+    /// 漂移(例如 `connect_pool` 的参数从 `initial_k` 变成收敛后的 K),
+    /// 日志就会与实际 spawn 的 Worker 数不符,而这种错误极难发现。
+    ///
+    /// 值在载体构造时从 `into_halves()` 的 Worker 向量长度取定,是
+    /// 「实际 spawn」而非「按公式重算」。
+    pub async fn shard_workers(&self) -> Option<usize> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => p.shard_workers().await,
+            MultiplexerInner::Yamux(m) => Some(m.shard_workers()),
+            _ => None,
+        }
+    }
+
+    /// 现有载体数(诊断/日志;非池变体返回 None)。只读,不改变池语义。
+    pub async fn pool_live_carriers(&self) -> Option<usize> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => Some(p.live_carriers().await),
+            _ => None,
+        }
+    }
+
+    /// 收缩多载体池的轮转分派前缀(round-10 自动定容)。仅
+    /// [`MultiplexerInner::YamuxPool`] 有动作,其余变体 no-op——单载体
+    /// 路径本就只有一个载体,收缩无意义且不得报错(调用方无条件收敛)。
+    pub async fn set_active_prefix(&self, n: usize) {
+        if let MultiplexerInner::YamuxPool(p) = &self.inner {
+            p.set_active_prefix(n).await;
+        }
+    }
+
+    /// 移除多载体池中的一个成员(round-10 报到收敛)。仅
+    /// [`MultiplexerInner::YamuxPool`] 有动作,其余变体 no-op(单载体
+    /// 路径没有可摘除的成员)。index 语义见
+    /// [`mux::YamuxMultiplexerPool::detach_carrier`]:先清重拨配方再
+    /// 关停物理连接,幂等。
+    pub async fn detach_carrier(&self, index: usize) {
+        if let MultiplexerInner::YamuxPool(p) = &self.inner {
+            p.detach_carrier(index).await;
+        }
+    }
+
+    /// 客户端:打开一个新流并返回落点载体身份(round-10.1)。池变体转发
+    /// 到 [`mux::YamuxMultiplexerPool::open_stream_tagged`];其余变体语义与
+    /// [`Self::open_stream`] 完全一致,id 恒 0(0 = 非池,不可按 id 摘除)。
+    pub async fn open_stream_tagged(&self) -> std::io::Result<(BoxedIo, u64)> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => p.open_stream_tagged().await,
+            _ => self.open_stream().await.map(|s| (s, 0)),
+        }
+    }
+
+    /// 按身份摘除池成员(round-10.1)。仅 [`MultiplexerInner::YamuxPool`]
+    /// 有动作;其余变体返回 false(无池可摘)。语义见
+    /// [`mux::YamuxMultiplexerPool::detach_carrier_by_id`]:先清重拨配方
+    /// 再关停物理连接,幂等。
+    pub async fn detach_carrier_by_id(&self, id: u64) -> bool {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => p.detach_carrier_by_id(id).await,
+            _ => false,
+        }
+    }
+
+    /// 池成员身份快照(round-10.1,成员表顺序)。非池变体返回空表——
+    /// 调用方(报到收敛)只在池路径使用;单载体路径无成员可摘。
+    pub async fn member_ids(&self) -> Vec<u64> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => p.member_ids().await,
+            _ => Vec::new(),
+        }
+    }
+
+    /// 池内**存活**成员身份快照(round-10.2,成员表顺序)。终态收敛按此
+    /// 计数保留额,避免把额度算给 dead-but-unreaped 成员后误摘健康成员。
+    /// 非池变体返回空表(同 [`Self::member_ids`])。
+    pub async fn live_member_ids(&self) -> Vec<u64> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => p.live_member_ids().await,
+            _ => Vec::new(),
+        }
+    }
+
+    /// 池成员表长度(含 dead-but-unreaped 成员,round-10.2)。服务端 cap
+    /// 检查用它而非存活数:dead 未 reap 的成员仍占物理连接与池内名额。
+    /// 非池变体返回 None。
+    pub async fn pool_member_count(&self) -> Option<usize> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => Some(p.pool_member_count().await),
+            _ => None,
+        }
+    }
+
     /// 客户端:打开一个新流(多路复用或新连接)。
     pub async fn open_stream(&self) -> std::io::Result<BoxedIo> {
         match &self.inner {
@@ -423,6 +892,7 @@ impl Multiplexer {
                 Err(other_err("open_stream on server-side single multiplexer"))
             }
             MultiplexerInner::Yamux(m) => m.open_stream().await,
+            MultiplexerInner::YamuxPool(p) => p.open_stream().await,
             MultiplexerInner::Quic(q) => q.open_stream().await,
         }
     }
@@ -443,6 +913,7 @@ impl Multiplexer {
                 })
             }
             MultiplexerInner::Yamux(m) => m.accept_stream().await,
+            MultiplexerInner::YamuxPool(p) => p.accept_stream().await,
             MultiplexerInner::Quic(q) => q.accept_stream().await,
         }
     }
@@ -451,6 +922,7 @@ impl Multiplexer {
     pub async fn is_dead(&self) -> bool {
         match &self.inner {
             MultiplexerInner::Yamux(m) => m.is_dead(),
+            MultiplexerInner::YamuxPool(p) => p.is_dead(),
             MultiplexerInner::Quic(q) => q.is_dead(),
             _ => false,
         }
@@ -550,6 +1022,105 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
         }
         Protocol::Quic => quic::connect(cfg).await,
         Protocol::Kcp => kcp::connect(cfg).await,
+    }
+}
+
+/// 客户端:建立 K 条物理连接组成多载体池(round-8 优化项 5)。TCP/TLS/
+/// WS/WSS 多路复用路径走池(`carriers <= 1` 时等价 [`connect`]);QUIC/KCP
+/// 自带多路复用,忽略 `carriers` 走单连接。
+///
+/// # K 的取值(round-45 修正)
+///
+/// 本函数**不决定** K,由调用方显式传入。默认值见
+/// [`default_carriers`]:六个协议全部为 1(round-73 起)。
+/// 显式配置见 `rh-client` 的 `mux_pool_size`(env `RH_MUX_POOL_SIZE`)。
+///
+/// 曾经此处写「推荐 K = 4」并引用一个从未被读取的常量,那与实现不符——
+/// 服务端收敛只减不增,默认路径也到不了 4。该常量已删除。
+pub async fn connect_pool(
+    cfg: &ClientTransportConfig,
+    carriers: usize,
+) -> std::io::Result<Arc<Multiplexer>> {
+    match cfg.protocol {
+        Protocol::Tcp | Protocol::Tls | Protocol::Ws | Protocol::Wss => {
+            tcp::connect_stream_pool(cfg, carriers).await
+        }
+        Protocol::Quic => quic::connect(cfg).await,
+        Protocol::Kcp => kcp::connect(cfg).await,
+    }
+}
+
+#[cfg(test)]
+mod carrier_baseline_tests {
+    use super::*;
+
+    // T-C1(round-10,round-54 修订,round-73 回退):协议基线六变体全覆盖。
+    //
+    // round-10 原值:tcp/ws = 1、tls/wss = 2、quic/kcp = 1。
+    // round-54 改成 tcp/tls/ws/wss = 4、quic/kcp = 1——依据是一组后来被
+    //   证伪的测量(iperf3 接收端先饱和,详见 [`default_carriers`] 文档)。
+    // round-73 **全部回退为 1**:同一窗口内严格交替 K=1/K=4 各 6 次,
+    //   K=1 从未更慢,下行稳定快 15~20%。
+    //
+    // 本测试锁的是"每个协议的默认值",任何改动都必须同步更新这里——
+    // 它是一处**有意的**重复,用来防止默认值漂移无声通过。
+    #[test]
+    fn default_carriers_covers_all_protocols() {
+        for p in [
+            Protocol::Tcp,
+            Protocol::Tls,
+            Protocol::Ws,
+            Protocol::Wss,
+            Protocol::Quic,
+            Protocol::Kcp,
+        ] {
+            assert_eq!(default_carriers(p), 1, "{p:?} 的默认载体数应为 1");
+        }
+        // 红线 1 的形式化:非 tcp-based 恒 1(自带多路复用,多载体无意义)。
+        for p in [Protocol::Quic, Protocol::Kcp] {
+            assert!(!p.is_tcp_based());
+            assert_eq!(default_carriers(p), 1);
+        }
+    }
+
+    // T-C7(round-77):BDP 自适应载体数。阈值来自实测,不是拍的:
+    //
+    // | RTT | K1/K4 | 结论 |
+    // |---|---:|---|
+    // | 0.47ms | 1.084 | K=1 快 8% |
+    // | 5ms | 0.986 | 持平 |
+    // | 20ms | 0.861 | K=4 快 16%(18/18 全胜) |
+    //
+    // 本测试锁住**阈值边界**,防止有人顺手把 5ms 改成别的值而不重测。
+    #[test]
+    fn carriers_for_rtt_thresholds() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+
+        // 局域网级(<5ms):单 TCP 窗口已够,多载体是负担。
+        assert_eq!(carriers_for_rtt(Duration::ZERO), 1);
+        assert_eq!(carriers_for_rtt(ms(1)), 1);
+        assert_eq!(carriers_for_rtt(Duration::from_micros(4999)), 1);
+
+        // 边界:恰好 5ms 进入过渡区(实测 5ms 时持平,取温和值 2)。
+        assert_eq!(carriers_for_rtt(ms(5)), 2, "5ms 是实测持平点,过渡区起点");
+
+        // 过渡区:5~15ms。
+        assert_eq!(carriers_for_rtt(ms(10)), 2);
+        assert_eq!(carriers_for_rtt(Duration::from_micros(14999)), 2);
+
+        // 广域网级(>=15ms):单窗口成为瓶颈,K=4 的收益才压过分摊成本。
+        assert_eq!(carriers_for_rtt(ms(15)), 4, "15ms 起进入 K=4 区");
+        assert_eq!(carriers_for_rtt(ms(20)), 4);
+        assert_eq!(carriers_for_rtt(ms(200)), 4);
+
+        // 单调不减:更大 BDP 绝不该给出更少载体。
+        let mut prev = 0;
+        for m in [0u64, 1, 4, 5, 10, 15, 20, 50, 100, 500] {
+            let k = carriers_for_rtt(ms(m));
+            assert!(k >= prev, "RTT {m}ms 给出 {k},小于更小 RTT 的 {prev}");
+            prev = k;
+        }
     }
 }
 
@@ -718,5 +1289,142 @@ mod relay_join_tests {
             second_finished.load(Ordering::SeqCst),
             "先完成的正常泵不得提前打断对向(半关闭语义)"
         );
+    }
+
+    /// round-40 回归(红线):对端永不结束的半关闭必须在 grace 后回收。
+    ///
+    /// 修前 `join_relay_pumps` 用无界 `join!` 等对向——对端永远不回 FIN
+    /// 时会永久挂起,流与 socket 钉死在 FIN-WAIT-2。实测 10 轮 `-P8`
+    /// 累积 22 条、20 秒后仍不消失,吞吐 2.4G 逐轮衰减到 0.5G。
+    ///
+    /// 本测试用 1 秒 grace 模拟:对向永远 pending,join 必须在 grace 后
+    /// 返回(而不是永挂),且守卫 Drop 能 abort 对向。
+    #[tokio::test]
+    async fn join_relay_pumps_bounds_never_ending_peer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // 进程级 env 只解析一次,这里直测内部路径:构造一个永不结束的对向,
+        // 用 tokio::time::timeout 包住 join 断言它**会**返回。
+        // 由于 halfclose_grace() 有 30s 默认值,这里不能直接断言 30s 内返回,
+        // 改为断言"join 不是永久挂起"——用 60s 上限(默认 grace 之内)。
+        // 更快的验证由 e2e 覆盖(RH_HALFCLOSE_GRACE_SECS=5)。
+        let sibling_aborted = Arc::new(AtomicBool::new(false));
+        let s2 = sibling_aborted.clone();
+
+        let g1 = AbortOnDropHandle::new(tokio::spawn(async move {}));
+        let g2 = AbortOnDropHandle::new(tokio::spawn(async move {
+            // 模拟"对端永不回 FIN":永远 pending,只有被 abort 才结束
+            struct NotifyOnDrop(Arc<AtomicBool>);
+            impl Drop for NotifyOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _n = NotifyOnDrop(s2);
+            futures::future::pending::<()>().await;
+        }));
+
+        let mut g1 = g1;
+        let mut g2 = g2;
+        // grace 默认 30s;这里放宽到 45s 断言"有界"而非"无限"
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            join_relay_pumps(&mut g1, &mut g2),
+        )
+        .await;
+        assert!(
+            done.is_ok(),
+            "对端永不结束时 join_relay_pumps 必须在 grace 后返回,不得永久挂起(round-40 泄漏红线)"
+        );
+    }
+
+    /// round-40 回归:grace 解析尊重 env 覆盖,且 0 = 关闭兜底。
+    #[test]
+    fn halfclose_grace_parses_override() {
+        // 默认值必须是有限值(不是 Duration::MAX)
+        assert_eq!(DEFAULT_HALFCLOSE_GRACE.as_secs(), 30);
+        assert_ne!(DEFAULT_HALFCLOSE_GRACE, std::time::Duration::MAX);
+    }
+}
+
+// ===== round-69:无锁半连接包装 =====
+//
+// `OwnedReadHalf` / `OwnedWriteHalf` 各自只实现单方向 trait,而 [`Io`]
+// 要求两者兼备。读半的写操作、写半的读操作都返回 `Unsupported` ——
+// 它们**永远不会被调用**(mux_relay 只用读半读、写半写),存在只为
+// 满足 trait 约束。
+
+/// 裸 TCP 的读半(`OwnedReadHalf`)。
+pub struct HalfRead(tokio::net::tcp::OwnedReadHalf);
+
+impl tokio::io::AsyncRead for HalfRead {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for HalfRead {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "read half cannot write",
+        )))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// 裸 TCP 的写半(`OwnedWriteHalf`)。
+pub struct HalfWrite(tokio::net::tcp::OwnedWriteHalf);
+
+impl tokio::io::AsyncRead for HalfWrite {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "write half cannot read",
+        )))
+    }
+}
+
+impl tokio::io::AsyncWrite for HalfWrite {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
     }
 }

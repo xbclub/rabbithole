@@ -11,7 +11,7 @@ use rh_protocol::{
     ProxySpec,
 };
 use rh_transport::BoxedIo;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use std::sync::Arc;
@@ -318,7 +318,13 @@ impl AppState {
             cfg,
             db,
             events,
-            sessions: Arc::new(SessionRegistry::new()),
+            // round-80:在线数 gauge 由注册表在每次成员变更时直接上报。
+            // 修前 gauge 只在拆除路径写、上线路径从不写,导致
+            // `/metrics` 的 clients_online 恒为 0。
+            sessions: Arc::new(SessionRegistry::with_online_gauge({
+                let g = metrics.client_online.clone();
+                Arc::new(move |n: usize| g.set(n as i64))
+            })),
             proxies,
             client_locks: Arc::new(dashmap::DashMap::new()),
             metrics,
@@ -709,7 +715,17 @@ impl ProxyState {
 pub struct TcpPool {
     /// 就绪通道(已完成 DATA_CHANNEL_HELLO,等待 START_FORWARD)。
     /// 元组:(建立该通道的会话 epoch, request_id, io)
-    pub ready: Mutex<Vec<(u64, u64, BoxedIo)>>,
+    ///
+    /// round-34:`Vec` → `VecDeque`,取用从 `pop()`(LIFO)改为
+    /// `pop_front()`(FIFO)。修前每次取走的是**最后**建好的那条通道,
+    /// 而"最后建好"的那条往往正是刚刚预热完成、尚未被任何流量验证过的;
+    /// 先建好的通道则长期沉底,直到过期才被驱逐。FIFO 让每条通道都被
+    /// 均匀使用一次,连接年龄分布稳定、不易出现"陈旧通道被突然启用"。
+    ///
+    /// 注:池内每条通道都是一条独立 yamux 流,单条流的在途字节数在服务端
+    /// 这一侧不可观测(流是透明的 `BoxedIo`,不带 carrier 归属),故本轮
+    /// 采用任务给出的 FIFO 选项,而非按在途字节做最小负载选择。
+    pub ready: Mutex<VecDeque<(u64, u64, BoxedIo)>>,
     /// 等待用户连接的等待者(用户连接先到)。带唯一 id:超时按 id 精确移除,
     /// 不得误删其他等待者(LIFO pop 会删错对象)。
     pub waiters: Mutex<Vec<(u64, tokio::sync::oneshot::Sender<BoxedIo>)>>,
@@ -727,7 +743,7 @@ pub struct TcpPool {
 impl TcpPool {
     pub fn new(size: usize) -> Self {
         Self {
-            ready: Mutex::new(Vec::new()),
+            ready: Mutex::new(VecDeque::new()),
             waiters: Mutex::new(Vec::new()),
             size,
             inflight: AtomicU64::new(0),

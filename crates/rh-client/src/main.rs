@@ -30,11 +30,34 @@ struct Cli {
     /// 覆盖共享密钥。
     #[arg(long)]
     secret: Option<String>,
+    /// 测试/诊断专用(隐藏):打印硬件上限探测结果后退出。
+    ///
+    /// 存在理由:`tests/e2e.sh` 需要「客户端实际会用的 hardware_cap」作为
+    /// 期望值。脚本早先用 Python 独立推算(读 sched_getaffinity + cgroup
+    /// 配额 + sysfs 队列),与 Rust 侧的 `available_parallelism()` 在嵌套
+    /// cgroup 下可能不一致(REPORT-round10.md「## 6. 遗留」第 1 条)。
+    ///
+    /// 现在脚本直接消费**这个二进制自己算出的值**,口径不可能再漂移。
+    /// 隐藏(`hide = true`)以免进入 `--help` 的公开接口面。
+    #[arg(long, hide = true)]
+    print_hardware_cap: bool,
 }
+
+/// 全局内存分配器(round-35):mimalloc(理由见 rh-server/src/main.rs 同处)。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // 测试/诊断专用出口:打印硬件上限后立即退出。
+    //
+    // 必须在读配置之前——`tests/e2e.sh` 只想要这个数,不该被迫提供
+    // 一份完整配置(client_id/secret 等)。
+    if cli.print_hardware_cap {
+        println!("{}", config::detect_hardware_cap());
+        return Ok(());
+    }
     // 配置来源优先级:CLI 覆盖 > 环境变量(RH_*)> 配置文件 > 内置默认。
     // 文件承载全部字段;env 是薄覆盖层(Docker 等场景 3 个字符串接入,见 config.rs)。
     let default_path = std::path::PathBuf::from("rh-client.toml");
@@ -72,6 +95,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
     // 三方 crate(yamux/tungstenite/kcp)走 log facade,桥接到 tracing
     let _ = tracing_log::LogTracer::init();
+    // 启动即确认实际生效的全局分配器(round-35)。
+    tracing::info!(allocator = "mimalloc", "global allocator");
     anyhow::ensure!(
         !cfg.client_id.is_empty(),
         "client_id 为空(配置文件 / RH_CLIENT_ID / --id)"

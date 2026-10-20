@@ -8,12 +8,11 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-use crate::connection::rtt::Rtt;
 use crate::frame::header::ACK;
 use crate::ConnectionError;
 use crate::{
     chunks::Chunks,
-    connection::{self, rtt, StreamCommand},
+    connection::{self, StreamCommand},
     frame::{
         header::{Data, Header, StreamId, WindowUpdate},
         Frame,
@@ -22,6 +21,9 @@ use crate::{
 };
 use bytes::BufMut;
 use flow_control::FlowController;
+// WU 快车道(round-9 §2):流持连接级共享状态句柄,纯 WU 帧直压 to_send。
+// halves 是 connection 的私有子模块,stream 同为其后代,可见性成立。
+use super::halves::ConnShared;
 use futures::{
     channel::mpsc,
     future::Either,
@@ -32,6 +34,7 @@ use parking_lot::{Mutex, MutexGuard};
 use std::{
     fmt, io,
     pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
     task::{Context, Poll, Waker},
 };
@@ -108,6 +111,13 @@ pub struct Stream {
     window_update_sender: mpsc::Sender<StreamCommand>,
     flag: Flag,
     shared: Arc<Mutex<Shared>>,
+    /// 连接级共享状态(round-9 WU 快车道):Some = halves 路径,无 flag 的
+    /// 纯 WU 帧经 `ConnShared::push_to_send` 直入 to_send(FlushTask 下一轮
+    /// 即取,消除流级 mpsc 排队 + SendWorker 中间跳);None = 未拆分路径
+    /// (Active,无 ConnShared)与单测直构形态,保持旧 mpsc 通路。
+    /// 带 flag(Syn/Ack)的建流授信帧与任何 Data/FIN/RST 永不走快车道
+    /// (红线:流内 FIFO 顺序契约)。
+    conn_shared: Option<Arc<ConnShared>>,
 }
 
 impl fmt::Debug for Stream {
@@ -132,24 +142,20 @@ impl Stream {
         config: Arc<Config>,
         send_window: u32,
         sender: mpsc::Sender<StreamCommand>,
-        rtt: rtt::Rtt,
-        accumulated_max_stream_windows: Arc<Mutex<usize>>,
+        conn_shared: Option<Arc<ConnShared>>,
     ) -> Self {
-        Self {
+        let mut stream = Self {
             id,
             conn,
             config: config.clone(),
             window_update_sender: sender.clone(),
             sender,
             flag: Flag::Ack,
-            shared: Arc::new(Mutex::new(Shared::new(
-                DEFAULT_CREDIT,
-                send_window,
-                accumulated_max_stream_windows,
-                rtt,
-                config,
-            ))),
-        }
+            shared: Arc::new(Mutex::new(Shared::new(DEFAULT_CREDIT, send_window, config))),
+            conn_shared,
+        };
+        stream.queue_creation_grant();
+        stream
     }
 
     pub(crate) fn new_outbound(
@@ -157,10 +163,9 @@ impl Stream {
         conn: connection::Id,
         config: Arc<Config>,
         sender: mpsc::Sender<StreamCommand>,
-        rtt: rtt::Rtt,
-        accumulated_max_stream_windows: Arc<Mutex<usize>>,
+        conn_shared: Option<Arc<ConnShared>>,
     ) -> Self {
-        Self {
+        let mut stream = Self {
             id,
             conn,
             config: config.clone(),
@@ -169,11 +174,56 @@ impl Stream {
             flag: Flag::Syn,
             shared: Arc::new(Mutex::new(Shared::new(
                 DEFAULT_CREDIT,
-                DEFAULT_CREDIT,
-                accumulated_max_stream_windows,
-                rtt,
+                // round-59:发送窗初值跟随配置(修前写死 DEFAULT_CREDIT,
+                // 与 initial_stream_receive_window 无关 ⟹ 发送方每 256KiB
+                // 就要等一次对端窗口更新往返)。
+                config.initial_stream_send_window() as u32,
                 config,
             ))),
+            conn_shared,
+        };
+        stream.queue_creation_grant();
+        stream
+    }
+
+    /// 建流即授信(round-4/B1,对齐 frp OpenStream/AcceptStream 时机):
+    /// 构造完成后立即把预授差额(max_receive_window − DEFAULT_CREDIT)以带
+    /// 初始 flag 的窗口更新帧排队授出——outbound SYN|WU 合帧(hashicorp
+    /// OpenStream 的 initialStreamFlags 行为)、inbound ACK|WU(镜像
+    /// `into_halves` 的 ACK 副作用记账),均为 upstream 合法组合,不再等
+    /// 读路径首个窗口更新 poll。通道在 make_new_*_stream 皆为容量
+    /// `STREAM_COMMAND_CAP` 的全新通道,建流时必空,try_send 必成;失败兜底
+    /// (测试以容量 0 通道直接构造流的用法)不得丢授信——flag 恢复原值
+    /// (Syn/Ack)、pregrant_pending 恢复 true,行为退回旧路径(读 poll
+    /// 授信 / into_halves 补 ACK)。
+    fn queue_creation_grant(&mut self) {
+        let delta = self.shared.lock().flow_controller.take_creation_grant();
+        if delta == 0 {
+            // 无预授(预算钳制回退/已授出):flag 不动,维持现状——
+            // lazy SYN 由首数据帧携带、ACK 由 into_halves 补。
+            return;
+        }
+        let prev_flag = self.flag;
+        let mut frame = Frame::window_update(self.id, delta).right();
+        self.add_flag(frame.header_mut());
+        let cmd = StreamCommand::SendFrame(frame);
+        if self.window_update_sender.try_send(cmd).is_ok() {
+            if prev_flag == Flag::Ack {
+                self.shared()
+                    .update_state(self.conn, self.id, State::Open { acknowledged: true });
+            }
+        } else {
+            // 回滚:flag 与预授记账复原,授信交还旧路径
+            self.flag = prev_flag;
+            self.shared
+                .lock()
+                .flow_controller
+                .restore_creation_grant(delta);
+            log::debug!(
+                "{}/{}: creation grant frame not queued, deferring to read-poll grant",
+                self.conn,
+                self.id
+            );
         }
     }
 
@@ -230,6 +280,25 @@ impl Stream {
             return Poll::Ready(Ok(()));
         }
 
+        // 快车道(round-9 §2):无 flag 的纯 WU 帧直压 to_send——纯信用
+        // 增量不携带数据/控制语义,不属于流内保序范畴,且 push_to_send
+        // 压入即取 send_waker 槽唤醒 FlushTask(优先级最高,下一轮即出),
+        // 无丢唤醒;产生速率受接收速率限制(收满半窗才一帧),天然有界。
+        // 带 flag(Syn/Ack)的 WU(建流授信余量)必须走旧 mpsc 通路保
+        // 流内 FIFO;next_window_update 的记账副作用紧跟 infallible 的
+        // 压入,无"已记账未发出"窗口。
+        if self.flag == Flag::None {
+            if let Some(shared) = &self.conn_shared {
+                let Some(credit) = self.shared.lock().next_window_update() else {
+                    return Poll::Ready(Ok(()));
+                };
+                let frame: Frame<Either<Data, WindowUpdate>> =
+                    Frame::window_update(self.id, credit).right();
+                shared.push_to_send(frame.into());
+                return Poll::Ready(Ok(()));
+            }
+        }
+
         ready!(self
             .window_update_sender
             .poll_ready(cx)
@@ -252,6 +321,9 @@ impl Stream {
     /// 零拷贝读:取出接收缓冲链首一整块 [`bytes::Bytes`](引用计数切片)。
     /// 语义与 [`futures::stream::Stream`] 实现一致(含窗口更新与 EOF);
     /// `Ok(None)` = EOF/流复位。rabbithole vendor 转发路径专用。
+    ///
+    /// 回窗时机对齐 frp(round-31 项 2):**先取块、后判定回窗**,缓冲
+    /// 长度按取出之后计。修前先回窗后取块,授信恒少算一块已消费数据。
     pub fn poll_read_chunk(
         mut self: Pin<&mut Self>,
         cx: &mut Context,
@@ -273,6 +345,32 @@ impl Stream {
         }
         let mut shared = self.shared();
         if let Some(bytes) = shared.buffer.pop() {
+            // 取出后判定:缓冲已缩一块,额度按取出后的长度算(同 frp)。
+            if let Some(credit) = shared.pending_window_update() {
+                shared.commit_window_update(credit);
+                drop(shared);
+                // 快车道可用时直压 to_send;否则走流级 mpsc(容量已在
+                // 上面 poll_ready 确认,start_send 无失败)。
+                if let Some(shared_conn) = self
+                    .conn_shared
+                    .as_ref()
+                    .filter(|_| self.flag == Flag::None)
+                {
+                    let frame: Frame<Either<Data, WindowUpdate>> =
+                        Frame::window_update(self.id, credit).right();
+                    shared_conn.push_to_send(frame.into());
+                } else {
+                    let mut frame = Frame::window_update(self.id, credit).right();
+                    self.add_flag(frame.header_mut());
+                    if self
+                        .window_update_sender
+                        .start_send(StreamCommand::SendFrame(frame))
+                        .is_err()
+                    {
+                        return Poll::Ready(Err(self.write_zero_err()));
+                    }
+                }
+            }
             return Poll::Ready(Ok(Some(bytes)));
         }
         if !shared.state().can_read() {
@@ -288,6 +386,7 @@ impl Stream {
     /// * 成功消费 k 字节:整块消费时置 `None`(保持引用计数 1,帧写穿后
     ///   可归池);部分消费时置 `Some(剩余)`(slice 视图,本轮不归池);
     /// * `Poll::Pending`(窗口耗尽/通道满):`chunk` 原样保留。
+    ///
     /// 返回本次消费字节数(0 = 空块)。rabbithole vendor 转发路径专用。
     pub fn poll_write_chunk(
         mut self: Pin<&mut Self>,
@@ -353,6 +452,7 @@ impl Stream {
             mut window_update_sender,
             flag,
             shared,
+            conn_shared,
         } = self;
         // C2:拆半后 ACK flag 随写半,而读半的窗口更新不携带 ACK——
         // 小流量流迟迟不触发窗口更新、写半首写又未到来时,ACK 憋在
@@ -387,6 +487,7 @@ impl Stream {
                 sender: sender.clone(),
                 window_update_sender,
                 shared: shared.clone(),
+                conn_shared: conn_shared.clone(),
             },
             StreamWriteHalf {
                 id,
@@ -395,6 +496,7 @@ impl Stream {
                 sender,
                 flag,
                 shared,
+                conn_shared,
             },
         )
     }
@@ -408,19 +510,143 @@ pub struct StreamReadHalf {
     sender: mpsc::Sender<StreamCommand>,
     window_update_sender: mpsc::Sender<StreamCommand>,
     shared: Arc<Mutex<Shared>>,
+    /// 同 [`Stream::conn_shared`]:读半是运行期 WU 帧的唯一产生侧。
+    conn_shared: Option<Arc<ConnShared>>,
+}
+
+/// [`StreamReadHalf::poll_read_chunk`] 快车道单锁热路径的判定结果:
+/// 锁内一次算完"取块 / 回窗额度 / EOF / park",锁外只做帧压入与返回
+/// (压入是 infallible 的 to_send 快车道,不违反"记账后必发出")。
+enum ReadStep {
+    /// 取到一块数据;`credit` = 本轮同时授出的窗口额度。
+    Data(bytes::Bytes, Option<u32>),
+    /// 流已不可读且缓冲为空:EOF。
+    Eof,
+    /// 缓冲为空且可读:已注册 reader waker(并复查过 buffer),附带
+    /// park 时刻的 send_window(round-11 诊断用)与本轮应授出的额度。
+    Parked(Option<u32>, u32),
 }
 
 impl StreamReadHalf {
     /// 同 [`Stream::poll_read_chunk`]。
+    ///
+    /// 快车道(有 `ConnShared`)走**单次取锁热路径**:状态检查、取块、
+    /// 回窗判定、记账一次锁内完成(round-31 项 2+3)。修前每次取块取锁
+    /// 四次(`state.can_read` / `ack_pending` / `next_window_update` /
+    /// `buffer.pop`),且回窗判定用的是**取出之前**的缓冲长度——rh 先回窗
+    /// 后取块,frp 先取块后回窗(`benchmark/frp-yamux-src/stream.go`
+    /// `Read`:`s.recvBuf.Read(b)` 之后才 `s.sendWindowUpdate()`),同一
+    /// 窗口下 rh 的授信恒比 frp 少算一块已消费数据,对端在 BDP 边缘会多
+    /// 停一拍。
     pub fn poll_read_chunk(&mut self, cx: &mut Context) -> Poll<io::Result<Option<bytes::Bytes>>> {
+        let __sd = crate::sched_diag::enabled();
+        if __sd {
+            crate::sched_diag::on_poll();
+            crate::sched_diag::begin_poll();
+        }
         if !self.config.read_after_close && self.sender.is_closed() {
+            if __sd {
+                crate::sched_diag::end_poll();
+            }
             return Poll::Ready(Ok(None));
         }
+
+        // ── 快车道热路径:一次取锁 ───────────────────────────────────
+        // 只在"有 ConnShared(纯 WU 走 to_send 快车道,压入 infallible)"
+        // 且"无待补 ACK"时启用——带 ACK 的 0-credit WU 属带 flag 帧,必须
+        // 走旧 mpsc 通路保流内 FIFO(见 `send_window_update` 注释),那条
+        // 路要求**先确认容量再记账**,与单锁热路径不相容,保持原样为冷路径。
+        if let Some(conn_shared) = self.conn_shared.clone() {
+            let step = {
+                let mut shared = self.shared();
+                if shared.ack_pending {
+                    None
+                } else {
+                    let can_read = shared.state.can_read();
+                    let bytes = shared.buffer.pop();
+                    // 回窗判定:缓冲长度取**取出之后**(对齐 frp 的
+                    // `recvBuf.Read` → `sendWindowUpdate` 顺序)。快车道的
+                    // 压入无失败可能,故锁内记账安全(不会出现"已记账未发出")。
+                    let credit = if can_read {
+                        shared.pending_window_update()
+                    } else {
+                        None
+                    };
+                    if let Some(c) = credit {
+                        shared.commit_window_update(c);
+                    }
+                    match bytes {
+                        Some(bytes) => Some(ReadStep::Data(bytes, credit)),
+                        None if can_read => {
+                            // park:同一把锁内注册 waker + 复查 buffer
+                            // (round-11 丢唤醒防线,见原实现注释)
+                            shared.reader = Some(cx.waker().clone());
+                            match shared.buffer.pop() {
+                                Some(bytes) => {
+                                    shared.reader = None; // 撤销注册:本 poll 已直接交付
+                                    Some(ReadStep::Data(bytes, credit))
+                                }
+                                None => Some(ReadStep::Parked(
+                                    credit,
+                                    shared.flow_controller.send_window(),
+                                )),
+                            }
+                        }
+                        None => Some(ReadStep::Eof),
+                    }
+                }
+            };
+            match step {
+                Some(ReadStep::Data(bytes, credit)) => {
+                    if let Some(credit) = credit {
+                        // 快车道:纯 WU 帧直压 to_send(FlushTask 下一轮即取)
+                        let frame: Frame<Either<Data, WindowUpdate>> =
+                            Frame::window_update(self.id, credit).right();
+                        conn_shared.push_to_send(frame.into());
+                    }
+                    if __sd {
+                        crate::sched_diag::end_poll();
+                    }
+                    return Poll::Ready(Ok(Some(bytes)));
+                }
+                Some(ReadStep::Eof) => {
+                    log::debug!("{}/{}: eof", self.conn, self.id);
+                    if __sd {
+                        crate::sched_diag::end_poll();
+                    }
+                    return Poll::Ready(Ok(None));
+                }
+                Some(ReadStep::Parked(credit, send_window)) => {
+                    if let Some(credit) = credit {
+                        // 缓冲已空但仍越过半窗阈值(全量消费后回补):授信
+                        // 直压 to_send,使对端不必等下一次读即恢复发送。
+                        let frame: Frame<Either<Data, WindowUpdate>> =
+                            Frame::window_update(self.id, credit).right();
+                        conn_shared.push_to_send(frame.into());
+                    }
+                    if crate::sched_diag::enabled() {
+                        crate::sched_diag::on_park_with_window(send_window);
+                        crate::sched_diag::on_park();
+                    }
+                    if __sd {
+                        crate::sched_diag::end_poll();
+                    }
+                    return Poll::Pending;
+                }
+                // ack_pending:落冷路径(带 ACK 的 WU 走旧 mpsc 通路)
+                None => {}
+            }
+        }
+
+        // ── 冷路径:待补 ACK / 无 ConnShared(Active 与单测直构形态) ──
         match self.send_window_update(cx) {
             Poll::Ready(Ok(())) => {}
             // C3:同 Stream::poll_read_chunk——缓冲优先于通道错误交付。
             Poll::Ready(Err(e)) => {
                 if self.shared.lock().buffer.is_empty() {
+                    if __sd {
+                        crate::sched_diag::end_poll();
+                    }
                     return Poll::Ready(Err(e));
                 }
             }
@@ -428,19 +654,65 @@ impl StreamReadHalf {
         }
         let mut shared = self.shared();
         if let Some(bytes) = shared.buffer.pop() {
+            if __sd {
+                crate::sched_diag::end_poll();
+            }
             return Poll::Ready(Ok(Some(bytes)));
         }
         if !shared.state().can_read() {
             log::debug!("{}/{}: eof", self.conn, self.id);
+            if __sd {
+                crate::sched_diag::end_poll();
+            }
             return Poll::Ready(Ok(None));
         }
+        // round-11:park 前在**同一把锁内**完成"注册 waker + 复查 buffer"。
+        // 原实现先 `buffer.pop()`(已持有 shared 锁,put 后释放),
+        // 再 `shared.reader = waker` —— 两步之间若 ShardWorker 已 push
+        // 并 take 走 reader(那时还没注册),本任务会永 park(丢失唤醒)。
+        // 这里改为:注册 waker 后立刻在同一锁内复查 buffer,非空则
+        // 撤销注册并直接交付。既修丢失唤醒,也减少空唤醒后的无效 park。
         shared.reader = Some(cx.waker().clone());
+        if let Some(bytes) = shared.buffer.pop() {
+            shared.reader = None; // 撤销注册:本 poll 已直接交付
+            if __sd {
+                crate::sched_diag::end_poll();
+            }
+            return Poll::Ready(Ok(Some(bytes)));
+        }
+        // round-11 诊断:park 时记录 send_window 是否耗尽,二分判据。
+        if crate::sched_diag::enabled() {
+            let sw = shared.flow_controller.send_window();
+            crate::sched_diag::on_park_with_window(sw);
+        }
+        if crate::sched_diag::enabled() {
+            crate::sched_diag::on_park();
+        }
+        if __sd {
+            crate::sched_diag::end_poll();
+        }
         Poll::Pending
     }
 
     fn send_window_update(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         if !self.shared.lock().state.can_read() {
             return Poll::Ready(Ok(()));
+        }
+        // 快车道(round-9 §2):无 flag 且无待补 ACK 的纯 WU 帧直压
+        // to_send(ack_pending 的 0-credit WU 携带 ACK,属带 flag 帧,
+        // 必须走旧 mpsc 通路——见 C2 补修注释)。记账副作用紧跟
+        // infallible 压入,无"已记账未发出"窗口。
+        let ack_pending = self.shared.lock().ack_pending;
+        if !ack_pending {
+            if let Some(shared) = &self.conn_shared {
+                let Some(credit) = self.shared.lock().next_window_update() else {
+                    return Poll::Ready(Ok(()));
+                };
+                let frame: Frame<Either<Data, WindowUpdate>> =
+                    Frame::window_update(self.id, credit).right();
+                shared.push_to_send(frame.into());
+                return Poll::Ready(Ok(()));
+            }
         }
         // C2 补修:除常规窗口更新外,共享待 ACK 状态也由此路径补发——
         // 即使无 credit 可授(小流量流),也发 0-credit WU+ACK,使 ACK
@@ -449,7 +721,6 @@ impl StreamReadHalf {
         // 注意 `next_window_update` 有记账副作用(receive_window 推进),
         // 必须在容量确认(poll_ready)之后调用,否则队列满时 credit
         // 已记账而帧未发出,窗口永久丢失。
-        let ack_pending = self.shared.lock().ack_pending;
         ready!(self
             .window_update_sender
             .poll_ready(cx)
@@ -458,6 +729,8 @@ impl StreamReadHalf {
         if credit.is_none() && !ack_pending {
             return Poll::Ready(Ok(()));
         }
+        // round-22 诊断:区分"纯 WU"与"0-credit WU+ACK"两条路径。
+        crate::sched_diag::on_wu_path(credit.is_some(), ack_pending);
         let frame = {
             let mut shared = self.shared();
             let mut header = Header::window_update(self.id, credit.unwrap_or(0));
@@ -498,6 +771,10 @@ pub struct StreamWriteHalf {
     sender: mpsc::Sender<StreamCommand>,
     flag: Flag,
     shared: Arc<Mutex<Shared>>,
+    /// 同 [`Stream::conn_shared`]:写半不产生 WU 帧,仅为 halves 形态
+    /// 对称持有(随拆半继承,保持两半共享同一连接级状态句柄)。
+    #[allow(dead_code)] // 快车道只服务读侧;写侧无消费点(规格 §2.2 要求三结构同字段)
+    conn_shared: Option<Arc<ConnShared>>,
 }
 
 impl StreamWriteHalf {
@@ -877,31 +1154,28 @@ pub(crate) struct Shared {
     /// "仅写半可发"即旧缺陷形态)。完整 Stream 不使用(其 flag
     /// 机制已覆盖全部外发路径)。
     pub(crate) ack_pending: bool,
+    /// halves 路径的未确认开流计数令牌(D4 精确性):Some ⟺ 该**出站**
+    /// 流已计入全局 ack_backlog_count 且尚未递减。基线 ack_backlog() 是
+    /// 全表实时扫描——流离开 Open{ack:false} 的**任何**迁移(对端 ACK
+    /// 确认 / 本地 poll_close 半关闭 / 对端 FIN、RST / 删除 / 连接排空)
+    /// 即刻不再计入;分片形态没有全局表可扫,由本令牌在 update_state
+    /// 的迁移点上恰递减一次(消费即置 None)。未拆分路径与非出站流恒
+    /// None,零行为影响。
+    pub(crate) ack_backlog_token: Option<Arc<AtomicUsize>>,
 }
 
 impl Shared {
-    fn new(
-        receive_window: u32,
-        send_window: u32,
-        accumulated_max_stream_windows: Arc<Mutex<usize>>,
-        rtt: Rtt,
-        config: Arc<Config>,
-    ) -> Self {
+    fn new(receive_window: u32, send_window: u32, config: Arc<Config>) -> Self {
         Shared {
             state: State::Open {
                 acknowledged: false,
             },
-            flow_controller: FlowController::new(
-                receive_window,
-                send_window,
-                accumulated_max_stream_windows,
-                rtt,
-                config,
-            ),
+            flow_controller: FlowController::new(receive_window, send_window, config),
             buffer: Chunks::new(),
             reader: None,
             writer: None,
             ack_pending: false,
+            ack_backlog_token: None,
         }
     }
 
@@ -919,6 +1193,26 @@ impl Shared {
         use self::State::*;
 
         let current = self.state;
+
+        // D4 令牌消费:离开 Open{ack:false} 的迁移点。基线靠全表实时扫描
+        // 自然"不再计入";分片形态在此恰递减一次全局未确认计数——所有
+        // 路径(对端 ACK 确认、本地 poll_close 半关闭、对端 FIN/RST、
+        // on_drop 删除、连接排空)都经本方法迁移状态,单点收口。
+        if matches!(
+            current,
+            Open {
+                acknowledged: false
+            }
+        ) && !matches!(
+            next,
+            Open {
+                acknowledged: false
+            }
+        ) {
+            if let Some(counter) = self.ack_backlog_token.take() {
+                counter.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
 
         match (current, next) {
             (Closed, _) => {}
@@ -949,6 +1243,18 @@ impl Shared {
         self.flow_controller.next_window_update(self.buffer.len())
     }
 
+    /// 回窗额度判定(纯函数,不记账):缓冲长度取**当前**值。调用方须在
+    /// "取块之后"调用才与 frp 同语义(见 [`StreamReadHalf::poll_read_chunk`])。
+    pub(crate) fn pending_window_update(&self) -> Option<u32> {
+        self.flow_controller
+            .pending_window_update(self.buffer.len())
+    }
+
+    /// 记账本轮授出的额度(须紧随无失败的帧压入)。
+    pub(crate) fn commit_window_update(&mut self, credit: u32) {
+        self.flow_controller.commit_window_update(credit);
+    }
+
     /// Whether we are still waiting for the remote to acknowledge this stream.
     pub fn is_pending_ack(&self) -> bool {
         matches!(
@@ -973,6 +1279,18 @@ impl Shared {
 
     pub(crate) fn consume_receive_window(&mut self, i: u32) -> Result<(), ConnectionError> {
         self.flow_controller.consume_receive_window(i)
+    }
+}
+
+impl Drop for Shared {
+    /// D4 防御网:所有表内路径理论上都经 update_state(Closed) 收尾并
+    /// 消费令牌;若仍有令牌滞留到整体析构(未来新增路径漏迁移),在此
+    /// 补递减,保证"计入一次 ⟺ 递减一次"的不变量无泄漏。令牌消费即
+    /// 置 None,与 update_state 的消费互斥,不会双重递减。
+    fn drop(&mut self) {
+        if let Some(counter) = self.ack_backlog_token.take() {
+            counter.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -1014,8 +1332,7 @@ mod tests {
             connection::Id::next(),
             Arc::new(Config::default()),
             sender,
-            Rtt::new(),
-            Default::default(),
+            None,
         );
 
         let write_waker = Arc::new(FlagWaker::default());
@@ -1064,8 +1381,7 @@ mod tests {
             Arc::new(Config::default()),
             DEFAULT_CREDIT,
             sender,
-            Rtt::new(),
-            Default::default(),
+            None,
         );
 
         let (_read_half, mut write_half) = stream.into_halves();
@@ -1129,8 +1445,7 @@ mod tests {
             Arc::new(Config::default()),
             DEFAULT_CREDIT,
             sender,
-            Rtt::new(),
-            Default::default(),
+            None,
         );
         let (r, w) = stream.into_halves();
         (r, w, receiver)
@@ -1193,8 +1508,7 @@ mod tests {
             Arc::new(Config::default()),
             DEFAULT_CREDIT,
             sender,
-            Rtt::new(),
-            Default::default(),
+            None,
         );
         let (mut read_half, _write_half) = stream.into_halves();
         // 拆半 ACK 已排队(干净 handle try_send 成功),且该 handle 因
@@ -1306,5 +1620,208 @@ mod tests {
             other => panic!("expected CloseStream, got {other:?}"),
         }
         assert!(!write_half.shared().ack_pending);
+    }
+
+    // ===== round-9 §2:WU 帧极速快车道 =====
+
+    /// 构造带连接级共享状态的入站流(halves 路径的生产等价形态:
+    /// ShardWorker::make_new_inbound_stream 传 Some(shared))与独立命令通道。
+    /// 6MiB 初窗 = 生产 mux_config 形态:建流授信(ACK|WU)经 try_send 自然
+    /// 消费 Ack flag,后续运行期 WU 即为纯 WU。
+    fn inbound_with_shared(
+        config: Arc<Config>,
+    ) -> (Stream, Arc<ConnShared>, mpsc::Receiver<StreamCommand>) {
+        let (sender, receiver) = mpsc::channel(10);
+        let conn_shared = Arc::new(ConnShared::new_for_test(
+            connection::Id::next(),
+            crate::Mode::Server,
+            Config::default(),
+            1,
+        ));
+        let stream = Stream::new_inbound(
+            StreamId::new(2),
+            connection::Id::next(),
+            config,
+            DEFAULT_CREDIT,
+            sender,
+            Some(conn_shared.clone()),
+        );
+        (stream, conn_shared, receiver)
+    }
+
+    /// 模拟接收侧入账(连接侧 on_data 的记账形态):仅消耗接收窗(缓冲
+    /// 只会缩减授出额度,不影响本组断言),使下一次读 poll 越过半窗阈值。
+    fn consume_received(stream: &mut Stream, n: u32) {
+        stream.shared().consume_receive_window(n).expect("window");
+    }
+
+    /// 同 [`consume_received`],拆半读侧形态。
+    fn consume_received_half(r: &StreamReadHalf, n: u32) {
+        r.shared().consume_receive_window(n).expect("window");
+    }
+
+    /// 取出建流授信帧(6MiB 配置下 queue_creation_grant 必然排队)。
+    fn take_creation_grant(receiver: &mut mpsc::Receiver<StreamCommand>) {
+        match receiver.try_recv().expect("creation grant queued via mpsc") {
+            StreamCommand::SendFrame(f) => {
+                assert_eq!(f.header().tag(), crate::frame::header::Tag::WindowUpdate);
+                assert!(f.header().flags().contains(ACK));
+                assert!(!f.header().flags().contains(crate::frame::header::SYN));
+                assert_eq!(f.header().len().val(), 6 * 1024 * 1024 - DEFAULT_CREDIT);
+            }
+            other => panic!("expected SendFrame, got {other:?}"),
+        }
+    }
+
+    fn six_mib_config() -> Arc<Config> {
+        let mut cfg = Config::default();
+        cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
+        Arc::new(cfg)
+    }
+
+    /// T-W1:无 flag 的纯 WU 帧走 to_send 快车道——读满半窗后 WU 帧在
+    /// to_send 中、线格式无任何 flag,且不经过流级 mpsc(通道保持空)。
+    /// 修前(纯 mpsc 路径)红:WU 落在通道里,to_send 恒空。
+    #[test]
+    fn wu_fastlane_pure_wu_goes_to_to_send() {
+        let (mut stream, conn_shared, mut receiver) = inbound_with_shared(six_mib_config());
+        take_creation_grant(&mut receiver); // Ack flag 已随授信消费
+        consume_received(&mut stream, 4 * 1024 * 1024);
+
+        let w = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&w);
+        match Pin::new(&mut stream).poll_read_chunk(&mut cx) {
+            Poll::Pending => {} // 缓冲为空:仅触发窗口更新后挂起
+            other => panic!("expected pending read, got {other:?}"),
+        }
+
+        assert_eq!(
+            conn_shared.to_send_len_for_test(),
+            1,
+            "纯 WU 帧必须进入 to_send 快车道"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "纯 WU 帧不得经过流级 mpsc 通道"
+        );
+        let frame = conn_shared.pop_to_send_for_test().expect("WU frame queued");
+        let hdr = frame.header();
+        assert_eq!(hdr.tag(), crate::frame::header::Tag::WindowUpdate);
+        assert_eq!(hdr.stream_id(), StreamId::new(2));
+        assert_eq!(hdr.len().val(), 4 * 1024 * 1024, "回补额度 == 已耗额度");
+        assert_eq!(hdr.flags().val(), 0, "快车道仅限无 flag 的纯 WU 帧");
+    }
+
+    /// T-W2:带 flag 的 WU 帧(建流授信 ACK|WU)仍走 mpsc 路径,严禁
+    /// 进入 to_send;读半的 ack_pending 补发(0-credit WU+ACK)同理。
+    /// flag 消费完毕后的运行期纯 WU 才切回快车道。
+    #[test]
+    fn wu_fastlane_flagged_grant_stays_on_mpsc() {
+        let (stream, conn_shared, mut receiver) = inbound_with_shared(six_mib_config());
+
+        // 建流授信:6MiB − 256KiB 差额,带 ACK,必须经 try_send 入 mpsc
+        assert_eq!(
+            conn_shared.to_send_len_for_test(),
+            0,
+            "建流授信帧严禁走 to_send 快车道"
+        );
+        take_creation_grant(&mut receiver);
+
+        // 拆半 + ack_pending(ACK 未发出的等价终态):补发帧携带 ACK,
+        // 即使读半持 conn_shared 也必须走 mpsc,不得入 to_send
+        let (mut read_half, _write_half) = stream.into_halves();
+        read_half.shared().ack_pending = true;
+        let w = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&w);
+        match read_half.poll_read_chunk(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("expected pending read, got {other:?}"),
+        }
+        assert_eq!(
+            conn_shared.to_send_len_for_test(),
+            0,
+            "携带 ACK 的补发 WU 不得走快车道"
+        );
+        match receiver.try_recv().expect("ACK resend via mpsc") {
+            StreamCommand::SendFrame(f) => {
+                assert!(f.header().flags().contains(ACK));
+                assert_eq!(f.header().len().val(), 0, "无 credit 可授,0-credit WU");
+            }
+            other => panic!("expected SendFrame, got {other:?}"),
+        }
+
+        // ack_pending 清零后:运行期纯 WU 恢复快车道(6MiB 窗,授信已入账,
+        // 再耗 4MiB 越过半窗阈值)
+        consume_received_half(&read_half, 4 * 1024 * 1024);
+        match read_half.poll_read_chunk(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("expected pending read, got {other:?}"),
+        }
+        assert_eq!(conn_shared.to_send_len_for_test(), 1, "纯 WU 走快车道");
+        assert!(receiver.try_recv().is_err(), "通道无新帧");
+    }
+
+    /// T-W3:16 流并发读满窗口,交叉 poll——快车道 WU 帧全数到达 to_send,
+    /// 无一丢失、无一错流(逐帧校验 stream_id 与无 flag)。
+    #[test]
+    fn wu_fastlane_sixteen_streams_no_loss() {
+        const N: u32 = 16;
+        let conn_shared = Arc::new(ConnShared::new_for_test(
+            connection::Id::next(),
+            crate::Mode::Server,
+            Config::default(),
+            1,
+        ));
+        let cfg = six_mib_config();
+        let mut streams = Vec::new();
+        let mut receivers = Vec::new();
+        for i in 0..N {
+            let (sender, mut receiver) = mpsc::channel(10);
+            let sid = StreamId::new(1 + 2 * i);
+            let mut stream = Stream::new_inbound(
+                sid,
+                connection::Id::next(),
+                cfg.clone(),
+                DEFAULT_CREDIT,
+                sender,
+                Some(conn_shared.clone()),
+            );
+            take_creation_grant(&mut receiver); // Ack 随授信消费,聚焦纯 WU
+            consume_received(&mut stream, 4 * 1024 * 1024);
+            streams.push(stream);
+            receivers.push(receiver);
+        }
+        let w = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&w);
+        // 交叉 poll:逐流触发各自的窗口更新(快车道直压 to_send)
+        for stream in streams.iter_mut() {
+            match Pin::new(stream).poll_read_chunk(&mut cx) {
+                Poll::Pending => {}
+                other => panic!("expected pending read, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            conn_shared.to_send_len_for_test(),
+            N as usize,
+            "16 流的 WU 帧必须全数到达 to_send"
+        );
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..N {
+            let frame = conn_shared
+                .pop_to_send_for_test()
+                .expect("WU frame present");
+            let hdr = frame.header();
+            assert_eq!(hdr.tag(), crate::frame::header::Tag::WindowUpdate);
+            assert_eq!(hdr.flags().val(), 0, "纯 WU:不得携带任何 flag");
+            assert_eq!(hdr.len().val(), 4 * 1024 * 1024);
+            assert!(
+                ids.insert(hdr.stream_id().val()),
+                "不得重复/丢失任何流的 WU"
+            );
+        }
+        assert_eq!(ids.len(), N as usize);
+        for r in receivers.iter_mut() {
+            assert!(r.try_recv().is_err(), "任何流都不得经 mpsc 发 WU");
+        }
     }
 }

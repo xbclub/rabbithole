@@ -29,6 +29,7 @@ pub fn file_count() -> usize {
     0
 }
 
+#[cfg(embed_ui)]
 fn mime_of(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
         "css" => "text/css; charset=utf-8",

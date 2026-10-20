@@ -9,6 +9,8 @@ name = "rh-client"
 path = "src/main.rs"
 
 [dependencies]
+# 全局分配器(round-35)
+mimalloc = { workspace = true }
 rh-protocol = { workspace = true }
 rh-transport = { workspace = true }
 rh-core = { workspace = true }
@@ -39,3 +41,8 @@ rustls-pki-types = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# 半关闭有界兜底回归(round-52):start_paused 让默认 grace 在虚拟时钟内走完,
+# 单测不必真等 30 秒
+tokio = { workspace = true, features = ["test-util"] }

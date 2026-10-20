@@ -8,6 +8,7 @@ use rh_protocol::message::udp_packet;
 use rh_protocol::message::{ChannelEntity, StartForward};
 use rh_protocol::{forward_flags, FrameType, ProxySpec};
 use rh_transport::{compress_stream, BoxedIo};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -61,10 +62,10 @@ async fn claim_pool(pool: &Arc<TcpPool>, sess: &Arc<Session>) {
     if sess.epoch > cur {
         pool.epoch.store(sess.epoch, Ordering::Relaxed);
         let mut ready = pool.ready.lock().await;
-        let mut keep = Vec::with_capacity(ready.len());
+        let mut keep = VecDeque::with_capacity(ready.len());
         for entry in ready.drain(..) {
             if entry.0 == sess.epoch {
-                keep.push(entry);
+                keep.push_back(entry);
             }
         }
         *ready = keep; // 旧会话条目在此丢弃,级联关闭通道
@@ -134,7 +135,7 @@ pub async fn tcp_on_channel(
                 // 接收端已放弃:通道回到池或关闭
                 let mut ready = pool.ready.lock().await;
                 if ready.len() < pool.size {
-                    ready.push((sess.epoch, request_id, stream));
+                    ready.push_back((sess.epoch, request_id, stream));
                 } else {
                     drop(stream);
                 }
@@ -143,7 +144,7 @@ pub async fn tcp_on_channel(
         None => {
             let mut ready = pool.ready.lock().await;
             if ready.len() < pool.size {
-                ready.push((sess.epoch, request_id, stream));
+                ready.push_back((sess.epoch, request_id, stream));
             } else {
                 // 超额:关闭
                 drop(stream);
@@ -163,7 +164,7 @@ pub async fn get_channel(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Optio
     {
         let mut ready = pool.ready.lock().await;
         let owner = pool.epoch.load(Ordering::Relaxed);
-        while let Some((epoch, _rid, s)) = ready.pop() {
+        while let Some((epoch, _rid, s)) = ready.pop_front() {
             if epoch == owner {
                 // 注意:必须先释放 ready 锁再 refill(内部会再取同锁)
                 drop(ready);
@@ -406,8 +407,11 @@ where
 /// 半关闭:双向各自运行到结束;规则取消(禁用/删除)级联关闭在途转发。
 /// final-gaps 补修:错误路径(非 panic IO 错误)与 mux_relay 对齐——
 /// 有界收尾(CANCEL_CLOSE_GRACE)+ 先完成侧异常(panic/错误)立即
-/// 终止对向泵(对向可能在等一个永远不来的数据/EOF,不得永存);
-/// clean EOF 保持无界半关闭等待(红线)。
+/// 终止对向泵(对向可能在等一个永远不来的数据/EOF,不得永存)。
+/// round-51:clean EOF 的半关闭等待也改走 [`rh_transport::join_relay_pumps`]
+/// 的有界兜底(round-40 在 mux_relay/splice_relay 上做过、这里漏改)——
+/// 对端永不回 FIN 时 socket 永久停 `FIN-WAIT-2`/`CLOSING`;等对向自然
+/// 结束的语义保留,只是把上限交给 halfclose_grace(默认 30s)。
 /// c84 G5 1/N 归因:异常终止(IO 错误/panic)经 rabbithole_session_
 /// failures_total 计数 + 单条 debug;规则取消与 clean EOF 不计。
 async fn copy_relay_pair(
@@ -517,7 +521,17 @@ async fn copy_relay_pair(
         );
         return;
     }
-    let _ = tokio::join!(&mut g1, &mut g2);
+    // 半关闭有界兜底(round-51):修前此处是裸 `tokio::join!`,对端永不回
+    // FIN 时永久挂起——socket 钉死在 FIN-WAIT-2/CLOSING,流与 IO 都不释放
+    // (round-40 在 mux_relay/splice_relay 上实测:10 轮 -P8 累积 22 条、
+    // 20s 后仍不消失、吞吐 2.4G 逐轮衰减到 0.5G)。join_relay_pumps 保留
+    // 「clean EOF → 等对向自然结束」语义,只把无界等待换成 halfclose_grace
+    // 内的有界等待(默认 30s,RH_HALFCLOSE_GRACE_SECS 可覆盖,0 = 旧行为)。
+    //
+    // 不动 abnormal 分支的提前 return:那里先完成侧已异常,等待本身已经被
+    // 跳过。g1/g2 以 `&mut` 传入(句柄未被 move),返回后仍可读 panicked()
+    // ——下游 count_relay_failure 的四个入参语义逐字不变。
+    rh_transport::join_relay_pumps(&mut g1, &mut g2).await;
     // 先完成侧 clean EOF:对向(后完成)若以 IO 错误/panic 结束同样计数
     //(clean EOF 与规则取消不计,见 count_relay_failure)。
     let second_up = first == 2;
@@ -1293,6 +1307,35 @@ fn conv_proxy_proto(v: rh_protocol::ProxyProtoVersion) -> rh_protocol::message::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// round-34:池取用必须是 FIFO——先建好的通道先被取走。
+    ///
+    /// 修前用 `Vec::pop()`(LIFO):每次取走最后建好的那条,先建好的
+    /// 长期沉底直到过期。这既是公平性问题,也让"预热完成但尚未验证"
+    /// 的新通道总是被优先启用。
+    #[tokio::test]
+    async fn tcp_pool_hands_out_channels_fifo() {
+        use std::sync::atomic::Ordering;
+        let pool = TcpPool::new(4);
+        pool.epoch.store(7, Ordering::Relaxed);
+        // 按建立顺序压入 1、2、3(用内容区分身份)
+        for tag in 1u8..=3 {
+            let (a, b) = tokio::io::duplex(64);
+            drop(b);
+            pool.ready
+                .lock()
+                .await
+                .push_back((7, tag as u64, Box::new(a) as BoxedIo));
+        }
+        // 依次取三次:必须按 1、2、3 的顺序(标签即 request_id)
+        for expect in 1u64..=3 {
+            let mut ready = pool.ready.lock().await;
+            let (epoch, rid, _io) = ready.pop_front().expect("pool must not be empty");
+            assert_eq!(epoch, 7, "epoch 必须匹配");
+            assert_eq!(rid, expect, "FIFO:第 {expect} 次取用应拿到第 {expect} 条");
+        }
+        assert!(pool.ready.lock().await.is_empty(), "三次取用后池应清空");
+    }
 
     /// 会话失败计数用的独立 Metrics(与生产实例同构造)。
     fn test_metrics() -> Arc<crate::state::Metrics> {
@@ -2216,5 +2259,193 @@ mod tests {
         assert_eq!(&got[..16], &vec![0xB2u8; 16][..], "外层残留最先");
         assert_eq!(&got[16..24], &vec![0xA1u8; 8][..], "内层残留次之");
         assert_eq!(&got[24..], b"stream", "流数据最后(顺序逐字节等价)");
+    }
+
+    /// 读半永远 Pending 的 IO:模拟「只 clean EOF 一向,对向永不结束」。
+    ///
+    /// 写半正常转发(否则构造不出「一向 clean EOF」);只有读永久挂起,
+    /// 即对端既不回数据也不回 FIN——round-40 实测里 socket 钉在
+    /// `FIN-WAIT-2`/`CLOSING` 的那种连接在内核侧的表现。
+    struct ReadPendIo {
+        inner: tokio::io::DuplexStream,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for ReadPendIo {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl tokio::io::AsyncRead for ReadPendIo {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            // 对端永不回 FIN:既不 Ready(0) 也不 Ready(n),永久 Pending
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ReadPendIo {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// round-51(红):clean EOF 路径的半关闭必须有界收敛。
+    ///
+    /// 修前 `copy_relay_pair` 用裸 `tokio::join!` 等对向——一条方向 clean
+    /// EOF、对向永不结束(对端不回 FIN)时父任务永久挂起,两侧 IO 与
+    /// 子泵都不释放(round-40 在 mux_relay/splice_relay 上实测:10 轮
+    /// `-P8` 累积 22 条 FIN-WAIT-2/CLOSING、20s 后仍不消失、吞吐
+    /// 2.4G→0.5G;服务端 copy 这条路径当时漏改)。
+    ///
+    /// 方向布局:用户侧普通 duplex(对端 shutdown → t1 读得 clean EOF),
+    /// 通道侧 [`ReadPendIo`](读半永远 Pending)→ t2 停在 channel 读,永不
+    /// 结束。这正是「服务端把数据写给用户、用户已 FIN,而隧道数据通道
+    /// 那头再也不回 FIN」的形态。
+    ///
+    /// 断言三点:
+    /// 1. 父任务在默认 30s grace 之后、45s 之前返回(既不永久挂起,
+    ///    也没有提前打断正常半关闭);
+    /// 2. 两侧 IO 探针都翻转(流/socket 真被释放,而非只是 future 结束);
+    /// 3. clean EOF + 半关闭超时**不计**会话失败(那是正常代理行为)。
+    ///
+    /// `start_paused` 用虚拟时钟把 30s 压成瞬时:tokio test-util 在所有
+    /// worker 都 idle 时自动推进到最近的定时器,所以这里既不必真等
+    /// 半分钟,也不必设 `RH_HALFCLOSE_GRACE_SECS`(进程级 OnceLock,改它
+    /// 会污染同进程内的其它用例)。
+    #[tokio::test(start_paused = true)]
+    async fn copy_clean_eof_bounded_when_peer_never_finishes() {
+        let (mut a_peer, a_local) = tokio::io::duplex(4096);
+        let (_c_peer_hold, c_local) = tokio::io::duplex(4096);
+
+        let d_user = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d_chan = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 用户侧:普通流(可正常读到 EOF)
+        let user: BoxedIo = Box::new(DropIo {
+            inner: a_local,
+            dropped: d_user.clone(),
+        });
+        // 通道侧:读半永久 Pending(对端既不回数据也不回 FIN)
+        let channel: BoxedIo = Box::new(ReadPendIo {
+            inner: c_local,
+            dropped: d_chan.clone(),
+        });
+
+        let metrics = test_metrics();
+        let mut parent = tokio::spawn(copy_relay_pair(
+            user,
+            channel,
+            None,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            RelayFailCtx {
+                metrics: metrics.clone(),
+                proxy: 0,
+                user_src: String::new(),
+            },
+        ));
+
+        use tokio::io::AsyncWriteExt as _;
+        // 用户写端关闭 → t1 读到 EOF(**clean EOF**,不置 up_errored);
+        // t2 停在 channel 读,通道对端永不回 FIN → 旧代码永挂于此
+        a_peer.write_all(b"tail").await.unwrap();
+        a_peer.shutdown().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(45), &mut parent)
+            .await
+            .expect(
+                "clean EOF + 对向永不结束:copy_relay_pair 必须在 halfclose_grace 内\
+                 返回,不得永久挂起(round-40 泄漏红线,服务端 copy 路径漏改)",
+            )
+            .unwrap();
+
+        assert!(
+            d_user.load(std::sync::atomic::Ordering::SeqCst),
+            "半关闭兜底后必须释放用户侧 IO(否则 socket 钉死)"
+        );
+        assert!(
+            d_chan.load(std::sync::atomic::Ordering::SeqCst),
+            "半关闭兜底后必须释放通道侧 IO"
+        );
+        // clean EOF 不是会话失败:即便等了 grace 也不得计失败
+        for reason in ["relay_up_error", "relay_down_error", "relay_pump_panic"] {
+            assert_eq!(
+                metrics
+                    .session_failures_total
+                    .with_label_values(&[reason])
+                    .get(),
+                0,
+                "clean EOF + 半关闭兜底不得计入 {reason}(正常代理行为,非会话失败)"
+            );
+        }
+    }
+
+    /// round-51 对照(半关闭红线):正常半关闭**不得**被 grace 提前打断。
+    ///
+    /// 上一条测试锁定「有界」,这一条锁定「边界足够宽」:一条方向 clean
+    /// EOF 后,对向仍需把剩余数据完整送达(这里是 300ms 后才写完的一段
+    /// 数据)——远小于默认 30s grace。修前修后都必须完整收到,否则就是
+    /// 用短超时截断半关闭,比泄漏更糟。
+    #[tokio::test(start_paused = true)]
+    async fn copy_clean_eof_still_delivers_late_peer_data() {
+        let (mut a_peer, a_local) = tokio::io::duplex(4096);
+        let (mut c_peer, c_local) = tokio::io::duplex(4096);
+
+        let mut parent = tokio::spawn(copy_relay_pair(
+            Box::new(a_local),
+            Box::new(c_local),
+            None,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            test_fail_ctx(),
+        ));
+
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        // 用户侧 clean EOF(用户不再发,但仍在读——典型 HTTP 请求结束后
+        // 等响应的形态)
+        a_peer.shutdown().await.unwrap();
+        // 对向延迟写好响应:必须穿过 grace 窗口完整送达
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            c_peer.write_all(b"late-response-body").await.unwrap();
+            c_peer.shutdown().await.unwrap();
+        });
+
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), a_peer.read_to_end(&mut got))
+            .await
+            .expect("clean EOF 后的对向数据必须在 grace 内完整送达(不得被短超时截断)")
+            .unwrap();
+        assert_eq!(
+            got, b"late-response-body",
+            "半关闭兜底不得截断正常半关闭的数据"
+        );
+        writer.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(45), &mut parent)
+            .await
+            .expect("数据送达后 relay 必须收敛")
+            .unwrap();
     }
 }

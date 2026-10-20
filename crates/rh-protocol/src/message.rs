@@ -80,6 +80,12 @@ pub struct Hello {
     /// 支持的代理能力集。
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// 附加载体报到(round-9 多载体池):多载体会话的后续物理连接在首流
+    /// HELLO 中携带所属会话 id,服务端查活跃 Session 聚合进池。None/缺省 =
+    /// 首条连接(完整挑战应答认证);skip_serializing_if 保证 None 形态的
+    /// 线格式与旧版本逐字节一致,现有字段语义不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -210,6 +216,19 @@ pub struct HelloAck {
     pub heartbeat_interval_s: u32,
     #[serde(default)]
     pub server_version: String,
+}
+
+/// 附加载体报到应答(round-10):服务端在报到流上回写,客户端据此定容。
+/// 仅走 [`FrameType::CARRIER_ATTACH_ACK`](crate::FrameType::CARRIER_ATTACH_ACK);
+/// `Hello`/`HelloAck` 字段不变(红线:旧线格式不动)。客户端读应答有 2s
+/// 超时,失败只损失该载体,不阻断主会话。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarrierAttachAck {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// 服务端允许的最大载体数(含首载体)。
+    pub max_carriers: usize,
 }
 
 /// 全量配置同步:该客户端全部 enabled 的代理与 visitor,幂等全量替换。
@@ -408,5 +427,68 @@ mod tests {
         let (a, d) = udp_packet::decode(&p).unwrap();
         assert_eq!(a, "[::1]:999");
         assert_eq!(d, &[1, 2, 3]);
+    }
+
+    // T-C6(round-10):报到应答两态序列化。成功态 error_code 必须被省略
+    // (旧解析器/日志不受空字段干扰);失败态回传错误码且可原样往返。
+    #[test]
+    fn carrier_attach_ack_roundtrip() {
+        let ok = CarrierAttachAck {
+            ok: true,
+            error_code: None,
+            max_carriers: 8,
+        };
+        let s = serde_json::to_string(&ok).unwrap();
+        assert_eq!(
+            s, r#"{"ok":true,"max_carriers":8}"#,
+            "成功态省略 error_code"
+        );
+        assert_eq!(serde_json::from_str::<CarrierAttachAck>(&s).unwrap(), ok);
+
+        let err = CarrierAttachAck {
+            ok: false,
+            error_code: Some("SESSION_MISMATCH".into()),
+            max_carriers: 2,
+        };
+        let s = serde_json::to_string(&err).unwrap();
+        assert!(s.contains("SESSION_MISMATCH"));
+        assert_eq!(serde_json::from_str::<CarrierAttachAck>(&s).unwrap(), err);
+        // 缺省 error_code(旧/精简报文)也可反序列化
+        let parsed: CarrierAttachAck =
+            serde_json::from_str(r#"{"ok":true,"max_carriers":4}"#).unwrap();
+        assert_eq!(parsed.error_code, None);
+    }
+
+    // round-10 红线:新帧类型不得与既有 S→C 段冲突。
+    #[test]
+    fn carrier_attach_ack_frame_type_is_free() {
+        use crate::FrameType;
+        for ty in [
+            FrameType::HELLO,
+            FrameType::PING,
+            FrameType::SYNC_REQUEST,
+            FrameType::DATA_CHANNEL_HELLO,
+            FrameType::UDP_PACKET,
+            FrameType::APPLY_RESULT,
+            FrameType::AUTH_RESPONSE,
+            FrameType::USER_CONNECT,
+            FrameType::HEALTH_REPORT,
+            FrameType::NAT_HOLE_REPORT,
+            FrameType::AUTH_CHALLENGE,
+            FrameType::HELLO_ACK,
+            FrameType::SERVICE_SYNC,
+            FrameType::SERVICE_UPDATE,
+            FrameType::SERVICE_REMOVE,
+            FrameType::CREATE_DATA_CHANNEL,
+            FrameType::PONG,
+            FrameType::START_FORWARD,
+            FrameType::START_VISITOR_RELAY,
+            FrameType::NAT_HOLE_PREPARE,
+            FrameType::NAT_HOLE_CONNECT,
+            FrameType::ERROR,
+        ] {
+            assert_ne!(ty, FrameType::CARRIER_ATTACH_ACK);
+        }
+        assert_eq!(FrameType::CARRIER_ATTACH_ACK, FrameType(0x0109));
     }
 }

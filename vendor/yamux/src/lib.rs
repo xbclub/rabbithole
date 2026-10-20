@@ -30,11 +30,15 @@ mod chunks;
 mod error;
 mod frame;
 pub mod pool;
+pub mod sched_diag;
 
 pub(crate) mod connection;
 mod tagged_stream;
 
-pub use crate::connection::{Connection, Mode, Packet, Stream, StreamReadHalf, StreamWriteHalf};
+pub use crate::connection::{
+    Connection, Mode, Packet, RecvHalf, SendHalf, SendWorker, ShardWorker, SplitSocket, Stream,
+    StreamReadHalf, StreamWriteHalf,
+};
 pub use crate::error::ConnectionError;
 pub use crate::frame::{
     header::{HeaderDecodeError, StreamId},
@@ -78,16 +82,35 @@ const DEFAULT_SPLIT_SEND_SIZE: usize = 16 * KIB;
 /// - max. number of streams = 512
 /// - read after close = true
 /// - split send size = 16 KiB
+/// - shard workers = 4
 #[derive(Debug, Clone)]
 pub struct Config {
     max_connection_receive_window: Option<usize>,
     max_num_streams: usize,
     read_after_close: bool,
     split_send_size: usize,
-    /// 每流初始接收窗(接收侧授信上限的起步值;见
-    /// [`Config::set_initial_stream_receive_window`])。默认
+    /// 每流初始接收窗(round-E1 起为**恒定值**:窗口不自增、无预算钳制;
+    /// 见 [`Config::set_initial_stream_receive_window`])。默认
     /// [`DEFAULT_CREDIT`],即 upstream 原行为。
     initial_stream_receive_window: usize,
+    /// 每流**发送窗**初值(rabbithole round-59)。
+    ///
+    /// 修前发送窗初值在两个构造点都写死 `DEFAULT_CREDIT`(256KiB),
+    /// 与本字段(接收窗)无关:`new_outbound` 传 `DEFAULT_CREDIT`,
+    /// `make_new_inbound_stream` 也传 `DEFAULT_CREDIT`。于是**发送方**
+    /// 每 256KiB 就要等一次对端窗口更新的往返。
+    ///
+    /// 实测(上行 n=16):rh 1.29 G vs frp 2.05 G,差 36%;`PUMP_UP`
+    /// 显示每批只有 ~100KB(受 256KiB 窗与往返节奏钳制),而同条件
+    /// **下行**每批 ~574KB、吞吐 2.41 G——差别正是下行时我们是写入
+    /// 用户 socket(无 mux 窗口),上行时我们是写入 mux 流(受窗口)。
+    ///
+    /// 设为与 `initial_stream_receive_window` 同值(6MiB)后,发送方
+    /// 首窗即 6MiB,不再每 256KiB 等一次往返。
+    initial_stream_send_window: usize,
+    /// 分片 Worker 数(halves 路径,round-5 §2.7)。≥1;默认 4;
+    /// 未拆分路径(Active/Connection::poll_*)忽略该配置。
+    shard_workers: usize,
 }
 
 impl Default for Config {
@@ -98,6 +121,8 @@ impl Default for Config {
             read_after_close: true,
             split_send_size: DEFAULT_SPLIT_SEND_SIZE,
             initial_stream_receive_window: DEFAULT_CREDIT as usize,
+            initial_stream_send_window: DEFAULT_CREDIT as usize,
+            shard_workers: 4,
         }
     }
 }
@@ -131,6 +156,12 @@ impl Config {
     /// Despite the difficulty of the attack one should choose a reasonable
     /// `max_connection_receive_window` to protect against this attack, especially since an attacker
     /// might use more than one stream per connection.
+    ///
+    /// round-E1(rabbithole,2026-10-16):流控对齐 frp v0.2.0 后本字段无任何
+    /// 消费者——BDP 自增窗与连接级共享预算记账已删(恒定单流窗,见
+    /// `connection::stream::flow_control`);rabbithole 接线(mux.rs)设为
+    /// `None`(不限,对齐 frp"无连接级共享预算")。字段为上游 API 兼容
+    /// 保留;`None` 时下方 setter 相互断言对 `usize::MAX` 恒真。
     pub fn set_max_connection_receive_window(&mut self, n: Option<usize>) -> &mut Self {
         self.max_connection_receive_window = n;
 
@@ -177,14 +208,15 @@ impl Config {
     /// Wire semantics stay per yamux specification: the remote sender starts
     /// with [`DEFAULT_CREDIT`] (256 KiB) of credit. What this configures is the
     /// receiver side: a freshly created stream's `max_receive_window` starts at
-    /// `n` instead of [`DEFAULT_CREDIT`], so the receiver's **first** window
-    /// update poll grants `n - 256 KiB` of additional credit via a regular
-    /// window update frame (upstream-legal for any peer). The pregrant is
-    /// charged against the connection budget
-    /// (`max_connection_receive_window - 256 KiB * max_num_streams`, shared
-    /// with auto-tuning) and clamped when the budget is exhausted, and the
-    /// first window update never triggers BDP doubling (the pregrant is not
-    /// measured receive throughput).
+    /// `n` instead of [`DEFAULT_CREDIT`], and the difference `n - 256 KiB` is
+    /// granted at stream creation via a window update frame carrying the
+    /// initial flag (outbound SYN|WU / inbound ACK|WU, both upstream-legal
+    /// combinations; round-4/B1, aligned with frp OpenStream/AcceptStream)
+    /// instead of waiting for the receiver's first read poll. round-E1
+    /// (2026-10-16, frp v0.2.0 alignment) makes the window **constant**: it is
+    /// never auto-tuned (no BDP growth) and not charged against any connection
+    /// budget (the shared-budget accounting has been removed); read-driven
+    /// window updates only replenish consumed credit.
     ///
     /// Motivation (rabbithole round-1, measured on the 3-machine testbed,
     /// `benchmark/runs/goal-repair/round-1/single-stream-medians.txt`): every
@@ -213,6 +245,49 @@ impl Config {
         self.initial_stream_receive_window = n;
         self
     }
+
+    /// 读取当前配置的每流发送窗初值。
+    pub(crate) fn initial_stream_send_window(&self) -> usize {
+        self.initial_stream_send_window
+    }
+
+    /// 设置每流**发送窗**初值(rabbithole round-59)。
+    ///
+    /// 语义:我方作为发送方时,对每条新流默认拥有的发送额度。yamux 规范
+    /// 把初始额度定为 256KiB(接收方必须按需补发窗口更新);把初值抬高
+    /// 等于**预授**额度,对端无需先发窗口更新即可写满该量。
+    ///
+    /// 约束与 `set_initial_stream_receive_window` 一致(>= 256KiB、
+    /// 必须 fit u32)。两侧必须相等或对端不小于本值,否则实际生效值
+    /// 由对端授信决定——抬高只是让我方在**收到对端窗口更新之前**就能
+    /// 继续写,不改变协议语义(对端仍可以只授 256KiB)。
+    ///
+    /// 注意:这**不是**绕过流控。真正的额度仍由对端授予;本项只是把
+    /// "首窗"从我方视角抬高到与接收窗对称,消除每 256KiB 一次往返。
+    pub fn set_initial_stream_send_window(&mut self, n: usize) -> &mut Self {
+        assert!(
+            n >= DEFAULT_CREDIT as usize,
+            "`initial_stream_send_window` must be `>= 256 KiB` (yamux spec floor)"
+        );
+        assert!(
+            n <= u32::MAX as usize,
+            "`initial_stream_send_window` must fit u32"
+        );
+        self.initial_stream_send_window = n;
+        self
+    }
+
+    /// Set the number of stream-shard workers for the split-halves path
+    /// (round-5 §2.7). Must be within `1..=64`; defaults to 4. The
+    /// unsplit path (`Active` / `Connection::poll_*`) ignores this.
+    pub fn set_shard_workers(&mut self, n: usize) -> &mut Self {
+        assert!(
+            (1..=64).contains(&n),
+            "`shard_workers` must be within 1..=64"
+        );
+        self.shard_workers = n;
+        self
+    }
 }
 
 // Check that we can safely cast a `usize` to a `u64`.
@@ -229,11 +304,11 @@ static_assertions::const_assert! {
 impl quickcheck::Arbitrary for Config {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
         // quickcheck 1 的 Gen 不暴露底层 rng:用 Arbitrary 取模近似 gen_range
+        // (impl 块体内被实现的 trait 已在作用域,无需再 use)
         fn gr_usize(g: &mut quickcheck::Gen, lo: usize, hi: usize) -> usize {
             if hi <= lo {
                 return lo;
             }
-            use quickcheck::Arbitrary;
             (u64::arbitrary(g) % ((hi - lo) as u64)) as usize + lo
         }
 
@@ -254,6 +329,10 @@ impl quickcheck::Arbitrary for Config {
             split_send_size: gr_usize(g, DEFAULT_SPLIT_SEND_SIZE, usize::MAX),
             // 随机配置保持 upstream 默认初窗(预授信行为由专项测试显式构造)
             initial_stream_receive_window: DEFAULT_CREDIT as usize,
+            // round-59:发送窗初值同样保持 upstream 默认
+            initial_stream_send_window: DEFAULT_CREDIT as usize,
+            // 分片数保持默认(分片行为由专项测试显式构造)
+            shard_workers: 4,
         }
     }
 }

@@ -46,6 +46,9 @@ impl FrameType {
     pub const PONG: FrameType = FrameType(0x0106);
     pub const START_FORWARD: FrameType = FrameType(0x0107);
     pub const START_VISITOR_RELAY: FrameType = FrameType(0x0108);
+    /// 附加载体报到应答(round-10):仅出现在报到流上,旧客户端不会读到,
+    /// 旧服务端不会发送——线格式对既有两个方向零影响。
+    pub const CARRIER_ATTACH_ACK: FrameType = FrameType(0x0109);
     pub const NAT_HOLE_PREPARE: FrameType = FrameType(0x0110);
     pub const NAT_HOLE_CONNECT: FrameType = FrameType(0x0112);
     pub const ERROR: FrameType = FrameType(0x0199);
