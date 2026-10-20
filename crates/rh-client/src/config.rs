@@ -449,6 +449,65 @@ secret = "s"
         assert_eq!(k, 1, "显式 1 覆盖协议基线(单载体)");
     }
 
+    // 证书下发校验的**开关判定**:只有 `secret_verified` 才该装 sink 并
+    // 执行比对。曾经用的是 `protocol.is_encrypted()`,后果是:
+    //   - insecure 的客户端(明文自签调试、E2E 全部用例)被强制 fail-closed,
+    //     收不到帧就拒绝连接 → tls/wss/quic 在 E2E 里全红;
+    //   - 没有降级防护之外的任何收益:pin/CA 已在握手内认证完毕。
+    // 本测试逐态锁定"哪些配置会走 secret 验证"。
+    #[test]
+    fn secret_verified_only_when_nothing_else_trusts() {
+        let mk = |ca: Option<&str>, pin: Option<&str>, insecure: bool| ClientConfig {
+            trusted_ca_file: ca.map(str::to_string),
+            tls_pin_sha256: pin.map(str::to_string),
+            tls_insecure_skip_verify: insecure,
+            ..ClientConfig::default()
+        };
+
+        // 默认(零配置):唯一走 secret 下发的路径
+        assert!(
+            mk(None, None, false)
+                .transport_cfg()
+                .unwrap()
+                .tls
+                .secret_verified
+        );
+
+        // 三种"已有别的信任来源"的配置都不得走 secret 校验
+        assert!(
+            !mk(Some("/dev/null"), None, false)
+                .transport_cfg()
+                .unwrap()
+                .tls
+                .secret_verified,
+            "配了 trusted_ca 就走 CA 链,不该再依赖下发帧"
+        );
+        assert!(
+            !mk(None, Some("00"), false)
+                .transport_cfg()
+                .unwrap()
+                .tls
+                .secret_verified,
+            "配了 pin 就走指纹固定,不该再依赖下发帧"
+        );
+        assert!(
+            !mk(None, None, true)
+                .transport_cfg()
+                .unwrap()
+                .tls
+                .secret_verified,
+            "insecure 是显式放弃校验,不得被强制 fail-closed"
+        );
+        assert!(
+            !mk(Some("/dev/null"), None, true)
+                .transport_cfg()
+                .unwrap()
+                .tls
+                .secret_verified,
+            "insecure + CA 同样不走 secret 校验"
+        );
+    }
+
     // T-C3(round-10,勘误版):硬件上限纯函数四态覆盖——能读到队列数时
     // min(cpu_cap, queues);读不到(None)时上限由 CPU 决定。结果恒在
     // [1,8],0/超大输入都不得 panic 或返回 0。

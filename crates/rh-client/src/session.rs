@@ -273,16 +273,35 @@ fn parse_attach_ack_payload(p: &[u8]) -> AckPayload {
     }
 }
 
+/// 是否执行"服务端加密下发证书"的绑定校验。
+///
+/// 两个条件缺一不可:
+/// - **协议必须是加密的**:明文 tcp/ws/kcp 根本没有 TLS 证书,服务端不会
+///   下发该帧,要求它是纯粹的误伤。
+/// - **本端必须是 `secret_verified`**:pin / CA 已在握手内完成认证,
+///   insecure 是显式放弃;只有零配置档才把下发帧当作唯一信任来源。
+///
+/// 这两条都曾经写错过一次(`is_encrypted()` 单独用 → insecure 被误杀;
+/// `secret_verified` 单独用 → 明文协议被误杀),故收敛成一个函数供
+/// sink 安装点与校验点共用,避免两处判定再次漂移。
+fn cert_binding_required(protocol: rh_transport::Protocol, secret_verified: bool) -> bool {
+    protocol.is_encrypted() && secret_verified
+}
+
 /// 校验服务端加密下发的证书与本次 TLS 握手实际看到的一致。
 ///
 /// 这是**唯一能挡住中间人转发**的检查:攻击者不知道 `secret`,因此无法
 /// 伪造一段能解开的密文;它若用自己的证书冒充,解密结果与握手看到的
 /// 对端证书不同,此处即失败。
 ///
+/// **调用方只在 `tls.secret_verified` 时调用本函数**(见调用点注释):
+/// pin / CA 已在握手内完成认证,insecure 则是显式放弃,都不该被这里
+/// 的 fail-closed 误伤。
+///
 /// 三种情况必须区分清楚:
 /// - 收到帧且解出的证书 == 对端证书 → 通过;
 /// - 收到帧但解不开/不一致 → **拒绝连接**(有人在中间,或 secret 不符);
-/// - 没收到帧(旧服务端 / 明文协议)→ 放行,保持改动前行为。
+/// - 没收到帧 → **拒绝连接**(降级防护,仅在 secret_verified 下成立)。
 async fn verify_server_cert(
     control: &mut (impl tokio::io::AsyncRead + Unpin),
     buf: &mut bytes::BytesMut,
@@ -369,8 +388,12 @@ pub async fn connect_and_run(
     let mut tcfg = cfg.transport_cfg()?;
     // 证书比对用:记录本次连接实际看到的对端证书(仅加密协议有意义)。
     // 必须逐次新建(不是复用):重连要对当前这次握手的证书做比对。
+    //
+    // 只在 `secret_verified` 时装 sink:那是唯一会读它的路径(见下方
+    // verify_server_cert 调用点)。pin/CA/insecure 下装了也没人读,却要求
+    // 传输层每种载体都支持写 sink —— quic 曾因没写而让默认配置无法连接。
     let peer_cert: Arc<std::sync::OnceLock<Vec<u8>>> = Arc::new(std::sync::OnceLock::new());
-    if tcfg.protocol.is_encrypted() {
+    if cert_binding_required(tcfg.protocol, tcfg.tls.secret_verified) {
         tcfg.peer_cert_sink = Some(peer_cert.clone());
     }
     // 三段式定容(round-10):显式值/协议基线先过硬件上限,报到后再按
@@ -472,11 +495,24 @@ pub async fn connect_and_run(
         anyhow::bail!("hello rejected: {:?}", ack.error_code);
     }
     let session_id = ack.session_id.clone().unwrap_or_default();
-    // 证书下发校验(仅加密协议):服务端用 secret 派生的密钥把它的 TLS 证书
-    // 加密发来,解出后与本次握手"实际看到的对端证书"逐字节比对。
+    // 证书下发校验:服务端用 secret 派生的密钥把它的 TLS 证书加密发来,
+    // 解出后与本次握手"实际看到的对端证书"逐字节比对。
     // 不一致 = 有人在中间转发(它拿不出用真 secret 加密的真证书),必须断开。
-    // 未收到该帧时保持原行为(不校验),兼容旧服务端。
-    if tcfg.protocol.is_encrypted() {
+    //
+    // **只在 `secret_verified` 时做**,这不是为了省事,而是这个检查的
+    // 契约只在那一档成立:
+    // - pin / trusted_ca:握手本身已经把对端钉死或验过 CA,下发帧是冗余的
+    //   附加证明。对它做 fail-closed 只会让**没有该帧的旧服务端**被新客户端
+    //   无故拒绝,并不增加任何安全性。
+    // - insecure:客户端已显式声明不做校验,再强制一个校验只会自相矛盾。
+    // - secret_verified:握手阶段**什么都没验**(见 tls.rs 的 NoVerify),
+    //   下发帧是唯一的信任来源。此时缺帧必须拒绝 —— 否则中间人只要丢弃
+    //   这一帧就能让比对静默跳过,那是可被主动利用的降级攻击。
+    //
+    // 曾经这里写的是 `is_encrypted()`,与上面"未收到该帧时保持原行为"的
+    // 注释相互矛盾:结果是 insecure 的客户端也被 fail-closed 打死
+    // (E2E 的 quic/tls/wss 用例正是踩在这里)。
+    if cert_binding_required(tcfg.protocol, tcfg.tls.secret_verified) {
         verify_server_cert(&mut control, &mut buf, &cfg, &peer_cert).await?;
     }
     info!(server = %cfg.server_addr, session = %session_id, "connected");
@@ -1448,6 +1484,37 @@ mod cert_binding_tests {
     //! 3. 它想丢弃该帧让校验静默跳过 → 已由 `verify_server_cert` 的
     //!    降级防护拒绝(此处无法直接测超时,靠代码约束)。
     use super::*;
+
+    // 绑定校验的开关判定。这里同时锁住两个曾经各自写错一次的方向:
+    //   - 只看 `is_encrypted()`:insecure 的客户端被强制 fail-closed
+    //     (E2E 的 tls/wss/quic 全红);
+    //   - 只看 `secret_verified`:明文 tcp/ws/kcp 也在等一个永远不会来的帧
+    //     (报 `收到 FrameType(258)` = SERVICE_SYNC)。
+    #[test]
+    fn cert_binding_requires_encrypted_protocol_and_secret_verified() {
+        use rh_transport::Protocol;
+        // 唯一该做的组合:加密协议 + 零配置档
+        for p in [Protocol::Tls, Protocol::Wss, Protocol::Quic] {
+            assert!(
+                cert_binding_required(p, true),
+                "{p:?} 在 secret_verified 下必须做绑定校验"
+            );
+        }
+        // 明文协议:没有 TLS 证书,服务端不下发该帧
+        for p in [Protocol::Tcp, Protocol::Ws, Protocol::Kcp] {
+            assert!(
+                !cert_binding_required(p, true),
+                "{p:?} 无 TLS 证书,不得要求下发帧(否则等一条永不到来的帧)"
+            );
+        }
+        // 加密协议但已有别的信任来源:pin/CA/insecure 都不该被这里拦
+        for p in [Protocol::Tls, Protocol::Wss, Protocol::Quic] {
+            assert!(
+                !cert_binding_required(p, false),
+                "{p:?} 在非 secret_verified 下不得强制下发帧绑定"
+            );
+        }
+    }
 
     const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 
