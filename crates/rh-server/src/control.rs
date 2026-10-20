@@ -764,11 +764,10 @@ async fn run_session_loop(
         pool.shutdown_pool();
     }
     // 下线清理:仅当注册表仍是本会话时
+    // round-80:gauge 已由 `remove_if_current` 内部上报(见 SessionRegistry
+    // 的 `on_change`),此处不再重复写——重复写不仅冗余,在"新会话已替换
+    // 旧会话"的时序下还会掩盖真实计数。
     state.sessions.remove_if_current(&sess.client_id, &sess);
-    state
-        .metrics
-        .client_online
-        .set(state.sessions.count_online() as i64);
     sess.cancel.cancel();
     crate::runtime::on_session_down(&state, &sess).await;
     let name = state

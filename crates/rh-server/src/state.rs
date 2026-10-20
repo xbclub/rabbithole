@@ -318,7 +318,13 @@ impl AppState {
             cfg,
             db,
             events,
-            sessions: Arc::new(SessionRegistry::new()),
+            // round-80:在线数 gauge 由注册表在每次成员变更时直接上报。
+            // 修前 gauge 只在拆除路径写、上线路径从不写,导致
+            // `/metrics` 的 clients_online 恒为 0。
+            sessions: Arc::new(SessionRegistry::with_online_gauge({
+                let g = metrics.client_online.clone();
+                Arc::new(move |n: usize| g.set(n as i64))
+            })),
             proxies,
             client_locks: Arc::new(dashmap::DashMap::new()),
             metrics,

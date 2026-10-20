@@ -168,6 +168,19 @@ impl Session {
 pub struct SessionRegistry {
     map: dashmap::DashMap<String, (Arc<Session>, u64)>,
     counter: AtomicU64,
+    /// 在线数上报钩子(round-80)。`None` = 不接指标(单测构造)。
+    ///
+    /// # 为什么把上报放在注册表内部
+    ///
+    /// 修前只有**拆除**路径(`control.rs` 末尾)更新 `client_online` gauge,
+    /// **上线路径从不设置** —— 于是 `/metrics` 的 `rabbithole_clients_online`
+    /// 恒为 0,即使客户端已连上并在正常转发数据(实测复现)。
+    ///
+    /// 现在把上报**收敛到注册表的两个变更点**(`register` /
+    /// `remove_if_current`),每个变更点完成"改 map + 写 gauge"这一对操作。
+    /// gauge 用 `map.len()` 无条件写(幂等),不做增量加减——增量在并发
+    /// 替换下容易多减/漏减,而 `len()` 永远反映真值。
+    on_change: Option<Arc<dyn Fn(usize) + Send + Sync>>,
 }
 
 impl SessionRegistry {
@@ -175,6 +188,16 @@ impl SessionRegistry {
         Self {
             map: dashmap::DashMap::new(),
             counter: AtomicU64::new(1),
+            on_change: None,
+        }
+    }
+
+    /// 带在线数上报的构造(生产用):每次成员变更后以 `map.len()` 回调。
+    pub fn with_online_gauge(f: Arc<dyn Fn(usize) + Send + Sync>) -> Self {
+        Self {
+            map: dashmap::DashMap::new(),
+            counter: AtomicU64::new(1),
+            on_change: Some(f),
         }
     }
 
@@ -182,11 +205,20 @@ impl SessionRegistry {
         self.counter.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// 把当前在线数同步给指标。注册表每次变更(插入/移除)后调用。
+    fn publish_online(&self) {
+        if let Some(f) = self.on_change.as_ref() {
+            f(self.map.len());
+        }
+    }
+
     /// 注册(替换)会话;返回被替换的旧会话(若有)。
     pub fn register(&self, sess: Arc<Session>) -> Option<Arc<Session>> {
         let prev = self
             .map
             .insert(sess.client_id.clone(), (sess.clone(), sess.epoch));
+        // 替换(in-place)不改变 len,但首次插入会;统一重算最稳妥。
+        self.publish_online();
         prev.map(|(s, _)| s)
     }
 
@@ -199,6 +231,9 @@ impl SessionRegistry {
     pub fn remove_if_current(&self, client_id: &str, sess: &Arc<Session>) {
         self.map
             .remove_if(client_id, |_k, (cur, _)| Arc::ptr_eq(cur, sess));
+        // 无论是否真的移除都要发布:被替换的旧会话拆除时,
+        // 当前值应仍是"新会话"的在线数(len 未变),写上不会错。
+        self.publish_online();
     }
 
     pub fn online_clients(&self) -> Vec<String> {
@@ -213,5 +248,105 @@ impl SessionRegistry {
 impl Default for SessionRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod online_gauge_tests {
+    //! round-80 回归: `/metrics` 的 `rabbithole_clients_online` 必须反映
+    //! 真实在线数。
+    //!
+    //! 修前只有拆除路径写 gauge、上线路径从不写,导致该值**恒为 0**
+    //! (即使客户端已连上并在转发数据)。本套件用注入的计数器锁住
+    //! "注册即上报、移除即上报"这条不变量。
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio_util::sync::CancellationToken;
+
+    /// 构造一个最小 Session(注册表只用 client_id / epoch)。
+    fn sess(client_id: &str, epoch: u64) -> Arc<Session> {
+        let (tx, _rx) = mpsc::channel(1);
+        Session::new(
+            client_id.to_string(),
+            format!("sid-{client_id}-{epoch}"),
+            epoch,
+            CancellationToken::new(),
+            tx,
+        )
+    }
+
+    /// 带记录的注册表:每次 publish 把值写进 `last`。
+    fn registry_with_probe() -> (SessionRegistry, Arc<AtomicUsize>) {
+        let last = Arc::new(AtomicUsize::new(usize::MAX));
+        let l = last.clone();
+        let reg = SessionRegistry::with_online_gauge(Arc::new(move |n: usize| {
+            l.store(n, AtomicOrdering::SeqCst);
+        }));
+        (reg, last)
+    }
+
+    // T-G1:注册一个客户端后,上报值必须是 1(修前这里是 0——上线不写)。
+    #[test]
+    fn register_publishes_online_count() {
+        let (reg, last) = registry_with_probe();
+        reg.register(sess("c1", 1));
+        assert_eq!(
+            last.load(AtomicOrdering::SeqCst),
+            1,
+            "注册后应立即上报在线数 1(修前上线路径不写 gauge,恒为 0)"
+        );
+        // 再注册一个不同客户端:2
+        reg.register(sess("c2", 2));
+        assert_eq!(last.load(AtomicOrdering::SeqCst), 2, "第二个客户端上线后为 2");
+    }
+
+    // T-G2:同一客户端重连(替换)不改变在线数。
+    #[test]
+    fn replace_keeps_count() {
+        let (reg, last) = registry_with_probe();
+        reg.register(sess("c1", 1));
+        assert_eq!(last.load(AtomicOrdering::SeqCst), 1);
+        // 同 client_id、新 epoch:替换而非新增
+        reg.register(sess("c1", 2));
+        assert_eq!(
+            last.load(AtomicOrdering::SeqCst),
+            1,
+            "同一客户端替换会话,在线数仍为 1"
+        );
+    }
+
+    // T-G3:移除会话后在线数归 0。
+    #[test]
+    fn remove_publishes_zero() {
+        let (reg, last) = registry_with_probe();
+        let s = sess("c1", 1);
+        reg.register(s.clone());
+        assert_eq!(last.load(AtomicOrdering::SeqCst), 1);
+        reg.remove_if_current("c1", &s);
+        assert_eq!(last.load(AtomicOrdering::SeqCst), 0, "拆除后应上报 0");
+    }
+
+    // T-G4:被替换的旧会话拆除时,不得把在线数错误写成 0。
+    //
+    // 这是修前的**第二个隐患**:拆除路径用 remove_if_current(比对失败、
+    // 不删)后再 count_online(),虽然当下能算对,但顺序依赖调用点;
+    // 现在统一由注册表在变更点发布,旧会话拆除时 len 仍是 1。
+    #[test]
+    fn stale_session_teardown_does_not_zero_count() {
+        let (reg, last) = registry_with_probe();
+        let old = sess("c1", 1);
+        reg.register(old.clone());
+        // 新会话顶替旧的
+        reg.register(sess("c1", 2));
+        assert_eq!(last.load(AtomicOrdering::SeqCst), 1);
+        // 旧会话迟到的拆除:remove_if_current 比对失败(当前已是新会话)
+        reg.remove_if_current("c1", &old);
+        assert_eq!(
+            last.load(AtomicOrdering::SeqCst),
+            1,
+            "旧会话拆除不得把在线数写成 0(新会话仍在线)"
+        );
+        // 且注册表里确实还是新会话
+        assert_eq!(reg.count_online(), 1);
     }
 }
