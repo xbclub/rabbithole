@@ -57,6 +57,10 @@ impl Db {
                 "0003_certs",
                 include_str!("../../../migrations/0003_certs.sql"),
             ),
+            (
+                "0004_user_pwd_version",
+                include_str!("../../../migrations/0004_user_pwd_version.sql"),
+            ),
         ];
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)",
@@ -108,9 +112,31 @@ impl Db {
     }
 
     pub async fn update_user_password(&self, username: &str, password_hash: &str) -> Result<bool> {
-        let r = sqlx::query("UPDATE users SET password_hash = ?2 WHERE username = ?1")
+        // B11:改密同时递增 pwd_version,既有令牌(含当前)立即失效。
+        let r = sqlx::query(
+            "UPDATE users SET password_hash = ?2, pwd_version = pwd_version + 1 WHERE username = ?1",
+        )
+        .bind(username)
+        .bind(password_hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// B11:读取用户当前 pwd_version(登出/改密令牌失效判据)。
+    pub async fn user_pwd_version(&self, username: &str) -> Result<i64> {
+        let v: Option<i64> =
+            sqlx::query_scalar("SELECT pwd_version FROM users WHERE username = ?1")
+                .bind(username)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(v.unwrap_or(0))
+    }
+
+    /// B11:登出 —— 递增 pwd_version 使该用户全部既有 JWT 失效。
+    pub async fn bump_user_pwd_version(&self, username: &str) -> Result<bool> {
+        let r = sqlx::query("UPDATE users SET pwd_version = pwd_version + 1 WHERE username = ?1")
             .bind(username)
-            .bind(password_hash)
             .execute(&self.pool)
             .await?;
         Ok(r.rows_affected() > 0)

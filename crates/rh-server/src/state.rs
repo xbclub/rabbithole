@@ -39,14 +39,22 @@ pub struct AppState {
     pub udp_relays: Arc<Mutex<std::collections::HashSet<u64>>>,
     /// XTCP 打洞协调器。
     pub nathole: Arc<crate::nathole::NatCoordinator>,
-    /// 登录限速(每分钟 5 次/IP+用户)。
+    /// C7:登录限速第一级 —— 每 IP(防用户名轮换绕过)。
     pub login_limiter: Arc<governor::DefaultKeyedRateLimiter<String>>,
+    /// C7:登录限速第二级 —— 每 IP+用户名。
+    pub login_limiter_user: Arc<governor::DefaultKeyedRateLimiter<String>>,
     /// JWT 密钥(启动时定;空则启动生成随机值)。
     pub web_jwt_secret: Arc<Mutex<Option<String>>>,
     /// 每 IP 认证中并发连接数(控制面未认证窗口)。
     unauth_conns: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
     /// 热生效配置子集(网页可管:端口策略/日志级别/SSH 网关)。
     pub hot: Arc<RwLock<HotConfig>>,
+    /// C1:visitor 解析缓存(client_id → 解析结果)。键内含配置版本,
+    /// 版本前进即视为失效。条目在插拔时按容量淘汰。
+    pub visitor_cache: dashmap::DashMap<String, std::sync::Arc<VisitorResolution>>,
+    /// C1:每个客户端的本地配置版本(任何规则/访问器变更 +1)。比 DB 的
+    /// config_revision 更廉价:纯内存原子,不需要每次解析都读 DB。
+    pub client_cfg_gen: Arc<dashmap::DashMap<String, u64>>,
     /// 热生效 limits(控制台可改):并发/限流上限的运行时唯一真源。
     /// 同步锁:enter_unauth 等非 async 路径也要读。
     pub limits: Arc<std::sync::RwLock<crate::config::LimitsConfig>>,
@@ -230,6 +238,7 @@ impl Clone for AppState {
             udp_relays: self.udp_relays.clone(),
             nathole: self.nathole.clone(),
             login_limiter: self.login_limiter.clone(),
+            login_limiter_user: self.login_limiter_user.clone(),
             web_jwt_secret: self.web_jwt_secret.clone(),
             unauth_conns: self.unauth_conns.clone(),
             client_usage: self.client_usage.clone(),
@@ -237,11 +246,31 @@ impl Clone for AppState {
             ssh_watch: (self.ssh_watch.0.clone(), self.ssh_watch.1.clone()),
             metrics_task: self.metrics_task.clone(),
             metrics_listen_addr: self.metrics_listen_addr.clone(),
+            visitor_cache: self.visitor_cache.clone(),
+            client_cfg_gen: self.client_cfg_gen.clone(),
         }
     }
 }
 
 impl AppState {
+    /// C1:推进客户端本地配置版本(规则/访问器任何变更后调用)。
+    pub fn bump_cfg_gen(&self, client_id: &str) {
+        let mut e = self
+            .client_cfg_gen
+            .entry(client_id.to_string())
+            .or_insert(0);
+        *e = e.wrapping_add(1);
+        self.visitor_cache.remove(client_id);
+    }
+
+    /// C1:读取客户端本地配置版本(0 = 从未变更)。
+    pub fn cfg_gen(&self, client_id: &str) -> u64 {
+        self.client_cfg_gen
+            .get(client_id)
+            .map(|e| *e.value())
+            .unwrap_or(0)
+    }
+
     /// 取(或建)客户端用量条目。
     pub fn client_usage(&self, id: &str) -> Arc<ClientUsage> {
         self.client_usage
@@ -340,11 +369,18 @@ impl AppState {
             relay_pairs: Arc::new(Mutex::new(HashMap::new())),
             udp_relays: Arc::new(Mutex::new(std::collections::HashSet::new())),
             nathole: Arc::new(crate::nathole::NatCoordinator::new()),
+            // 每 IP 30 次/分钟(宽桶,容纳办公室 NAT 后多人同时输错)
             login_limiter: Arc::new(governor::RateLimiter::keyed(governor::Quota::per_minute(
-                std::num::NonZeroU32::new(5).unwrap(),
+                std::num::NonZeroU32::new(30).unwrap(),
             ))),
+            // 每 IP+用户名 5 次/分钟(窄桶,原有语义)
+            login_limiter_user: Arc::new(governor::RateLimiter::keyed(
+                governor::Quota::per_minute(std::num::NonZeroU32::new(5).unwrap()),
+            )),
             web_jwt_secret: Arc::new(Mutex::new(Some(jwt_secret))),
             unauth_conns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            visitor_cache: dashmap::DashMap::new(),
+            client_cfg_gen: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -605,6 +641,8 @@ pub struct Metrics {
     /// 故 PONG 改为 `try_send`,满即丢(丢 PONG 只让客户端那一次探测超时,
     /// 下一拍自愈;远比整会话卡死轻)。
     pub dropped_pong: prometheus::IntCounter,
+    /// B7:UDP 会话表满导致的拒收计数(每个被拒新源地址 +1)。
+    pub udp_sessions_rejected: prometheus::IntCounter,
     /// 汇总(控制台 overview)。原子化:数据面每块字节都要经过这里,
     /// 全局互斥锁曾是所有转发连接的串行点。
     pub conns_current: std::sync::atomic::AtomicI64,
@@ -659,8 +697,14 @@ impl Metrics {
             "PONG replies dropped because the control reply queue was full (A1 self-lock guard)",
         )
         .unwrap();
+        let udp_sessions_rejected = IntCounter::new(
+            "rabbithole_udp_sessions_rejected_total",
+            "new UDP sources dropped because the per-proxy session table is full (B7)",
+        )
+        .unwrap();
         let _ = registry.register(Box::new(session_failures_total.clone()));
         let _ = registry.register(Box::new(dropped_pong.clone()));
+        let _ = registry.register(Box::new(udp_sessions_rejected.clone()));
         Self {
             registry,
             connections,
@@ -670,6 +714,7 @@ impl Metrics {
             relay_path_total,
             session_failures_total,
             dropped_pong,
+            udp_sessions_rejected,
             conns_current: std::sync::atomic::AtomicI64::new(0),
             console_bytes_in: std::sync::atomic::AtomicU64::new(0),
             console_bytes_out: std::sync::atomic::AtomicU64::new(0),
@@ -868,6 +913,16 @@ impl ProxyRuntime {
     }
 }
 
+/// C1:一次 USER_CONNECT 的解析结果(visitor + 目标规则)。
+pub struct VisitorResolution {
+    /// 生成该结果时的客户端配置版本。
+    pub gen: u64,
+    pub visitor_id: u64,
+    pub target_client: String,
+    pub vspec: rh_protocol::VisitorSpec,
+    pub pspec: ProxySpec,
+}
+
 /// 组负载均衡:同 (kind, bind_ip, bind_port, group) 的成员共享监听。
 /// TCP 组:首个绑定成功的成员启动共享 serve loop(取消权归组,不随单个成员退出);
 /// vhost 组(http/https/tcpmux):仅登记成员供 group_pick 轮询。
@@ -899,9 +954,11 @@ pub struct ProxyManager {
     /// 组运行时
     pub groups: dashmap::DashMap<String, Arc<GroupRuntime>>,
     /// vhost HTTP 路由表:domain/host → proxy_id
-    pub vhost_http: RwLock<Vec<VhostRoute>>,
-    pub vhost_https: RwLock<Vec<VhostRoute>>,
-    pub vhost_tcpmux: RwLock<Vec<VhostRoute>>,
+    // C3:路由表用 Arc 快照 —— 请求路径只 clone 一次 Arc(O(1)),
+    // 修前每请求 `read().await.clone()` 深拷贝整张表(含全部 String/Vec)。
+    pub vhost_http: RwLock<Arc<Vec<VhostRoute>>>,
+    pub vhost_https: RwLock<Arc<Vec<VhostRoute>>>,
+    pub vhost_tcpmux: RwLock<Arc<Vec<VhostRoute>>>,
     /// 热生效端口策略(网页可改,与 AppState.hot 同源)。
     pub hot: Arc<RwLock<HotConfig>>,
 }
@@ -993,9 +1050,9 @@ impl ProxyManager {
             hot,
             runtimes: dashmap::DashMap::new(),
             groups: dashmap::DashMap::new(),
-            vhost_http: RwLock::new(Vec::new()),
-            vhost_https: RwLock::new(Vec::new()),
-            vhost_tcpmux: RwLock::new(Vec::new()),
+            vhost_http: RwLock::new(Arc::new(Vec::new())),
+            vhost_https: RwLock::new(Arc::new(Vec::new())),
+            vhost_tcpmux: RwLock::new(Arc::new(Vec::new())),
         }
     }
 
@@ -1165,7 +1222,7 @@ impl ProxyManager {
                     let Some(c) = &spec.https else { continue };
                     for d in &c.custom_domains {
                         https.push(VhostRoute {
-                            host: d.clone(),
+                            host: d.trim().to_lowercase(),
                             locations: vec![],
                             http_user: String::new(),
                             http_password: String::new(),
@@ -1179,7 +1236,7 @@ impl ProxyManager {
                     }
                     if !c.subdomain.is_empty() && !subdomain_host.is_empty() {
                         https.push(VhostRoute {
-                            host: format!("{}.{}", c.subdomain, subdomain_host),
+                            host: format!("{}.{}", c.subdomain, subdomain_host).to_lowercase(),
                             locations: vec![],
                             http_user: String::new(),
                             http_password: String::new(),
@@ -1196,7 +1253,7 @@ impl ProxyManager {
                     let Some(c) = &spec.tcpmux else { continue };
                     for d in &c.custom_domains {
                         tcpmux.push(VhostRoute {
-                            host: d.clone(),
+                            host: d.trim().to_lowercase(),
                             locations: vec![],
                             http_user: c.http_user.clone(),
                             http_password: c.http_password.clone(),
@@ -1212,9 +1269,9 @@ impl ProxyManager {
                 _ => {}
             }
         }
-        *self.vhost_http.write().await = http;
-        *self.vhost_https.write().await = https;
-        *self.vhost_tcpmux.write().await = tcpmux;
+        *self.vhost_http.write().await = Arc::new(http);
+        *self.vhost_https.write().await = Arc::new(https);
+        *self.vhost_tcpmux.write().await = Arc::new(tcpmux);
     }
 }
 
@@ -1224,6 +1281,9 @@ fn route_from(
     host: String,
     c: &rh_protocol::HttpProxyConfig,
 ) -> VhostRoute {
+    // B3:注册域名统一小写。请求侧 Host 一律小写(`vhost.rs`),
+    // 修前注册 `Example.Foo.com` 永远不命中。
+    let host = host.trim().to_lowercase();
     VhostRoute {
         host,
         locations: c.locations.clone(),
@@ -1240,6 +1300,54 @@ fn route_from(
 
 // ---------------- 数据通道请求签发 ----------------
 impl AppState {
+    /// B8:完整端口占用判定 = 内存运行态 + DB 已启用行。
+    ///
+    /// `ProxyManager::port_in_use` 只看已注册的 runtime。两个客户端并发
+    /// 创建同端口规则时,串行锁是**每客户端**粒度,两者的 runtime 都尚未
+    /// 注册,双双通过检查 → 后绑定者失败但记录已落库(enabled=1),留下
+    /// 永久 BindError 行,且该端口被它占住。
+    ///
+    /// 这里补一次 DB 复核(只统计 `enabled=1` 且 `uses_bind_port` 的规则,
+    /// 排除自身)。DB 写与检查仍在调用方的 serial_lock 内,跨客户端竞态
+    /// 窗口收窄到"读到写"的毫秒级;真正的绑定失败仍由 trial_bind 兜底。
+    pub async fn port_in_use_full(
+        &self,
+        proto: &str,
+        ip: IpAddr,
+        port: u16,
+        except_proxy: Option<u64>,
+        new_group_key: Option<String>,
+    ) -> bool {
+        if self
+            .proxies
+            .port_in_use(proto, ip, port, except_proxy, new_group_key.clone())
+            .await
+        {
+            return true;
+        }
+        let Ok(rows) = self.db.list_proxies(None).await else {
+            return false;
+        };
+        for (id, _cid, spec) in rows {
+            if Some(id as u64) == except_proxy || !spec.enabled || !spec.kind.uses_bind_port() {
+                continue;
+            }
+            if new_group_key.is_some() && Self::group_key_of(&spec) == new_group_key {
+                continue; // 同组共享监听
+            }
+            let other_ip =
+                rh_core::net::parse_bind_ip(&spec.bind_ip).unwrap_or(IpAddr::from([0, 0, 0, 0]));
+            if bind_conflicts(proto, ip, port, proto, other_ip, spec.bind_port) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn group_key_of(spec: &ProxySpec) -> Option<String> {
+        ProxyManager::group_key(spec)
+    }
+
     /// 向客户端签发一个数据通道请求(服务端指令发起)。
     pub async fn issue_create_channel(
         &self,

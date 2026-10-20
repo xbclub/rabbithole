@@ -9,6 +9,7 @@
 
 use crate::session::{RequestPurpose, Session};
 use crate::state::AppState;
+use crate::state::VisitorResolution;
 use rh_protocol::message::{ChannelEntity, StartForward, StartVisitorRelay, UserConnect};
 use rh_protocol::{forward_flags, FrameType, ProxyKind, ProxySpec, VisitorSpec};
 use rh_transport::BoxedIo;
@@ -18,29 +19,57 @@ use tracing::warn;
 
 /// USER_CONNECT:visitor 本地新连接(stcp/xtcp TCP;sudp 首包触发)。
 pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: UserConnect) {
-    let visitors = state
-        .db
-        .list_visitors(Some(&sess.client_id))
-        .await
-        .unwrap_or_default();
-    let Some((_vid, _v_client, v_target_client, vspec)) = visitors
-        .into_iter()
-        .find(|(id, _, _, s)| *id as u64 == u.visitor_id && s.enabled)
-    else {
-        return;
+    // C1:解析结果按 (client_id, config_revision) 缓存。
+    //
+    // 修前每条用户连接两次全表 DB 读 + 全量 JSON 反序列化,并且内联在
+    // **控制读循环**里(visitor 连接建立速率一高就把控制面拖住)。配置只在
+    // revision 变化时更新,缓存命中即为最新。
+    let resolve = match state.visitor_cache.get(&sess.client_id) {
+        Some(c) if c.gen == state.cfg_gen(&sess.client_id) => c.clone(),
+        _ => {
+            let visitors = state
+                .db
+                .list_visitors(Some(&sess.client_id))
+                .await
+                .unwrap_or_default();
+            let Some((_vid, _v_client, v_target_client, vspec)) = visitors
+                .into_iter()
+                .find(|(id, _, _, s)| *id as u64 == u.visitor_id && s.enabled)
+            else {
+                return;
+            };
+            let proxies = state
+                .db
+                .list_proxies(Some(&v_target_client))
+                .await
+                .unwrap_or_default();
+            let Some((_pid, _pcid, pspec)) = proxies
+                .into_iter()
+                .find(|(_, _, s)| s.name == vspec.target_proxy_name && s.enabled)
+            else {
+                warn!(visitor = vspec.name, "target proxy not found/enabled");
+                return;
+            };
+            let entry = Arc::new(VisitorResolution {
+                gen: state.cfg_gen(&sess.client_id),
+                visitor_id: vspec.id,
+                target_client: v_target_client,
+                vspec,
+                pspec,
+            });
+            state
+                .visitor_cache
+                .insert(sess.client_id.clone(), entry.clone());
+            entry
+        }
     };
-    let proxies = state
-        .db
-        .list_proxies(Some(&v_target_client))
-        .await
-        .unwrap_or_default();
-    let Some((_pid, _pcid, pspec)) = proxies
-        .into_iter()
-        .find(|(_, _, s)| s.name == vspec.target_proxy_name && s.enabled)
-    else {
-        warn!(visitor = vspec.name, "target proxy not found/enabled");
+    // 缓存命中后仍需按请求的 visitor_id 校验(同一会话可能有多个访问器)
+    if resolve.visitor_id != u.visitor_id || !resolve.vspec.enabled || !resolve.pspec.enabled {
         return;
-    };
+    }
+    let vspec = resolve.vspec.clone();
+    let pspec = resolve.pspec.clone();
+    let v_target_client = resolve.target_client.clone();
     if !secret_ok(&pspec, &vspec) {
         return;
     }
@@ -255,7 +284,7 @@ async fn relay_udp(
             }
         };
         let mut b = crate::data::CountedUserIo::user(b, &st, prt);
-        let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+        let _ = crate::data::copy_bidirectional_bounded(&mut a, &mut b).await;
         st.udp_relays.lock().await.remove(&vid);
     });
 }
@@ -325,6 +354,7 @@ pub async fn on_relay_proxy_channel(
         flags,
         proxy_proto: conv_proxy_proto(pspec.transport.proxy_proto),
         proxy_name: pspec.name.clone(),
+        xtcp_auth: String::new(),
     };
     let payload = serde_json::to_vec(&fwd).unwrap();
     if rh_protocol::write_frame(&mut stream, FrameType::START_FORWARD, &payload)
@@ -372,7 +402,7 @@ async fn splice_relay(
         None => return, // F2 配额超限:中继不建立
     };
     let mut b = crate::data::CountedUserIo::user(visitor_stream, &state, rt);
-    let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+    let _ = crate::data::copy_bidirectional_bounded(&mut a, &mut b).await;
 }
 
 fn conv_proxy_proto(v: rh_protocol::ProxyProtoVersion) -> rh_protocol::message::ProxyProto {

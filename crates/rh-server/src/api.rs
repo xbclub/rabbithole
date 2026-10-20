@@ -105,13 +105,20 @@ async fn login(
     ConnectInfo(peer): ConnectInfo<crate::WebAddr>,
     Json(req): Json<LoginReq>,
 ) -> Response {
-    // 登录限速:每 IP+用户名 5 次/分钟(governor)。
-    // 用户名截断防任意长度 key 撑内存。
+    // C7:登录限速改为两级 —— 每 IP 一个宽桶 + 每 IP+用户名一个小桶。
+    //
+    // 修前只有 `{ip}|{user}` 单键:攻击者轮换用户名即可绕过 IP 限制,
+    // 且键随"用户名"无限增长(无淘汰)。现在 IP 维度的桶先兜住洪峰,
+    // 用户名截断仍然保留。
     let uname: String = req.username.chars().take(64).collect();
     if state
         .login_limiter
-        .check_key(&format!("{peer}|{uname}"))
+        .check_key(&format!("ip|{peer}"))
         .is_err()
+        || state
+            .login_limiter_user
+            .check_key(&format!("{peer}|{uname}"))
+            .is_err()
     {
         state
             .events
@@ -122,9 +129,12 @@ async fn login(
     let user = match state.db.get_user(&req.username).await {
         Ok(Some(u)) => u,
         _ => {
-            // 对不存在的用户也执行一次等价 argon2 校验,消除时序侧信道枚举
+            // 对不存在的用户也执行一次等价 argon2 校验,消除时序侧信道枚举。
+            // C6:argon2id 是 CPU 密集的同步计算,必须放到 blocking 池 ——
+            // 直接在 tokio worker 上跑会让并发登录把转发任务一起卡住。
             const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$OXRoZXJlYXJlZnJwaHJvbGl0Z$5ENkQGI9XCo8uUU6eW/y6vLzRnF8YD2NO6wanjaApfE";
-            let _ = verify_password(&req.password, DUMMY_HASH);
+            let pw = req.password.clone();
+            let _ = tokio::task::spawn_blocking(move || verify_password(&pw, DUMMY_HASH)).await;
             state
                 .events
                 .emit("warn", "auth", &format!("登录失败(用户不存在):{uname}"))
@@ -132,7 +142,13 @@ async fn login(
             return err(1001, "用户名或密码错误");
         }
     };
-    if !verify_password(&req.password, &user.1) {
+    // C6:同上 —— 真实校验也必须在 blocking 池。
+    let pw = req.password.clone();
+    let hash = user.1.clone();
+    let verified = tokio::task::spawn_blocking(move || verify_password(&pw, &hash))
+        .await
+        .unwrap_or(false);
+    if !verified {
         state
             .events
             .emit(
@@ -144,7 +160,9 @@ async fn login(
         return err(1001, "用户名或密码错误");
     }
     let ttl = chrono_hours(state.cfg.web.jwt_ttl_hours);
-    let token = match mint_jwt(&state, &req.username, ttl).await {
+    // B11:令牌携带签发时的 pwd_version,登出/改密递增后旧令牌立即 401。
+    let pv = state.db.user_pwd_version(&req.username).await.unwrap_or(0);
+    let token = match mint_jwt(&state, &req.username, ttl, pv).await {
         Ok(t) => t,
         Err(e) => return err(500, &format!("内部错误(jwt):{e}")),
     };
@@ -231,7 +249,12 @@ pub fn hash_password(plain: &str) -> anyhow::Result<String> {
         .to_string())
 }
 
-async fn mint_jwt(state: &Arc<AppState>, username: &str, ttl_hours: u64) -> anyhow::Result<String> {
+async fn mint_jwt(
+    state: &Arc<AppState>,
+    username: &str,
+    ttl_hours: u64,
+    pwd_version: i64,
+) -> anyhow::Result<String> {
     let secret = state.jwt_secret().await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -240,6 +263,7 @@ async fn mint_jwt(state: &Arc<AppState>, username: &str, ttl_hours: u64) -> anyh
         "sub": username,
         "iat": now,
         "exp": now + (ttl_hours as i64) * 3600,
+        "pv": pwd_version,
     });
     Ok(jsonwebtoken::encode(
         &jsonwebtoken::Header::default(),
@@ -271,12 +295,25 @@ async fn require_auth(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Stri
         &jsonwebtoken::Validation::default(),
     );
     match data {
-        Ok(d) => Ok(d
-            .claims
-            .get("sub")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()),
+        Ok(d) => {
+            let user = d
+                .claims
+                .get("sub")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if user.is_empty() {
+                return Err(Box::new(unauthorized()));
+            }
+            // B11:令牌版本必须与用户当前 pwd_version 一致。登出/改密递增
+            // 后,旧令牌在下一次请求即失效(无状态 JWT 的吊销点)。
+            let want = d.claims.get("pv").and_then(|v| v.as_i64()).unwrap_or(0);
+            let cur = state.db.user_pwd_version(&user).await.unwrap_or(0);
+            if want != cur {
+                return Err(Box::new(unauthorized()));
+            }
+            Ok(user)
+        }
         Err(_) => Err(Box::new(unauthorized())),
     }
 }
@@ -284,6 +321,10 @@ async fn require_auth(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Stri
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     match require_auth(&state, &headers).await {
         Ok(user) => {
+            // B11:登出即吊销 —— 递增 pwd_version,该用户全部既有令牌失效。
+            if let Err(e) = state.db.bump_user_pwd_version(&user).await {
+                tracing::warn!(error = %e, user = %user, "logout: bump pwd_version failed");
+            }
             state
                 .events
                 .emit("info", "auth", &format!("已登出:{user}"))
@@ -562,6 +603,7 @@ async fn update_client(
             let proxies = state.db.list_proxies(Some(&id)).await.unwrap_or_default();
             let visitors = state.db.list_visitors(Some(&id)).await.unwrap_or_default();
             let rev = state.db.bump_revision(&id).await.unwrap_or(0);
+            state.bump_cfg_gen(&id);
             for (pid, _, _spec) in &proxies {
                 crate::runtime::teardown_runtime(&state, *pid as u64).await;
                 if let Some(sess) = state.sessions.get(&id) {
@@ -825,8 +867,7 @@ async fn create_service_inner(
             let proto = spec.kind.as_str();
             let gkey = crate::state::ProxyManager::group_key(spec);
             if state
-                .proxies
-                .port_in_use(proto, bind_ip, spec.bind_port, None, gkey.clone())
+                .port_in_use_full(proto, bind_ip, spec.bind_port, None, gkey.clone())
                 .await
             {
                 return Err((2006, "PORT_CONFLICT:端口已被占用".into()));
@@ -1066,8 +1107,7 @@ async fn update_service_inner(state: &Arc<AppState>, id: i64, mut spec: ProxySpe
         }
         let gkey = crate::state::ProxyManager::group_key(&spec);
         if state
-            .proxies
-            .port_in_use(
+            .port_in_use_full(
                 spec.kind.as_str(),
                 new_ip,
                 spec.bind_port,
@@ -1170,6 +1210,7 @@ async fn enable_service(
         }
     }
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     crate::runtime::teardown_runtime(&state, id as u64).await;
     crate::runtime::spawn_runtime(&state, &client_id, &spec, rev).await;
     ok(json!({"enabled": true, "revision": rev}))
@@ -1300,8 +1341,7 @@ async fn create_bind_checked(
     }
     let gkey = crate::state::ProxyManager::group_key(spec);
     if state
-        .proxies
-        .port_in_use(
+        .port_in_use_full(
             spec.kind.as_str(),
             bind_ip,
             spec.bind_port,
@@ -1358,6 +1398,7 @@ async fn disable_service(
     };
     state.db.set_proxy_enabled(id, false).await.ok();
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     crate::runtime::teardown_runtime(&state, id as u64).await;
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove};
@@ -1400,6 +1441,7 @@ async fn delete_service(
         return err(3001, "转发规则不存在");
     };
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     crate::runtime::teardown_runtime(&state, id as u64).await;
     if let Err(e) = state.db.delete_proxy(id).await {
         return err(500, &format!("{e}"));
@@ -1475,6 +1517,7 @@ async fn enable_service_locked(state: &Arc<AppState>, id: i64) -> (i32, String) 
     state.db.set_proxy_enabled(id, true).await.ok();
     spec.enabled = true;
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     let client_enabled = state
         .db
         .get_client(&client_id)
@@ -1529,6 +1572,7 @@ async fn disable_service_locked(state: &Arc<AppState>, id: i64) -> (i32, String)
     };
     state.db.set_proxy_enabled(id, false).await.ok();
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     crate::runtime::teardown_runtime(state, id as u64).await;
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove};
@@ -1554,6 +1598,7 @@ async fn delete_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     crate::runtime::teardown_runtime(state, id as u64).await;
     let _ = state.db.delete_proxy(id).await;
     if let Some(sess) = state.sessions.get(&client_id) {
@@ -1614,23 +1659,12 @@ struct CreateVisitorReq {
     spec: VisitorSpec,
 }
 
-async fn create_visitor(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<CreateVisitorReq>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
-    let mut spec = req.spec;
-    if spec.name.is_empty() || spec.bind_port == 0 {
-        return err(4001, "缺少 name 或 bind_port");
-    }
-    spec.id = 0;
-    // 密钥由目标规则单一管理:访问器一律不存储(连接时继承规则当前密钥),入参忽略
-    spec.secret_key = String::new();
-    // 解析目标代理归属(同名规则可能存在于多个客户端:优先当前在线的客户端,
-    // 全部离线时取创建序首个,并在歧义时告警)
+/// B15:解析 visitor 的目标代理归属(创建与更新共用)。
+///
+/// 同名规则可能存在于多个客户端:优先当前在线的客户端;全部离线时取
+/// 创建序首个,歧义时告警。修前 update 取"首个匹配"(不看在不在线),
+/// create 优先在线 —— 同名一在线一离线时,update 会把归属改到离线端。
+async fn resolve_visitor_target(state: &Arc<AppState>, spec: &VisitorSpec) -> Option<String> {
     let clients = state.db.list_clients().await.unwrap_or_default();
     let mut candidates: Vec<String> = Vec::new();
     for c in &clients {
@@ -1649,11 +1683,29 @@ async fn create_visitor(
             "visitor target proxy name ambiguous; preferring online client"
         );
     }
-    let target_client = candidates
+    candidates
         .iter()
         .find(|c| state.sessions.get(c).is_some())
         .or_else(|| candidates.first())
-        .cloned();
+        .cloned()
+}
+
+async fn create_visitor(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateVisitorReq>,
+) -> Response {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    let mut spec = req.spec;
+    if spec.name.is_empty() || spec.bind_port == 0 {
+        return err(4001, "缺少 name 或 bind_port");
+    }
+    spec.id = 0;
+    // 密钥由目标规则单一管理:访问器一律不存储(连接时继承规则当前密钥),入参忽略
+    spec.secret_key = String::new();
+    let target_client = resolve_visitor_target(&state, &spec).await;
     let target_proxy_found = target_client.is_some();
     if !target_proxy_found {
         return err(4002, "目标规则不存在(类型须匹配)");
@@ -1669,6 +1721,7 @@ async fn create_visitor(
         Err(e) => return err(500, &format!("{e}")),
     };
     let rev = state.db.bump_revision(&req.client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&req.client_id);
     spec.id = id as u64;
     // 下发
     if let Some(sess) = state.sessions.get(&req.client_id) {
@@ -1718,26 +1771,15 @@ async fn update_visitor(
     spec.id = id as u64;
     // 密钥由目标规则单一管理:访问器一律不存储(连接时继承规则当前密钥),入参忽略
     spec.secret_key = String::new();
-    // 重新解析目标:与创建同语义(名称 + 类型都须匹配,否则拒绝)
-    let clients = state.db.list_clients().await.unwrap_or_default();
-    let mut target_client = None;
-    for c in &clients {
-        if let Ok(list) = state.db.list_proxies(Some(&c.id)).await {
-            if list.iter().any(|(_, _, p)| {
-                p.name == spec.target_proxy_name && p.kind.as_str() == spec.kind.as_str()
-            }) {
-                target_client = Some(c.id.clone());
-                break;
-            }
-        }
-    }
-    let Some(target_client) = target_client else {
+    // B15:与创建同一解析器(名称 + 类型都须匹配,优先在线客户端)
+    let Some(target_client) = resolve_visitor_target(&state, &spec).await else {
         return err(4002, "目标规则不存在(类型须匹配)");
     };
     if let Err(e) = state.db.update_visitor(id, &target_client, &spec).await {
         return err(500, &format!("{e}"));
     }
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceUpdate, SyncEntity};
         let _ = sess
@@ -1799,6 +1841,7 @@ async fn toggle_visitor(state: Arc<AppState>, id: i64, enabled: bool) -> Respons
     state.db.set_visitor_enabled(id, enabled).await.ok();
     spec.enabled = enabled;
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove, ServiceUpdate, SyncEntity};
         if enabled {
@@ -1853,6 +1896,7 @@ async fn delete_visitor(
         return err(4003, "访问器不存在");
     }
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     let _ = state.db.delete_visitor(id).await;
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove};
@@ -2598,7 +2642,7 @@ mod tests {
     }
 
     async fn auth_headers(state: &Arc<AppState>) -> HeaderMap {
-        let token = mint_jwt(state, "admin", 1).await.unwrap();
+        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
         let mut h = HeaderMap::new();
         h.insert(
             "authorization",

@@ -393,8 +393,10 @@ async fn attach_additional_carrier(
         let _ = send_error(&mut stream, "AUTH_FAILED", "session mismatch").await;
         return Ok(());
     }
-    match state.db.get_client(&hello.client_id).await {
-        Ok(Some(c)) if c.enabled => {}
+    // B9:报到必须携带 attach HMAC。明文 session_id 只证明"知道 id",
+    // 不足以证明"持有 secret";缺失/不符一律拒绝(不回退到纯 id 聚合)。
+    let client = match state.db.get_client(&hello.client_id).await {
+        Ok(Some(c)) if c.enabled => c,
         Ok(_) => {
             reject_carrier(
                 &mut stream,
@@ -414,6 +416,32 @@ async fn attach_additional_carrier(
             reject_carrier(&mut stream, cap, "INTERNAL", &hello.client_id, session_id).await;
             return Ok(());
         }
+    };
+    let Some(got_auth) = hello.attach_auth.as_deref() else {
+        reject_carrier(
+            &mut stream,
+            cap,
+            "ATTACH_AUTH_MISSING",
+            &hello.client_id,
+            session_id,
+        )
+        .await;
+        return Ok(());
+    };
+    let expect_auth = hmac_hex(
+        client.secret.as_bytes(),
+        &format!("rh3:attach:{session_id}"),
+    );
+    if !rh_transport::constant_time_eq(got_auth.as_bytes(), expect_auth.as_bytes()) {
+        reject_carrier(
+            &mut stream,
+            cap,
+            "ATTACH_AUTH_BAD",
+            &hello.client_id,
+            session_id,
+        )
+        .await;
+        return Ok(());
     }
     // 上限强制(round-10.1 §2.3 / round-48 **原子化**):cap 含首载体,池内
     // 只装附加载体,故允许本次附加的条件是
@@ -1157,17 +1185,10 @@ pub async fn handle_data_channel_hello(
     payload: &[u8],
 ) -> anyhow::Result<()> {
     let hello: rh_protocol::message::DataChannelHello = serde_json::from_slice(payload)?;
-    // 查找会话
+    // C2:O(1) 索引查找(修前是 O(在线客户端) 全表扫描)
     let sess = state
         .sessions
-        .online_clients()
-        .into_iter()
-        .find_map(|cid| {
-            state
-                .sessions
-                .get(&cid)
-                .filter(|s| s.session_id == hello.session_id)
-        })
+        .get_by_session(&hello.session_id)
         .ok_or_else(|| anyhow::anyhow!("no session"))?;
     // round-10 重拨补位:客户端池重拨的新载体未再发报到 HELLO,其首流
     // 直接是数据通道——把该连接聚合进会话池,后续流不再搁浅。单载体
@@ -1249,6 +1270,10 @@ pub async fn handle_data_channel_hello(
     routed
 }
 
+/// B9:测试客户端 secret(各测试的 `state_with*` 均以 `0`*64 建库)。
+#[cfg(test)]
+const TEST_CLIENT_SECRET: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
 #[cfg(test)]
 mod carrier_ack_tests {
     //! round-10 报到应答(T-S1/T-S2)直连单测:不经完整客户端,直接构造
@@ -1281,6 +1306,19 @@ mod carrier_ack_tests {
     }
 
     fn attach_hello(session_id: &str) -> Hello {
+        hello_with_auth(session_id, None)
+    }
+
+    /// B9:报到 Hello 的认证字段。`auth=None` 时按测试客户端的 secret
+    /// 计算正确 HMAC(正常路径);`Some(v)` 用于构造错误/缺失凭据的负例。
+    fn hello_with_auth(session_id: &str, auth: Option<Option<String>>) -> Hello {
+        let attach_auth = match auth {
+            Some(v) => v,
+            None => Some(hmac_hex(
+                TEST_CLIENT_SECRET.as_bytes(),
+                &format!("rh3:attach:{session_id}"),
+            )),
+        };
         Hello {
             client_id: CID.into(),
             version: PROTOCOL_VERSION.into(),
@@ -1289,6 +1327,7 @@ mod carrier_ack_tests {
             arch: "test".into(),
             capabilities: Vec::new(),
             session_id: Some(session_id.into()),
+            attach_auth,
         }
     }
 
@@ -1883,6 +1922,10 @@ mod carrier_attach_concurrency_tests {
             arch: "test".into(),
             capabilities: Vec::new(),
             session_id: Some(sid.into()),
+            attach_auth: Some(hmac_hex(
+                TEST_CLIENT_SECRET.as_bytes(),
+                &format!("rh3:attach:{sid}"),
+            )),
         }
     }
 

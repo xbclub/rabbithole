@@ -195,7 +195,7 @@ impl std::future::Future for AbortOnDropHandle {
 const DEFAULT_HALFCLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 半关闭兜底上限(env 可覆盖,进程内只解析一次)。
-pub(crate) fn halfclose_grace() -> std::time::Duration {
+pub fn halfclose_grace() -> std::time::Duration {
     static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         match std::env::var("RH_HALFCLOSE_GRACE_SECS")

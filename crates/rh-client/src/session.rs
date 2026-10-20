@@ -37,6 +37,9 @@ pub struct ClientSession {
     pub punched: Mutex<HashMap<u64, Arc<rh_transport::Multiplexer>>>,
     /// 打洞事务保留 socket(候选与打洞同源;双端各自入队)。
     pub nat_socks: Mutex<HashMap<String, std::collections::VecDeque<Arc<tokio::net::UdpSocket>>>>,
+    /// A7:打洞成功的直连首帧凭据(visitor_id → auth)。与 `punched`
+    /// (visitor_id → mux)同生命周期:每次打洞成功写入,替换 mux 时一并更新。
+    pub punched_auth: Mutex<HashMap<u64, String>>,
     /// sudp 通道交付:visitor_id → sender。
     pub sudp_deliver: Mutex<HashMap<u64, mpsc::Sender<BoxedIo>>>,
     pub mux: Arc<rh_transport::Multiplexer>,
@@ -434,6 +437,7 @@ pub async fn connect_and_run(
         .collect(),
         // 首条连接:无会话归属,走完整挑战应答认证(附加载体报到见下方)
         session_id: None,
+        attach_auth: None,
     };
     frame::write_frame(&mut control, FrameType::HELLO, &serde_json::to_vec(&hello)?).await?;
     let mut buf = bytes::BytesMut::with_capacity(1024);
@@ -543,6 +547,9 @@ pub async fn connect_and_run(
     // 本身失败时无法得知落点,不记 id(该载体可能仍健康)。
     let mut failed_ids: Vec<u64> = Vec::new();
     if initial_k > 1 {
+        // B9:报到流必须证明持有 secret —— 仅凭明文 session_id 即可聚合
+        // 会把"id 泄漏"升级为"会话池被混入"。
+        let attach_auth = attach_hmac(cfg.secret.as_bytes(), &session_id);
         let attach = Hello {
             client_id: cfg.client_id.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -551,6 +558,7 @@ pub async fn connect_and_run(
             arch: std::env::consts::ARCH.to_string(),
             capabilities: Vec::new(),
             session_id: Some(session_id.clone()),
+            attach_auth: Some(attach_auth),
         };
         let payload = serde_json::to_vec(&attach)?;
         for i in 1..initial_k {
@@ -678,6 +686,7 @@ pub async fn connect_and_run(
         waiting: Mutex::new(HashMap::new()),
         punched: Mutex::new(HashMap::new()),
         nat_socks: Mutex::new(HashMap::new()),
+        punched_auth: Mutex::new(HashMap::new()),
         sudp_deliver: Mutex::new(HashMap::new()),
         mux: mux.clone(),
         conn_counter: AtomicU64::new(0),
@@ -696,6 +705,11 @@ fn hostname_or_unknown() -> String {
         }
     }
     std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into())
+}
+
+/// B9:附加载体报到凭据(HMAC-SHA256,与 `auth` 用同一 secret 但域分隔)。
+pub fn attach_hmac(secret: &[u8], session_id: &str) -> String {
+    hmac_hex(secret, &format!("rh3:attach:{session_id}"))
 }
 
 pub fn hmac_hex(secret: &[u8], msg: &str) -> String {

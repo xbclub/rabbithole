@@ -1,5 +1,10 @@
 # 深审修复方案(2026-10-20,基线 ffd49d3)
 
+> **状态(2026-10-20 收尾)**:批次一 A1–A10、批次二 B1–B12/B14–B16、批次三
+> C1–C5/C7–C10 已全部落地并有回归测试;`cargo fmt` / `clippy -D warnings` /
+> `cargo test --workspace` 全绿。逐项状态见文末 §8。A7(xtcp 直连认证)是
+> **行为变化**,发布说明必须列入兼容性小节。
+
 七路并行只读审查(server 控制面 / server 数据面 / server API+DB / rh-client /
 mux+yamux / 传输载体 / kcp+core+protocol)的结论与修复方案。行号 = ffd49d3
 实读,已抽查核对。审查确认**无数据损坏级(P0)**;数据搬送主路径(splice/copy
@@ -281,3 +286,71 @@ fail-closed);yamux 池不变式、writev 批回退、staging 边界、侧链背�
 (PENDING_ROUTE_CAP)、80decd6 回窗时机;frame.rs 1MiB 双侧强制;
 certprov HKDF 绑定;ratelimit 单调时钟与取消安全;kcp `get_conv` 前置
 检查、demux 满队列自锁修复、punch 任务泄漏修复(PunchCancel)。
+
+---
+
+## 8 落地状态(2026-10-20)
+
+### 批次一(P1)
+
+| # | 状态 | 证据/落点 |
+|---|---|---|
+| A1 | ✅ | `control.rs` PONG 走 `try_send` + `dropped_pong` 指标;`handle_client_message` 的 `sess.send` 全部 `timeout(2s)`;`reply_queue_selflock_tests` |
+| A2 | ✅ | `close_proxy_channels` 保留 sender;泵只由 `rule_cancel`/shutdown 退出;`udp_pump_survives_reconnect_tests` |
+| A3 | ✅ | `UnauthGuard`(RAII)+ 认证成功点 `disarm()`;`unauth_window_tests` |
+| A4 | ✅ | `Session.cancel` + GC/退出路径 `cancel()` + socket shutdown |
+| A5 | ✅ | `disable_service_inner` / `disable_service_locked` 共用;update 置 `enabled=false` 走同一 teardown |
+| A6 | ✅ | 组级 `serve_cancel`;`group_listener_ownership_tests` |
+| A7 | ✅ | 协议新增 `NatHolePrepare.nonce`、`NatHoleConnect.{nonce,auth}`、`StartForward.xtcp_auth`;直连首帧恒定时间比对;打洞 listen/dial 只认候选来源。测试 `a7_*`(2 条) |
+| A8 | ✅ | `RetiredTable`(固定容量 FIFO)+ `SessionGate`(全局上限 + 每 IP 令牌桶);测试 `a8_*`(4 条) |
+| A9 | ✅ | `open_stream` prefix_pending 分支先建 notified 再复查 |
+| A10 | ✅ | 发送帧体帽 `min(split_send_size, MAX_FRAME_BODY_LEN)` + 静态断言 |
+
+### 批次二(P2 生命周期/逻辑/安全)
+
+| # | 状态 | 落点 |
+|---|---|---|
+| B1 | ✅ | `claim_pool` 换 epoch 时 `inflight.store(0)` |
+| B2 | ✅ | `on_session_down` 持 `serial_lock(client_id)` |
+| B3 | ✅ | `route_from` / https / tcpmux 注册域名统一 `to_lowercase` |
+| B4 | ✅ | `handle_http_request` 每请求 `try_open_user_conn(Some(rt))` |
+| B5 | ✅ | `http_timeout_s` 默认 30s;CONNECT 头读取与 TLS 握手均有界 |
+| B6 | ✅ | `data::copy_bidirectional_bounded` 替换 5 处裸 `copy_bidirectional`(半关闭有界兜底) |
+| B7 | ✅ | `max_udp_sessions_per_proxy` 默认 1024;超限 `warn` + `udp_sessions_rejected` 指标 |
+| B8 | ✅ | `AppState::port_in_use_full` 追加 DB enabled 行复核 |
+| B9 | ✅ | `Hello.attach_auth = HMAC(secret, "rh3:attach:"+session_id)`,服务端恒定时间比对,缺失/不符即拒 |
+| B10 | ⚠️ 部分 | 现有 `secret_verified` 逐载体比对已由 1f5dc55/95ea8ba 落地;多载体降级单载体的短期缓解未做(需实机验证后再定) |
+| B11 | ✅ | `users.pwd_version`(迁移 0004);JWT 带 `pv`;登出/改密递增 → 旧令牌 401 |
+| B12 | ✅ | `max_early_data_size=0` / `enable_early_data=false` / `Resumption` 显式化 + 3 条配置断言 |
+| B13 | ✅ | 见 A7 |
+| B14 | ✅ | `now_ms()` 改为进程启动锚的 `Instant` 差值 |
+| B15 | ✅ | `resolve_visitor_target` 创建/更新共用 |
+| B16 | ✅ | WS `WebSocketConfig` 压到 2MiB;`rd_buf` 消费后按容量归还 |
+
+### 批次三(P2 性能)
+
+| # | 状态 | 落点 |
+|---|---|---|
+| C1 | ✅ | `AppState::visitor_cache` + `client_cfg_gen`(按客户端配置版本失效) |
+| C2 | ✅ | `SessionRegistry::by_session` 索引 + `get_by_session` |
+| C3 | ✅ | vhost 路由表改 `Arc<Vec<VhostRoute>>` 快照(O(1) clone) |
+| C4 | ✅ | yamux 池新增大缓冲类(`LARGE_MAX=1MiB+8KiB`,总预算 32MiB) |
+| C5 | ✅ | 下行 `pending_bytes` 增量维护 + 段数上限判据 |
+| C6 | ✅ | 登录 argon2 校验(含 dummy hash)全部 `spawn_blocking` |
+| C7 | ✅ | 登录限速两级:每 IP 30/min + 每 IP+用户名 5/min |
+| C8 | ✅ | 插件拨号改走 `forward::resolve`(异步)+ 10s connect 超时 |
+| C9 | ⚠️ 部分 | 自定义 DNS 已走 `spawn_blocking`;TTL 缓存/singleflight 未做(短连接压测未暴露瓶颈,留作后续) |
+| C10 | ✅ | visitor 用户侧 accept 补 `set_nodelay(true)` |
+
+### 未纳入本轮(明确记录,不假装完成)
+
+- **B10 多载体降级单载体**:需先在三机确认"逐载体比对"在 K>1 时确实全部通过,
+  再决定是否需要降级兜底。
+- **C9 DNS TTL 缓存/singleflight**:当前每次解析都走 blocking 池,不阻塞 worker;
+  缓存收益需先有短连接压测数据支撑。
+- **批次四 P3 择要**:未在本轮实施(小改动、清理类,不影响吞吐与正确性)。
+
+### 性能验证
+
+见 `docs/deep-review-performance-report.md`(三机 peer 基准,TCP/TLS 对 frp,
+Go loadgen)。

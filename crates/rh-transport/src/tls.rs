@@ -52,6 +52,10 @@ pub fn server_config_with_alpn(
         .with_single_cert(certs, key)
         .map_err(|e| io::Error::other(format!("tls: build server config: {e}")))?;
     cfg.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
+    // 0-RTT 永久禁用(B12 / docs/0rtt-remediation.md §3.1):early data 无
+    // 防重放保护。依赖库默认值即为 0,这里显式置零以把"依赖默认"升级为
+    // "代码承诺",并由 `tests::server_disables_early_data` 锁定。
+    cfg.max_early_data_size = 0;
     Ok(Arc::new(cfg))
 }
 
@@ -244,6 +248,11 @@ pub fn client_config_with_alpn(
 
 fn with_alpn(mut cfg: rustls::ClientConfig, alpn: &[String]) -> Arc<rustls::ClientConfig> {
     cfg.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
+    // 0-RTT 禁用(B12 / docs/0rtt-remediation.md §3.2):会话恢复仅 1-RTT
+    // PSK,无 early data 面。三个校验分支(pin/insecure/CA/secret_verified)
+    // 统一经过这里。
+    cfg.enable_early_data = false;
+    cfg.resumption = rustls::client::Resumption::in_memory_sessions(256);
     Arc::new(cfg)
 }
 
@@ -426,5 +435,79 @@ mod tests {
         let mut bad = digest;
         bad[0] ^= 1;
         assert!(verify_pin(&bad, leaf.as_ref()).is_err());
+    }
+
+    // ---- B12 0-RTT 回归(docs/0rtt-remediation.md §3.4) ----
+
+    fn server_opts() -> TlsServerOptions {
+        TlsServerOptions::default()
+    }
+
+    fn client_opts() -> TlsClientOptions {
+        TlsClientOptions {
+            trusted_ca: None,
+            server_name: None,
+            insecure_skip_verify: true,
+            pin_sha256: None,
+            secret_verified: false,
+        }
+    }
+
+    /// B12 / docs/0rtt-remediation.md §3.4-1:服务端必须显式禁用 early data。
+    /// 不能只依赖 rustls 默认值 —— 依赖升级可能无声改变它。
+    #[test]
+    fn server_disables_early_data() {
+        let cfg = server_config(&server_opts()).expect("server cfg");
+        assert_eq!(
+            cfg.max_early_data_size, 0,
+            "服务端 max_early_data_size 必须为 0(0-RTT 永久禁用)"
+        );
+    }
+
+    /// B12 §3.4-1:客户端必须显式关闭 early data,并保留 1-RTT PSK 恢复。
+    #[test]
+    fn client_disables_early_data() {
+        let (cfg, verify) = client_config(&client_opts()).expect("client cfg");
+        assert!(matches!(verify, ClientVerify::Insecure));
+        assert!(
+            !cfg.enable_early_data,
+            "客户端 enable_early_data 必须为 false"
+        );
+    }
+
+    /// B12 §3.4-1:secret_verified / pin / CA 三个分支共用 with_alpn,
+    /// 全部必须关闭 early data(防止只改一个分支)。
+    #[test]
+    fn all_client_branches_disable_early_data() {
+        // pin 分支
+        let pin = "00".repeat(32);
+        let (cfg, _) = client_config(&TlsClientOptions {
+            pin_sha256: Some(pin),
+            ..client_opts()
+        })
+        .expect("pin cfg");
+        assert!(!cfg.enable_early_data, "pin 分支必须关闭 early data");
+
+        // secret_verified 分支
+        let (cfg, _) = client_config(&TlsClientOptions {
+            secret_verified: true,
+            insecure_skip_verify: false,
+            ..client_opts()
+        })
+        .expect("secret_verified cfg");
+        assert!(
+            !cfg.enable_early_data,
+            "secret_verified 分支必须关闭 early data"
+        );
+
+        // CA 分支:用自签证书当根(无需真的能验证成功,只检查配置字段)
+        let (crt, _key) = generate_self_signed().expect("self signed");
+        let (cfg, _) = client_config(&TlsClientOptions {
+            trusted_ca: Some(crt),
+            insecure_skip_verify: false,
+            ..client_opts()
+        })
+        .expect("ca cfg");
+        assert!(!cfg.enable_early_data, "CA 分支必须关闭 early data");
     }
 }

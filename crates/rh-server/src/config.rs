@@ -127,7 +127,7 @@ impl Default for WebConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct VhostConfig {
     /// HTTP vhost 共享监听端口;0 = 关闭。
@@ -140,9 +140,26 @@ pub struct VhostConfig {
     pub tcpmux_passthrough: bool,
     /// 子域名后缀(subdomain 路由)。
     pub subdomain_host: String,
-    /// vhost HTTP 空闲超时(秒)。
+    /// vhost HTTP 读头部超时(秒);0 = 不启用。
+    ///
+    /// B5:默认 30s。修前默认 0 表示"永不超时",慢速头(slowloris)
+    /// 可以无限期占用连接与并发名额。
     pub http_timeout_s: u64,
     pub custom_404_page: Option<PathBuf>,
+}
+
+impl Default for VhostConfig {
+    fn default() -> Self {
+        Self {
+            http_port: 0,
+            https_port: 0,
+            tcpmux_port: 0,
+            tcpmux_passthrough: false,
+            subdomain_host: String::new(),
+            http_timeout_s: 30,
+            custom_404_page: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -189,7 +206,9 @@ impl Default for LimitsConfig {
             // 运维可在控制台或配置文件显式加帽
             max_mux_streams: 0,
             max_data_conns_per_client: 0,
-            max_udp_sessions_per_proxy: 0,
+            // B7:UDP 会话表默认必须有上限。修前 0=不限,伪造源地址洪水
+            // 在 60s GC 窗口内可把表撑到任意大小。
+            max_udp_sessions_per_proxy: 1024,
             max_pool_size: 0,
             default_pool_size: 2,
             control_send_queue: 256,

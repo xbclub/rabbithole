@@ -27,24 +27,41 @@ use bytes::BytesMut;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// 池内单缓冲目标容量(对齐 split_send_size 默认档)。
+/// 池内小类目标容量(对齐 split_send_size 默认档)。
 const CLASS: usize = 64 * 1024;
-/// 接收纳管的最大容量(标准类上界 = CLASS + 分配器对齐余量)。
+/// 小类接收纳管的最大容量(标准类上界 = CLASS + 分配器对齐余量)。
 const CLASS_MAX: usize = CLASS + 8 * 1024;
-/// 空闲缓冲总条目上限(全部分片合计)。
+/// 空闲缓冲条目上限(小类,全部分片合计)。
 const MAX_IDLE: usize = 256;
 /// 归还的最小容量(过小缓冲不值得复用)。
 const MIN_RECYCLE: usize = 16 * 1024;
+
+// ---- C4:大缓冲类 ----
+//
+// 上行中继读块默认 256KiB(`mux.rs::up_chunk_cap`),超出小类 CLASS_MAX,
+// 于是 `get(256KiB)` 必然 miss、每块新分配,池在主力上行路径上零命中。
+// 这里加一个大类:容量落在 (CLASS_MAX, LARGE_MAX] 的缓冲单独归集。
+//
+// 字节上界:大类的条目数按总字节预算约束(不超过 LARGE_BUDGET),而非
+// 条目数 —— 1MiB 级缓冲按 64 条封顶会到 64MiB,这里显式压到 32MiB。
+const LARGE_MAX: usize = 1024 * 1024 + 8 * 1024;
+const LARGE_BUDGET: usize = 32 * 1024 * 1024;
+const MAX_IDLE_LARGE: usize = 64;
 /// 分片数(2 的幂,轮转指针位与即可)。
 const SHARDS: usize = 8;
 
-// B3 字节上界静态锁:池内条目 capacity ≤ CLASS_MAX、条目数 ≤ MAX_IDLE,
+// B3 字节上界静态锁:小类条目 capacity ≤ CLASS_MAX、条目数 ≤ MAX_IDLE,
 // 总驻留 ≤ 256 × 72KiB = 18MiB(与模块文档口径一致)。
 const _: () = assert!(MAX_IDLE * CLASS_MAX <= 20 * 1024 * 1024);
+// C4 大类的静态上界同样锁死。
+const _: () = assert!(MAX_IDLE_LARGE * LARGE_MAX <= 72 * 1024 * 1024);
 
-/// 分片聚合缓冲池实例。
+/// 分片聚合缓冲池实例(小类 + 大类)。
 pub(crate) struct Pool {
     shards: [Mutex<Vec<BytesMut>>; SHARDS],
+    large: [Mutex<Vec<BytesMut>>; SHARDS],
+    /// 大类驻留字节(粗粒度,仅用于预算判定;Relaxed 足够)。
+    large_bytes: AtomicUsize,
     rotor: AtomicUsize,
     /// 新分配计数(诊断缝:命中率回归断言用;仅 miss 新分配路径计数,
     /// 开销相对 64KiB 分配可忽略)。
@@ -64,6 +81,17 @@ impl Pool {
                 Mutex::new(Vec::new()),
                 Mutex::new(Vec::new()),
             ],
+            large: [
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+            ],
+            large_bytes: AtomicUsize::new(0),
             rotor: AtomicUsize::new(0),
             allocations: AtomicUsize::new(0),
         }
@@ -82,6 +110,23 @@ impl Pool {
     /// B2:先试轮转起始片,miss 时扫描其余片(容量 ≥ min 逐条判定),
     /// 全部 miss 才新分配;put 落哪片不再影响后续 get 命中。
     pub(crate) fn get(&self, min: usize) -> BytesMut {
+        if min > CLASS_MAX && min <= LARGE_MAX {
+            // C4:大缓冲类 —— 上行 256KiB 读块走这里命中,不再每块新分配。
+            let start = self.rotor.fetch_add(1, Ordering::Relaxed) & (SHARDS - 1);
+            for i in 0..SHARDS {
+                let idx = (start + i) & (SHARDS - 1);
+                let mut g = match self.large[idx].lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                if let Some(b) = g.pop() {
+                    drop(g);
+                    return b;
+                }
+            }
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            return BytesMut::with_capacity(min);
+        }
         if min > CLASS_MAX {
             // 池内条目容量恒 ≤ CLASS_MAX,必然 miss:跳过扫描,避免
             // 途中误淘汰较小条目。
@@ -130,6 +175,36 @@ impl Pool {
     /// 归还缓冲;容量过小或超限(B3:字节口径上界)、或池满则丢弃(正常释放)。
     pub(crate) fn put(&self, b: BytesMut) {
         let cap = b.capacity();
+        if cap > CLASS_MAX {
+            if cap > LARGE_MAX {
+                return;
+            }
+            // C4:大类归还,按总字节预算封顶。
+            let cur = self.large_bytes.load(Ordering::Relaxed);
+            if cur + cap > LARGE_BUDGET
+                || self
+                    .large_bytes
+                    .compare_exchange(cur, cur + cap, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_err()
+            {
+                // 预算已满或并发更新失败:放弃复用(直接释放)。
+                return;
+            }
+            let start = self.rotor.fetch_add(1, Ordering::Relaxed) & (SHARDS - 1);
+            for i in 0..SHARDS {
+                let idx = (start + i) & (SHARDS - 1);
+                let mut g = match self.large[idx].lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                if g.len() < MAX_IDLE_LARGE / SHARDS {
+                    g.push(b);
+                    return;
+                }
+            }
+            self.large_bytes.fetch_sub(cap, Ordering::Relaxed);
+            return;
+        }
         if !(MIN_RECYCLE..=CLASS_MAX).contains(&cap) {
             return;
         }

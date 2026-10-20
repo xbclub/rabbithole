@@ -38,7 +38,13 @@ pub async fn on_session_up(state: &Arc<AppState>, sess: &Arc<Session>) {
 }
 
 /// 会话断开:关池与通道,状态落 offline。
+///
+/// B2:`on_session_up`(注册新会话)持 `serial_lock(client_id)`,本函数也
+/// 必须持同一把锁:否则"判定未被替换 → 新会话注册 → 本函数写 Offline"
+/// 的交错会把刚上线的规则永久钉在 Offline(没有后续事件自愈)。
 pub async fn on_session_down(state: &Arc<AppState>, sess: &Arc<Session>) {
+    let lock = state.serial_lock(&sess.client_id);
+    let _g = lock.lock().await;
     let proxies = match state.db.list_proxies(Some(&sess.client_id)).await {
         Ok(p) => p,
         Err(_) => return,

@@ -1107,6 +1107,10 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     // 把读到的块全部堆进本队列,直到 `DOWN_BATCH_BYTES` 触顶;下一轮
     // 直接从队列取,不再每次只带一块。
     let mut pending: std::collections::VecDeque<Bytes> = std::collections::VecDeque::new();
+    // C5:预取队列的字节数增量维护。修前每次判断都在 `pending` 上
+    // `sum()` 一遍 —— 小帧 + 写阻塞时队列可达百万级段数,每轮 O(n) 变成
+    // 整体 O(n²),CPU 与延迟一起劣化。
+    let mut pending_bytes: usize = 0;
     // 单流口径埋点(仅 RH_PUMP_STATS=1 时累加,关闭时零开销)
     let mut rd_ns: u64 = 0;
     let mut wr_ns: u64 = 0;
@@ -1151,9 +1155,11 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         // 直到上限。预取队列可能有多块——这正是与 round-31~75 的差别。
         while let Some(c) = pending.pop_front() {
             if batch_bytes >= DOWN_BATCH_BYTES || batch.len() >= SMALL_CHUNK_SEGS {
+                pending_bytes += c.len();
                 pending.push_front(c); // 放回,留给下一轮
                 break;
             }
+            pending_bytes = pending_bytes.saturating_sub(c.len());
             batch_bytes += c.len();
             batch.push(c);
         }
@@ -1224,15 +1230,18 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             futures::pin_mut!(write_fut);
             loop {
                 // 预取已够下一轮用:不再发起新读,专心等写完成。
-                let pend_bytes: usize = pending.iter().map(|c| c.len()).sum();
-                if pend_bytes >= DOWN_BATCH_BYTES {
+                // C5:增量计数,不再每轮 O(n) 重算
+                if pending_bytes >= DOWN_BATCH_BYTES || pending.len() >= SMALL_CHUNK_SEGS {
                     break write_fut.await;
                 }
                 let read_fut = b_read.read_chunk();
                 futures::pin_mut!(read_fut);
                 match futures::future::select(read_fut, write_fut.as_mut()).await {
                     futures::future::Either::Left((nr, _)) => match nr {
-                        Ok(Some(c)) if !c.is_empty() => pending.push_back(c),
+                        Ok(Some(c)) if !c.is_empty() => {
+                            pending_bytes += c.len();
+                            pending.push_back(c)
+                        }
                         Ok(_) => {
                             batch_eof = true;
                             break write_fut.await;

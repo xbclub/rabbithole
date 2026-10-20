@@ -9,6 +9,19 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_tungstenite::tungstenite::protocol::{Message, Role};
 
+/// B16:WebSocket 帧/消息上限。tungstenite 默认 64MiB —— 一条巨帧就能让
+/// 单个隧道连接吃掉数倍于 up_chunk_cap 的内存。RHTP 自身的帧体上限是
+/// 1MiB,这里给 2MiB 留出控制帧与压缩余量。
+const WS_MAX_MESSAGE: usize = 2 * 1024 * 1024;
+const WS_MAX_FRAME: usize = 2 * 1024 * 1024;
+
+fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    let mut c = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    c.max_message_size = Some(WS_MAX_MESSAGE);
+    c.max_frame_size = Some(WS_MAX_FRAME);
+    c
+}
+
 /// WebSocket 升级路径。
 ///
 /// **为什么不是 `/rhtp`**:该路径以明文出现在 `GET <path> HTTP/1.1` 请求行,
@@ -95,8 +108,13 @@ pub async fn upgrade_server(mut io: BoxedIo, expect_path: &str) -> io::Result<Bo
         .position(|w| w == b"\r\n\r\n")
         .unwrap_or(buf.len());
     let part = buf[term + 4..].to_vec();
-    let ws =
-        tokio_tungstenite::WebSocketStream::from_partially_read(io, part, Role::Server, None).await;
+    let ws = tokio_tungstenite::WebSocketStream::from_partially_read(
+        io,
+        part,
+        Role::Server,
+        Some(ws_config()),
+    )
+    .await;
     Ok(Box::new(WsIo::new(ws)))
 }
 
@@ -158,8 +176,13 @@ pub async fn client_handshake(mut io: BoxedIo, host: &str, path: &str) -> io::Re
         .position(|w| w == b"\r\n\r\n")
         .unwrap_or(buf.len());
     let part = buf[term + 4..].to_vec();
-    let ws =
-        tokio_tungstenite::WebSocketStream::from_partially_read(io, part, Role::Client, None).await;
+    let ws = tokio_tungstenite::WebSocketStream::from_partially_read(
+        io,
+        part,
+        Role::Client,
+        Some(ws_config()),
+    )
+    .await;
     Ok(Box::new(WsIo::new(ws)))
 }
 
@@ -215,7 +238,14 @@ impl AsyncRead for WsIo {
                 buf.put_slice(&avail[..n]);
                 *this.rd_pos += n;
                 if *this.rd_pos == this.rd_buf.len() {
-                    this.rd_buf.clear();
+                    // B16:大帧消费后归还容量。`clear()` 只置长度不释放,
+                    // 一条 1MiB 帧会让该连接长期占着 1MiB;超过 64KiB 的
+                    // 缓冲直接丢弃,下次按实际帧大小重新分配。
+                    if this.rd_buf.capacity() > 64 * 1024 {
+                        *this.rd_buf = Vec::new();
+                    } else {
+                        this.rd_buf.clear();
+                    }
                     *this.rd_pos = 0;
                 }
                 return Poll::Ready(Ok(()));

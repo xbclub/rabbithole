@@ -86,6 +86,11 @@ pub struct Hello {
     /// 线格式与旧版本逐字节一致,现有字段语义不变。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// B9:附加载体报到凭据 —— HMAC(secret, "rh3:attach:" + session_id)。
+    /// 修前仅凭明文 session_id 聚合,id 一旦泄漏(日志/抓包)即可把第三方
+    /// 连接混入会话池。None/缺省 = 首载体(走完整挑战应答),线格式不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_auth: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -290,6 +295,11 @@ pub struct StartForward {
     /// 供路由/健康检查关联的代理名。
     #[serde(default)]
     pub proxy_name: String,
+    /// A7:XTCP 直连首帧的一次性凭据(HMAC(secret_key, nonce),见
+    /// [`NatHoleConnect::auth`])。中继路径不填;直连路径必须在发送侧写入、
+    /// 接收侧恒定时间比对,缺失或不符即断(旧端缺字段 = 拒绝,不静默降级)。
+    #[serde(default)]
+    pub xtcp_auth: String,
 }
 
 /// visitor 侧中继启动(数据连接最后一帧):桥接到本地等待连接。
@@ -315,6 +325,9 @@ pub struct NatHolePrepare {
     pub transaction_id: String,
     /// 打洞超时(秒);超时未回报则服务端判定失败转中继。
     pub timeout_seconds: u64,
+    /// A7:本事务一次性随机数。直连首帧必须回填它,第三方无法凭空构造。
+    #[serde(default)]
+    pub nonce: String,
 }
 
 /// NAT 打洞连接指令(S→C,双端):携带对端候选与选定角色。
@@ -336,6 +349,13 @@ pub struct NatHoleConnect {
     /// 中继模式(stcp)标识:xtcp 直连失败后本事务转中继。
     #[serde(default)]
     pub relay_mode: bool,
+    /// A7:与 PREPARE 相同的一次性随机数。
+    #[serde(default)]
+    pub nonce: String,
+    /// A7:向 dial 侧下发的凭据 —— HMAC(目标规则 secret_key, nonce)。
+    /// dial 侧原样写入直连首帧,listen 侧用本机规则密钥重算并恒定时间比对。
+    #[serde(default)]
+    pub auth: String,
 }
 
 fn default_true_fn() -> bool {

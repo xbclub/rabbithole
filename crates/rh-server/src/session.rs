@@ -167,6 +167,10 @@ impl Session {
 /// 每客户端会话注册表。
 pub struct SessionRegistry {
     map: dashmap::DashMap<String, (Arc<Session>, u64)>,
+    /// C2:session_id → client_id 索引。裸模式/附加载体的数据连接首帧
+    /// 只带 session_id;修前靠 O(在线客户端) 全表扫描,1000 客户端在线
+    /// 时每次建连都要遍历一遍。
+    by_session: dashmap::DashMap<String, String>,
     counter: AtomicU64,
     /// 在线数上报钩子(round-80)。`None` = 不接指标(单测构造)。
     ///
@@ -187,6 +191,7 @@ impl SessionRegistry {
     pub fn new() -> Self {
         Self {
             map: dashmap::DashMap::new(),
+            by_session: dashmap::DashMap::new(),
             counter: AtomicU64::new(1),
             on_change: None,
         }
@@ -196,6 +201,7 @@ impl SessionRegistry {
     pub fn with_online_gauge(f: Arc<dyn Fn(usize) + Send + Sync>) -> Self {
         Self {
             map: dashmap::DashMap::new(),
+            by_session: dashmap::DashMap::new(),
             counter: AtomicU64::new(1),
             on_change: Some(f),
         }
@@ -217,6 +223,9 @@ impl SessionRegistry {
         let prev = self
             .map
             .insert(sess.client_id.clone(), (sess.clone(), sess.epoch));
+        // C2:维护 session_id 索引;旧会话的同名条目在替换时被覆盖
+        self.by_session
+            .insert(sess.session_id.clone(), sess.client_id.clone());
         // 替换(in-place)不改变 len,但首次插入会;统一重算最稳妥。
         self.publish_online();
         prev.map(|(s, _)| s)
@@ -226,16 +235,39 @@ impl SessionRegistry {
         self.map.get(client_id).map(|e| e.value().0.clone())
     }
 
+    /// C2:按 session_id 取会话(裸模式/附加载体首帧路径)。
+    ///
+    /// 返回前复核 `sess.session_id` —— 索引可能在替换窗口内短暂指向
+    /// 已被替换的旧会话,复核对调用方是不可见的正确性保证。
+    pub fn get_by_session(&self, session_id: &str) -> Option<Arc<Session>> {
+        let cid = self.by_session.get(session_id).map(|e| e.value().clone())?;
+        let s = self.get(&cid)?;
+        (s.session_id == session_id).then_some(s)
+    }
+
     /// 移除会话,仅当当前注册的就是该会话(指针比对,防旧清理误删新会话)。
     /// remove_if 原子完成比对+删除,避免比对后、删除前新会话插入被误删。
     pub fn remove_if_current(&self, client_id: &str, sess: &Arc<Session>) {
+        let was_current = self
+            .map
+            .get(client_id)
+            .map(|e| Arc::ptr_eq(&e.value().0, sess))
+            .unwrap_or(false);
         self.map
             .remove_if(client_id, |_k, (cur, _)| Arc::ptr_eq(cur, sess));
+        if was_current {
+            // 只删自己的索引条目,避免迟到清理误删已替换会话的索引
+            self.by_session
+                .remove_if(&sess.session_id, |_k, v| v == &sess.client_id);
+        }
         // 无论是否真的移除都要发布:被替换的旧会话拆除时,
         // 当前值应仍是"新会话"的在线数(len 未变),写上不会错。
         self.publish_online();
     }
 
+    /// 在线客户端 id 列表(控制台/诊断用)。C2 之后数据面不再走全表扫描,
+    /// 保留为观测接口。
+    #[allow(dead_code)]
     pub fn online_clients(&self) -> Vec<String> {
         self.map.iter().map(|e| e.key().clone()).collect()
     }

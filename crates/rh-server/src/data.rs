@@ -72,6 +72,10 @@ async fn claim_pool(pool: &Arc<TcpPool>, sess: &Arc<Session>) {
     let cur = pool.epoch.load(Ordering::Relaxed);
     if sess.epoch > cur {
         pool.epoch.store(sess.epoch, Ordering::Relaxed);
+        // B1:换 epoch 必须把旧会话遗留的在途计数清零。断连会打断在途
+        // CREATE,那些请求的 inflight 永不会减(交付路径已按 epoch 丢弃),
+        // 池会永久饥饿:ready+inflight 恒 ≥ want,再也不签发。
+        pool.inflight.store(0, Ordering::Relaxed);
         let mut ready = pool.ready.lock().await;
         let mut keep = VecDeque::with_capacity(ready.len());
         for entry in ready.drain(..) {
@@ -240,6 +244,7 @@ pub async fn assign_forward(
         flags,
         proxy_proto: conv_proxy_proto(spec.transport.proxy_proto),
         proxy_name: spec.name.clone(),
+        xtcp_auth: String::new(),
     };
     let payload = match serde_json::to_vec(&fwd) {
         Ok(p) => p,
@@ -1236,7 +1241,18 @@ fn udp_session_admit(
         return true;
     }
     let limit = state.limits.read().unwrap().max_udp_sessions_per_proxy;
-    limit == 0 || sessions.len() < limit
+    if limit != 0 && sessions.len() >= limit {
+        // B7:超限必须可见 —— 静默丢弃会让"UDP 不通"无从排查。
+        state.metrics.udp_sessions_rejected.inc();
+        tracing::warn!(
+            limit,
+            current = sessions.len(),
+            %addr,
+            "udp session table full, dropping new source"
+        );
+        return false;
+    }
+    true
 }
 
 pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: Arc<UdpSocket>) {
@@ -2732,4 +2748,79 @@ mod group_listener_ownership_tests {
             .expect("独享端口必须随 rule_cancel 退出")
             .unwrap();
     }
+}
+
+// ---------------- B6:有界双向中继(裸 copy_bidirectional 的收敛替代) ----------------
+
+/// 双向中继,带半关闭有界兜底。
+///
+/// 替换裸 `tokio::io::copy_bidirectional`:`copy_bidirectional` 在一侧
+/// clean EOF 后会无限期等待对向 EOF —— 对端永不回 FIN 时 socket 永久停在
+/// FIN-WAIT-2/CLOSING,fd 与连接计数一起泄漏。这里保持"等对向结束"的语义,
+/// 只把等待上限交给 `halfclose_grace`(默认 30s,`RH_HALFCLOSE_GRACE_SECS`
+/// 可覆盖,0 = 旧行为)。
+///
+/// 与 [`copy_relay_pair`] 的差异:本函数不做字节计量/限速/失败归因,
+/// 用于 vhost / visitor 裸中继路径(这些路径的计量在 CountedUserIo 上)。
+///
+/// 注意:不用 `tokio::spawn` —— 入参是 `&mut`(非 'static),拆半句柄不能
+/// move 进独立任务。这里用 `select!` 在同一 future 内并发双向 copy:先完成
+/// 的一向关闭对向写半,然后在 `halfclose_grace` 内等第二向自然结束;超时
+/// 则直接返回(拆半句柄随函数返回 drop → fd 释放)。
+pub async fn copy_bidirectional_bounded<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut a_r, mut a_w) = tokio::io::split(a);
+    let (mut b_r, mut b_w) = tokio::io::split(b);
+    let up = async {
+        let n = tokio::io::copy(&mut a_r, &mut b_w).await.ok();
+        let _ = b_w.shutdown().await;
+        n
+    };
+    let down = async {
+        let n = tokio::io::copy(&mut b_r, &mut a_w).await.ok();
+        let _ = a_w.shutdown().await;
+        n
+    };
+    futures::pin_mut!(up, down);
+    // 先完成的一向决定后续等待上限
+    let (first_up, n) = tokio::select! {
+        n = &mut up => (true, n),
+        n = &mut down => (false, n),
+    };
+    let grace = rh_transport::halfclose_grace();
+    let second = if grace == std::time::Duration::MAX {
+        None
+    } else {
+        match tokio::time::timeout(grace, async {
+            if first_up {
+                (&mut down).await
+            } else {
+                (&mut up).await
+            }
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        grace_secs = grace.as_secs(),
+                        "half-close timeout: peer never completed close handshake; \
+                         aborting vhost/visitor relay to release the stream"
+                    );
+                });
+                None
+            }
+        }
+    };
+    let (u, d) = if first_up {
+        (n.unwrap_or(0), second.unwrap_or(0))
+    } else {
+        (second.unwrap_or(0), n.unwrap_or(0))
+    };
+    Ok((u, d))
 }

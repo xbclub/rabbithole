@@ -116,22 +116,32 @@ fn basic_auth(user: &str, pass: &str) -> Option<(String, String)> {
     }
 }
 
-fn resolve_addr(host: &str, port: u16) -> anyhow::Result<std::net::SocketAddr> {
-    use std::net::ToSocketAddrs;
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return Ok(std::net::SocketAddr::new(ip, port));
+/// C8:插件拨号解析必须走异步路径。
+///
+/// 修前 `to_socket_addrs()` 在 async 上下文里同步执行 getaddrinfo ——
+/// DNS 故障时会把 tokio worker 整个阻塞(几十秒),期间该 worker 上
+/// 所有转发任务停摆。这里复用 `forward::resolve`(内部 spawn_blocking
+/// + 自定义 DNS 支持)。
+async fn resolve_addr(host: &str, port: u16) -> anyhow::Result<std::net::SocketAddr> {
+    crate::forward::resolve(host, port).await
+}
+
+/// C8:插件拨号超时。DNS 慢 + connect 慢的叠加必须有界。
+const PLUGIN_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn connect_with_timeout(addr: std::net::SocketAddr) -> anyhow::Result<tokio::net::TcpStream> {
+    match tokio::time::timeout(PLUGIN_DIAL_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
+        Ok(r) => Ok(r?),
+        Err(_) => Err(anyhow::anyhow!("plugin dial timeout: {addr}")),
     }
-    let mut it = (host, port).to_socket_addrs()?;
-    it.next()
-        .ok_or_else(|| anyhow::anyhow!("resolve {host} failed"))
 }
 
 // ---------------- http_proxy / socks5(经本地代理出站) ----------------
 
 async fn dial_http_proxy(fwd: &StartForward, user: &str, pass: &str) -> anyhow::Result<BoxedIo> {
     // 目标字段承载本地代理地址
-    let addr = resolve_addr(&fwd.target_host, fwd.target_port)?;
-    let mut s = tokio::net::TcpStream::connect(addr).await?;
+    let addr = resolve_addr(&fwd.target_host, fwd.target_port).await?;
+    let mut s = connect_with_timeout(addr).await?;
     let mut req = format!(
         "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n",
         host = fwd.target_host,
@@ -164,8 +174,8 @@ async fn dial_http_proxy(fwd: &StartForward, user: &str, pass: &str) -> anyhow::
 }
 
 async fn dial_socks5(fwd: &StartForward, user: &str, pass: &str) -> anyhow::Result<BoxedIo> {
-    let addr = resolve_addr(&fwd.target_host, fwd.target_port)?;
-    let mut s = tokio::net::TcpStream::connect(addr).await?;
+    let addr = resolve_addr(&fwd.target_host, fwd.target_port).await?;
+    let mut s = connect_with_timeout(addr).await?;
     if user.is_empty() {
         s.write_all(&[0x05, 0x01, 0x00]).await?;
     } else {
@@ -544,8 +554,8 @@ async fn connect_upstream(local_addr: &str, tls: bool) -> anyhow::Result<BoxedIo
         .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("bad local_addr {local_addr}"))?;
     let port: u16 = port.parse()?;
-    let addr = resolve_addr(host, port)?;
-    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    let addr = resolve_addr(host, port).await?;
+    let tcp = connect_with_timeout(addr).await?;
     if !tls {
         return Ok(Box::new(tcp));
     }

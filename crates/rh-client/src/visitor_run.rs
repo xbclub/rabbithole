@@ -58,6 +58,10 @@ async fn run_tcp(
         tokio::select! {
             acc = l.accept() => {
                 let Ok((conn, peer)) = acc else { return };
+                // C10:用户侧连接必须关闭 Nagle 并开启 keepalive。
+                // 修前 visitor 用户侧是全仓唯一不设这两个选项的 accept 路径,
+                // stcp/xtcp 的小包交互会被 Nagle 合并出额外 RTT。
+                let _ = conn.set_nodelay(true);
                 let s2 = sess.clone();
                 let sp = spec.clone();
                 let vid = visitor_id;
@@ -85,8 +89,9 @@ async fn handle_user_conn(
         if let Some(mux) = mux {
             match xtcp_direct_stream(&sess, &mux, &spec, user_conn_id, conn).await {
                 Some(conn_back) => {
-                    // 直连失败:移除失效 mux,落入常规路径
+                    // 直连失败:移除失效 mux(与其凭据同生命周期),落入常规路径
                     sess.punched.lock().await.remove(&visitor_id);
+                    sess.punched_auth.lock().await.remove(&visitor_id);
                     conn = conn_back;
                 }
                 None => return,
@@ -131,6 +136,14 @@ async fn xtcp_direct_stream(
         // 开流失败(mux 已死):返还连接,由调用方移除失效 mux 并走常规路径
         Err(_) => return Some(conn),
     };
+    // A7:直连首帧凭据(与已缓存的 punched mux 同源,由 NAT_HOLE_CONNECT 下发)。
+    let xtcp_auth = sess
+        .punched_auth
+        .lock()
+        .await
+        .get(&spec.id)
+        .cloned()
+        .unwrap_or_default();
     let fwd = StartForward {
         proxy_id: 0,
         user_src: String::new(),
@@ -139,6 +152,7 @@ async fn xtcp_direct_stream(
         flags: 0,
         proxy_proto: rh_protocol::message::ProxyProto::None,
         proxy_name: spec.target_proxy_name.clone(),
+        xtcp_auth,
     };
     let Ok(payload) = serde_json::to_vec(&fwd) else {
         return Some(conn);

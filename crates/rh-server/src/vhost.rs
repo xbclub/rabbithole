@@ -86,10 +86,10 @@ async fn handle_http_request(
     let path = req.uri().path().to_string();
 
     // 路由:域名 + locations 前缀(最长匹配)
-    let routes = state.proxies.vhost_http.read().await.clone();
+    let routes = state.proxies.vhost_http.read().await.clone(); // C3: Arc 快照,O(1)
     let mut best: Option<(&VhostRoute, usize)> = None;
     let mut domain_hit: Option<&VhostRoute> = None;
-    for r in &routes {
+    for r in routes.iter() {
         if r.host != host {
             continue;
         }
@@ -169,6 +169,11 @@ async fn handle_http_request(
     if !rt.healthy.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(service_unavailable());
     }
+    // B4:每个 HTTP 请求占用规则并发配额(修前只在连接级计数、且 proxy=None,
+    // max_conns 对本路径完全失效:一条 keep-alive 连接可无限制扇出请求)。
+    let Some(_conn_guard) = crate::data::try_open_user_conn(&state, Some(&rt)) else {
+        return Ok(service_unavailable());
+    };
     let Some(channel) = crate::data::get_channel(&state, &rt).await else {
         return Ok(service_unavailable());
     };
@@ -384,6 +389,7 @@ pub async fn send_start_forward(
         flags,
         proxy_proto: conv_pp(spec.transport.proxy_proto),
         proxy_name: spec.name.clone(),
+        xtcp_auth: String::new(),
     };
     let payload = serde_json::to_vec(&fwd).unwrap();
     rh_protocol::write_frame(channel, rh_protocol::FrameType::START_FORWARD, &payload)
@@ -482,9 +488,16 @@ async fn serve_https(
         let certs = state.certs.read().await;
         if let Some(entry) = certs.iter().find(|c| c.matches(&sni)) {
             let acceptor = tokio_rustls::TlsAcceptor::from(entry.cfg.clone());
-            let stream = match acceptor.accept(sock).await {
-                Ok(s) => s,
-                Err(_) => return Ok(()),
+            // B5:TLS 握手必须有界(慢 ClientHello 会永久占用连接)
+            let hs_to = state.cfg.vhost.http_timeout_s.max(1);
+            let stream = match tokio::time::timeout(
+                std::time::Duration::from_secs(hs_to),
+                acceptor.accept(sock),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                _ => return Ok(()),
             };
             let st = state.clone();
             let _conn_guard = crate::data::try_open_user_conn(&st, None);
@@ -515,7 +528,7 @@ async fn serve_https(
             return Ok(());
         }
     }
-    let routes = state.proxies.vhost_https.read().await.clone();
+    let routes = state.proxies.vhost_https.read().await.clone(); // C3: Arc 快照
     let route = routes.iter().find(|r| r.host == sni);
     let Some(route) = route else {
         return Ok(());
@@ -546,7 +559,7 @@ async fn serve_https(
         return Ok(()); // F2 配额超限
     };
     let mut sock = crate::data::CountedUserIo::user(sock, &state, Some(rt.clone()));
-    let _ = tokio::io::copy_bidirectional(&mut sock, &mut channel).await;
+    let _ = crate::data::copy_bidirectional_bounded(&mut sock, &mut channel).await;
     Ok(())
 }
 
@@ -673,10 +686,17 @@ async fn serve_tcpmux(
     passthrough: bool,
 ) -> anyhow::Result<()> {
     // 读 CONNECT 请求(终止符之后同批到达的字节须回灌,如 yamux 首帧/TLS ClientHello)
+    // B5:整个头部读取必须有界。修前这里是裸 `read`,慢速 CONNECT
+    // (逐字节滴流)可无限期占用一条连接与 fd。
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
+    let head_to = state.cfg.vhost.http_timeout_s.max(1);
+    let head_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(head_to);
     let tail = loop {
-        let n = sock.read(&mut chunk).await?;
+        let n = match tokio::time::timeout_at(head_deadline, sock.read(&mut chunk)).await {
+            Ok(r) => r?,
+            Err(_) => return Ok(()), // 头部超时:放弃本连接
+        };
         if n == 0 {
             return Ok(());
         }
@@ -701,7 +721,7 @@ async fn serve_tcpmux(
     // Basic 认证
     let mut user_ok = true;
     {
-        let routes = state.proxies.vhost_tcpmux.read().await.clone();
+        let routes = state.proxies.vhost_tcpmux.read().await.clone(); // C3: Arc 快照
         if let Some(r) = routes.iter().find(|r| r.host == host) {
             if !r.http_user.is_empty() {
                 let got = head.lines().find_map(|l| {
@@ -724,7 +744,7 @@ async fn serve_tcpmux(
         return Ok(());
     }
     // 路由:按 host 匹配 tcpmux 规则
-    let routes = state.proxies.vhost_tcpmux.read().await.clone();
+    let routes = state.proxies.vhost_tcpmux.read().await.clone(); // C3: Arc 快照
     let Some(route) = routes.iter().find(|r| r.host == host) else {
         sock.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?;
         return Ok(());
@@ -759,6 +779,7 @@ async fn serve_tcpmux(
             flags,
             proxy_proto: conv_pp(spec.transport.proxy_proto),
             proxy_name: spec.name.clone(),
+            xtcp_auth: String::new(),
         };
         rh_protocol::write_frame(
             &mut channel,
@@ -780,7 +801,7 @@ async fn serve_tcpmux(
             return Ok(()); // F2 配额超限
         };
         let mut sock = crate::data::CountedUserIo::user(sock, &state, Some(rt.clone()));
-        let _ = tokio::io::copy_bidirectional(&mut sock, &mut channel).await;
+        let _ = crate::data::copy_bidirectional_bounded(&mut sock, &mut channel).await;
         return Ok(());
     }
     // 标准模式:服务端在用户连接上终结 yamux,每个入站流 = 一次独立数据通道转发
@@ -817,7 +838,7 @@ async fn serve_tcpmux(
                     None => return, // F2 配额超限
                 };
                 let mut stream = crate::data::CountedUserIo::user(stream, &st2, Some(rt2.clone()));
-                let _ = tokio::io::copy_bidirectional(&mut stream, &mut ch).await;
+                let _ = crate::data::copy_bidirectional_bounded(&mut stream, &mut ch).await;
             }
         });
     }
