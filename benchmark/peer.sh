@@ -65,11 +65,24 @@ T_TCP="${T_TCP:-19102}"
 T_UDP="${T_UDP:-19103}"
 T_HTTP="${T_HTTP:-19104}"
 
-# IPERF3_BIN:压测用 iperf3(绝对路径或命令名)。系统 3.9 单线程,
-# -P 不扩展吞吐;三机已分发 /tmp/rh-bin/iperf3(3.17.1 多线程)。
+# 吞吐压测工具。默认 iperf3(保持既有行为与历史数据可比)。
+#   THP_TOOL=iperf3   系统 iperf3 单线程,-P 不扩展吞吐;多线程版见 IPERF3_BIN
+#   THP_TOOL=loadgen  仓库自带 Go 压测器(benchmark/loadgen)
+#
+# ★为什么需要 loadgen:TLS 下的吞吐量级会显著高于明文,
+# iperf3 3.9 单线程与 Python loadgen 的天花板都在 2 Gbps 量级;
+# 用它去测 TLS 会把两边都压到同一数字,测到的是压测器瓶颈而不是产品差异
+# (见 benchmark/loadgen/main.go 顶部注释,该坑在明文场景已踩过一次)。
+# loadgen 与 iperf3 的字节口径一致(只计有效载荷),结果可对照。
+THP_TOOL="${THP_TOOL:-iperf3}"
 IPERF3_BIN="${IPERF3_BIN:-iperf3}"
-command -v "$IPERF3_BIN" >/dev/null 2>&1 \
-  || die "iperf3 不可用: IPERF3_BIN=$IPERF3_BIN (三机上 /tmp/rh-bin/iperf3 可用)"
+LOADGEN_BIN="${LOADGEN_BIN:-/tmp/rh-bin/loadgen}"
+if [ "$THP_TOOL" = "loadgen" ]; then
+  [ -x "$LOADGEN_BIN" ] || die "THP_TOOL=loadgen 但 LOADGEN_BIN 不可执行: $LOADGEN_BIN"
+else
+  command -v "$IPERF3_BIN" >/dev/null 2>&1 \
+    || die "iperf3 不可用: IPERF3_BIN=$IPERF3_BIN (三机上 /tmp/rh-bin/iperf3 可用)"
+fi
 
 # 并发最高档 → 本轮 fd 需求(每连接 1 fd + 余量 512;4096 档即 ≥4608,
 # 统一推荐 65535。见 docs/performance-repair-acceptance.md §1.2/§5 P3.0)
@@ -121,8 +134,14 @@ run_iperf() {
   rc=$?
   t1="$(epoch_us)"
   printf '%s\n' "$rc" >"$x"
-  if [ "$rc" -eq 0 ] && jq -e '(.end.sum_received.bits_per_second // 0) > 0' "$j" >/dev/null 2>&1; then
-    mbps="$(jq -r '.end.sum_received.bits_per_second/1e6|floor' "$j")"
+  local ok_expr='(.end.sum_received.bits_per_second // 0) > 0'
+  local mbps_expr='.end.sum_received.bits_per_second/1e6|floor'
+  if [ "$THP_TOOL" = "loadgen" ]; then
+    ok_expr='(.gbps // 0) > 0'
+    mbps_expr='.gbps*1000|floor'
+  fi
+  if [ "$rc" -eq 0 ] && jq -e "$ok_expr" "$j" >/dev/null 2>&1; then
+    mbps="$(jq -r "$mbps_expr" "$j")"
     jq -cn --argjson mbps "$mbps" --argjson t0 "$t0" --argjson t1 "$t1" --arg id "$id" \
       '{valid:true,mbps:$mbps,exit:0,window_start_us:$t0,window_end_us:$t1,
         raw_json:("raw/"+$id+".json"),raw_stderr:("raw/"+$id+".stderr"),raw_exit:("raw/"+$id+".exit")}'
@@ -286,7 +305,12 @@ peer_drive() {  # <a_ip> <b_ip> <api_port> <token> <client_id> [label]
   local cli_ver iperf_ver
   cli_ver="$(curl -s -m 10 -H "Authorization: Bearer $token" "$API/api/clients" \
     | jq -r --arg id "$cid" '.data[] | select(.id==$id) | .client_version // ""' 2>/dev/null)"
-  iperf_ver="$("$IPERF3_BIN" --version 2>/dev/null | head -1)"
+  # 证据里记录**实际使用的**压测器版本(换工具后仍可追溯)
+  if [ "$THP_TOOL" = "loadgen" ]; then
+    iperf_ver="loadgen($LOADGEN_BIN)"
+  else
+    iperf_ver="$("$IPERF3_BIN" --version 2>/dev/null | head -1)"
+  fi
   # ★A9:client_version 为空即中止本轮(版本不可信 → 全部数据不可信)
   if [ -z "$cli_ver" ]; then
     rec "$(jq -cn --arg run_id "$PEER_RUN_ID" --arg lbl "$label" \
