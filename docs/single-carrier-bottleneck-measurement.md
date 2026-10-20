@@ -13005,3 +13005,115 @@ VALUES ('bench-client-002','bench2','<secret>','',<now_ms>);
    (本轮多次观察到)。不影响数据面,但如果用它做监控会误判。
 3. 本轮 flapping 测试期间发现**同一 client_id 起两个进程**时旧进程不会
    被服务端主动踢掉(行为未深究)。
+
+## 85. Round-80:修复 `/metrics` 的 clients_online 恒为 0
+
+### 85.1 现象
+
+客户端已连上并在正常转发数据,但:
+
+```
+$ curl -s http://127.0.0.1:19080/metrics | grep clients_online
+rabbithole_clients_online 0
+```
+
+**恒为 0。** 这个指标在 console 概览页用作"在线客户端数",显示错误
+会直接误导运维。
+
+### 85.2 根因
+
+gauge 只在**会话拆除**路径(`control.rs` 末尾)被写:
+
+```rust
+state.sessions.remove_if_current(&sess.client_id, &sess);
+state.metrics.client_online.set(state.sessions.count_online() as i64);
+```
+
+而**上线路径(`register`)从不写**。所以一个正常在线的会话,该值从未
+被设置过,停留在初始 0。
+
+### 85.3 顺带发现的第二个隐患
+
+拆除路径是 `remove_if_current`(可能因比对失败而不删)**之后**再
+`count_online()`。当"新会话已顶替旧会话"时:
+
+- 旧会话拆除 → 比对失败、不删 → `count_online()` 返回 1 → 写 1(碰巧对)
+- 但只要有一处算错,或 register 侧将来也加写入,两条路径就会互相覆盖
+
+**最终值取决于哪条路径最后跑**,是顺序依赖的脆弱结构。
+
+### 85.4 修复
+
+把上报**收敛到注册表的两个变更点**,每个变更点完成"改 map + 写 gauge"
+这一对操作,用 `map.len()` 无条件写(幂等,不做增量):
+
+```rust
+pub struct SessionRegistry {
+    map: DashMap<String, (Arc<Session>, u64)>,
+    counter: AtomicU64,
+    /// 在线数上报钩子(round-80)。None = 不接指标(单测构造)。
+    on_change: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+}
+
+fn publish_online(&self) {
+    if let Some(f) = self.on_change.as_ref() { f(self.map.len()); }
+}
+
+pub fn register(&self, sess: Arc<Session>) -> Option<Arc<Session>> {
+    let prev = self.map.insert(...);
+    self.publish_online();      // ← 上线也上报
+    prev.map(|(s, _)| s)
+}
+
+pub fn remove_if_current(&self, client_id: &str, sess: &Arc<Session>) {
+    self.map.remove_if(...);
+    self.publish_online();      // ← 拆除也上报(幂等)
+}
+```
+
+`AppState` 构造时注入:
+
+```rust
+sessions: Arc::new(SessionRegistry::with_online_gauge({
+    let g = metrics.client_online.clone();
+    Arc::new(move |n: usize| g.set(n as i64))
+})),
+```
+
+`control.rs` 拆除路径的旧写入已删除(否则重复)。
+
+**用 `len()` 而非增量**:并发替换场景下增量容易多减/漏减;`len()` 永远
+反映真值,且重复写无副作用。
+
+### 85.5 回归测试
+
+新增 4 个测试(`session::online_gauge_tests`):
+
+| 测试 | 锁住的语义 |
+|---|---|
+| `register_publishes_online_count` | 注册即上报 1(**修前恒 0**) |
+| `replace_keeps_count` | 同客户端重连不改变计数 |
+| `remove_publishes_zero` | 拆除后归 0 |
+| `stale_session_teardown_does_not_zero_count` | 旧会话迟到拆除不得把在线数写成 0 |
+
+`rh-server` 测试数 42 → 46。
+
+### 85.6 实机验证(r80)
+
+部署 r80 后逐步验证:
+
+| 步骤 | 指标值 | 说明 |
+|---|---:|---|
+| 1 个客户端在线 | **1** | 修前此处恒为 0 |
+| kill 该客户端(等 4s) | **0** | 拆除正确归零 |
+| 重启客户端 | **1** | 上线正确上报 |
+| 再起第二个客户端 | **2** | 多客户端正确累加 |
+| 杀掉第二个 | **1** | 回落正确 |
+
+**0 → 1 → 0 → 1 → 2 → 1,全部符合预期。**
+
+### 85.7 同批审计的其他指标
+
+- `rabbithole_connections{proxy,kind}`:`inc()` / `dec()` 成对出现在同一
+  函数(`data.rs` 的会话建立/拆除),**无此问题**。
+- `rabbithole_relay_path_total`:纯计数,只增,无此问题。
