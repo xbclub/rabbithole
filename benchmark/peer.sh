@@ -74,13 +74,28 @@ T_HTTP="${T_HTTP:-19104}"
 # 用它去测 TLS 会把两边都压到同一数字,测到的是压测器瓶颈而不是产品差异
 # (见 benchmark/loadgen/main.go 顶部注释,该坑在明文场景已踩过一次)。
 # loadgen 与 iperf3 的字节口径一致(只计有效载荷),结果可对照。
+# 数据通道是否开启端到端 snappy 压缩(use_compression)。
+#   PEER_COMPRESS=0  默认,规则不开压缩(走 splice / chunk 快路径)
+#   PEER_COMPRESS=1  规则开压缩 → 客户端恒回落 forward::splice 的 copy 路径
+#
+# ★为什么需要这个开关:压缩规则走的是 `forward.rs::splice()`(服务端压缩流
+# 包着通道,客户端必须解压,故不能 splice 零拷贝),而这条路径承接了
+# 所有 use_compression=true 的规则、relay_mode=copy 的 A/B 对照、全部插件
+# 规则与全部 visitor 流量。要度量这条路径的改动(如 round-69 的无锁拆分)
+# 就必须能在同一套 peer 拓扑上把它打开 —— 否则只能另写压测脚本,那会丢掉
+# 证据采集(CPU 采样/端点实况/nofile/无效样本留痕)。
+PEER_COMPRESS="${PEER_COMPRESS:-0}"
+
 THP_TOOL="${THP_TOOL:-iperf3}"
 IPERF3_BIN="${IPERF3_BIN:-iperf3}"
 LOADGEN_BIN="${LOADGEN_BIN:-/tmp/rh-bin/loadgen}"
 # 必须 export:run_iperf 在 `$(...)` 子 shell 里执行,未导出的普通变量
 # 在那里不可见 —— 会导致 THP_TOOL 回落成 iperf3,而解析分支仍按 loadgen
 # 判断(空 JSON → 全部 INVALID(exit=0))。这个不一致极难从输出看出来。
-export THP_TOOL LOADGEN_BIN
+# PEER_COMPRESS 同样必须 export(role_* 由 `$(...)`/子 shell 分派,
+# 未导出时预算里的压缩开关在子进程看不到 → 规则静默不开压缩,
+# 与 THP_TOOL 曾踩的坑同型)。
+export THP_TOOL LOADGEN_BIN PEER_COMPRESS
 if [ "$THP_TOOL" = "loadgen" ]; then
   [ -x "$LOADGEN_BIN" ] || die "THP_TOOL=loadgen 但 LOADGEN_BIN 不可执行: $LOADGEN_BIN"
 else
@@ -371,11 +386,15 @@ peer_drive() {  # <a_ip> <b_ip> <api_port> <token> <client_id> [label]
   done
   [ -n "$old_ids" ] && sleep 2
 
+  # 压缩开关:打开时规则带 transport.use_compression=true,客户端该通道
+  # 回落 forward::splice 的 copy 路径(压缩流无法零拷贝)。
+  local COMPRESS_JSON=""
+  if [ "$PEER_COMPRESS" = "1" ]; then COMPRESS_JSON=',"transport":{"use_compression":true}'; fi
   create_service "$API" "$token" \
-    "{\"client_id\":\"$cid\",\"name\":\"tcp\",\"kind\":\"tcp\",\"bind_port\":$P_TCP,\"target_host\":\"127.0.0.1\",\"target_port\":$T_TCP,\"pool_size\":4,\"enabled\":true}" >/dev/null \
+    "{\"client_id\":\"$cid\",\"name\":\"tcp\",\"kind\":\"tcp\",\"bind_port\":$P_TCP,\"target_host\":\"127.0.0.1\",\"target_port\":$T_TCP,\"pool_size\":4${COMPRESS_JSON},\"enabled\":true}" >/dev/null \
     || { err "tcp 规则失败"; return 1; }
   create_service "$API" "$token" \
-    "{\"client_id\":\"$cid\",\"name\":\"iperf\",\"kind\":\"tcp\",\"bind_port\":$P_IPERF,\"target_host\":\"127.0.0.1\",\"target_port\":$T_IPERF,\"pool_size\":4,\"enabled\":true}" >/dev/null \
+    "{\"client_id\":\"$cid\",\"name\":\"iperf\",\"kind\":\"tcp\",\"bind_port\":$P_IPERF,\"target_host\":\"127.0.0.1\",\"target_port\":$T_IPERF,\"pool_size\":4${COMPRESS_JSON},\"enabled\":true}" >/dev/null \
     || { err "iperf 规则失败"; return 1; }
   create_service "$API" "$token" \
     "{\"client_id\":\"$cid\",\"name\":\"udp\",\"kind\":\"udp\",\"bind_port\":$P_UDP,\"target_host\":\"127.0.0.1\",\"target_port\":$T_UDP,\"enabled\":true}" >/dev/null \
