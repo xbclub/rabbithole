@@ -86,6 +86,12 @@ T_HTTP="${T_HTTP:-19104}"
 # 证据采集(CPU 采样/端点实况/nofile/无效样本留痕)。
 PEER_COMPRESS="${PEER_COMPRESS:-0}"
 
+# UDP 并发源地址数(每个源 = 隧道侧一个用户会话)。
+#   1(默认)= 单会话,旧行为
+#   >1      = 多会话,用于压测"每源一个回写任务"的写路径(锁争用/队头阻塞)
+# 代理侧按用户源地址建会话,单源压测永远测不到多会话争用。
+PEER_UDP_SOURCES="${PEER_UDP_SOURCES:-1}"
+
 THP_TOOL="${THP_TOOL:-iperf3}"
 IPERF3_BIN="${IPERF3_BIN:-iperf3}"
 LOADGEN_BIN="${LOADGEN_BIN:-/tmp/rh-bin/loadgen}"
@@ -95,7 +101,7 @@ LOADGEN_BIN="${LOADGEN_BIN:-/tmp/rh-bin/loadgen}"
 # PEER_COMPRESS 同样必须 export(role_* 由 `$(...)`/子 shell 分派,
 # 未导出时预算里的压缩开关在子进程看不到 → 规则静默不开压缩,
 # 与 THP_TOOL 曾踩的坑同型)。
-export THP_TOOL LOADGEN_BIN PEER_COMPRESS
+export THP_TOOL LOADGEN_BIN PEER_COMPRESS PEER_UDP_SOURCES
 if [ "$THP_TOOL" = "loadgen" ]; then
   [ -x "$LOADGEN_BIN" ] || die "THP_TOOL=loadgen 但 LOADGEN_BIN 不可执行: $LOADGEN_BIN"
 else
@@ -463,6 +469,7 @@ PYEOF
     for path in direct tunnel; do
       if [ "$path" = direct ]; then host="$b_ip" port="$T_UDP"; else host="$a_ip" port="$P_UDP"; fi
       d_u="$(run_loadgen "udp-$label-s${sample}-$path" --host "$host" --port "$port" udp \
+        --sources "$PEER_UDP_SOURCES" \
         --size 1200 --duration 8 --window 32 --drain "$PEER_UDP_DRAIN")"
       loadgen_failed "$d_u" || true
       rec "$(printf '%s' "$d_u" | jq -c \
