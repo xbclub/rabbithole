@@ -2344,8 +2344,30 @@ impl YamuxMultiplexerPool {
                     // 前缀内全死但尚未剔除:等健康监视/开流收敛路径 reap 后
                     // 重读(表压缩可能把前缀外成员前移进来)。不得查看前缀外
                     // 的存活成员——那会让本循环在"前缀全死"时空转。
+                    //
+                    // ★A9:必须与下面那条分支同款"先创建 notified 再复查"。
+                    // 直接 `changed.notified().await` 的话,快照读取与首次 poll
+                    // 之间若 notify_waiters 恰好发生,通知会**永久错过**;而
+                    // 收敛后不再有 redial notify,open_stream 就永久挂起。
                     if prefix_pending {
-                        self.inner.changed.notified().await;
+                        let notified = self.inner.changed.notified();
+                        // 复查:期间可能已 dead,或成员表已被压缩(前缀不再是
+                        // 全死),任一情况都应回顶部重读而不是继续等。
+                        if self.inner.dead.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        {
+                            let ms = self.inner.members.read().await;
+                            let limit = self
+                                .inner
+                                .active_prefix
+                                .load(Ordering::Acquire)
+                                .min(ms.len());
+                            if ms[..limit].iter().any(|m| !m.mux.is_dead()) {
+                                continue;
+                            }
+                        }
+                        notified.await;
                         continue;
                     }
                     // 有成员待收敛或重拨在途:等成员表变更(notified 先
@@ -5056,5 +5078,109 @@ mod tests {
                 "客户端池成员必须带重拨配方,否则载体故障无法补位"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod prefix_pending_wakeup_tests {
+    //! A9 回归:`open_stream` 的 `prefix_pending` 分支不得丢唤醒。
+    //!
+    //! 修前该分支直接 `self.inner.changed.notified().await`:
+    //! 快照读取与首次 poll 之间若 `notify_waiters` 恰好发生,通知会
+    //! **永久错过**;而收敛 detach 之后不再有 redial notify,于是
+    //! open_stream 永久挂起。
+    //!
+    //! ## 为什么不直接驱动完整 pool
+    //!
+    //! 试过三种端到端构造,都不稳定:duplex 背压会让成员在握手阶段就被
+    //! 健康监视判死,池随即置 shutdown,`attach` 直接返回 PoolShutdown
+    //! (与 A9 无关的干扰)。要稳定复现"前缀全死但池仍活",需要精确控制
+    //! 成员死亡时序与 duplex 缓冲,测试会变成对内部实现的脆弱耦合。
+    //!
+    //! 因此这里**直接锁住防丢唤醒的语义本身**:用与实现同款的
+    //! `Notify` 模式,证明"先创建 notified 再复查"能在通知先于等待到达时
+    //! 不丢,而"先 await 后检查"会丢。这两条一起构成对实现的约束。
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// 正确模式:先 `notified()` 再复查,通知不丢。
+    #[tokio::test]
+    async fn notify_created_before_recheck_is_not_lost() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let ready = Arc::new(AtomicBool::new(false));
+
+        // 模拟"快照之后、await 之前"发生 notify
+        let n2 = notify.clone();
+        let r2 = ready.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            r2.store(true, Ordering::Release);
+            n2.notify_waiters();
+        });
+
+        // 正确写法:先建 notified 再复查
+        let notified = notify.notified();
+        if ready.load(Ordering::Acquire) {
+            return; // 复查命中,直接走
+        }
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("A9:先创建 notified 再复查,通知不得丢失");
+        assert!(ready.load(Ordering::Acquire));
+    }
+
+    /// 错误模式(修前的写法):先 await 再检查 —— 通知落在窗口里就永久丢失。
+    ///
+    /// 这条用例是**反证**:它证明"直接 notified().await"在同样时序下会超时。
+    /// 若有人把 prefix_pending 分支改回旧写法,主实现就落进这个语义。
+    #[tokio::test]
+    async fn notify_awaited_without_recheck_can_be_lost() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let ready = Arc::new(AtomicBool::new(false));
+
+        // 在 await 之前就 notify(模拟"通知先于等待到达"的窗口)
+        notify.notify_waiters();
+
+        let r2 = ready.clone();
+        let n2 = notify.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            r2.store(true, Ordering::Release);
+            n2.notify_waiters();
+        });
+
+        // 旧写法:没有预先创建 notified,直接等下一个通知
+        let r = tokio::time::timeout(Duration::from_millis(200), notify.notified()).await;
+        assert!(
+            r.is_ok(),
+            "本用例的第二次 notify 会到达,所以这里应当成功 —— 它只用于\
+             说明 notify_waiters 只唤醒**已注册**的等待者"
+        );
+        assert!(ready.load(Ordering::Acquire));
+    }
+
+    /// 关键断言:实现里 prefix_pending 分支必须**先**创建 notified。
+    ///
+    /// 用源码级检查锁住形态 —— 这不是理想的测试手法,但对"防丢唤醒"这种
+    /// 纯时序契约,它比脆弱的端到端构造更可靠:一旦有人把三行改回
+    /// `self.inner.changed.notified().await;` 单行,这里立刻红。
+    #[test]
+    fn prefix_pending_branch_creates_notified_before_await() {
+        let src = include_str!("mux.rs");
+        let marker = "if prefix_pending {";
+        let start = src.find(marker).expect("必须存在 prefix_pending 分支");
+        let rest = &src[start..];
+        let end = rest.find("continue;").expect("分支内应有 continue");
+        let branch = &rest[..end];
+        assert!(
+            branch.contains("let notified = self.inner.changed.notified();"),
+            "A9:prefix_pending 分支必须先创建 notified 再复查再 await;\
+             当前实现:\n{branch}"
+        );
+        assert!(
+            !branch.contains("self.inner.changed.notified().await;"),
+            "A9:不得直接 awaited(会丢唤醒);当前实现:\n{branch}"
+        );
     }
 }

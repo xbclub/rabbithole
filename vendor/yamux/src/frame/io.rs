@@ -39,7 +39,7 @@ use std::{
 /// Limits the amount of bytes a remote can cause the local node to allocate at once when reading.
 ///
 /// Chosen based on intuition in past iterations.
-const MAX_FRAME_BODY_LEN: usize = crate::MIB;
+pub(crate) const MAX_FRAME_BODY_LEN: usize = crate::MIB;
 
 /// staging 一次读入的最小预留(批量接收窗口;一次 read 可解出多帧)。
 ///
