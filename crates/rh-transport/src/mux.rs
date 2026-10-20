@@ -4903,6 +4903,12 @@ mod tests {
     // 两侧均 new_duplex(裸 TCP 双 fd,镜像 tcp.rs try_dup_tcp 的
     // AsFd/try_clone_to_owned + from_std 路径),open_stream/accept/echo
     // 全链往返——真实 TCP socket 上验证读∥写零锁路径的组网。
+    //
+    // round-80:本测试依赖 `std::os::fd`(Unix 专属),Windows 上编不过
+    // (v0.4.0 发布的 msvc 目标因此变红)。整个用例按 `cfg(unix)` 关掉——
+    // 它验证的是 Linux/macOS 的 fd-dup 双载体路径;Windows 走锁路径
+    // (`try_dup_tcp` 返回 None),本就无此路径可测。
+    #[cfg(unix)]
     #[tokio::test]
     async fn duplex_mux_tcp_smoke_roundtrip() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

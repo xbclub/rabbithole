@@ -119,12 +119,30 @@ struct VerifiedConn {
 /// 等 fd 状态同源),`from_std` 重新注册到当前 runtime 的 IO driver
 ///(独立注册,与原 fd 无冲突)。任一步失败 → None → 调用方降级锁路径
 ///(不报错、不失败建连)。
+///
+/// # 仅 Unix(round-80 修复)
+///
+/// `std::os::fd` 是 Unix 专属模块;Windows 没有 fd 概念(用 HANDLE),
+/// 该模块被 `cfg` 掉。修前此函数无条件 `use std::os::fd::AsFd`,
+/// **Windows 目标直接编译失败**(v0.4.0 发布流水线 x86_64/aarch64
+/// 两个 msvc 目标同时红,报 E0432 `unresolved import std::os::fd`)。
+///
+/// 现在按 `cfg(unix)` 分支:非 Unix 返回 `None`,调用方本就把它当作
+/// "无法 fd 复制"而降级到锁路径(`SplitSocket` + BiLock),**语义完全
+/// 等价**——只是少了读∥写的物理并行,功能不受影响。
+#[cfg(unix)]
 fn try_dup_tcp(stream: &tokio::net::TcpStream) -> Option<crate::BoxedIo> {
     use std::os::fd::AsFd as _;
     let fd = stream.as_fd().try_clone_to_owned().ok()?;
     let std_stream = std::net::TcpStream::from(fd);
     let dup = tokio::net::TcpStream::from_std(std_stream).ok()?;
     Some(Box::new(dup) as crate::BoxedIo)
+}
+
+/// 非 Unix(Windows 等):无 `std::os::fd`,不支持 fd 复制 → 降级锁路径。
+#[cfg(not(unix))]
+fn try_dup_tcp(_stream: &tokio::net::TcpStream) -> Option<crate::BoxedIo> {
+    None
 }
 
 /// 单连接验证管线:TLS → WS 升级 → 首字节窥探。
