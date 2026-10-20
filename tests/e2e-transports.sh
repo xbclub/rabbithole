@@ -158,6 +158,10 @@ run_one() {  # $1=proto $2=ctl_port $3=api_port $4=bind_port $5=echo_port [6=max
   #   链路的用例**必须显式配**;这也正是 de49db8 保留的可选路径。
   #   不配 = 走默认(auto_carriers,环回 <5ms 恒为 1)。
   local NO_INSECURE="${7:-}" TAG="${8:-$1}" POOL="${9:-}"
+  # secret_verified 组把日志开到 debug:正向断言要看到
+  # "服务端证书比对通过",那是一条 tracing::debug!。
+  local LOGLEVEL="info"
+  if [ -n "$NO_INSECURE" ]; then LOGLEVEL="debug"; fi
   local W; W=$(mktemp -d /tmp/rh-tr-$TAG.XXXXXX)
   local PIDS=()
   cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; sleep 0.3; rm -rf "$W"; }
@@ -234,7 +238,7 @@ multiplex = true
 client_id = "$CID"
 secret = "$SEC"
 $EXTRA
-log_level = "info"
+log_level = "$LOGLEVEL"
 EOF
   if [ -n "$POOL" ]; then
     printf 'mux_pool_size = %s\n' "$POOL" >> "$W/client.toml"
@@ -275,6 +279,26 @@ EOF
     cp "$W/server.log" /tmp/tr-$TAG-server.log 2>/dev/null; cp "$W/client.log" /tmp/tr-$TAG-client.log 2>/dev/null
   else
     ok "$TAG: 转发+半关闭"
+  fi
+
+  # secret_verified 路径的正向断言(仅 $7=no_insecure 组)。
+  # 光"能上线"不足以证明走的是下发比对:万一客户端退化成 insecure 也能上线。
+  # 必须看到服务端确实下发了 SERVER_CERT、且客户端完成了逐字节比对。
+  if [ -n "$NO_INSECURE" ]; then
+    local clog
+    clog=$(sed -E 's/\x1b\[[0-9;]*m//g' "$W/client.log" 2>/dev/null)
+    if printf '%s' "$clog" | grep -q "服务端证书比对通过"; then
+      ok "$TAG: 客户端完成证书下发比对(secret_verified 路径)"
+    else
+      bad "$TAG: 未见\"服务端证书比对通过\"(未真正走 secret 校验路径)"
+      cp "$W/client.log" /tmp/tr-$TAG-client.log 2>/dev/null
+    fi
+    if printf '%s' "$clog" | grep -qE "可能存在中间人|无法完成比对|缺失该帧"; then
+      bad "$TAG: 出现证书校验失败日志(应通过)"
+      cp "$W/client.log" /tmp/tr-$TAG-client.log 2>/dev/null
+    else
+      ok "$TAG: 无证书校验失败日志"
+    fi
   fi
 
   # round-10 定容断言(§4 T-E1/T-E2/T-E3):
@@ -426,6 +450,187 @@ EOF
 
 check(){ [ "$1" = "0" ] && ok "$2" || bad "$2"; }
 
+# ---------------------------------------------------------------------------
+# 反向用例(降级防护):模拟"旧服务端"——完成 HELLO/挑战应答认证后**不下发**
+# SERVER_CERT。新客户端在 secret_verified 路径下必须**拒绝连接**,而不是
+# 静默放行(fail-open)。若这里被改成 fail-open,中间人丢弃该帧即可绕过
+# 全部证书比对,本用例会立刻变红。
+#
+# 为什么必须用假服务端:真服务端按设计总会下发该帧,无法制造"缺失"。
+# 假服务端用同一份自签证书起 TLS(客户端握手不校验证书,信任完全来自
+# secret),故 TLS 层能通、认证也能过,缺的只有应用层那一帧 —— 这样拒绝
+# 才确实归因于"缺帧",而不是连接没建立。
+#
+# 必须 multiplex=false:多路复用下 RHTP 帧在 yamux 流内,裸 socket 读不到。
+# ---------------------------------------------------------------------------
+run_oldserver_no_frame() {
+  local CTL="$1"
+  local W; W=$(mktemp -d /tmp/rh-tr-oldnodown.XXXXXX)
+  local PIDS=()
+  cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; sleep 0.3; rm -rf "$W"; }
+  trap cleanup EXIT
+
+  # 起一个真服务端,只为拿 admin/客户端凭据(假服务端不实现 DB/API)
+  cat > "$W/real.toml" <<EOF
+bind_addr = "127.0.0.1"
+bind_protocol = "tcp"
+bind_port = 1
+[web]
+bind_addr = "127.0.0.1"
+port = $((CTL + 1))
+[vhost]
+http_port = 0
+https_port = 0
+tcpmux_port = 0
+[ports]
+auto_range = "28800-28810"
+[log]
+level = "warn"
+EOF
+  "$SERVER" --config "$W/real.toml" admin create admin Od-123-456 >/dev/null 2>&1
+  "$SERVER" --config "$W/real.toml" >"$W/real.log" 2>&1 &
+  PIDS+=($!)
+  sleep 2
+  local TOKEN
+  TOKEN=$(curl -s -X POST "http://127.0.0.1:$((CTL + 1))/api/auth/login" \
+    -H 'Content-Type: application/json' \
+    -d '{"username":"admin","password":"Od-123-456"}' \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["accessToken"])' 2>/dev/null)
+  if [ -z "$TOKEN" ]; then
+    bad "oldnodown: 无法取得凭据(真服务端未起来)"
+    cleanup; trap - EXIT; return 1
+  fi
+  local CR CID SEC
+  CR=$(curl -s -X POST "http://127.0.0.1:$((CTL + 1))/api/clients" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d '{"name":"oldnodown"}')
+  CID=$(echo "$CR"|python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["id"])' 2>/dev/null)
+  SEC=$(echo "$CR"|python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["secret"])' 2>/dev/null)
+  if [ -z "$CID" ] || [ -z "$SEC" ]; then
+    bad "oldnodown: 无法创建客户端"
+    cleanup; trap - EXIT; return 1
+  fi
+
+  # 假服务端:同一份自签证书 + 完整认证 + 故意不发 SERVER_CERT
+  "$SERVER" --config "$W/real.toml" gencert "$W/certs" >/dev/null 2>&1
+  python3 - "$CTL" "$W/certs/cert.pem" "$W/certs/key.pem" "$SEC" >"$W/fake.log" 2>&1 <<'PYFAKE' &
+import hashlib, hmac, json, socket, ssl, struct, sys, threading, time
+
+PORT, CERT, KEY, SECRET = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4].encode()
+MAGIC = b"RHTP"
+HELLO, AUTH_CHALLENGE, AUTH_RESPONSE, HELLO_ACK, SERVICE_SYNC = (
+    0x0001, 0x0009, 0x000A, 0x0101, 0x0102)
+
+def recv_exact(s, n):
+    b = b""
+    while len(b) < n:
+        d = s.recv(n - len(b))
+        if not d:
+            raise EOFError
+        b += d
+    return b
+
+def read_frame(s):
+    h = recv_exact(s, 11)
+    if h[:4] != MAGIC:
+        raise ValueError("bad magic %r" % h[:4])
+    return struct.unpack(">H", h[5:7])[0], recv_exact(s, struct.unpack(">I", h[7:11])[0])
+
+def write_frame(s, ty, payload):
+    s.sendall(MAGIC + bytes([1]) + struct.pack(">H", ty)
+              + struct.pack(">I", len(payload)) + payload)
+
+def handle(raw):
+    try:
+        s = ctx.wrap_socket(raw, server_side=True)
+    except Exception:
+        return
+    try:
+        ty, p = read_frame(s)
+        if ty != HELLO:
+            return
+        cid = json.loads(p)["client_id"]
+        nonce = "old-server-nonce-0123456789abcdef"
+        write_frame(s, AUTH_CHALLENGE, json.dumps({"nonce": nonce}).encode())
+        ty, p = read_frame(s)
+        if ty != AUTH_RESPONSE:
+            return
+        want = hmac.new(SECRET, ("rh2:%s:%s" % (cid, nonce)).encode(),
+                        hashlib.sha256).hexdigest()
+        if json.loads(p).get("auth") != want:
+            print("BAD_AUTH", flush=True)
+            return
+        print("AUTH_OK_NO_CERT_FRAME", flush=True)
+        write_frame(s, HELLO_ACK, json.dumps({
+            "ok": True, "session_id": "old-session", "heartbeat_interval_s": 30,
+            "server_version": "0.4.0"}).encode())
+        write_frame(s, SERVICE_SYNC, json.dumps({"revision": 0, "entities": []}).encode())
+        time.sleep(15)
+    except Exception:
+        pass
+    finally:
+        try: s.close()
+        except Exception: pass
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(CERT, KEY)
+ctx.set_alpn_protocols(["h2", "http/1.1"])
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", PORT)); srv.listen(16)
+print("FAKE_OLD_SERVER_UP", flush=True)
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=handle, args=(c,), daemon=True).start()
+PYFAKE
+  PIDS+=($!)
+  sleep 1.5
+  if ! grep -q "FAKE_OLD_SERVER_UP" "$W/fake.log" 2>/dev/null; then
+    bad "oldnodown: 假服务端未启动"
+    head -5 "$W/fake.log" 2>/dev/null
+    cleanup; trap - EXIT; return 1
+  fi
+
+  # 被测客户端:不写 insecure / CA / pin → 走 secret_verified
+  cat > "$W/client.toml" <<EOF
+server_addr = "127.0.0.1:$CTL"
+protocol = "tls"
+multiplex = false
+client_id = "$CID"
+secret = "$SEC"
+log_level = "debug"
+EOF
+  "$CLIENT" --config "$W/client.toml" >"$W/client.log" 2>&1 &
+  PIDS+=($!)
+  sleep 6
+  local clog
+  clog=$(sed -E 's/\x1b\[[0-9;]*m//g' "$W/client.log" 2>/dev/null)
+
+  # 核心断言:必须明确因"缺帧"而拒绝,且绝不能出现"比对通过"
+  if printf '%s' "$clog" | grep -qE "缺失该帧|无法验证对端身份|期望服务端证书下发帧"; then
+    ok "oldnodown: 客户端因缺 SERVER_CERT 帧拒绝连接(fail-closed)"
+  else
+    bad "oldnodown: 客户端未因缺帧拒绝(可能已 fail-open 成静默放行)"
+    cp "$W/client.log" /tmp/tr-oldnodown-client.log 2>/dev/null
+  fi
+  if printf '%s' "$clog" | grep -q "服务端证书比对通过"; then
+    bad "oldnodown: 缺帧却报告比对通过(严重:fail-open)"
+    cp "$W/client.log" /tmp/tr-oldnodown-client.log 2>/dev/null
+  else
+    ok "oldnodown: 缺帧时未伪装成比对通过"
+  fi
+  # 假服务端确实认证成功过 —— 证明拒绝发生在认证之后、证书校验处
+  if grep -q "AUTH_OK_NO_CERT_FRAME" "$W/fake.log" 2>/dev/null; then
+    ok "oldnodown: 假服务端已完成认证(拒绝确由缺帧导致)"
+  else
+    bad "oldnodown: 假服务端未完成认证(用例未命中目标路径)"
+    head -5 "$W/fake.log" 2>/dev/null
+  fi
+
+  cleanup; trap - EXIT
+  return 0
+}
+
 # 载体数期望(自 de49db8 起默认全部为 1):
 #   - tcp/ws:不配 mux_pool_size,走默认 → 恒单载体,只验连通与转发;
 #   - tls/wss:显式 mux_pool_size=2,保留池化链路(报到/收敛/载体数)的覆盖
@@ -443,6 +648,8 @@ run_one quic 19390 19391 19392 19399
 # → 无限重连(本组会卡在"客户端上线"FAIL)。
 run_one quic 19450 19451 19452 19459 "" no_insecure quic-secret
 run_one kcp  19410 19411 19412 19419
+# 降级防护反向用例:旧服务端不下发 SERVER_CERT → 客户端必须拒绝,不得放行
+run_oldserver_no_frame 19470
 
 echo
 echo "== 结果: PASS=$PASS FAIL=$FAIL =="

@@ -298,7 +298,14 @@ fn cert_binding_required(protocol: rh_transport::Protocol, secret_verified: bool
 /// 三种情况必须区分清楚:
 /// - 收到帧且解出的证书 == 对端证书 → 通过;
 /// - 收到帧但解不开/不一致 → **拒绝连接**(有人在中间,或 secret 不符);
-/// - 没收到帧 → **拒绝连接**(降级防护,仅在 secret_verified 下成立)。
+/// - 没收到帧(超时/旧服务端不下发)→ **拒绝连接**。
+///
+/// 第三条是**有意**的 fail-closed:中间人无法伪造/解密该帧,但它可以
+/// *丢弃*该帧让比对被静默跳过——那正是可被主动利用的降级攻击。所以
+/// "缺失"必须与"不一致"同等对待。
+///
+/// 代价:升级窗口内"新客户端 + 旧服务端"连不上(客户端日志会明确写出
+/// 原因)。这是为堵住降级攻击付出的、有意接受的代价,不是缺陷。
 async fn verify_server_cert(
     control: &mut (impl tokio::io::AsyncRead + Unpin),
     buf: &mut bytes::BytesMut,
@@ -306,8 +313,9 @@ async fn verify_server_cert(
     peer_cert: &Arc<std::sync::OnceLock<Vec<u8>>>,
 ) -> anyhow::Result<()> {
     use base64::Engine as _;
-    // 短超时:该帧紧接 HELLO_ACK,不应久等;超时视为"未下发"而非失败,
-    // 否则旧服务端会让新客户端无法连接。
+    // 短超时:该帧紧接 HELLO_ACK,不应久等。**超时即拒绝**(见下方 Err 分支)——
+    // 不是"没收到就放过",否则中间人只要把这一帧拖住/丢掉就能让比对静默跳过。
+    // 代价是升级窗口内"新客户端 + 旧服务端(不下发该帧)"会连不上,见调用点注释。
     let got = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         frame::read_frame(control, buf),
@@ -504,9 +512,17 @@ pub async fn connect_and_run(
     //   下发帧是唯一的信任来源。此时缺帧必须拒绝 —— 否则中间人只要丢弃
     //   这一帧就能让比对静默跳过,那是可被主动利用的降级攻击。
     //
-    // 曾经这里写的是 `is_encrypted()`,与上面"未收到该帧时保持原行为"的
-    // 注释相互矛盾:结果是 insecure 的客户端也被 fail-closed 打死
-    // (E2E 的 quic/tls/wss 用例正是踩在这里)。
+    // **缺失该帧即拒绝连接**,不是放行。本端以 secret 验证对端身份时,
+    // 下发帧是唯一的信任来源(握手阶段什么都没验);中间人虽伪造不了它,
+    // 却能把它丢弃,从而让比对被静默跳过 —— 那是可被主动利用的降级攻击。
+    //
+    // 有意代价:升级窗口内**新客户端 + 旧服务端**(旧版不下发该帧)会连不上,
+    // 客户端会明确报"缺失该帧即拒绝连接"并重连退避。要连上只能二选一:
+    // 升级服务端,或在客户端显式配 pin / trusted_ca / insecure 换用别的
+    // 信任来源。**不得**为了让旧服务端能连而把这里改成 fail-open。
+    //
+    // 历史:这里曾用 `is_encrypted()` 判定,导致 insecure 的客户端也被
+    // fail-closed 打死(E2E 的 quic/tls/wss 用例正是踩在这里)。
     if cert_binding_required(tcfg.protocol, tcfg.tls.secret_verified) {
         verify_server_cert(&mut control, &mut buf, &cfg, &peer_cert).await?;
     }
