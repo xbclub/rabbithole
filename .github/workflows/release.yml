@@ -23,11 +23,11 @@ jobs:
     name: 控制台前端(console/dist)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           package_json_file: console/package.json
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -37,7 +37,7 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
         working-directory: console
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: console-dist
           path: console/dist/
@@ -59,9 +59,9 @@ jobs:
           - { os: macos-latest, target: aarch64-apple-darwin }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: 注入前端产物(rust-embed 构建期内嵌)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: console-dist
           path: console/dist
@@ -108,7 +108,7 @@ jobs:
           Compress-Archive -Path "stage/$stage" -DestinationPath "$stage.zip"
           "$((Get-FileHash -Algorithm SHA256 "$stage.zip").Hash.ToLower())  $stage.zip" | Out-File -Encoding ascii "$stage.zip.sha256"
       - name: 上传发布归档
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.target }}
           path: |
@@ -121,7 +121,7 @@ jobs:
       # linux 静态二进制另存一份供 Docker 镜像打包
       - name: 上传裸二进制(Docker 用)
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.target }}
           path: |
@@ -135,20 +135,20 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: bin-x86_64-unknown-linux-musl
           path: bin/amd64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: bin-aarch64-unknown-linux-musl
           path: bin/arm64
       # artifact 传输不保留权限位,恢复可执行(Dockerfile 侧另有 COPY --chmod=755 兜底)
       - name: 恢复二进制可执行位
         run: chmod +x bin/amd64/rh-server bin/amd64/rh-client bin/arm64/rh-server bin/arm64/rh-client
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -195,12 +195,12 @@ jobs:
     needs: [build, docker]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
