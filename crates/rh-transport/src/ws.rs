@@ -9,7 +9,14 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_tungstenite::tungstenite::protocol::{Message, Role};
 
-pub const WS_PATH: &str = "/rhtp";
+/// WebSocket 升级路径。
+///
+/// **为什么不是 `/rhtp`**:该路径以明文出现在 `GET <path> HTTP/1.1` 请求行,
+/// 是比 ALPN 更显眼的指纹——任何反代、WAF、DPI 看一眼请求行就知道是这个
+/// 项目。改用常见的路径形态,混在同机其它 WS 服务里不显眼。
+///
+/// 与 ALPN 同理,改动需要服务端与客户端一致(两端同版本即一致)。
+pub const WS_PATH: &str = "/ws";
 
 /// 服务端:完成 WS 升级握手,返回字节流。
 pub async fn upgrade_server(mut io: BoxedIo, expect_path: &str) -> io::Result<BoxedIo> {

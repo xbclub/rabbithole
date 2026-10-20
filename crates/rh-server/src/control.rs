@@ -292,6 +292,13 @@ async fn auth_and_run(
         &serde_json::to_vec(&ack)?,
     )
     .await?;
+    // 证书下发:仅加密协议。客户端解密后与 TLS 对端证书比对,不一致即断开。
+    // 失败只 warn(不影响会话):客户端在缺失该帧时退回改动前的行为。
+    if inc.protocol.is_encrypted() {
+        if let Err(e) = send_server_cert(&state, &mut stream, &latest.id, &latest.secret).await {
+            warn!(client = %latest.id, error = %e, "下发服务端证书失败");
+        }
+    }
     let _ = state
         .db
         .update_client_meta(&latest.id, &hello.version, &hello.hostname, &hello.os)
@@ -608,6 +615,45 @@ pub fn hmac_hex(secret: &[u8], msg: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac key");
     mac.update(msg.as_bytes());
     hex::encode(mac.finalize().into_bytes())
+}
+
+/// 认证成功后下发服务端 TLS 证书(见 [`rh_protocol::certprov`])。
+///
+/// 客户端解密后与 TLS 握手实际看到的对端证书比对 —— 不一致说明有人在
+/// 中间转发,客户端会断开。密钥由 `secret` 经 HKDF 派生,攻击者不知道
+/// `secret` 就既解不开也伪造不了。
+///
+/// 证书缺失(纯明文控制面 / 尚未注入)时静默跳过:此帧是附加证明,
+/// 不是认证前提,缺了不应导致连接失败。
+async fn send_server_cert(
+    state: &Arc<AppState>,
+    stream: &mut BoxedIo,
+    client_id: &str,
+    secret: &str,
+) -> anyhow::Result<()> {
+    let Some(leaf) = state.control_leaf_cert.get() else {
+        return Ok(());
+    };
+    let nonce = rh_protocol::certprov::random_nonce()
+        .ok_or_else(|| anyhow::anyhow!("CSPRNG 不可用,跳过证书下发"))?;
+    let sealed = rh_protocol::certprov::seal_cert(secret.as_bytes(), nonce, leaf)
+        .ok_or_else(|| anyhow::anyhow!("证书加密失败"))?;
+    // 与 AUTH_CHALLENGE 等一致:帧体内直接放内层结构,不套 ServerMessage 信封
+    let msg = rh_protocol::message::ServerCert {
+        nonce_b64: b64::encode(&sealed.nonce),
+        cert_der_b64: b64::encode(&sealed.ciphertext),
+    };
+    write_frame(stream, FrameType::SERVER_CERT, &serde_json::to_vec(&msg)?).await?;
+    tracing::debug!(client = %client_id, "已下发服务端证书(加密)");
+    Ok(())
+}
+
+/// base64(标准、无填充容忍差异;仅编码用)。
+mod b64 {
+    use base64::Engine as _;
+    pub fn encode(b: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(b)
+    }
 }
 
 async fn send_error(stream: &mut BoxedIo, code: &str, message: &str) -> std::io::Result<()> {

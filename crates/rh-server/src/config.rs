@@ -16,6 +16,12 @@ pub struct ServerConfig {
     pub config_path: std::path::PathBuf,
     /// 附加传输监听(quic/kcp/ws/tls 等多协议并存)。
     pub extra_listeners: Vec<ListenerConfig>,
+    /// TLS ALPN 标识列表(留空 = 用 [`rh_transport::DEFAULT_ALPN`] = "h2")。
+    ///
+    /// ALPN 在 ClientHello 里是**明文**的,项目专属名字会被 DPI 直接识别。
+    /// 默认用 `h2`(最常见的 TLS 流量之一)避免成为指纹;需要恢复专属标识
+    /// 或改成其它值时在此配置。**必须与客户端一致**,否则 TLS 握手失败。
+    pub alpn: Vec<String>,
     /// TCP 传输是否启用 yamux 多路复用。
     pub multiplex: bool,
     /// 数据面中继模式:splice(Linux 零拷贝,默认)| copy(用户态拷贝)。
@@ -57,6 +63,7 @@ impl Default for ServerConfig {
             bind_port: 0,
             config_path: std::path::PathBuf::new(),
             extra_listeners: Vec::new(),
+            alpn: Vec::new(),
             multiplex: false,
             relay_mode: String::new(),
             tls: None,

@@ -292,9 +292,13 @@ pub async fn listen_stream(
     let listener = TcpListener::bind(cfg.bind_addr).await?;
     let local = listener.local_addr()?;
     let tls = if matches!(cfg.protocol, crate::Protocol::Tls | crate::Protocol::Wss) {
-        Some(tokio_rustls::TlsAcceptor::from(crate::tls::server_config(
-            &cfg.tls,
-        )?))
+        // 必须用 `server_config_with_alpn(cfg.alpn)`:早先误用了
+        // `server_config()`(内部固定取 DEFAULT_ALPN),导致配置里的
+        // `alpn` 列表**完全失效**——配了 ["h2","http/1.1"] 也只协商 h2,
+        // 且客户端只提 http/1.1 时服务端回 no_application_protocol 警报。
+        Some(tokio_rustls::TlsAcceptor::from(
+            crate::tls::server_config_with_alpn(&cfg.tls, &cfg.alpn)?,
+        ))
     } else {
         None
     };
@@ -550,7 +554,8 @@ async fn dial_io(
                 ))
             }
             crate::Protocol::Tls | crate::Protocol::Wss => {
-                let (rust, verify) = crate::tls::client_config(&cfg.tls)?;
+                // 同服务端:必须传入 cfg.alpn,否则配置项被静默忽略。
+                let (rust, verify) = crate::tls::client_config_with_alpn(&cfg.tls, &cfg.alpn)?;
                 let connector = TlsConnector::from(rust);
                 let name = rustls_pki_types::ServerName::try_from(
                     cfg.tls
@@ -561,6 +566,17 @@ async fn dial_io(
                 .map_err(|e| other_err(format!("bad tls server name: {e}")))?
                 .to_owned();
                 let tls_stream = connector.connect(name, tcp).await?;
+                // 记录对端叶子证书:上层用它比对服务端加密下发的证书(防中间人)。
+                if let Some(sink) = &cfg.peer_cert_sink {
+                    if let Some(leaf) = tls_stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|c| c.first())
+                    {
+                        let _ = sink.set(leaf.as_ref().to_vec());
+                    }
+                }
                 // pin 模式:握手后、发任何数据前比对叶子证书指纹
                 if let crate::tls::ClientVerify::Pin(expected) = verify {
                     let certs = tls_stream

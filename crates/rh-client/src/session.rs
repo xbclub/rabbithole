@@ -273,13 +273,106 @@ fn parse_attach_ack_payload(p: &[u8]) -> AckPayload {
     }
 }
 
+/// 校验服务端加密下发的证书与本次 TLS 握手实际看到的一致。
+///
+/// 这是**唯一能挡住中间人转发**的检查:攻击者不知道 `secret`,因此无法
+/// 伪造一段能解开的密文;它若用自己的证书冒充,解密结果与握手看到的
+/// 对端证书不同,此处即失败。
+///
+/// 三种情况必须区分清楚:
+/// - 收到帧且解出的证书 == 对端证书 → 通过;
+/// - 收到帧但解不开/不一致 → **拒绝连接**(有人在中间,或 secret 不符);
+/// - 没收到帧(旧服务端 / 明文协议)→ 放行,保持改动前行为。
+async fn verify_server_cert(
+    control: &mut (impl tokio::io::AsyncRead + Unpin),
+    buf: &mut bytes::BytesMut,
+    cfg: &ClientConfig,
+    peer_cert: &Arc<std::sync::OnceLock<Vec<u8>>>,
+) -> anyhow::Result<()> {
+    use base64::Engine as _;
+    // 短超时:该帧紧接 HELLO_ACK,不应久等;超时视为"未下发"而非失败,
+    // 否则旧服务端会让新客户端无法连接。
+    let got = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        frame::read_frame(control, buf),
+    )
+    .await;
+    let (ty, payload) = match got {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(anyhow::anyhow!("读取证书下发帧失败: {e}")),
+        Err(_) => {
+            // 降级防护:本端已声明"靠 secret 验证对端"(secret_verified),
+            // 此时**缺少**该帧必须视为失败。否则中间人只要丢弃这一帧
+            // 就能让比对被静默跳过——那是可被主动利用的降级攻击。
+            anyhow::bail!(
+                "等待服务端证书下发帧超时:本端以 secret 验证对端身份,缺失该帧即拒绝连接\
+                 (可能是旧服务端,或中间人丢弃了该帧)"
+            );
+        }
+    };
+    if ty != FrameType::SERVER_CERT {
+        // 同理:声明了 secret 验证就不能接受"帧不存在"。旧服务端会在这里
+        // 被明确拒绝(而不是静默降级),升级时客户端会看到明确原因。
+        anyhow::bail!(
+            "期望服务端证书下发帧,实际收到 {ty:?}:无法验证对端身份,拒绝连接"
+        );
+    }
+    let msg: rh_protocol::message::ServerCert = serde_json::from_slice(&payload)?;
+    let nonce_raw = base64::engine::general_purpose::STANDARD
+        .decode(msg.nonce_b64.as_bytes())
+        .map_err(|e| anyhow::anyhow!("证书下发帧 nonce 非法: {e}"))?;
+    let nonce: [u8; 12] = nonce_raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("证书下发帧 nonce 长度错误"))?;
+    let ciphertext = base64::engine::general_purpose::STANDARD
+        .decode(msg.cert_der_b64.as_bytes())
+        .map_err(|e| anyhow::anyhow!("证书下发帧密文非法: {e}"))?;
+    let sealed = rh_protocol::certprov::SealedCert { nonce, ciphertext };
+    let seen = peer_cert.get().ok_or_else(|| {
+        anyhow::anyhow!("未能取得本次 TLS 会话的对端证书,无法完成比对——拒绝连接")
+    })?;
+    compare_announced_cert(cfg.secret.as_bytes(), &sealed, seen)?;
+    tracing::debug!("服务端证书比对通过");
+    Ok(())
+}
+
+/// 比对"服务端加密自称的证书"与"握手实际看到的对端证书"。
+///
+/// 抽成独立函数是为了能对它做单元测试 —— 这是整套防中间人机制的唯一
+/// 判据,必须能被精确验证(见本文件 tests 模块)。
+fn compare_announced_cert(
+    secret: &[u8],
+    sealed: &rh_protocol::certprov::SealedCert,
+    seen: &[u8],
+) -> anyhow::Result<()> {
+    let announced = rh_protocol::certprov::open_cert(secret, sealed).ok_or_else(|| {
+        anyhow::anyhow!("服务端证书下发帧无法解密(secret 不符,或对端不是真服务端)——拒绝连接")
+    })?;
+    if announced != seen {
+        anyhow::bail!(
+            "服务端证书不一致:下发证书与 TLS 实际对端不同,可能存在中间人——拒绝连接\
+             (下发 {} 字节,实际 {} 字节)",
+            announced.len(),
+            seen.len()
+        );
+    }
+    Ok(())
+}
+
 /// 建立:连接 → 控制流 → HELLO/挑战/应答 → 运行会话循环。
 /// Err 返回触发外层重连。
 pub async fn connect_and_run(
     cfg: Arc<ClientConfig>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let tcfg = cfg.transport_cfg()?;
+    let mut tcfg = cfg.transport_cfg()?;
+    // 证书比对用:记录本次连接实际看到的对端证书(仅加密协议有意义)。
+    // 必须逐次新建(不是复用):重连要对当前这次握手的证书做比对。
+    let peer_cert: Arc<std::sync::OnceLock<Vec<u8>>> = Arc::new(std::sync::OnceLock::new());
+    if tcfg.protocol.is_encrypted() {
+        tcfg.peer_cert_sink = Some(peer_cert.clone());
+    }
     // 三段式定容(round-10):显式值/协议基线先过硬件上限,报到后再按
     // 服务端应答收敛。QUIC/KCP 与非 multiplex 不建池(恒单载体)。
     let (sized_k, hardware_cap) = initial_k_for(&cfg, tcfg.protocol).await;
@@ -379,6 +472,13 @@ pub async fn connect_and_run(
         anyhow::bail!("hello rejected: {:?}", ack.error_code);
     }
     let session_id = ack.session_id.clone().unwrap_or_default();
+    // 证书下发校验(仅加密协议):服务端用 secret 派生的密钥把它的 TLS 证书
+    // 加密发来,解出后与本次握手"实际看到的对端证书"逐字节比对。
+    // 不一致 = 有人在中间转发(它拿不出用真 secret 加密的真证书),必须断开。
+    // 未收到该帧时保持原行为(不校验),兼容旧服务端。
+    if tcfg.protocol.is_encrypted() {
+        verify_server_cert(&mut control, &mut buf, &cfg, &peer_cert).await?;
+    }
     info!(server = %cfg.server_addr, session = %session_id, "connected");
 
     // 附加载体报到(round-9 §3.5 / round-10 §2.3.4):池化多载体时,其余
@@ -1335,5 +1435,76 @@ mod sizing_tests {
         assert_eq!(pool.pool_live_carriers().await, Some(2));
         assert!(live_ids.contains(&ids[2]), "第三个健康成员必须保留");
         assert!(live_ids.contains(&control_id), "控制成员必须保留");
+    }
+}
+
+#[cfg(test)]
+mod cert_binding_tests {
+    //! 证书下发机制的判定核心:**这是防中间人的唯一判据**,必须精确锁定。
+    //!
+    //! 中间人的可行路径被这三条测试覆盖:
+    //! 1. 它不知道 secret → 造不出能解开的密文(改密文即失败);
+    //! 2. 它能转发真密文,但自己的握手证书不同 → 比对不一致即失败;
+    //! 3. 它想丢弃该帧让校验静默跳过 → 已由 `verify_server_cert` 的
+    //!    降级防护拒绝(此处无法直接测超时,靠代码约束)。
+    use super::*;
+
+    const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    fn seal(secret: &[u8], cert: &[u8]) -> rh_protocol::certprov::SealedCert {
+        rh_protocol::certprov::seal_cert(secret, [9u8; 12], cert).expect("seal")
+    }
+
+    /// 诚实服务端:下发的就是握手出示的 → 通过。
+    #[test]
+    fn honest_server_passes() {
+        let cert = b"real-server-leaf-der";
+        let sealed = seal(SECRET, cert);
+        assert!(compare_announced_cert(SECRET, &sealed, cert).is_ok());
+    }
+
+    /// 中间人用自己的证书与应用层握手,同时**原样转发**真服务端的密文。
+    /// 客户端解出的是真证书,但握手看到的是中间人证书 → 必须拒绝。
+    #[test]
+    fn mitm_with_own_cert_is_rejected() {
+        let real = b"real-server-leaf-der";
+        let mitm = b"mitm-leaf-der-different";
+        let sealed = seal(SECRET, real); // 真服务端发出的密文,中间人解不开只能转发
+        let e = compare_announced_cert(SECRET, &sealed, mitm).unwrap_err();
+        assert!(
+            e.to_string().contains("中间人"),
+            "应在错误里明确指出中间人风险,实际: {e}"
+        );
+    }
+
+    /// 中间人不知道 secret,自行加密一张假证书:客户端解不开 → 拒绝。
+    #[test]
+    fn mitm_cannot_forge_sealed_cert() {
+        let attacker_secret = b"attacker-guessed-wrong-secret";
+        let sealed = seal(attacker_secret, b"forged");
+        let e = compare_announced_cert(SECRET, &sealed, b"forged").unwrap_err();
+        assert!(
+            e.to_string().contains("无法解密"),
+            "攻击者伪造的密文必须解不开,实际: {e}"
+        );
+    }
+
+    /// 密文被篡改(位翻转)→ GCM tag 校验失败 → 拒绝。
+    #[test]
+    fn tampered_sealed_cert_is_rejected() {
+        let cert = b"real-server-leaf-der";
+        let mut sealed = seal(SECRET, cert);
+        sealed.ciphertext[0] ^= 0x01;
+        let e = compare_announced_cert(SECRET, &sealed, cert).unwrap_err();
+        assert!(e.to_string().contains("无法解密"), "实际: {e}");
+    }
+
+    /// 客户端 secret 配错:同样解不开 → 明确报错而不是放行。
+    #[test]
+    fn wrong_local_secret_is_rejected() {
+        let cert = b"real-server-leaf-der";
+        let sealed = seal(SECRET, cert);
+        let e = compare_announced_cert(b"wrong-local-secret", &sealed, cert).unwrap_err();
+        assert!(e.to_string().contains("无法解密"), "实际: {e}");
     }
 }

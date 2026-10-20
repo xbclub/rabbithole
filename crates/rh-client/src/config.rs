@@ -34,6 +34,11 @@ pub struct ClientConfig {
     pub server_name: Option<String>,
     pub tls_insecure_skip_verify: bool,
     pub tls_pin_sha256: Option<String>,
+    /// TLS ALPN 标识列表;留空 = 用 [`rh_transport::DEFAULT_ALPN`]("h2")。
+    ///
+    /// ALPN 在 ClientHello 里是明文,项目专属名字会被 DPI 识别,故默认用
+    /// 最常见的 `h2`。**必须与服务端一致**,否则 TLS 握手失败。
+    pub alpn: Vec<String>,
     /// HTTP/SOCKS5 代理拨号(http://user:pass@host:port 或 socks5://…)。
     pub proxy_url: Option<String>,
     /// XTCP 打洞 STUN 服务器;空 = 以本机地址作候选。
@@ -61,6 +66,7 @@ impl Default for ClientConfig {
             proxy_url: None,
             stun_server: None,
             dns_server: None,
+            alpn: Vec::new(),
             log_level: "info".into(),
         }
     }
@@ -101,10 +107,20 @@ impl ClientConfig {
                 server_name: self.server_name.clone(),
                 insecure_skip_verify: self.tls_insecure_skip_verify,
                 pin_sha256: self.tls_pin_sha256.clone(),
+                // 没有 CA 也没有 pin 时,靠 secret 认证后下发证书来验证对端。
+                // 这是"零配置也能防中间人"的路径,见 rh_protocol::certprov。
+                secret_verified: self.tls_pin_sha256.is_none()
+                    && self.trusted_ca_file.is_none()
+                    && !self.tls_insecure_skip_verify,
             },
             proxy_url: self.proxy_url.clone(),
-            alpn: vec!["rhtp".into()],
+            alpn: if self.alpn.is_empty() {
+                vec![rh_transport::DEFAULT_ALPN.into()]
+            } else {
+                self.alpn.clone()
+            },
             connect_timeout: std::time::Duration::from_secs(10),
+            peer_cert_sink: None,
         })
     }
 
@@ -145,6 +161,14 @@ impl ClientConfig {
         }
         if let Some(v) = s("RH_SERVER_NAME") {
             self.server_name = Some(v);
+        }
+        if let Some(v) = s("RH_ALPN") {
+            // 逗号分隔;空串视为"用默认值"(对 Docker 传空变量更友好)
+            self.alpn = v
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
         }
         if let Some(v) = s("RH_PROXY_URL") {
             self.proxy_url = Some(v);

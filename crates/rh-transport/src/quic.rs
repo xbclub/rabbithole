@@ -1,4 +1,4 @@
-//! QUIC 载体(quinn):原生多流,一连接多流;ALPN "rhtp"。
+//! QUIC 载体(quinn):原生多流,一连接多流;ALPN 默认见 `DEFAULT_ALPN`。
 
 use crate::{
     other_err, BoxedIo, ClientTransportConfig, Incoming, Multiplexer, MultiplexerInner,
@@ -277,7 +277,7 @@ mod tests {
                 key_pem: Some(key),
                 ..Default::default()
             },
-            alpn: vec!["rhtp".into()],
+            alpn: vec![crate::DEFAULT_ALPN.into()],
         };
         let mut listener = listen(
             &server_cfg,

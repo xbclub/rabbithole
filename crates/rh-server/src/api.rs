@@ -1881,6 +1881,8 @@ async fn get_server_config(State(state): State<Arc<AppState>>, headers: HeaderMa
                 .unwrap_or(serde_json::Value::Null),
         },
         "authorized_keys": authorized_keys,
+        // 重启生效项:ALPN 在监听器构建时固化(TLS acceptor),热改无效。
+        "alpn": state.cfg.alpn,
     }))
 }
 
@@ -1900,6 +1902,17 @@ struct ServerConfigUpdate {
     /// authorized_keys 文件全文(空串 = 清空;null = 不动)。
     #[serde(default)]
     authorized_keys: Option<String>,
+    /// TLS 相关(重启生效)。
+    #[serde(default)]
+    tls: Option<TlsUpdate>,
+}
+
+/// [tls] 段:目前只有 ALPN。改动需重启(监听器构建时固化)。
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct TlsUpdate {
+    /// ALPN 标识列表;空数组 = 用默认值(`h2`)。
+    alpn: Option<Vec<String>>,
 }
 
 /// [limits] 热改子集:全部字段可选,0 = 不限(max_pool_size 除外,见字段)。
@@ -2020,6 +2033,27 @@ async fn put_server_config(
         }
     }
 
+    if let Some(t) = &req.tls {
+        if let Some(list) = &t.alpn {
+            if list.len() > 8 {
+                return err(1002, "alpn 最多 8 项");
+            }
+            for item in list {
+                // RFC 7301:ALPN 标识是 1-255 字节的 opaque 字节串;
+                // 实际使用中都为可打印 ASCII,这里按可见 ASCII 收紧校验,
+                // 避免控制字符进入配置文件后无法编辑。
+                if item.is_empty() || item.len() > 255 {
+                    return err(1002, "alpn 每项须为 1-255 字节");
+                }
+                if !item
+                    .bytes()
+                    .all(|b| (0x21..=0x7e).contains(&b))
+                {
+                    return err(1002, &format!("alpn 含非法字符(须为可见 ASCII):{item}"));
+                }
+            }
+        }
+    }
     if let Some(l) = &req.limits {
         if let Some(n) = l.max_mux_streams {
             if n > rh_transport::MUX_STREAMS_UNLIMITED {
@@ -2239,11 +2273,27 @@ async fn put_server_config(
         let _ = state.ssh_watch.0.send(u64::MAX);
     }
 
+    // ALPN:监听器构建时固化,无法热改 —— 写回文件并标记 restart_required。
+    let mut restart_required: Vec<String> = Vec::new();
+    if let Some(t) = &req.tls {
+        if let Some(list) = &t.alpn {
+            let norm: Vec<String> = list.iter().map(|s| s.trim().to_string()).collect();
+            if norm != state.cfg.alpn {
+                restart_required.push("alpn".into());
+            }
+        }
+    }
+
     // 回写配置文件:热子集合并进启动配置快照;原文件备份一次(.bak),注释会丢失
     let persist_err;
     {
         let hot = state.hot.read().await;
         let mut disk = state.cfg.as_ref().clone();
+        if let Some(t) = &req.tls {
+            if let Some(list) = &t.alpn {
+                disk.alpn = list.iter().map(|s| s.trim().to_string()).collect();
+            }
+        }
         disk.ports.allow_ports = hot.allow_ports.clone();
         disk.ports.max_services_per_client = hot.max_services_per_client;
         disk.log.level = hot.log_level.clone();
@@ -2269,14 +2319,14 @@ async fn put_server_config(
             .emit("warn", "server", &format!("配置已生效但写回文件失败:{e}"))
             .await;
         return ok(
-            json!({ "applied": applied, "restart_required": [], "persisted": false, "error": e }),
+            json!({ "applied": applied, "restart_required": restart_required, "persisted": false, "error": e }),
         );
     }
     state
         .events
         .emit("info", "server", "服务器配置已更新(热生效并写回文件)")
         .await;
-    ok(json!({ "applied": applied, "restart_required": [], "persisted": true }))
+    ok(json!({ "applied": applied, "restart_required": restart_required, "persisted": true }))
 }
 
 // ---------------- 证书管理(M3:SNI 服务端终结) ----------------

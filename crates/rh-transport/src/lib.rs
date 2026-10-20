@@ -414,6 +414,18 @@ impl fmt::Display for Protocol {
     }
 }
 
+/// 默认 ALPN 标识。
+///
+/// **默认用 `h2` 而不用 `rhtp`**:ALPN 位于 ClientHello,是**明文**的
+/// (实测可见:扩展类型 0x0010 后紧跟 UTF-8 字节串)。用项目专属名字会让
+/// 任何被动 DPI 一眼认出"这是 rabbithole"。`h2` 是 HTTP/2 的标准标识,
+/// 属于最常见的 TLS 流量之一,不构成可区分的指纹。
+///
+/// 代价:若服务端是真正的 HTTP/2 服务,双方会协商成功但应用层数据不通 ——
+/// 本项目的端口只跑自己的协议,故不受影响。需要恢复专属标识或改成
+/// 其它值时,用 `alpn` 配置项/`RH_ALPN` 覆盖。
+pub const DEFAULT_ALPN: &str = "h2";
+
 /// 多载体池协议基线(round-10):单载体即可跑到路径上限,故恒 1。
 ///
 /// # 这是默认 K 的唯一来源(round-45 / round-73)
@@ -570,6 +582,16 @@ pub struct TlsClientOptions {
     pub insecure_skip_verify: bool,
     /// 固定服务端叶子证书 SHA-256 指纹(hex)。设置时优先于 CA 链校验。
     pub pin_sha256: Option<String>,
+    /// 由 `secret` 验证对端身份:握手阶段不校验证书,认证成功后由服务端
+    /// 用 `secret` 派生的密钥加密下发它自己的证书,客户端解出后与握手实际
+    /// 看到的对端证书比对。
+    ///
+    /// 这样客户端**首次连接即能识破中间人**,且不需要 CA、不需要 pin、
+    /// 不写任何状态文件 —— 信任完全来自客户端已经持有的 `secret`。
+    ///
+    /// 前提:上层必须真的执行比对(见 `rh_protocol::certprov`)。
+    /// 只置位不比对,安全性与 `insecure_skip_verify` 等同。
+    pub secret_verified: bool,
 }
 
 /// TLS 服务端选项。
@@ -600,6 +622,12 @@ pub struct ClientTransportConfig {
     pub alpn: Vec<String>,
     /// 拨号总超时。
     pub connect_timeout: std::time::Duration,
+    /// 握手完成后写入**对端叶子证书 DER**(首个成功拨号者置入)。
+    ///
+    /// 供上层做证书下发比对:客户端解密服务端下发的证书后,与此处记录的
+    /// 实际对端证书逐字节比对,不一致即说明中间有人在转发。
+    /// `None` = 调用方不需要该信息,传输层不做额外工作。
+    pub peer_cert_sink: Option<Arc<std::sync::OnceLock<Vec<u8>>>>,
 }
 
 impl Default for ClientTransportConfig {
@@ -610,8 +638,9 @@ impl Default for ClientTransportConfig {
             multiplex: false,
             tls: TlsClientOptions::default(),
             proxy_url: None,
-            alpn: vec!["rhtp".to_string()],
+            alpn: vec![DEFAULT_ALPN.to_string()],
             connect_timeout: std::time::Duration::from_secs(10),
+            peer_cert_sink: None,
         }
     }
 }
@@ -633,7 +662,7 @@ impl Default for ServerTransportConfig {
             bind_addr: "0.0.0.0:7000".parse().unwrap(),
             multiplex: false,
             tls: TlsServerOptions::default(),
-            alpn: vec!["rhtp".to_string()],
+            alpn: vec![DEFAULT_ALPN.to_string()],
         }
     }
 }

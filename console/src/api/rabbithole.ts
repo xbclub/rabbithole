@@ -238,6 +238,8 @@ export interface LimitsConfig {
 
 export interface ServerConfigView {
   config: Record<string, unknown>;
+  /** 重启生效:ALPN 在监听器构建时固化,热改无效。空数组 = 用默认值 "h2"。 */
+  alpn: string[];
   hot: {
     allow_ports: string[];
     log_level: string;
@@ -260,6 +262,8 @@ export interface ServerConfigUpdate {
   metrics?: { enable_prometheus?: boolean; bind_addr?: string; port?: number };
   limits?: Partial<LimitsConfig>;
   authorized_keys?: string;
+  /** TLS 段(重启生效):ALPN 标识列表。空数组 = 用默认值 "h2"。 */
+  tls?: { alpn?: string[] };
 }
 
 export interface ServerConfigResult {

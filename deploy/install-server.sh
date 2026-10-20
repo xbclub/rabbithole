@@ -111,6 +111,27 @@ EOF
   echo ">> 已写入默认配置 $CONF_DIR/server.toml"
 fi
 
+# ---------- 证书目录 ----------
+# 控制面 TLS 自签证书落在 <配置目录>/certs/(rh-server 按 config 路径推导)。
+# 目录在这里显式创建并收紧权限,而不是留给运行时自动 mkdir:
+#   * 安装期就能暴露"目录不可写"这类问题,而不是等首次启动生成证书失败
+#     —— 那种失败是文件系统错误,看不出与证书有关,服务端会直接起不来;
+#   * 0700 让目录本身不可列举。私钥文件虽是 0600,但目录可读会泄露
+#     "有哪些证书、何时生成"这类元信息。
+# 已存在则只补权限,不覆盖内容(升级路径保留既有证书,指纹不变)。
+# 目录建不出来只告警不中断:此时服务端首次启动仍会自己尝试创建
+# (auto_cert 里有 create_dir_all),安装脚本不该因此半途而废;但如果
+# 那里也失败,服务端会直接起不来 —— 故把原因明确告诉操作者。
+if mkdir -p "$CONF_DIR/certs" 2>/dev/null; then
+  if chmod 0700 "$CONF_DIR/certs" 2>/dev/null; then
+    echo ">> 证书目录 $CONF_DIR/certs (0700)"
+  else
+    echo "!! 无法把 $CONF_DIR/certs 权限设为 0700,请手动检查属主" >&2
+  fi
+else
+  echo "!! 无法创建 $CONF_DIR/certs(服务端首次启动可能失败,请手动检查)" >&2
+fi
+
 # ---------- systemd ----------
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   cat > "/etc/systemd/system/$SERVICE.service" <<EOF

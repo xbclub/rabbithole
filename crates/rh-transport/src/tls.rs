@@ -19,11 +19,14 @@ pub enum ClientVerify {
     Standard,
     /// 无任何校验(仅测试)。
     Insecure,
+    /// 握手不校验,但**上层必须**用 secret 加密下发的方式核对对端证书
+    /// (见 [`crate::TlsClientOptions::secret_verified`])。
+    SecretVerified,
 }
 
 /// 服务端 TLS 配置。cert/key 或自动自签(可持久化)。
 pub fn server_config(opts: &TlsServerOptions) -> io::Result<Arc<rustls::ServerConfig>> {
-    server_config_with_alpn(opts, &["rhtp".to_string()])
+    server_config_with_alpn(opts, &[crate::DEFAULT_ALPN.to_string()])
 }
 
 pub fn server_config_with_alpn(
@@ -96,6 +99,12 @@ fn set_key_perm(_path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
+/// 生成自签证书。
+///
+/// **不用 `rcgen::generate_simple_self_signed`**:它的 CN 固定为
+/// `rcgen self signed cert`,在任何抓包里都是显眼的指纹(证书是明文传输的,
+/// 中间人/DPI 直接可读)。这里显式构造参数,CN 用 SAN 的首项(默认
+/// `localhost`),与普通自签证书无异。
 fn generate_self_signed() -> io::Result<(Vec<u8>, Vec<u8>)> {
     let mut names = vec![
         "localhost".to_string(),
@@ -107,11 +116,22 @@ fn generate_self_signed() -> io::Result<(Vec<u8>, Vec<u8>)> {
             names.push(host);
         }
     }
-    let cert = rcgen::generate_simple_self_signed(names)
+    let mut params = rcgen::CertificateParams::new(names.clone())
+        .map_err(|e| io::Error::other(format!("tls: cert params: {e}")))?;
+    // CN 取首个标识(通常 localhost),避免出现 rcgen 的默认字样。
+    params.distinguished_name = {
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, names[0].clone());
+        dn
+    };
+    let key_pair = rcgen::KeyPair::generate()
+        .map_err(|e| io::Error::other(format!("tls: self-signed key: {e}")))?;
+    let cert = params
+        .self_signed(&key_pair)
         .map_err(|e| io::Error::other(format!("tls: self-signed gen: {e}")))?;
     Ok((
-        cert.cert.pem().into_bytes(),
-        cert.key_pair.serialize_pem().into_bytes(),
+        cert.pem().into_bytes(),
+        key_pair.serialize_pem().into_bytes(),
     ))
 }
 
@@ -168,7 +188,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 pub fn client_config(
     opts: &TlsClientOptions,
 ) -> io::Result<(Arc<rustls::ClientConfig>, ClientVerify)> {
-    client_config_with_alpn(opts, &["rhtp".to_string()])
+    client_config_with_alpn(opts, &[crate::DEFAULT_ALPN.to_string()])
 }
 
 pub fn client_config_with_alpn(
@@ -203,8 +223,22 @@ pub fn client_config_with_alpn(
             .with_no_client_auth();
         return Ok((with_alpn(cfg, alpn), ClientVerify::Standard));
     }
+    if opts.secret_verified {
+        // 握手阶段不校验对端证书:此刻还没有任何先验信任锚。
+        // 信任由**应用层**建立 —— 服务端用 secret 派生的密钥加密下发它的
+        // 证书,客户端解出后与本次握手实际看到的对端证书比对。
+        // 见 `rh_protocol::certprov` 与客户端 `verify_server_cert`。
+        //
+        // 安全性前提:必须真的执行那次比对。`SecretVerified` 只表示
+        // "本端允许先握手再验证",不含任何保证;若上层不比对,等价于 insecure。
+        let cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        return Ok((with_alpn(cfg, alpn), ClientVerify::SecretVerified));
+    }
     Err(io::Error::other(
-        "tls client: need trusted_ca, pin_sha256 or insecure_skip_verify",
+        "tls client: need trusted_ca, pin_sha256, insecure_skip_verify or secret_verified",
     ))
 }
 
@@ -247,6 +281,32 @@ pub fn verify_pin(expected: &[u8; 32], leaf_cert: &[u8]) -> io::Result<()> {
     }
 }
 
+/// 从 PEM 证书链取**叶子证书** SHA-256 指纹(hex,小写 64 字符)。
+///
+/// 与客户端 `pin_sha256` 记录的是同一个值,故服务端启动时打印这个字符串,
+/// 运维可直接复制进客户端配置。
+pub fn leaf_fingerprint_pem(cert_pem: &[u8]) -> io::Result<String> {
+    let leaf = CertificateDer::pem_slice_iter(cert_pem)
+        .next()
+        .ok_or_else(|| io::Error::other("tls: empty certificate chain"))?
+        .map_err(|e| io::Error::other(format!("tls: parse cert: {e}")))?;
+    Ok(hex32(&sha256(leaf.as_ref())))
+}
+
+/// 从 PEM 证书链取叶子证书的 DER 字节(证书下发的载荷)。
+pub fn leaf_der_pem(cert_pem: &[u8]) -> io::Result<Vec<u8>> {
+    let leaf = CertificateDer::pem_slice_iter(cert_pem)
+        .next()
+        .ok_or_else(|| io::Error::other("tls: empty certificate chain"))?
+        .map_err(|e| io::Error::other(format!("tls: parse cert: {e}")))?;
+    Ok(leaf.as_ref().to_vec())
+}
+
+/// 32 字节指纹 → 小写 hex(64 字符,与 `pin_sha256` 同格式)。
+pub fn hex32(v: &[u8; 32]) -> String {
+    v.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +330,55 @@ mod tests {
             hex(&sha256(&million_a)),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
+    }
+
+    /// ALPN 必须真的进入 rustls 配置。
+    ///
+    /// 这条测试的由来:服务端 `listen_stream` 曾误用 `server_config()`
+    /// (内部固定取 DEFAULT_ALPN),导致 `alpn` 配置项被静默忽略 ——
+    /// 配了 ["h2","http/1.1"] 实际只协商 h2,且客户端只提 http/1.1 时
+    /// 服务端回 no_application_protocol。配置项形同虚设却无任何报错,
+    /// 只能靠实测发现。此处从配置对象反查,锁死"传进去就生效"。
+    #[test]
+    fn alpn_list_reaches_rustls_config() {
+        let (cert, key) = generate_self_signed().unwrap();
+        let opts = TlsServerOptions {
+            cert_pem: Some(cert),
+            key_pem: Some(key),
+            ..Default::default()
+        };
+        // 服务端:多值必须按顺序保留
+        let want = vec!["h2".to_string(), "http/1.1".to_string()];
+        let cfg = server_config_with_alpn(&opts, &want).unwrap();
+        assert_eq!(
+            cfg.alpn_protocols,
+            want.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>(),
+            "服务端 ALPN 列表必须完整进入配置且顺序不变"
+        );
+
+        // 客户端:同一份列表也要进入配置
+        let c = client_config_with_alpn(
+            &TlsClientOptions {
+                insecure_skip_verify: true,
+                ..Default::default()
+            },
+            &want,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(
+            c.alpn_protocols,
+            want.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>(),
+            "客户端 ALPN 列表必须完整进入配置"
+        );
+
+        // 默认路径用 DEFAULT_ALPN(不是写死的旧值)
+        let def = server_config(&opts).unwrap();
+        assert_eq!(
+            def.alpn_protocols,
+            vec![crate::DEFAULT_ALPN.as_bytes().to_vec()]
+        );
+        assert_eq!(crate::DEFAULT_ALPN, "h2");
     }
 
     #[test]

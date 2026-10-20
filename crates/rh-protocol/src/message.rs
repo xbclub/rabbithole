@@ -206,6 +206,21 @@ pub struct AuthChallenge {
     pub nonce: String,
 }
 
+/// 证书下发(见 [`crate::certprov`])。认证成功后服务端立即发送。
+///
+/// 只在**加密协议**(tls/wss/quic)上发送:明文协议链路本身可被窃听,
+/// 下发证书不提供任何额外保证,只会制造虚假安全感。
+///
+/// `cert_der_b64` 是密文(含 GCM tag)的 base64;客户端解密后与 TLS 握手
+/// 实际看到的对端叶子证书逐字节比对,不一致必须断开。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerCert {
+    /// AEAD nonce,base64(12 字节)。
+    pub nonce_b64: String,
+    /// 密文 + tag,base64。
+    pub cert_der_b64: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HelloAck {
     pub ok: bool,
