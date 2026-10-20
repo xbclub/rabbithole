@@ -130,8 +130,16 @@ run_iperf() {
   local j="$RAW_DIR/$id.json" e="$RAW_DIR/$id.stderr" x="$RAW_DIR/$id.exit"
   local t0 t1 rc mbps
   t0="$(epoch_us)"
-  "$IPERF3_BIN" -c "$dst" -p "$port" -t "$PEER_DURATION" -P "$streams" $rev -J >"$j" 2>"$e"
-  rc=$?
+  if [ "$THP_TOOL" = "loadgen" ]; then
+    # loadgen src <host:port> <seconds> <conns>:与 iperf3 -c/-P 语义对齐。
+    # 它只有单向发送(sink 读空),故忽略 $rev —— 下行样本会如实记为同口径
+    # 的单向数据,而不是伪装成双向。
+    "$LOADGEN_BIN" src "$dst:$port" "$PEER_DURATION" "$streams" >"$j" 2>"$e"
+    rc=$?
+  else
+    "$IPERF3_BIN" -c "$dst" -p "$port" -t "$PEER_DURATION" -P "$streams" $rev -J >"$j" 2>"$e"
+    rc=$?
+  fi
   t1="$(epoch_us)"
   printf '%s\n' "$rc" >"$x"
   local ok_expr='(.end.sum_received.bits_per_second // 0) > 0'
