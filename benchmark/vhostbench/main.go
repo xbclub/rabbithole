@@ -137,6 +137,25 @@ func pct(sorted []float64, p float64) float64 {
 func r3(v float64) float64 { return float64(int64(v*1000+0.5)) / 1000 }
 func r1(v float64) float64 { return float64(int64(v*10+0.5)) / 10 }
 
+// setNoDelay 对底层 TCP 连接关 Nagle。
+//
+// c 可能是 *tls.Conn:它包着 *net.TCPConn,直接断言会失败。用接口
+// NetConn() 往下剥一层,**必须连剥到底** —— 少剥一层就又退回 Nagle,
+// 而 Nagle 会让「明文比 TLS 慢十倍」这种反常结果出现在基准里。
+func setNoDelay(c net.Conn) {
+	for i := 0; i < 4; i++ {
+		switch v := c.(type) {
+		case *net.TCPConn:
+			_ = v.SetNoDelay(true)
+			return
+		case interface{ NetConn() net.Conn }:
+			c = v.NetConn()
+		default:
+			return
+		}
+	}
+}
+
 // ---------------------------------------------------------------- serve
 
 // buildResponse 预构建整份响应字节(状态行 + 头 + 体)。
@@ -170,9 +189,11 @@ func buildResponse(bodySize int) []byte {
 // 识别它可以让「半关闭后继续写」的噪音更早消失。
 func serveConn(c net.Conn, resp []byte, counter *atomic.Int64) {
 	defer c.Close()
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-	}
+	// TLS listener 返回的是 *tls.Conn,直接断言 *net.TCPConn 会失败 ——
+	// 于是明文侧设了 NoDelay、TLS 侧没设,结果 **TLS 反而比明文快 10 倍**
+	// (明文走 Nagle+延迟 ACK,40ms 量级的停顿;实测 p50 8.3ms vs 0.76ms)。
+	// 必须先剥掉 tls.Conn 再设,两边才可比。
+	setNoDelay(c)
 	br := bufio.NewReaderSize(c, 16<<10)
 	for {
 		closeAfter := false
