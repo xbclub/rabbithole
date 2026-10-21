@@ -165,8 +165,9 @@ async fn replay_waiting(
     m: &NatHoleConnect,
     mux: Arc<rh_transport::Multiplexer>,
 ) {
-    let entry = sess.waiting.lock().await.remove(&m.user_conn_id);
-    let Some((conn, visitor_id)) = entry else {
+    // 保留整条 entry(含登记时刻):回退重放时原样放回,不重置 TTL。
+    let entry = sess.take_waiting(m.user_conn_id).await;
+    let Some((conn, visitor_id, registered_at)) = entry else {
         return;
     };
     let vspec = sess.visitors.lock().await.get(&visitor_id).cloned();
@@ -190,11 +191,9 @@ async fn replay_waiting(
             sess.punched.lock().await.insert(visitor_id, mux);
         }
         Some(_conn) => {
-            // 直连失败:登记回等待并回退中继
-            sess.waiting
-                .lock()
-                .await
-                .insert(m.user_conn_id, (_conn, visitor_id));
+            // 直连失败:登记回等待并回退中继(沿用原登记时刻,不续命)
+            sess.requeue_waiting(m.user_conn_id, (_conn, visitor_id, registered_at))
+                .await;
             reissue_user_connect(sess, m).await;
         }
     }
@@ -203,10 +202,7 @@ async fn replay_waiting(
 async fn reissue_user_connect(sess: &Arc<ClientSession>, m: &NatHoleConnect) {
     // 等待连接重新可见:直接以原 user_conn_id 重发
     // 找回等待项所属 visitor(未消费的重放/回退场景)
-    let vid = {
-        let w = sess.waiting.lock().await;
-        w.get(&m.user_conn_id).map(|(_, v)| *v)
-    };
+    let vid = sess.waiting_visitor(m.user_conn_id).await;
     let Some(vid) = vid else {
         warn!(
             conn = m.user_conn_id,

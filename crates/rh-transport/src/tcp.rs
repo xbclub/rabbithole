@@ -393,8 +393,22 @@ pub async fn listen_stream(
 pub async fn connect_stream(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>> {
     if cfg.multiplex || cfg.protocol.always_muxed() {
         let (io, write_dup) = dial_io(cfg).await?;
-        // 客户端为开流方:超限是单流报错(不杀会话),取"不限制"即可,
-        // 真正的策略上限由服务端在 DATA_CHANNEL_HELLO 处执行。
+        // 客户端为开流方,取"不限制"即可 —— 但**理由不是"超限只影响单流"**。
+        //
+        // 修前这里写「超限是单流报错(不杀会话)」,那是错的:yamux 的
+        // `TooManyStreams` 是**连接级**错误。实测(限 4 开第 5 条)该载体上
+        // 已开的 4 条流全部失效,后续开流返回 "mux driver gone"。代码路径:
+        // `SendHalf::poll_new_outbound` 返回 `Err` → `send_driver` 先
+        // `dead.store(true)` 再终结驱动(见 mux.rs send_driver);对端收到
+        // 超限 SYN 更是直接 `Action::Terminate`(vendor connection.rs)。
+        //
+        // 因此客户端**不能**用 yamux 硬顶做自我限流:一旦触发就是整条
+        // 会话断,而限流本该是"拒绝新流、保留老流"的干净拒绝。
+        //
+        // 正确的分层:策略上限由服务端在 DATA_CHANNEL_HELLO 处以**应用层
+        // 计数器**执行(control.rs),其配额刻意钳到 `mux_streams - 1024`
+        // 以保证应用层永远先于 yamux 拒绝。客户端是开流方,限流是服务端
+        // 对客户端的约束,自己再设一道只会自伤。
         // round-E2:裸 TCP 持写侧 fd 副本 → 双载体 mux(零锁读∥写);
         // None(非 Tcp 协议 / try_clone 失败)→ 锁路径。
         Ok(match write_dup {
@@ -520,6 +534,9 @@ async fn dial_client_mux(
     shards: usize,
 ) -> io::Result<crate::mux::YamuxMultiplexer> {
     let (io, write_dup) = dial_io(cfg).await?;
+    // 同样取"不限制":yamux 硬顶在客户端一旦触发是**连接级**失败
+    // (杀掉该载体上所有已有流),不能当限流用。理由详见
+    // `connect_stream` 内同名字段处的长注释。
     Ok(match write_dup {
         Some(dup) => crate::mux::YamuxMultiplexer::new_duplex(
             io,

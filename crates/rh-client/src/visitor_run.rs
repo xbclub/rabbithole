@@ -7,7 +7,6 @@ use rh_protocol::message::{
 use rh_protocol::{VisitorKind, VisitorSpec};
 use rh_transport::BoxedIo;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -105,18 +104,13 @@ async fn handle_user_conn(
             }
         }
     }
-    // 常规:登记等待 + USER_CONNECT;TTL 10s
-    sess.waiting
-        .lock()
-        .await
-        .insert(user_conn_id, (conn, visitor_id));
-    {
-        let s2 = sess.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            s2.waiting.lock().await.remove(&user_conn_id);
-        });
-    }
+    // 常规:登记等待 + USER_CONNECT;TTL 10s。
+    //
+    // TTL 淘汰不再**每连接 spawn 一个 sleep 任务**(修前交付成功后无法
+    // abort,任务会活到 10s 才醒来对已移除的 key 做一次无意义 remove,
+    // 任务数随连接数增长)。改为登记时刻随条目保存,由会话级单个
+    // `waiting_sweeper` 周期淘汰。
+    sess.insert_waiting(user_conn_id, conn, visitor_id).await;
     tracing::debug!(visitor_id, user_conn_id, "user connect registered, sending");
     let uc = UserConnect {
         visitor_id,
@@ -125,7 +119,7 @@ async fn handle_user_conn(
         udp: false,
     };
     if !sess.send_msg(ClientMessage::UserConnect(uc)).await {
-        sess.waiting.lock().await.remove(&user_conn_id);
+        sess.take_waiting(user_conn_id).await;
     }
 }
 
@@ -164,7 +158,15 @@ async fn xtcp_direct_stream(
     {
         return Some(conn);
     }
-    crate::forward::splice(stream, Box::new(conn), None).await;
+    // Y1 零拷贝 mux 中继(visitor 直连):`mux.open_stream()` 产出的就是
+    // 未包装 `RhMuxStream`,满足 chunk 快路径前提。走 `mux_relay` 后数据
+    // 以 `Bytes` 引用直达帧体,省掉 copy 回落路径的两次中间拷贝。
+    //
+    // 与 forward.rs `handle_start_forward` 同式:未压缩 + relay_mode≠copy。
+    // xtcp 直连首帧 `flags: 0`(不带 COMPRESSED),这里的「未压缩」由
+    // 协议语义保证,但判定仍按实际 `BoxedIo` 类型走——`is_mux_stream`
+    // 对任何包装(PrependedIo/压缩流)恒 false,不会误入快路径。
+    crate::forward::relay_stream(stream, Box::new(conn), &sess.cfg.relay_mode).await;
     let _ = sess;
     None
 }
@@ -189,14 +191,19 @@ pub async fn deliver_relay(
     _vspec: VisitorSpec,
     prefix: Vec<u8>,
 ) {
-    let Some((mut conn, _)) = sess.waiting.lock().await.remove(&relay.user_conn_id) else {
+    let Some((mut conn, _, _)) = sess.take_waiting(relay.user_conn_id).await else {
         tracing::warn!(
             conn = relay.user_conn_id,
             "relay delivered but user conn gone"
         );
         return; // 本地连接已超时:丢弃通道
     };
-    // 压缩时残留字节是压缩流首块,须回灌给解压器;未压缩时直接写给本地连接
+    // 压缩时残留字节是压缩流首块,须回灌给解压器;未压缩时直接写给本地连接。
+    //
+    // 只有**未压缩**分支才可能走零拷贝 mux chunk 快路径:`channel` 源自
+    // `sess.mux.open_stream()`(未包装 `RhMuxStream`),压缩分支产出
+    // `DuplexStream`,`is_mux_stream` 恒 false 自然回落 copy。因此这里不做
+    // 额外分支——压缩路径逐行保持原样,判定交给 `relay_stream` 的实际类型。
     let channel = if relay.flags & forward_flags::COMPRESSED != 0 {
         let inner = if prefix.is_empty() {
             channel
@@ -211,7 +218,7 @@ pub async fn deliver_relay(
         }
         channel
     };
-    crate::forward::splice(channel, Box::new(conn), None).await;
+    crate::forward::relay_stream(channel, Box::new(conn), &sess.cfg.relay_mode).await;
 }
 
 /// sudp:本地 UDP 监听;首包触发 USER_CONNECT(udp=true);通道到位后
@@ -278,5 +285,246 @@ async fn run_udp(
             _ = cancel.cancelled() => return,
             _ = sess.cancel.cancelled() => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// 整个用例的 deadline(防挂死;mux 泵在两端的收敛缺陷会让测试永久挂起)。
+    const DEADLINE: Duration = Duration::from_secs(20);
+    /// 每方向搬运量。够大以覆盖多帧(64KiB 级别 yamux 帧),又不拖慢 CI。
+    const BYTES: usize = 512 * 1024;
+
+    fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        let mut x = seed | 1;
+        for _ in 0..n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.push((x >> 24) as u8);
+        }
+        out
+    }
+
+    /// 真实 yamux 对:`open_stream` 产出的就是 visitor 手里的 channel 形态。
+    fn mux_pair() -> (
+        Arc<rh_transport::Multiplexer>,
+        Arc<rh_transport::Multiplexer>,
+    ) {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let client = rh_transport::mux::wrap_stream_as_client(Box::new(a) as BoxedIo, true, 100);
+        let server = rh_transport::mux::wrap_stream_as_server(Box::new(b) as BoxedIo, true, 100);
+        (client, server)
+    }
+
+    async fn read_exact_n<R: tokio::io::AsyncRead + Unpin>(
+        r: &mut R,
+        n: usize,
+        what: &str,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; n];
+        tokio::io::AsyncReadExt::read_exact(r, &mut buf)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: read_exact({n}) failed: {e}"));
+        buf
+    }
+
+    /// 核心验收:一对 wrap_stream_as_client/server 建 mux,开一路流,
+    /// 经 `relay_stream`(mux_relay)接 duplex 目标,双向各 512KiB 校验一致,
+    /// 并验证半关闭沿两个方向传递。
+    async fn bidirectional_mux_relay(relay_mode: &'static str, expect_chunk: bool) {
+        // 路径探针:整个用例独占计数窗口(async 锁,跨 await 安全)
+        let _serial = crate::forward::relay_path_probe::serial().await;
+        let base = crate::forward::relay_path_probe::snapshot();
+        let (client, server) = mux_pair();
+        let stream = client.open_stream().await.expect("open_stream");
+
+        // 前提(快路径可达性):visitor 拿到的必须是**未包装** RhMuxStream,
+        // 否则 is_mux_stream 恒 false,这条测试就退化成 copy 路径验证。
+        if relay_mode != "copy" {
+            assert!(
+                rh_transport::mux::is_mux_stream(&stream),
+                "open_stream 产物必须是未包装 RhMuxStream"
+            );
+        }
+
+        let (local_relay, local_app) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(crate::forward::relay_stream(
+            stream,
+            Box::new(local_relay) as BoxedIo,
+            relay_mode,
+        ));
+
+        let peer = server.accept().await.expect("accept");
+        // 路径自证:accept 侧拿到的也必须是未包装 RhMuxStream —— relay 的
+        // 另一头是 duplex,若这里退化成非 mux 流,说明整条链根本没走 chunk。
+        assert!(
+            rh_transport::mux::is_mux_stream(&peer),
+            "对端 accept 产物必须是未包装 RhMuxStream"
+        );
+        let (mut peer_r, mut peer_w) = tokio::io::split(peer);
+        let (mut app_r, mut app_w) = tokio::io::split(local_app);
+
+        // ---- 方向 1:peer(远端)→ local_app(本地目标)----
+        let down = pseudo_random(BYTES, 0x1111_2222_3333_4444);
+        let expect_down = down.clone();
+        let writer = tokio::spawn(async move {
+            tokio::io::AsyncWriteExt::write_all(&mut peer_w, &down)
+                .await
+                .expect("peer write");
+            peer_w
+        });
+        let got = read_exact_n(&mut app_r, BYTES, "peer→local").await;
+        let mut peer_w = writer.await.expect("writer join");
+        assert!(got == expect_down, "peer→local 数据不一致");
+
+        // ---- 方向 2:local_app(本地目标)→ peer(远端)----
+        let up = pseudo_random(BYTES, 0x5555_6666_7777_8888);
+        let expect_up = up.clone();
+        let writer = tokio::spawn(async move {
+            tokio::io::AsyncWriteExt::write_all(&mut app_w, &up)
+                .await
+                .expect("local write");
+            app_w
+        });
+        let got = read_exact_n(&mut peer_r, BYTES, "local→peer").await;
+        let mut app_w = writer.await.expect("writer join");
+        assert!(got == expect_up, "local→peer 数据不一致");
+
+        // ---- 半关闭 1:peer 关写 → local 读端 EOF(远端 FIN 透传)----
+        tokio::io::AsyncWriteExt::shutdown(&mut peer_w)
+            .await
+            .expect("peer shutdown");
+        let mut probe = [0u8; 1];
+        assert_eq!(
+            tokio::io::AsyncReadExt::read(&mut app_r, &mut probe)
+                .await
+                .expect("local read after peer FIN"),
+            0,
+            "peer 半关闭后 local 必须读到 EOF"
+        );
+
+        // ---- 半关闭 2:local 关写 → peer 读端 EOF(本地 FIN 透传)----
+        tokio::io::AsyncWriteExt::shutdown(&mut app_w)
+            .await
+            .expect("local shutdown");
+        assert_eq!(
+            tokio::io::AsyncReadExt::read(&mut peer_r, &mut probe)
+                .await
+                .expect("peer read after local FIN"),
+            0,
+            "local 半关闭后 peer 必须读到 EOF"
+        );
+
+        relay.await.expect("relay join");
+
+        // 路径断言:这是本次改造的**核心验收**。功能测试区分不了两条路径
+        // (mux_relay 与 splice 语义等价,把快路径关掉照样全绿),必须直接锁。
+        let (chunk, copy) = crate::forward::relay_path_probe::since(base);
+        if expect_chunk {
+            assert_eq!(chunk, 1, "必须走零拷贝 mux chunk 快路径(chunk={chunk}, copy={copy})");
+            assert_eq!(copy, 0, "不得回落 copy(chunk={chunk}, copy={copy})");
+        } else {
+            assert_eq!(chunk, 0, "relay_mode=copy 不得走快路径(chunk={chunk}, copy={copy})");
+            assert_eq!(copy, 1, "relay_mode=copy 必须回落 copy(chunk={chunk}, copy={copy})");
+        }
+    }
+
+    /// 零拷贝 mux chunk 中继(visitor 直连路径的目标形态)。
+    #[tokio::test]
+    async fn visitor_mux_relay_bidirectional_and_half_close() {
+        tokio::time::timeout(DEADLINE, bidirectional_mux_relay("mux", true))
+            .await
+            .expect("整个用例 deadline");
+    }
+
+    /// relay_mode=copy 是 A/B 对照开关:必须回落 copy 且功能完全一致。
+    #[tokio::test]
+    async fn visitor_relay_mode_copy_still_works() {
+        tokio::time::timeout(DEADLINE, bidirectional_mux_relay("copy", false))
+            .await
+            .expect("整个用例 deadline");
+    }
+
+    /// 红线:压缩流不是 RhMuxStream,判定自然 false → 原样回落 copy。
+    /// 这里直接锁「压缩包装后 is_mux_stream 为假」这一事实,防止以后有人
+    /// 为了"顺手统一"把它改快。
+    #[tokio::test]
+    async fn compressed_stream_is_not_mux_stream() {
+        tokio::time::timeout(DEADLINE, async {
+            let (client, _server) = mux_pair();
+            let stream = client.open_stream().await.expect("open_stream");
+            assert!(rh_transport::mux::is_mux_stream(&stream));
+
+            let compressed = rh_transport::compress_stream(stream).await;
+            assert!(
+                !rh_transport::mux::is_mux_stream(&compressed),
+                "压缩流必须不是 RhMuxStream,否则会被误判进快路径"
+            );
+
+            // PrependedIo 同理(残留字节回灌包装)
+            let (_client2, _server2) = mux_pair();
+            let wrapped = rh_transport::PrependedIo::wrap(compressed, b"prefix".to_vec());
+            assert!(
+                !rh_transport::mux::is_mux_stream(&wrapped),
+                "PrependedIo 包装必须不是 RhMuxStream"
+            );
+        })
+        .await
+        .expect("整个用例 deadline");
+    }
+
+    /// 压缩回落路径端到端仍正确:compress_stream 包装后经 relay_stream,
+    /// 对端解压,padding 数据双向一致。
+    #[tokio::test]
+    async fn compressed_path_through_relay_stream_roundtrips() {
+        tokio::time::timeout(DEADLINE, async {
+            let (client, server) = mux_pair();
+            let stream = client.open_stream().await.expect("open_stream");
+            let compressed = rh_transport::compress_stream(stream).await;
+
+            let (local_relay, local_app) = tokio::io::duplex(64 * 1024);
+            let _serial = crate::forward::relay_path_probe::serial().await;
+            let base = crate::forward::relay_path_probe::snapshot();
+            let relay = tokio::spawn(crate::forward::relay_stream(
+                compressed,
+                Box::new(local_relay) as BoxedIo,
+                "mux",
+            ));
+
+            // 对端也要解压才看得懂
+            let peer = server.accept().await.expect("accept");
+            let mut peer = rh_transport::compress_stream(peer).await;
+
+            let n = 256 * 1024;
+            let payload = pseudo_random(n, 0xDEAD_BEEF_0000_0001);
+            let expect = payload.clone();
+            let (mut local_r, mut local_w) = tokio::io::split(local_app);
+
+            let writer = tokio::spawn(async move {
+                tokio::io::AsyncWriteExt::write_all(&mut local_w, &payload)
+                    .await
+                    .expect("local write");
+                local_w
+            });
+            let got = read_exact_n(&mut peer, n, "local→peer(compressed)").await;
+            let _local_w = writer.await.expect("writer join");
+            assert!(got == expect, "压缩回落路径数据不一致");
+            let _ = &mut local_r;
+
+            // 红线:即使 relay_mode="mux",压缩流也必须回落 copy
+            let (chunk, copy) = crate::forward::relay_path_probe::since(base);
+            assert_eq!(chunk, 0, "压缩流不得进快路径(chunk={chunk}, copy={copy})");
+            assert_eq!(copy, 1, "压缩流必须回落 copy(chunk={chunk}, copy={copy})");
+
+            drop(peer);
+            relay.abort();
+        })
+        .await
+        .expect("整个用例 deadline");
     }
 }

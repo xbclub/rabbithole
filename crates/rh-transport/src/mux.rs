@@ -1013,6 +1013,36 @@ const DOWN_BATCH_BYTES: usize = 1024 * 1024;
 ///
 /// 返回 true = 以 clean EOF 结束(b_read Ok(None));false = 读/写错误
 /// (调用方收尾走有界 grace)。
+/// 循环间隔诊断的**纯函数内核**:读旧值 → 若存在则累计 → 返回新值。
+///
+/// 抽出来是为了可单测。修前这段逻辑内联在 `pump_down` 的循环体里,且
+/// 循环体末尾用 `let __last_read_end = ...` **重新绑定**同名局部变量 ——
+/// 那是个新变量,循环体作用域结束即失效,外层那个永远停在 `None`。
+/// 结果 `LOOP_GAP_NS`/`LOOP_GAP_N` 恒为 0,`PUMP_GAP` 永不打印
+/// (诊断数据一直空着;对吞吐无影响,因为 `if let` 立即跳过)。
+///
+/// 语义:返回 `Some(now())` 表示"本轮读结束时刻",供下一轮算间隔;
+/// 诊断关闭时返回 `None`,且**不调用** `Instant::now()`
+/// (红线:关闭时零开销)。
+#[inline]
+fn loop_gap_step(
+    prev: Option<std::time::Instant>,
+    enabled: bool,
+) -> Option<std::time::Instant> {
+    if let Some(prev) = prev {
+        pump_diag::LOOP_GAP_NS.fetch_add(
+            prev.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        pump_diag::LOOP_GAP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if enabled {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    }
+}
+
 async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     a_w: &mut W,
     b_read: &mut RhMuxStreamRead,
@@ -1119,14 +1149,6 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     let mut by_bytes: u64 = 0;
     let mut wr_slow: u64 = 0;
     let clean = 'outer: loop {
-        // round-13 诊断:上一轮 read 返回到本轮 read 开始之间的间隔(循环开销)。
-        if let Some(prev) = __last_read_end {
-            pump_diag::LOOP_GAP_NS.fetch_add(
-                prev.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            pump_diag::LOOP_GAP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         let __t0 = if pump_diag::enabled() {
             Some(std::time::Instant::now())
         } else {
@@ -1208,11 +1230,13 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                 yamux::sched_diag::dump_spare("down");
             }
         }
-        let __last_read_end = if pump_diag::enabled() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+        // round-13 诊断 + 本轮修复:上一轮 read 结束 → 本轮 loop 开头的间隔。
+        //
+        // 必须**对外层赋值**:修前这里是 `let __last_read_end = ...`,
+        // 重新绑定了一个同名新变量,循环体作用域结束就失效,外层永远是
+        // `None` → LOOP_GAP_* 恒 0、PUMP_GAP 永不打印。
+        // `Instant` 是 `Copy`,直接赋值无借用冲突;此点之后再无旧值引用。
+        __last_read_end = loop_gap_step(__last_read_end, pump_diag::enabled());
 
         let __w0 = if pump_diag::enabled() {
             Some(std::time::Instant::now())
@@ -3234,6 +3258,192 @@ pub fn tcpmux_server_mux(io: crate::BoxedIo, max_streams: usize) -> Arc<crate::M
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== 循环间隔诊断(LOOP_GAP / PUMP_GAP)=====
+    //
+    // 修前 `pump_down` 循环体末尾用 `let __last_read_end = ...` 遮蔽外层
+    // 同名变量,导致 LOOP_GAP_* 恒 0、PUMP_GAP 永不打印。下面用纯函数
+    // 锁住「第二轮必须观测到 prev」这一行为。
+
+    /// 串行锁:LOOP_GAP_* 是进程级全局原子,用例之间必须隔离。
+    /// 同步锁用于纯函数测试(不跨 await);跨 await 的端到端测试用下面
+    /// 的 `GAP_ASYNC_LOCK`,避免 clippy `await_holding_lock`。
+    static GAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static GAP_ASYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn gap_reset() {
+        pump_diag::LOOP_GAP_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+        pump_diag::LOOP_GAP_N.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn gap_snapshot() -> (u64, u64) {
+        (
+            pump_diag::LOOP_GAP_NS.load(std::sync::atomic::Ordering::Relaxed),
+            pump_diag::LOOP_GAP_N.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// 核心验收:第一轮 None(无 prev),**第二轮必须观测到 prev**。
+    ///
+    /// 修前的遮蔽写法等价于「每轮都从 None 开始」,因此这个断言会失败
+    /// (见下方 negative 说明)。
+    #[test]
+    fn loop_gap_observes_previous_round() {
+        let _g = GAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        gap_reset();
+
+        let mut last: Option<std::time::Instant> = None;
+        // 第 1 轮:无 prev,N 保持 0
+        last = loop_gap_step(last, true);
+        assert!(last.is_some(), "开启时必须返回新的时间点");
+        assert_eq!(gap_snapshot().1, 0, "首轮没有 prev,不应累加");
+
+        // 第 2 轮:必须观测到 prev(累加 1 次)
+        last = loop_gap_step(last, true);
+        assert_eq!(gap_snapshot().1, 1, "第二轮必须观测到上一轮的时间点");
+
+        // 第 3 轮:再累加
+        let last = loop_gap_step(last, true);
+        assert_eq!(gap_snapshot().1, 2, "第三轮继续累加");
+        assert!(gap_snapshot().0 > 0, "累计间隔应为正值");
+        assert!(last.is_some());
+    }
+
+    /// 反证:如果像修前那样每轮都从 `None` 开始(re-bind 遮蔽的等价),
+    /// 计数恒为 0。这条锁住"遮蔽会被本测试抓到"。
+    #[test]
+    fn shadowed_rebind_would_keep_counter_zero() {
+        let _g = GAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        gap_reset();
+
+        // 模拟修前:外层变量永远是 None,循环体末尾 re-bind 一个新变量
+        let outer: Option<std::time::Instant> = None;
+        for _ in 0..3 {
+            let _shadow = loop_gap_step(outer, true); // 每轮都从 None 起
+        }
+        assert_eq!(
+            gap_snapshot().1,
+            0,
+            "遮蔽写法下计数必须恒为 0(这正是修前的症状)"
+        );
+    }
+
+    /// 红线:诊断关闭时**不产生时间点**,也就不可能调用 `Instant::now()`。
+    #[test]
+    fn disabled_produces_no_timestamp() {
+        let _g = GAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        gap_reset();
+
+        let mut last: Option<std::time::Instant> = None;
+        for _ in 0..5 {
+            last = loop_gap_step(last, false);
+            assert!(last.is_none(), "关闭时不得保留时间点(零开销)");
+        }
+        assert_eq!(gap_snapshot().1, 0, "关闭时不得累加计数");
+        assert_eq!(gap_snapshot().0, 0, "关闭时不得累加纳秒");
+    }
+
+    /// 开启 → 关闭 → 重新开启 的迁移语义。
+    ///
+    /// 注意**关闭那一轮仍会累加一次**:统计发生在"读到 prev"之后、
+    /// 判定 enabled 之前 —— 只要手里有上一轮的结束时刻,那一段间隔就是
+    /// 真实发生过的。这与生产行为一致(诊断开关不会中途翻转,所以
+    /// 边界只在测试里可见)。
+    #[test]
+    fn toggle_off_stops_recording_new_stamps() {
+        let _g = GAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        gap_reset();
+
+        let mut last = loop_gap_step(None, true); // 开:得到 T1,首轮无 prev
+        assert!(last.is_some());
+        assert_eq!(gap_snapshot().1, 0);
+
+        last = loop_gap_step(last, true); // 开:观测到 T1 → 计数 1
+        assert_eq!(gap_snapshot().1, 1);
+
+        // 关:仍观测到上一轮 → 计数 2;但**不再产生新时间点**
+        last = loop_gap_step(last, false);
+        assert!(last.is_none(), "关闭后不得再有时间点");
+        assert_eq!(gap_snapshot().1, 2, "关闭轮仍会结算已发生的那段间隔");
+
+        // 之后保持关闭:无 prev,不再累加
+        last = loop_gap_step(last, false);
+        assert!(last.is_none());
+        assert_eq!(gap_snapshot().1, 2, "关闭态下不再累加");
+
+        // 重新开启:首轮无 prev,不累加
+        last = loop_gap_step(last, true);
+        assert!(last.is_some());
+        assert_eq!(gap_snapshot().1, 2, "重新开启的首轮没有 prev");
+        let last = loop_gap_step(last, true);
+        assert_eq!(gap_snapshot().1, 3, "之后恢复累加");
+        assert!(last.is_some());
+    }
+
+    /// PUMP_GAP 的打印条件:`LOOP_GAP_N > 0`。修前恒 0 故永不打印。
+    #[test]
+    fn pump_gap_print_gate_follows_counter() {
+        let _g = GAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        gap_reset();
+        assert_eq!(gap_snapshot().1, 0, "初始为 0 → dump 里 if gn > 0 不成立");
+
+        let mut last = loop_gap_step(None, true);
+        last = loop_gap_step(last, true);
+        last = loop_gap_step(last, true);
+        assert!(gap_snapshot().1 > 0, "有 prev 后计数 > 0 → PUMP_GAP 会打印");
+        assert!(last.is_some());
+    }
+
+    /// **端到端**:真实跑一次 `pump_down`,断言 `LOOP_GAP_N` 真的增长。
+    ///
+    /// 这条是唯一能抓到「调用点遮蔽」的测试:纯函数 `loop_gap_step` 本身
+    /// 没错,错在循环体末尾用 `let` 重新绑定、导致外层永远 `None`。
+    /// 把遮蔽改回去,纯函数测试**照样全绿**(实测过),只有本测试会红。
+    ///
+    /// 依赖 `RH_PUMP_STATS=1`(`enabled()` 是进程级 `OnceLock`,无法在
+    /// 测试内切换)。未开启时**跳过**并说明原因,而不是假绿。
+    #[tokio::test]
+    async fn pump_down_records_loop_gap_end_to_end() {
+        if !pump_diag::enabled() {
+            eprintln!(
+                "SKIP pump_down_records_loop_gap_end_to_end: 需要 RH_PUMP_STATS=1 \
+                 (enabled() 是进程级 OnceLock,测试内无法切换)"
+            );
+            return;
+        }
+        // 注意:本测试跨 await 运行,不能用 `std::sync::Mutex` 守全局计数
+        // (clippy await_holding_lock)。改用 tokio 的 async 锁。
+        let _g = GAP_ASYNC_LOCK.lock().await;
+        gap_reset();
+
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let client = wrap_stream_as_client(Box::new(a) as crate::BoxedIo, true, 100);
+        let server = wrap_stream_as_server(Box::new(b) as crate::BoxedIo, true, 100);
+
+        let mut out = client.open_stream().await.expect("open");
+        let mut inp = server.accept().await.expect("accept");
+        for _ in 0..8 {
+            tokio::io::AsyncWriteExt::write_all(&mut out, &[0xABu8; 4096])
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::flush(&mut out).await.unwrap();
+        }
+        tokio::io::AsyncWriteExt::shutdown(&mut out).await.unwrap();
+
+        let (mut b_read, b_write) = crate::mux::steal_mux_halves(&mut inp).expect("halves");
+        drop(b_write);
+        let mut sink: Vec<u8> = Vec::new();
+        let clean = pump_down(&mut sink, &mut b_read, &None).await;
+        assert!(clean, "干净 EOF");
+        assert_eq!(sink.len(), 8 * 4096, "数据必须完整搬运");
+
+        let (ns, n) = gap_snapshot();
+        assert!(
+            n > 0,
+            "LOOP_GAP_N 必须 > 0(修前是遮蔽导致恒 0);实际 n={n}"
+        );
+        assert!(ns > 0, "累计间隔应为正值,实际 {ns}");
+    }
 
     // R2(红线 2 锁):读块上限常量必须保持 64KiB。
     #[test]

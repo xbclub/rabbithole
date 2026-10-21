@@ -200,6 +200,92 @@ fn client_chunk_gate(use_compression_flag_clear: bool, relay_mode: &str) -> bool
     use_compression_flag_clear && relay_mode != "copy"
 }
 
+/// 中继一条「通道 ↔ 本地 IO」:能走零拷贝 mux chunk 快路径就走,否则回落
+/// copy(与 [`splice`] 等价)。
+///
+/// 这是 [`handle_start_forward`] 里那段快路径判定的**可复用外形**:
+/// * `peer` 是未包装 `RhMuxStream`、且 `relay_mode != "copy"` → 偷出双半,
+///   交 [`rh_transport::mux::mux_relay`] 按 `Bytes` 引用搬运;
+/// * 任何包装(压缩流 / `PrependedIo`)或 `steal` 失败 → 原样回落
+///   [`splice`]。压缩流不是 `RhMuxStream`,`is_mux_stream` 恒 false,
+///   所以这里**不需要**再单独判压缩位——判定与实现不脱钩。
+///
+/// 用于没有规则级联取消的 visitor 路径,故 `cancel` 恒 `None`。
+pub async fn relay_stream(peer: BoxedIo, local: BoxedIo, relay_mode: &str) {
+    if relay_mode != "copy" && rh_transport::mux::is_mux_stream(&peer) {
+        let mut p = peer;
+        if let Some((b_r, b_w)) = rh_transport::mux::steal_mux_halves(&mut p) {
+            drop(p); // 壳(halves 已偷出)
+            #[cfg(test)]
+            relay_path_probe::note(relay_path_probe::Path::Chunk);
+            rh_transport::mux::mux_relay(local, b_r, b_w, None, None).await;
+            return;
+        }
+        // steal 失败(理论不可达):壳仍完整,回落 copy
+        #[cfg(test)]
+        relay_path_probe::note(relay_path_probe::Path::Copy);
+        splice(p, local, None).await;
+        return;
+    }
+    #[cfg(test)]
+    relay_path_probe::note(relay_path_probe::Path::Copy);
+    splice(peer, local, None).await;
+}
+
+/// 测试用路径探针:让「走了 chunk 还是 copy」成为可断言的事实。
+///
+/// 必要性:`mux_relay` 与 `splice` 语义等价(双向搬运 + 半关闭),纯功能
+/// 测试**无法**区分两条路径——把快路径关掉测试照样全绿(实测过)。所以
+/// 验收必须直接锁路径,否则「改了但没生效」会静默通过。
+#[cfg(test)]
+pub(crate) mod relay_path_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Path {
+        Chunk,
+        Copy,
+    }
+
+    static CHUNK: AtomicUsize = AtomicUsize::new(0);
+    static COPY: AtomicUsize = AtomicUsize::new(0);
+    /// 串行化「基线 → 运行 → 断言」整个用例。
+    ///
+    /// 必须是 **async 锁**:同步 `MutexGuard` 跨 await 持有会阻塞整个 OS
+    /// 线程(clippy `await_holding_lock` 报错);而用「取基线即放锁」的短
+    /// 临界区,并行测试会在窗口内互相计数(实测 chunk=1/copy=2 交叉污染)。
+    pub static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    pub fn note(p: Path) {
+        match p {
+            Path::Chunk => CHUNK.fetch_add(1, Ordering::SeqCst),
+            Path::Copy => COPY.fetch_add(1, Ordering::SeqCst),
+        };
+    }
+
+    /// (chunk 次数, copy 次数)
+    pub fn snapshot() -> (usize, usize) {
+        (
+            CHUNK.load(Ordering::SeqCst),
+            COPY.load(Ordering::SeqCst),
+        )
+    }
+
+    /// 进入串行窗口:整个用例期间持有,结束随 guard drop 释放。
+    ///
+    /// 这是 async 锁,跨 await 持有是安全的(只是让其他用例如期等待),
+    /// 也正是它保证了「基线 → 运行 → 断言」期间没有别的用例计数。
+    pub async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().await
+    }
+
+    /// 相对基线的增量((chunk, copy))。调用方须已持有 `serial()` 窗口。
+    pub fn since(base: (usize, usize)) -> (usize, usize) {
+        let now = snapshot();
+        (now.0 - base.0, now.1 - base.1)
+    }
+}
+
 /// 装配客户端限速器:无桶(未配限速/非 Client 模式)返回 None,
 /// chunk/splice 快路径零热路径开销。
 fn mk_client_limiter(
@@ -233,17 +319,26 @@ pub async fn dial_target(
 /// 目标解析:IP 直返;自定义 DNS 走 blocking 线程;系统解析(getaddrinfo)
 /// 同样移出 async 线程池(DNS 不可达时每连接可阻塞 2s+,拖垮 runtime 调度)。
 pub async fn resolve(host: &str, port: u16) -> anyhow::Result<std::net::SocketAddr> {
+    // 红线:IP 直连快路径 —— 不查缓存、不解析、不进 spawn_blocking。
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(std::net::SocketAddr::new(ip, port));
     }
-    // 自定义 DNS(配置了 dns_server 时):直接向该服务器发 A/AAAA 查询
-    if let Some(ns) = crate::session::dns_server() {
-        if let Some(ip) = crate::dnsquery::query_spawn_blocking(host, &ns).await {
-            return Ok(std::net::SocketAddr::new(ip, port));
-        }
-    }
+    // 域名目标:TTL 缓存 + 并发去重(C9)。
+    //
+    // 修前每次调用都要走一趟 `spawn_blocking`(自定义 DNS 还要等最多 2s
+    // 超时),短连接场景下等于每请求一次。现在同 (host,port,dns_server)
+    // 在 TTL 内直接命中;并发请求合并为一次真实解析。
+    crate::dnsquery::resolve_cached(host, port, crate::session::dns_server())
+        .await
+        .ok_or_else(|| anyhow::anyhow!("resolve {host}:{port} failed"))
+}
+
+/// 系统解析(getaddrinfo),在 blocking 线程执行。
+///
+/// 抽出来供 `dnsquery::default_query` 复用,避免两处各写一份解析逻辑。
+pub async fn system_resolve(host: &str, port: u16) -> Option<std::net::SocketAddr> {
     let host_owned = host.to_string();
-    let resolved = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         use std::net::ToSocketAddrs;
         (host_owned.as_str(), port)
             .to_socket_addrs()
@@ -251,8 +346,8 @@ pub async fn resolve(host: &str, port: u16) -> anyhow::Result<std::net::SocketAd
             .and_then(|mut it| it.next())
     })
     .await
-    .map_err(|e| anyhow::anyhow!("resolve task: {e}"))?;
-    resolved.ok_or_else(|| anyhow::anyhow!("resolve {host}:{port} failed"))
+    .ok()
+    .flatten()
 }
 
 /// 错误路径收尾等待上限(final-gaps,与服务端 data.rs CANCEL_CLOSE_GRACE

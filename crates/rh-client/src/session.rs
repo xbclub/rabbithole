@@ -21,8 +21,13 @@ pub struct ClientSession {
     pub cfg: Arc<ClientConfig>,
     pub session_id: String,
     pub heartbeat_s: u32,
-    /// 控制写队列。
-    pub send_tx: mpsc::Sender<(FrameType, Vec<u8>)>,
+    /// 控制写队列:**已编码的完整帧**(含头),发送侧直接 `write_all`。
+    ///
+    /// 修前队列存 `(FrameType, Vec<u8>)`(仅 payload),run_loop 再调
+    /// `write_frame` → `encode_frame_bytes` 分配 `BytesMut` 并整包拷一遍。
+    /// 现在序列化与成帧都只做一次,队列元素即可直接下发的 `Bytes`
+    /// (引用计数移动,跨任务零拷贝)。
+    pub send_tx: mpsc::Sender<bytes::Bytes>,
     pub cancel: CancellationToken,
     // 实体表
     pub proxies: Mutex<HashMap<u64, ProxySpec>>,
@@ -31,8 +36,13 @@ pub struct ClientSession {
     pub visitor_cancels: Mutex<HashMap<u64, CancellationToken>>,
     /// 健康检查任务取消器。
     pub health_cancels: Mutex<HashMap<u64, CancellationToken>>,
-    /// stcp/xtcp 等待配对的本地连接:user_conn_id → (连接本体, visitor_id)。
-    pub waiting: Mutex<HashMap<u64, (tokio::net::TcpStream, u64)>>,
+    /// stcp/xtcp 等待配对的本地连接:user_conn_id → (连接本体, visitor_id, 登记时刻)。
+    ///
+    /// 第三个字段是**登记时刻**,TTL 淘汰由 [`ClientSession::waiting_sweeper`]
+    /// 的单一后台任务按它判定;修前是每连接 spawn 一个 `sleep(10s)` 任务,
+    /// 交付成功后无法 abort,只能空转到期后对已移除的 key 做一次无意义
+    /// remove(高并发下任务数随连接数增长)。
+    pub waiting: Mutex<HashMap<u64, WaitingEntry>>,
     /// XTCP 打洞成功后的直连多路复用:visitor_id → mux。
     pub punched: Mutex<HashMap<u64, Arc<rh_transport::Multiplexer>>>,
     /// 打洞事务保留 socket(候选与打洞同源;双端各自入队)。
@@ -45,6 +55,16 @@ pub struct ClientSession {
     pub mux: Arc<rh_transport::Multiplexer>,
     pub conn_counter: AtomicU64,
 }
+
+/// waiting 表条目:(本地连接, visitor_id, 登记时刻)。
+pub type WaitingEntry = (tokio::net::TcpStream, u64, std::time::Instant);
+
+/// waiting 表 TTL:语义不变(登记后 10s 未被配对即淘汰)。
+pub const WAITING_TTL: Duration = Duration::from_secs(10);
+
+/// TTL 清理扫描周期。取 1s:相对 10s TTL 足够细,单次扫描成本与条目数
+/// 线性且无锁等待之外的额外开销。
+const WAITING_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 在真实流之前回放一段残留字节(read_frame 缓冲丢失问题)。
 pub use rh_transport::PrependedIo;
@@ -68,13 +88,96 @@ pub fn frame_type_of_client(m: &ClientMessage) -> FrameType {
     }
 }
 
+/// 控制消息 → 完整帧字节(序列化 + 成帧各一次)。
+///
+/// 保留 [`frame::MAX_FRAME_LEN`] 校验,且**在成帧之前**判长度:超限载荷
+/// 编码出去就是一个腐化帧(长度字段被截断),对端会以 `TooLarge` 关掉
+/// 整条连接,不如本端直接拒绝。
+///
+/// 返回 `None` = 序列化失败或载荷超限(与修前 `unwrap_or_default()`
+/// 一样按"发不出去"处理,调用方拿到 `false`)。
+fn encode_control_frame(m: &ClientMessage) -> Option<bytes::Bytes> {
+    let ty = frame_type_of_client(m);
+    let payload = serde_json::to_vec(m).ok()?;
+    if payload.len() > frame::MAX_FRAME_LEN {
+        return None;
+    }
+    Some(frame::encode_frame_bytes(ty, &payload))
+}
+
 impl ClientSession {
-    pub async fn send_msg(&self, m: ClientMessage) -> bool {
-        let payload = serde_json::to_vec(&m).unwrap_or_default();
-        self.send_tx
-            .send((frame_type_of_client(&m), payload))
+    /// 登记一个等待配对的本地连接(带登记时刻,供 TTL 淘汰)。
+    pub async fn insert_waiting(&self, user_conn_id: u64, conn: tokio::net::TcpStream, visitor_id: u64) {
+        self.waiting.lock().await.insert(
+            user_conn_id,
+            (conn, visitor_id, std::time::Instant::now()),
+        );
+    }
+
+    /// 取出一个等待中的连接(配对成功时调用)。
+    pub async fn take_waiting(&self, user_conn_id: u64) -> Option<WaitingEntry> {
+        self.waiting.lock().await.remove(&user_conn_id)
+    }
+
+    /// 等待项所属 visitor(仅需读 visitor_id 时用,避免取走连接)。
+    pub async fn waiting_visitor(&self, user_conn_id: u64) -> Option<u64> {
+        self.waiting
+            .lock()
             .await
-            .is_ok()
+            .get(&user_conn_id)
+            .map(|(_, v, _)| *v)
+    }
+
+    /// 放回等待项(打洞回退重放路径):保留原登记时刻,不重置 TTL。
+    ///
+    /// 这是**语义选择**:回退属于同一次用户连接的生命周期,重置 TTL 会
+    /// 让它在打洞反复失败时无限续命,与修前的行为也不同(修前放回时
+    /// 已经过了若干秒,剩余 TTL 变短)。
+    pub async fn requeue_waiting(&self, user_conn_id: u64, entry: WaitingEntry) {
+        self.waiting.lock().await.insert(user_conn_id, entry);
+    }
+
+    /// 淘汰超过 TTL 的等待项,返回淘汰数量。
+    ///
+    /// 修前每个连接 spawn 一个 `sleep(10s)` 任务:交付成功后任务无法
+    /// abort,会活到 10s 才醒来对已移除的 key 做一次无意义 remove。
+    /// 改成单一后台任务周期扫描后,任务数与连接数无关。
+    pub async fn sweep_waiting(&self) -> usize {
+        let now = std::time::Instant::now();
+        let mut w = self.waiting.lock().await;
+        let before = w.len();
+        w.retain(|_, (_, _, at)| now.duration_since(*at) < WAITING_TTL);
+        before - w.len()
+    }
+
+    /// 启动 waiting 表的 TTL 清理任务,返回其句柄(供调用方在会话结束时 abort)。
+    ///
+    /// 单一后台任务,与连接数无关。每 [`WAITING_SWEEP_INTERVAL`] 扫描一次,
+    /// 淘汰登记超过 [`WAITING_TTL`] 的条目。
+    pub fn spawn_waiting_sweeper(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let sess = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(WAITING_SWEEP_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                // 会话结束(或连接被丢弃)时随之退出,不 leak
+                tokio::select! {
+                    _ = sess.cancel.cancelled() => return,
+                    _ = tick.tick() => {}
+                }
+                let evicted = sess.sweep_waiting().await;
+                if evicted > 0 {
+                    tracing::debug!(evicted, "waiting entries expired");
+                }
+            }
+        })
+    }
+
+    pub async fn send_msg(&self, m: ClientMessage) -> bool {
+        match encode_control_frame(&m) {
+            Some(bytes) => self.send_tx.send(bytes).await.is_ok(),
+            None => false,
+        }
     }
 
     pub async fn next_conn_id(&self) -> u64 {
@@ -96,8 +199,8 @@ async fn initial_k_for(cfg: &ClientConfig, protocol: rh_transport::Protocol) -> 
 
 /// [`initial_k_for`] 的异步实现(需要一次 RTT 探测)。
 ///
-/// RTT 探测只看 `server_addr`(与协议无关);探针失败时退回协议基线,
-/// 不阻断连接。
+/// RTT 探测只看 `server_addr` 与 `proxy_url`(与协议无关);探针失败时
+/// 退回协议基线,**不阻断连接**。
 pub(crate) async fn initial_k_for_async(
     cfg: &ClientConfig,
     protocol: rh_transport::Protocol,
@@ -107,10 +210,25 @@ pub(crate) async fn initial_k_for_async(
     let baseline = match cfg.mux_pool_size {
         // 显式配置最高优先:不再探测 RTT(用户已明确表态)。
         Some(_) => proto_baseline,
+        // 协议 gate **必须**在探测之前:quic/kcp 与非 multiplex 恒单载体,
+        // 探测结果会被调用方直接丢弃。修前 gate 在探测之后,这两类协议
+        // 照样白打一条 TCP(accept 完立刻断)。
+        //
+        // 这里直接返回 1(而非 proto_baseline):这两类场景下调用方的
+        // `if is_tcp_based() && multiplex { sized_k } else { 1 }` 会把值
+        // 压成 1,返回基线只会让本函数的输出与最终结果不一致(测试抓到过)。
+        None if !protocol.is_tcp_based() || !cfg.multiplex => 1,
         None => {
             let rtt_k = match cfg.server_addr.parse::<std::net::SocketAddr>() {
                 Ok(addr) => {
-                    rh_transport::auto_carriers(addr, std::time::Duration::from_secs(2)).await
+                    // 探针走与真实拨号相同的路径(含 proxy_url);
+                    // 结果按 (addr, proxy_url) 进程内缓存,重连复用。
+                    rh_transport::auto_carriers(
+                        addr,
+                        std::time::Duration::from_secs(2),
+                        cfg.proxy_url.clone(),
+                    )
+                    .await
                 }
                 // 地址是域名或非法:无法探测,退回保守基线。
                 Err(_) => proto_baseline,
@@ -679,7 +797,8 @@ pub async fn connect_and_run(
         "pool sizing"
     );
 
-    let (send_tx, send_rx) = mpsc::channel::<(FrameType, Vec<u8>)>(256);
+    // 256 容量不变(背压语义:满了 send_msg 会 await,不丢帧)
+    let (send_tx, send_rx) = mpsc::channel::<bytes::Bytes>(256);
     let sess = Arc::new(ClientSession {
         cfg: cfg.clone(),
         session_id: session_id.clone(),
@@ -699,8 +818,10 @@ pub async fn connect_and_run(
         conn_counter: AtomicU64::new(0),
     });
     let _ = shutdown.clone();
+    let sweeper = sess.spawn_waiting_sweeper();
     run_loop(sess.clone(), control, send_rx, shutdown).await;
     sess.cancel.cancel();
+    sweeper.abort();
     Ok(())
 }
 
@@ -731,7 +852,7 @@ pub fn hmac_hex(secret: &[u8], msg: &str) -> String {
 async fn run_loop(
     sess: Arc<ClientSession>,
     mut control: BoxedIo,
-    mut send_rx: mpsc::Receiver<(FrameType, Vec<u8>)>,
+    mut send_rx: mpsc::Receiver<bytes::Bytes>,
     shutdown: CancellationToken,
 ) {
     let mut buf = bytes::BytesMut::with_capacity(4096);
@@ -764,8 +885,11 @@ async fn run_loop(
             }
             out = send_rx.recv() => {
                 match out {
-                    Some((ty, payload)) => {
-                        if frame::write_frame(&mut control, ty, &payload).await.is_err() {
+                    // 帧已在 send_msg 里编码好:这里只有一次 write_all,
+                    // 不再分配、不再拷贝 payload。
+                    Some(bytes) => {
+                        use tokio::io::AsyncWriteExt as _;
+                        if control.write_all(&bytes).await.is_err() {
                             break;
                         }
                     }
@@ -941,9 +1065,11 @@ async fn apply_sync(
                 _ => stop_proxy(sess, id).await,
             }
         }
-        let existing: Vec<u64> = cur.keys().copied().collect();
+        // 直接查 `cur` 本身(此刻它刚被重填完,语义与「先收集 existing
+        // 再 contains」完全等价)。修前先 `keys().collect()` 成 Vec 再
+        // `Vec::contains` 线性扫描,规则数 N 时全量同步是 O(N²)。
         for (id, spec) in &new_proxies {
-            if existing.contains(id) {
+            if cur.contains_key(id) {
                 continue;
             }
             let mut spec = spec.clone();
@@ -964,9 +1090,9 @@ async fn apply_sync(
                 _ => stop_visitor(sess, id).await,
             }
         }
-        let existing: Vec<u64> = cur.keys().copied().collect();
+        // 同上:直接查 `cur`,去掉 O(N²) 的 Vec + contains。
         for (id, spec) in &new_visitors {
-            if existing.contains(id) {
+            if cur.contains_key(id) {
                 continue;
             }
             let spec = spec.clone();
@@ -1140,6 +1266,114 @@ mod sizing_tests {
         assert!(drops.is_empty(), "K=4 <= 服务端 8,无成员可摘");
         let (capped, _) = plan_convergence(4, &[2]);
         assert_eq!(capped, 2, "服务端只允许 2 时收敛到 2");
+    }
+
+    // ---- RTT 探针的协议 gate(round-78)-------------------------------
+    //
+    // 修前 gate 在探测**之后**:quic/kcp 与非 multiplex 也会白打一条 TCP
+    // (accept 完立刻断),探测结果随后被丢弃。现在 gate 提到探测之前。
+    //
+    // 用 rh-transport 的探针计数断言「一次都没有探测」——纯功能断言
+    // (K 等于 1)在修前也成立,区分不了两条路径。
+
+    static K_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// 非 tcp_based 协议(quic/kcp)不得触发探测。
+    #[tokio::test]
+    async fn non_tcp_protocol_skips_probe() {
+        let _g = K_LOCK.lock().await;
+        rh_transport::probe_cache_clear();
+        let before = rh_transport::probe_call_count();
+        for p in [rh_transport::Protocol::Quic, rh_transport::Protocol::Kcp] {
+            let cfg = ClientConfig {
+                server_addr: "203.0.113.9:7000".into(),
+                ..ClientConfig::default()
+            };
+            let (k, _hw) = initial_k_for_async(&cfg, p, 8).await;
+            assert_eq!(k, 1, "{p:?} 必须单载体");
+        }
+        assert_eq!(
+            rh_transport::probe_call_count(),
+            before,
+            "quic/kcp 不得触发 RTT 探测"
+        );
+    }
+
+    /// multiplex=false 的 tcp 同样不探测(恒单载体)。
+    #[tokio::test]
+    async fn non_multiplex_skips_probe() {
+        let _g = K_LOCK.lock().await;
+        rh_transport::probe_cache_clear();
+        let before = rh_transport::probe_call_count();
+        let cfg = ClientConfig {
+            server_addr: "203.0.113.9:7000".into(),
+            multiplex: false,
+            ..ClientConfig::default()
+        };
+        let (k, _hw) = initial_k_for_async(&cfg, rh_transport::Protocol::Tcp, 8).await;
+        assert_eq!(k, 1, "multiplex=false 必须单载体");
+        assert_eq!(
+            rh_transport::probe_call_count(),
+            before,
+            "multiplex=false 不得触发 RTT 探测"
+        );
+    }
+
+    /// 红线:显式 mux_pool_size 最高优先,且**不探测**。
+    #[tokio::test]
+    async fn explicit_pool_size_skips_probe() {
+        let _g = K_LOCK.lock().await;
+        rh_transport::probe_cache_clear();
+        let before = rh_transport::probe_call_count();
+        let cfg = ClientConfig {
+            server_addr: "203.0.113.9:7000".into(),
+            mux_pool_size: Some(3),
+            ..ClientConfig::default()
+        };
+        let (k, hw) = initial_k_for_async(&cfg, rh_transport::Protocol::Tcp, 8).await;
+        assert_eq!(k, 3, "显式值必须原样生效");
+        assert_eq!(hw, 8);
+        assert_eq!(
+            rh_transport::probe_call_count(),
+            before,
+            "显式配置不得触发 RTT 探测"
+        );
+    }
+
+    /// tcp + multiplex + 无显式配置:确实会探测一次(反面证据)。
+    #[tokio::test]
+    async fn tcp_multiplex_does_probe() {
+        let _g = K_LOCK.lock().await;
+        rh_transport::probe_cache_clear();
+        let before = rh_transport::probe_call_count();
+        // 不可达地址:探针会失败,但**必须发生一次尝试**
+        let cfg = ClientConfig {
+            server_addr: "203.0.113.9:7000".into(),
+            ..ClientConfig::default()
+        };
+        let (k, _hw) = initial_k_for_async(&cfg, rh_transport::Protocol::Tcp, 8).await;
+        // 探测失败 → 1;再与协议基线(2)取 max → 2
+        assert_eq!(k, 2, "失败退回 1 后与 tcp 基线 2 取 max");
+        assert_eq!(
+            rh_transport::probe_call_count(),
+            before + 1,
+            "tcp+multiplex 必须探测一次"
+        );
+    }
+
+    /// 探针失败不得阻断连接:返回可用的 K,不 panic、不上抛错误。
+    #[tokio::test]
+    async fn probe_failure_does_not_block() {
+        let _g = K_LOCK.lock().await;
+        rh_transport::probe_cache_clear();
+        let cfg = ClientConfig {
+            server_addr: "203.0.113.9:7000".into(),
+            ..ClientConfig::default()
+        };
+        // 2s 超时下不可达地址会失败;函数必须正常返回
+        let (k, hw) = initial_k_for_async(&cfg, rh_transport::Protocol::Tcp, 8).await;
+        assert!((1..=8).contains(&k), "K 必须在合法区间,实际 {k}");
+        assert_eq!(hw, 8);
     }
 
     // 硬件上限仍能压住显式请求:1 核机器上必须退化为单载体。
@@ -1609,5 +1843,571 @@ mod cert_binding_tests {
         let sealed = seal(SECRET, cert);
         let e = compare_announced_cert(b"wrong-local-secret", &sealed, cert).unwrap_err();
         assert!(e.to_string().contains("无法解密"), "实际: {e}");
+    }
+}
+
+#[cfg(test)]
+mod control_frame_tests {
+    use super::*;
+    use rh_protocol::message::{HealthReport, NatHoleReport, Ping, UserConnect};
+
+    /// 用真实的 `read_frame` 解一段字节,返回 (FrameType, payload)。
+    async fn decode(bytes: &[u8]) -> (FrameType, bytes::Bytes) {
+        let mut cur = std::io::Cursor::new(bytes.to_vec());
+        let mut buf = bytes::BytesMut::new();
+        rh_protocol::frame::read_frame(&mut cur, &mut buf)
+            .await
+            .expect("对端必须能解出该帧")
+    }
+
+    /// 回归:控制帧形状零变更 —— 与修前「先 to_vec 再 write_frame」的
+    /// 字节完全一致(逐字节比对),且能被 read_frame 正确解出。
+    #[tokio::test]
+    async fn control_frame_bytes_identical_to_legacy_path() {
+        let msgs = vec![
+            ClientMessage::Ping(Ping { ts_ms: 1_700_000_000_123, probe: false }),
+            ClientMessage::UserConnect(UserConnect {
+                visitor_id: 42,
+                user_conn_id: 7,
+                src_addr: "203.0.113.5:54321".into(),
+                udp: false,
+            }),
+            ClientMessage::HealthReport(HealthReport {
+                proxy_id: 9,
+                healthy: true,
+                reason: String::new(),
+            }),
+            ClientMessage::NatHoleReport(NatHoleReport {
+                transaction_id: "tx-abc".into(),
+                candidates: vec!["198.51.100.7:7000".into()],
+                nat_behavior: "endpoint-independent".into(),
+            }),
+        ];
+        for m in msgs {
+            let ty = frame_type_of_client(&m);
+            let payload = serde_json::to_vec(&m).unwrap();
+
+            // 修前路径:write_frame 内部 encode_frame_bytes
+            let mut legacy = Vec::new();
+            rh_protocol::frame::write_frame(&mut legacy, ty, &payload)
+                .await
+                .unwrap();
+
+            // 修后路径
+            let now = encode_control_frame(&m).expect("必须编码成功");
+
+            assert_eq!(
+                now.as_ref(),
+                legacy.as_slice(),
+                "{ty:?} 的帧字节与修前不一致(线格式被改动)"
+            );
+
+            // 对端可解,且 FrameType 与 payload 语义不变
+            let (got_ty, got_payload) = decode(&now).await;
+            assert_eq!(got_ty, ty, "FrameType 映射被改动");
+            assert_eq!(
+                got_payload.as_ref(),
+                payload.as_slice(),
+                "payload 字节被改动"
+            );
+        }
+    }
+
+    /// 每种 ClientMessage 变体都映射到预期的 FrameType(红线:映射不变)。
+    #[test]
+    fn frame_type_mapping_unchanged() {
+        use rh_protocol::message::{ApplyResult, DataChannelHello, Hello};
+        let cases: Vec<(ClientMessage, FrameType)> = vec![
+            (
+                ClientMessage::Hello(Hello {
+                    client_id: "c".into(),
+                    version: "1".into(),
+                    hostname: String::new(),
+                    os: String::new(),
+                    arch: String::new(),
+                    capabilities: vec![],
+                    session_id: None,
+                    attach_auth: None,
+                }),
+                FrameType::HELLO,
+            ),
+            (ClientMessage::Ping(Ping { ts_ms: 0, probe: false }), FrameType::PING),
+            (
+                ClientMessage::SyncRequest {},
+                FrameType::SYNC_REQUEST,
+            ),
+            (
+                ClientMessage::DataChannelHello(DataChannelHello {
+                    session_id: "s".into(),
+                    request_id: 1,
+                }),
+                FrameType::DATA_CHANNEL_HELLO,
+            ),
+            (
+                ClientMessage::ApplyResult(ApplyResult {
+                    revision: 1,
+                    ok: true,
+                    error: None,
+                }),
+                FrameType::APPLY_RESULT,
+            ),
+        ];
+        for (m, want) in cases {
+            assert_eq!(frame_type_of_client(&m), want, "FrameType 映射被改动");
+        }
+    }
+
+    /// 红线:超限载荷必须被拒绝,**不得**编码出一个腐化帧。
+    #[test]
+    fn oversized_payload_is_rejected() {
+        // 构造一条 payload 明确超过 MAX_FRAME_LEN 的消息:UserConnect 的
+        // src_addr 是可变长字符串,直接塞满。
+        let huge = "x".repeat(rh_protocol::frame::MAX_FRAME_LEN + 1);
+        let m = ClientMessage::UserConnect(UserConnect {
+            visitor_id: 1,
+            user_conn_id: 2,
+            src_addr: huge,
+            udp: false,
+        });
+        assert!(
+            encode_control_frame(&m).is_none(),
+            "超限载荷必须被拒绝(否则对端会以 TooLarge 关连接)"
+        );
+    }
+
+    /// 边界:恰好 MAX_FRAME_LEN 的载荷必须放行。
+    #[test]
+    fn payload_at_limit_is_accepted() {
+        // 先算出一条消息的固定开销,再补齐到恰好 MAX_FRAME_LEN。
+        let probe = ClientMessage::UserConnect(UserConnect {
+            visitor_id: 1,
+            user_conn_id: 2,
+            src_addr: String::new(),
+            udp: false,
+        });
+        let base = serde_json::to_vec(&probe).unwrap().len();
+        let fill = rh_protocol::frame::MAX_FRAME_LEN - base;
+        let m = ClientMessage::UserConnect(UserConnect {
+            visitor_id: 1,
+            user_conn_id: 2,
+            src_addr: "x".repeat(fill),
+            udp: false,
+        });
+        let payload_len = serde_json::to_vec(&m).unwrap().len();
+        assert_eq!(payload_len, rh_protocol::frame::MAX_FRAME_LEN);
+        assert!(
+            encode_control_frame(&m).is_some(),
+            "恰为上限的载荷必须放行"
+        );
+    }
+
+    /// 计数探针:每消息只编码一次(`encode_frame_bytes` 恰好被调用 1 次)。
+    ///
+    /// 修前的路径是「to_vec → 队列 → write_frame 内再 encode 一次」,即
+    /// 同一消息会经历一次序列化 + 一次成帧拷贝;这里锁住「成帧只做一次」。
+    #[tokio::test]
+    async fn each_message_is_framed_exactly_once() {
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(256);
+        let sess = Arc::new(ClientSession {
+            cfg: Arc::new(ClientConfig::default()),
+            session_id: "s".into(),
+            heartbeat_s: 30,
+            send_tx: tx,
+            cancel: CancellationToken::new(),
+            proxies: Mutex::new(HashMap::new()),
+            visitors: Mutex::new(HashMap::new()),
+            visitor_cancels: Mutex::new(HashMap::new()),
+            health_cancels: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            punched: Mutex::new(HashMap::new()),
+            nat_socks: Mutex::new(HashMap::new()),
+            punched_auth: Mutex::new(HashMap::new()),
+            sudp_deliver: Mutex::new(HashMap::new()),
+            mux: rh_transport::mux::wrap_stream_as_client(
+                Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
+                true,
+                100,
+            ),
+            conn_counter: AtomicU64::new(0),
+        });
+
+        let m = ClientMessage::Ping(Ping { ts_ms: 99, probe: false });
+        assert!(sess.send_msg(m.clone()).await);
+        let got = rx.recv().await.expect("队列里必须有一帧");
+
+        // 队列元素**就是完整帧**:长度 = 头 + payload,且能被 read_frame 解出
+        let payload = serde_json::to_vec(&m).unwrap();
+        assert_eq!(
+            got.len(),
+            rh_protocol::frame::HEADER_LEN + payload.len(),
+            "队列元素必须已是完整帧(头 + payload),否则下行还要再成帧一次"
+        );
+        let (ty, body) = decode(&got).await;
+        assert_eq!(ty, frame_type_of_client(&m));
+        assert_eq!(body.as_ref(), payload.as_slice());
+
+        // run_loop 侧只做 write_all:用一个 Vec 承接,字节必须与原帧完全一致
+        let mut sink: Vec<u8> = Vec::new();
+        use tokio::io::AsyncWriteExt as _;
+        sink.write_all(&got).await.unwrap();
+        assert_eq!(sink, got.to_vec(), "write_all 不得改动帧字节");
+    }
+
+    /// 背压语义:队列容量 256,塞满 256 帧后第 257 次 send 必须 await
+    /// (而不是丢弃或扩容)。
+    #[tokio::test]
+    async fn queue_capacity_preserves_backpressure() {
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(256);
+        // 256 条应能立即入队
+        for i in 0..256 {
+            tx.send(bytes::Bytes::from(vec![i as u8]))
+                .await
+                .expect("容量 256 内必须能入队");
+        }
+        // 第 257 条:通道满 → 必须 pending
+        let extra = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            tx.send(bytes::Bytes::from_static(b"257")),
+        )
+        .await;
+        assert!(extra.is_err(), "队满时 send 必须 await(背压语义),不得静默丢弃");
+
+        // 消费一条后应恢复可写
+        let _ = rx.recv().await;
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            tx.send(bytes::Bytes::from_static(b"257")),
+        )
+        .await;
+        assert!(ok.is_ok(), "消费后必须能继续入队");
+    }
+
+    /// 序列化失败可选地返回 false(不 panic)。这里只验"不发出去"的语义:
+    /// 用超限消息走 send_msg 路径,必须返回 false 且队列为空。
+    #[tokio::test]
+    async fn send_msg_returns_false_on_oversized() {
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(256);
+        let sess = Arc::new(ClientSession {
+            cfg: Arc::new(ClientConfig::default()),
+            session_id: "s".into(),
+            heartbeat_s: 30,
+            send_tx: tx,
+            cancel: CancellationToken::new(),
+            proxies: Mutex::new(HashMap::new()),
+            visitors: Mutex::new(HashMap::new()),
+            visitor_cancels: Mutex::new(HashMap::new()),
+            health_cancels: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            punched: Mutex::new(HashMap::new()),
+            nat_socks: Mutex::new(HashMap::new()),
+            punched_auth: Mutex::new(HashMap::new()),
+            sudp_deliver: Mutex::new(HashMap::new()),
+            mux: rh_transport::mux::wrap_stream_as_client(
+                Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
+                true,
+                100,
+            ),
+            conn_counter: AtomicU64::new(0),
+        });
+        let huge = "x".repeat(rh_protocol::frame::MAX_FRAME_LEN + 1);
+        let m = ClientMessage::UserConnect(UserConnect {
+            visitor_id: 1,
+            user_conn_id: 2,
+            src_addr: huge,
+            udp: false,
+        });
+        assert!(!sess.send_msg(m).await, "超限消息必须返回 false");
+        assert!(
+            rx.try_recv().is_err(),
+            "超限消息不得进入队列(否则会发出腐化帧)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod waiting_ttl_tests {
+    use super::*;
+
+    /// 测试用会话(只需 waiting 表与 cancel 可用)。
+    async fn test_session() -> (Arc<ClientSession>, mpsc::Receiver<bytes::Bytes>) {
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(256);
+        let sess = Arc::new(ClientSession {
+            cfg: Arc::new(ClientConfig::default()),
+            session_id: "s".into(),
+            heartbeat_s: 30,
+            send_tx: tx,
+            cancel: CancellationToken::new(),
+            proxies: Mutex::new(HashMap::new()),
+            visitors: Mutex::new(HashMap::new()),
+            visitor_cancels: Mutex::new(HashMap::new()),
+            health_cancels: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            punched: Mutex::new(HashMap::new()),
+            nat_socks: Mutex::new(HashMap::new()),
+            punched_auth: Mutex::new(HashMap::new()),
+            sudp_deliver: Mutex::new(HashMap::new()),
+            mux: rh_transport::mux::wrap_stream_as_client(
+                Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
+                true,
+                100,
+            ),
+            conn_counter: AtomicU64::new(0),
+        });
+        (sess, rx)
+    }
+
+    /// 造一条真实的本地 TCP 连接对(登记进 waiting 表需要真 TcpStream)。
+    async fn tcp_conn() -> tokio::net::TcpStream {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        let c = tokio::net::TcpStream::connect(a).await.unwrap();
+        // listener 侧立即接受并丢弃,避免 accept 队列堆积
+        tokio::spawn(async move {
+            let _ = l.accept().await;
+        });
+        c
+    }
+
+    /// 验收:1000 个 waiting 条目、1s 内全部交付,结束后表为空。
+    ///
+    /// 「交付」= `take_waiting`(与 deliver_relay 成功路径同语义)。修前
+    /// 每条会额外 spawn 一个 sleep 任务,交付后仍活到 10s;现在没有
+    /// 每连接任务,交付即出表。
+    #[tokio::test]
+    async fn thousand_entries_delivered_within_1s_no_residual_tasks() {
+        let (sess, _rx) = test_session().await;
+        const N: u64 = 1000;
+
+        for id in 0..N {
+            let c = tcp_conn().await;
+            sess.insert_waiting(id, c, 1).await;
+        }
+        assert_eq!(sess.waiting.lock().await.len() as u64, N, "1000 条必须全部登记");
+
+        // 1s 内全部交付
+        let t0 = std::time::Instant::now();
+        for id in 0..N {
+            let got = sess.take_waiting(id).await;
+            assert!(got.is_some(), "条目 {id} 必须可交付");
+        }
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "1000 条交付耗时 {elapsed:?},超过 1s"
+        );
+
+        assert!(
+            sess.waiting.lock().await.is_empty(),
+            "全部交付后表必须为空"
+        );
+
+        // 没有残留的每连接任务:交付后再 sweep 一轮,不应有可淘汰项
+        assert_eq!(sess.sweep_waiting().await, 0, "交付后不得有残留条目");
+
+        // 修前的 1000 个 sleep 任务此时仍会存活:用一个可观测的替代证明
+        // —— 登记→交付全程没有 spawn 任何任务(见 spawn_waiting_sweeper 的
+        // 单一任务设计);这里断言 tokio 运行时未因本测试产生额外常驻任务
+        // 不现实,故以「表为空 + 无淘汰项」作为结构性证据。
+    }
+
+    /// **红线**:TTL 的绝对值必须是 10s —— 用字面量断言,不引用常量本身。
+    ///
+    /// 引用 `WAITING_TTL` 的测试是自证循环:把常量改成 1s,断言跟着改
+    /// 就永远绿(实测过:第一版正是如此,负向验证抓不到)。
+    #[test]
+    fn ttl_is_exactly_ten_seconds() {
+        assert_eq!(
+            WAITING_TTL,
+            Duration::from_secs(10),
+            "waiting 表 TTL 语义是 10s,不得改动"
+        );
+    }
+
+    /// 扫描周期应显著小于 TTL(否则过期条目会滞留一个周期量级)。
+    #[test]
+    fn sweep_interval_shorter_than_ttl() {
+        assert!(
+            WAITING_SWEEP_INTERVAL < WAITING_TTL / 2,
+            "扫描周期必须明显小于 TTL"
+        );
+    }
+
+    /// TTL 边界:9s 的保留、11s 的淘汰(用**字面量**秒数,不引用常量)。
+    #[tokio::test]
+    async fn sweep_evicts_only_expired() {
+        let (sess, _rx) = test_session().await;
+        // 一条「已超 10s」的条目
+        let c = tcp_conn().await;
+        sess.insert_waiting(1, c, 7).await;
+        {
+            let mut w = sess.waiting.lock().await;
+            if let Some((_, _, at)) = w.get_mut(&1) {
+                *at = std::time::Instant::now() - Duration::from_secs(11);
+            }
+        }
+        // 一条「9s 前登记」的条目(未过期)
+        let c2 = tcp_conn().await;
+        sess.insert_waiting(2, c2, 7).await;
+        {
+            let mut w = sess.waiting.lock().await;
+            if let Some((_, _, at)) = w.get_mut(&2) {
+                *at = std::time::Instant::now() - Duration::from_secs(9);
+            }
+        }
+
+        let evicted = sess.sweep_waiting().await;
+        assert_eq!(evicted, 1, "只应淘汰超过 10s 的那一条");
+        let w = sess.waiting.lock().await;
+        assert!(!w.contains_key(&1), "11s 前的条目必须被淘汰");
+        assert!(w.contains_key(&2), "9s 前的条目必须保留");
+    }
+
+    /// 红线:配对顺序与 user_conn_id 生成不变。
+    #[tokio::test]
+    async fn user_conn_id_is_monotonic_and_order_preserved() {
+        let (sess, _rx) = test_session().await;
+        let a = sess.next_conn_id().await;
+        let b = sess.next_conn_id().await;
+        let c = sess.next_conn_id().await;
+        assert_eq!((a, b, c), (1, 2, 3), "user_conn_id 必须从 1 起严格递增");
+    }
+
+    /// 回退重放不重置 TTL:requeue 保留原登记时刻。
+    #[tokio::test]
+    async fn requeue_keeps_original_timestamp() {
+        let (sess, _rx) = test_session().await;
+        let c = tcp_conn().await;
+        sess.insert_waiting(1, c, 5).await;
+
+        let entry = sess.take_waiting(1).await.expect("必须先能取出");
+        let at = entry.2;
+        // 模拟耗时 3s 后回退
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        sess.requeue_waiting(1, entry).await;
+
+        let w = sess.waiting.lock().await;
+        let now_at = w.get(&1).unwrap().2;
+        assert_eq!(now_at, at, "回退放回必须保留原登记时刻,不得续命");
+    }
+
+    /// 会话结束时 sweeper 必须退出(不 leak)。
+    #[tokio::test]
+    async fn sweeper_exits_on_cancel() {
+        let (sess, _rx) = test_session().await;
+        let h = sess.spawn_waiting_sweeper();
+        // 触发会话取消
+        sess.cancel.cancel();
+        // sweeper 应在下一轮 select 立即返回
+        let joined = tokio::time::timeout(Duration::from_secs(2), h).await;
+        assert!(joined.is_ok(), "取消后 sweeper 必须退出,不得 leak");
+    }
+
+    /// sweeper 确实会淘汰过期项(端到端跑一次真实 tick)。
+    #[tokio::test]
+    async fn sweeper_evicts_expired_entry() {
+        let (sess, _rx) = test_session().await;
+        let c = tcp_conn().await;
+        sess.insert_waiting(1, c, 3).await;
+        // 把登记时刻拨到过期
+        {
+            let mut w = sess.waiting.lock().await;
+            if let Some((_, _, at)) = w.get_mut(&1) {
+                *at = std::time::Instant::now() - Duration::from_secs(11);
+            }
+        }
+        let h = sess.spawn_waiting_sweeper();
+        // 扫描周期 1s,留 3s 余量
+        let mut evicted = false;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if sess.waiting.lock().await.is_empty() {
+                evicted = true;
+                break;
+            }
+        }
+        assert!(evicted, "过期条目必须被 sweeper 淘汰");
+        sess.cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+    }
+}
+
+#[cfg(test)]
+mod apply_sync_bench {
+    use std::time::Instant;
+
+    /// 500 条规则全量同步里「判存在」这一步的耗时(改前 O(N²) vs 改后 O(N))。
+    ///
+    /// 隔离掉 `stop_proxy`/`start_health` 等真实副作用,只测两种判存在
+    /// 写法的差距。用 `u64` 键的 HashMap(与 `proxies`/`visitors` 同形),
+    /// 值类型不影响哈希查找成本。
+    #[test]
+    fn contains_key_vs_vec_contains_at_500() {
+        const N: u64 = 500;
+
+        let build = || {
+            let mut cur: std::collections::HashMap<u64, ()> = std::collections::HashMap::new();
+            for id in 0..N {
+                cur.insert(id, ());
+            }
+            let mut new: std::collections::HashMap<u64, ()> = std::collections::HashMap::new();
+            for id in 0..N {
+                new.insert(id, ());
+            }
+            (cur, new)
+        };
+
+        // 改前:先 collect 成 Vec 再线性 contains
+        let old_style = |cur: &std::collections::HashMap<u64, ()>,
+                         new: &std::collections::HashMap<u64, ()>| {
+            let existing: Vec<u64> = cur.keys().copied().collect();
+            let mut hits = 0usize;
+            for id in new.keys() {
+                if existing.contains(id) {
+                    hits += 1;
+                }
+            }
+            hits
+        };
+        // 改后:直接哈希查
+        let new_style = |cur: &std::collections::HashMap<u64, ()>,
+                         new: &std::collections::HashMap<u64, ()>| {
+            let mut hits = 0usize;
+            for id in new.keys() {
+                if cur.contains_key(id) {
+                    hits += 1;
+                }
+            }
+            hits
+        };
+
+        let (cur, new) = build();
+        assert_eq!(old_style(&cur, &new), N as usize);
+        assert_eq!(new_style(&cur, &new), N as usize, "两种写法语义必须一致");
+
+        let rounds = 200usize;
+        let mut t_old = Vec::with_capacity(rounds);
+        let mut t_new = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let (cur, new) = build();
+            let t = Instant::now();
+            std::hint::black_box(old_style(&cur, &new));
+            t_old.push(t.elapsed());
+
+            let t = Instant::now();
+            std::hint::black_box(new_style(&cur, &new));
+            t_new.push(t.elapsed());
+        }
+        t_old.sort();
+        t_new.sort();
+        let med_old = t_old[rounds / 2];
+        let med_new = t_new[rounds / 2];
+        println!(
+            "BENCH apply_sync N={N}: vec_contains med={:?}  hash_contains_key med={:?}  ratio={:.1}x",
+            med_old,
+            med_new,
+            med_old.as_secs_f64() / med_new.as_secs_f64().max(1e-12)
+        );
+        // 只作记录,不做阈值断言(CI 机器噪声大);断言仅防"改后明显更慢"
+        assert!(med_new <= med_old * 2, "改后不应比改前慢(允许噪声)");
     }
 }

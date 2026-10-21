@@ -339,16 +339,26 @@ certprov HKDF 绑定;ratelimit 单调时钟与取消安全;kcp `get_conv` 前置
 | C6 | ✅ | 登录 argon2 校验(含 dummy hash)全部 `spawn_blocking` |
 | C7 | ✅ | 登录限速两级:每 IP 30/min + 每 IP+用户名 5/min |
 | C8 | ✅ | 插件拨号改走 `forward::resolve`(异步)+ 10s connect 超时 |
-| C9 | ⚠️ 部分 | 自定义 DNS 已走 `spawn_blocking`;TTL 缓存/singleflight 未做(短连接压测未暴露瓶颈,留作后续) |
+| C9 | ✅ | TTL 缓存(正 30s / 负 5s,`RH_DNS_TTL_SECS` 可覆盖,上限 4096 淘汰最旧)+ singleflight 并发去重;键含 host/port/dns_server。域名目标 vhost 短连接 QPS +51%(3483→5254 med),见 `docs/dns-cache-c9.md` |
 | C10 | ✅ | visitor 用户侧 accept 补 `set_nodelay(true)` |
 
 ### 未纳入本轮(明确记录,不假装完成)
 
 - **B10 多载体降级单载体**:需先在三机确认"逐载体比对"在 K>1 时确实全部通过,
   再决定是否需要降级兜底。
-- **C9 DNS TTL 缓存/singleflight**:当前每次解析都走 blocking 池,不阻塞 worker;
-  缓存收益需先有短连接压测数据支撑。
-- **批次四 P3 择要**:未在本轮实施(小改动、清理类,不影响吞吐与正确性)。
+- ~~**C9 DNS TTL 缓存/singleflight**~~:**已完成**(2026-10-21)。域名目标短连接
+  实测 QPS 3483→5254(med,+50.8%),见 `docs/dns-cache-c9.md`。
+- **批次四 P3 择要**:除下一项外未在本轮实施(小改动、清理类,不影响吞吐与正确性)。
+
+### 补充落地(2026-10-21,round-49)
+
+- **批次四 `compress 泵缓冲/Decoder 复用`(compress.rs:52/112)已做**。
+  压/解两侧缓冲与 `Decoder` 全部提到 loop 外复用,snappy 直写 `BytesMut`
+  spare 区去掉 comp→wire 的整块拷贝,varint 由逐字节 `read_exact` 改为
+  单次 `read` 解析。同口径实测:33 块时压侧分配 68→3、解侧 69→2;1MiB
+  链路本机 CPU 时间降 10%~43%(随数据可压缩性)。线格式与
+  `MAX_DECOMPRESSED_CHUNK` 校验不变。详见
+  `docs/compress-pump-fixed-cost.md`。
 
 ### 性能验证(2026-10-20 三机,Go loadgen)
 

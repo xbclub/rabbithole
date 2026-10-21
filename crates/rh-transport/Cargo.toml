@@ -40,3 +40,7 @@ libc = "0.2"
 # kcp 回归测试用 start_paused(可控时钟)
 tokio = { workspace = true, features = ["test-util"] }
 
+# compress_bench 例子的 RSS 探针(仅诊断,不进产品路径)
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+

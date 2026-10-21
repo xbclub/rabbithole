@@ -563,6 +563,44 @@ pub fn carriers_for_rtt(rtt: std::time::Duration) -> usize {
     }
 }
 
+/// 探针用的拨号时钟前缀:让 `probe_rtt` 与真实拨号走**同一条路径**。
+///
+/// 真实拨号在 [`tcp::dial_tcp`] 里按 `cfg.proxy_url` 决定直连还是经代理;
+/// 探针若总是直连,走代理的部署会恒失败 → 自适应静默失效,还白等一个
+/// 超时。这里把「拨号函数」抽成可替换的,探针与真实拨号共用同一实现。
+pub type DialFn = fn(
+    SocketAddr,
+    Option<String>,
+) -> futures::future::BoxFuture<'static, std::io::Result<tokio::net::TcpStream>>;
+
+fn dial_fn() -> DialFn {
+    DIAL.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(default_dial)
+}
+
+static DIAL: std::sync::Mutex<Option<DialFn>> = std::sync::Mutex::new(None);
+
+/// 默认拨号:与 [`tcp::dial_tcp`] 同语义(有 `proxy_url` 走代理)。
+fn default_dial(
+    addr: SocketAddr,
+    proxy_url: Option<String>,
+) -> futures::future::BoxFuture<'static, std::io::Result<tokio::net::TcpStream>> {
+    Box::pin(async move {
+        match proxy_url {
+            Some(url) => {
+                let proxy = crate::proxy_dial::ProxyUrl::parse(&url)?;
+                crate::proxy_dial::dial_via_proxy(&proxy, addr).await
+            }
+            None => tokio::net::TcpStream::connect(addr).await,
+        }
+    })
+}
+
+/// **仅测试**:替换探针的拨号函数(用于计数与注入失败)。
+#[cfg(test)]
+pub fn probe_set_dial(f: Option<DialFn>) {
+    *DIAL.lock().unwrap_or_else(|e| e.into_inner()) = f;
+}
+
 /// 测量到服务端的 RTT(round-77):基于 TCP 建连耗时估计。
 ///
 /// # 这是估计,不是精确测量
@@ -571,8 +609,10 @@ pub fn carriers_for_rtt(rtt: std::time::Duration) -> usize {
 /// 代理量,因为:
 ///
 /// - 建连本身就是一次往返,量级与后续 RTT 同源(同一路径、同一队列);
-/// - 零额外流量、零协议改动,失败不影响连接(探针失败按"无法判定"处理,
-///   退回 [`default_carriers`] 的单载体保守值)。
+/// - 零额外流量、零协议改动,失败不影响连接。
+///
+/// **走与真实拨号相同的路径**:`proxy_url` 存在时经代理拨号,否则直连。
+/// 修前探针无条件直连,走代理的部署必然探测失败。
 ///
 /// 已知偏差:SYN 队列排队、服务端 accept backlog 满、NAT 冷启动都会让
 /// 建连耗时**偏大**;而 RTT 缓存命中时会偏小。因此阈值取得比较宽松
@@ -582,9 +622,11 @@ pub fn carriers_for_rtt(rtt: std::time::Duration) -> usize {
 pub async fn probe_rtt(
     addr: SocketAddr,
     timeout: std::time::Duration,
+    proxy_url: Option<String>,
 ) -> Option<std::time::Duration> {
     let start = std::time::Instant::now();
-    let conn = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+    let dial = dial_fn();
+    let conn = tokio::time::timeout(timeout, dial(addr, proxy_url))
         .await
         .ok()?
         .ok()?;
@@ -593,17 +635,73 @@ pub async fn probe_rtt(
     Some(elapsed)
 }
 
-/// 依据实测 RTT 选择载体数(round-77);探针失败时退回协议基线。
+/// 进程内 RTT 探测缓存:键为 `(server_addr, proxy_url)`。
+///
+/// 修前**每次重连**都探一次(accept 完立刻断),断线抖动时会变成周期性
+/// 小冲击。探针结果在原地不变的前提下没有时效性,缓存即可。
+type RttCache = std::collections::HashMap<(SocketAddr, Option<String>), usize>;
+
+fn rtt_cache() -> &'static std::sync::Mutex<RttCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<RttCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(RttCache::new()))
+}
+
+/// 清空 RTT 缓存(**测试与诊断**用)。
+///
+/// 始终编译:它只清一张进程内 map,生产不会调用;但下游 crate(rh-client)
+/// 的集成测试需要它来隔离用例。不是 `#[cfg(test)]` —— 那样只有
+/// rh-transport 自身的测试能看到,下游看不见(实测编译失败)。
+pub fn probe_cache_clear() {
+    rtt_cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// 本进程内**真实发生过**的探测次数(缓存命中不计)。
+///
+/// 用于断言「非 tcp 协议 / 显式配置 / 重复重连」没有触发探测。计数器
+/// 在每次未命中缓存时 `Relaxed` 自增,生产开销可忽略。
+pub fn probe_call_count() -> usize {
+    probe_calls().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn probe_calls() -> &'static std::sync::atomic::AtomicUsize {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &N
+}
+
+/// 依据实测 RTT 选择载体数(round-77);探针失败时退回**单载体**(不是
+/// 协议基线 —— 协议基线由调用方的 `default_carriers` 另外参与 `max`)。
+///
+/// 结果按 `(server_addr, proxy_url)` 缓存在进程内:同一目标只探一次,
+/// 后续重连直接复用。显式配置的短路在调用方(`initial_k_for_async`)完成。
 ///
 /// **显式配置优先**:调用方必须在调用本函数**之前**处理
 /// `RH_MUX_POOL_SIZE` / 配置文件里的 `mux_pool_size`,不要把两者混在一处。
-pub async fn auto_carriers(addr: SocketAddr, timeout: std::time::Duration) -> usize {
-    match probe_rtt(addr, timeout).await {
+pub async fn auto_carriers(
+    addr: SocketAddr,
+    timeout: std::time::Duration,
+    proxy_url: Option<String>,
+) -> usize {
+    let key = (addr, proxy_url.clone());
+    if let Some(hit) = rtt_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied()
+    {
+        return hit;
+    }
+    probe_calls().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let k = match probe_rtt(addr, timeout, proxy_url).await {
         Some(rtt) => carriers_for_rtt(rtt),
         // 探针失败(拨号不通/超时):不臆测,退回单载体。真正的拨号会
         // 在随后由 connect/connect_pool 执行并给出真实错误。
         None => 1,
-    }
+    };
+    rtt_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, k);
+    k
 }
 
 /// TLS 客户端选项。
@@ -1117,6 +1215,177 @@ pub async fn connect_pool(
 #[cfg(test)]
 mod carrier_baseline_tests {
     use super::*;
+
+    // ---- RTT 探针(carriers_for_rtt 阈值见下方既有测试)------------------
+
+    // 探针用例的注入状态**全部是线程局部**。
+    //
+    // 修前用 `static AtomicUsize`:持锁窗口只覆盖了 `probe_setup`,而用例
+    // 在窗口内还会改 `DIAL_MS`(测两档 RTT)。并行跑其它 crate 的探针
+    // 用例时,同一进程里两边互相改对方的注入值——实测全量偶发
+    // `probe_result_matches_thresholds` 得到 K=2(应为 1)。
+    // tokio 的 current_thread 测试在单线程内跑,线程局部即可隔离。
+    // 注入状态用**进程级全局原子**,不用 thread_local。
+    //
+    // 理由:`#[tokio::test]` 不保证整个测试跑在同一线程(multi_thread 下
+    // 会跨 worker 迁移)。thread_local 在那种场景下 setUp 与 setUp 之间
+    // 看得见的不是同一份状态,断言会随机失败。正确做法是全局 + 一把
+    // async 锁把「设置 → 运行 → 断言」整个窗口串行化(`PROBE_LOCK`)。
+    static DIALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static DIAL_MS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static DIAL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    static LAST_PROXY: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+
+    fn dials() -> usize {
+        DIALS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn counting_dial(
+        _addr: SocketAddr,
+        proxy: Option<String>,
+    ) -> futures::future::BoxFuture<'static, std::io::Result<tokio::net::TcpStream>> {
+        DIALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *LAST_PROXY.lock().unwrap_or_else(|e| e.into_inner()) = Some(proxy);
+        let ms = DIAL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64;
+        let ok = DIAL_OK.load(std::sync::atomic::Ordering::Relaxed);
+        Box::pin(async move {
+            if ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+            if !ok {
+                return Err(std::io::Error::other("injected dial failure"));
+            }
+            // 返回一条真实但已断的 loopback 连接:探针只测"建连耗时",
+            // 拿到后立刻 drop,不需要可用会话。
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let a = l.local_addr()?;
+            let c = tokio::net::TcpStream::connect(a).await?;
+            Ok(c)
+        })
+    }
+
+    /// 缓存仍是**进程级全局**(生产语义如此),故仍需串行;但注入量已
+    /// 线程局部,窗口内改 RTT 不再影响别的用例。
+    static PROBE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn probe_setup(ok: bool, ms: usize) -> tokio::sync::MutexGuard<'static, ()> {
+        let g = PROBE_LOCK.lock().await;
+        probe_cache_clear();
+        DIALS.store(0, std::sync::atomic::Ordering::Relaxed);
+        DIAL_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+        DIAL_OK.store(ok, std::sync::atomic::Ordering::Relaxed);
+        *LAST_PROXY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        probe_set_dial(Some(counting_dial));
+        g
+    }
+
+    fn probe_teardown() {
+        probe_set_dial(None);
+        probe_cache_clear();
+        DIAL_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        DIAL_OK.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn addr() -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, 1], 7000))
+    }
+
+    /// 连续重连 10 次:只应发生 1 次真实探测(结果按 (addr,proxy) 缓存)。
+    #[tokio::test]
+    async fn repeated_reconnects_probe_only_once() {
+        let _g = probe_setup(true, 1).await;
+        let mut ks = Vec::new();
+        for _ in 0..10 {
+            ks.push(auto_carriers(addr(), std::time::Duration::from_secs(2), None).await);
+        }
+        assert!(
+            ks.iter().all(|k| *k == ks[0]),
+            "缓存命中必须返回同一结果,实际 {ks:?}"
+        );
+        assert_eq!(
+            dials(),
+            1,
+            "连续 10 次重连应只探测 1 次,实际探测了 {} 次",
+            dials()
+        );
+        probe_teardown();
+    }
+
+    /// 缓存键含 proxy_url:同一地址不同代理必须分别探测(结果可能不同)。
+    #[tokio::test]
+    async fn cache_key_includes_proxy_url() {
+        let _g = probe_setup(true, 1).await;
+        auto_carriers(addr(), std::time::Duration::from_secs(2), None).await;
+        auto_carriers(addr(), std::time::Duration::from_secs(2), None).await;
+        assert_eq!(dials(), 1);
+
+        auto_carriers(
+            addr(),
+            std::time::Duration::from_secs(2),
+            Some("http://127.0.0.1:3128".into()),
+        )
+        .await;
+        assert_eq!(
+            dials(),
+            2,
+            "不同 proxy_url 必须各自探测一次"
+        );
+        probe_teardown();
+    }
+
+    /// 探针必须把 proxy_url 传给拨号函数(修前是完全忽略)。
+    #[tokio::test]
+    async fn probe_passes_proxy_url_to_dialer() {
+        let _g = probe_setup(true, 1).await;
+        let proxy = Some("socks5://127.0.0.1:1080".to_string());
+        auto_carriers(addr(), std::time::Duration::from_secs(2), proxy.clone()).await;
+        let seen = LAST_PROXY.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            seen,
+            Some(proxy),
+            "探针必须把 proxy_url 原样传给拨号函数,实际 {seen:?}"
+        );
+        probe_teardown();
+    }
+
+    /// 探针失败不得阻断:返回 1(单载体),不 panic、不阻塞调用方。
+    #[tokio::test]
+    async fn probe_failure_degrades_to_single_carrier() {
+        let _g = probe_setup(false, 0).await;
+        let k = auto_carriers(addr(), std::time::Duration::from_secs(2), None).await;
+        assert_eq!(k, 1, "探测失败必须退回单载体");
+        // 失败结果也要缓存:避免断线时每次重连都白等超时
+        let k2 = auto_carriers(addr(), std::time::Duration::from_secs(2), None).await;
+        assert_eq!(k2, 1);
+        assert_eq!(
+            dials(),
+            1,
+            "失败结果也必须缓存"
+        );
+        probe_teardown();
+    }
+
+    /// 不同 RTT 给出不同 K,且与 carriers_for_rtt 一致。
+    ///
+    /// 注意:同一把锁**不能嵌套获取**(`probe_setup` 会 `lock().await`)。
+    /// 两档 RTT 用不同地址区分,共用一次持锁窗口。
+    #[tokio::test]
+    async fn probe_result_matches_thresholds() {
+        let _g = probe_setup(true, 1).await;
+        // 1ms → 局域网档 → K=1
+        let lan = auto_carriers(addr(), std::time::Duration::from_secs(2), None).await;
+        assert_eq!(lan, carriers_for_rtt(std::time::Duration::from_millis(1)));
+        assert_eq!(lan, 1);
+
+        // 改注入延迟为 20ms(不重新取锁),清缓存后换一个地址再探
+        DIAL_MS.store(20, std::sync::atomic::Ordering::Relaxed);
+        probe_cache_clear();
+        let wan_addr = SocketAddr::from(([203, 0, 113, 2], 7000));
+        let wan = auto_carriers(wan_addr, std::time::Duration::from_secs(2), None).await;
+        assert_eq!(wan, carriers_for_rtt(std::time::Duration::from_millis(20)));
+        assert_eq!(wan, 4);
+        probe_teardown();
+    }
 
     // T-C1(round-10 → round-54 → round-73 → 2026-10-20):协议基线六变体全覆盖。
     //
