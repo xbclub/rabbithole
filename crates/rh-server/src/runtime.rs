@@ -540,6 +540,10 @@ pub async fn publish_spec_in_place(
 ) -> bool {
     *rt.spec.write().await = spec.clone();
     rt.latest_revision.store(revision, Ordering::Relaxed);
+    // 规则变更:上游连接池里的连接可能仍指向旧目标(改 target_host /
+    // target_port 后复用旧连接会把请求转发到错误后端)。整池丢弃,
+    // 后续请求重建。代价是一次冷启动,正确性优先。
+    rt.http_upstream.clear();
     if let Some(sess) = state.sessions.get(&rt.client_id) {
         sess.mark_unconfirmed(revision).await;
         let _ = sess

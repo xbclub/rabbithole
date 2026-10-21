@@ -870,6 +870,14 @@ pub struct ProxyRuntime {
     pub conns_current: AtomicI64,
     /// M2 HTTP 静态缓存(仅 http 规则使用)。
     pub http_cache: std::sync::Mutex<HttpCache>,
+    /// HTTP vhost 上游连接池(仅 http/https 规则使用)。
+    ///
+    /// 修前每个 HTTP 请求都 `hyper::client::conn::http1::handshake` 新建
+    /// 一份完整 HTTP/1.1 状态机 + spawn 一个 conn 任务,请求结束即丢弃 ——
+    /// 池化数据通道只被复用一次。单机实测(16 连接 keep-alive):
+    ///   直连源站 41602 QPS / 纯 TCP 转发 10187 QPS / HTTP vhost 4262 QPS。
+    /// vhost 只有直连的 10%,而纯 TCP 转发有 24% —— 主要损失在 vhost 这层。
+    pub http_upstream: crate::vhost::UpstreamPool,
 }
 
 impl ProxyRuntime {
@@ -889,6 +897,7 @@ impl ProxyRuntime {
             bytes_out: AtomicU64::new(0),
             conns_current: AtomicI64::new(0),
             http_cache: std::sync::Mutex::new(HttpCache::default()),
+            http_upstream: crate::vhost::UpstreamPool::default(),
             tcp_listener: Mutex::new(None),
             serve_handle: Mutex::new(None),
             udp_socket: Mutex::new(None),
