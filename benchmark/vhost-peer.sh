@@ -64,6 +64,11 @@ P_VHOST_HTTP="${P_VHOST_HTTP:-20004}"
 P_VHOST_HTTPS="${P_VHOST_HTTPS:-20005}"
 T_HTTP="${T_HTTP:-19104}"
 T_HTTPS="${T_HTTPS:-19105}"
+# TLS 大响应体源站:tput-tls 必须打它。
+# 踩过:一开始 tput-tls 打的是 T_HTTPS(4 KiB 源站),直连只有 0.3~0.45 Gbps,
+# 而明文 tput 打 4 MiB 源站有 2.9 Gbps —— 两个数根本不可比,若照此出数
+# 会得出「HTTPS vhost 吞吐只有明文 1/8」的错误结论。
+T_HTTPS_BIG="${T_HTTPS_BIG:-19107}"
 
 VHOST_DOMAIN="${VHOST_DOMAIN:-bench.test}"
 # 压测参数(可覆盖)。默认值按「样本量足够/单轮可接受耗时」折中选定:
@@ -252,7 +257,10 @@ vhost_client() {  # <a_addr> <cid> <secret>
   local t_big="${T_BIG:-19106}"
   "$VHOST_BIN" serve --port "$t_big"   --body "$VHOST_TPUT_BODY" >"$PEER_DIR/srv-big.log" 2>&1 &
   echo $! > "$PEER_DIR/srv-big.pid"
-  for p in "$T_HTTP" "$T_HTTPS" "$t_big"; do
+  # TLS + 大响应体:tput-tls 的直连基线必须是它,否则与明文 tput 不可比
+  "$VHOST_BIN" serve --port "$T_HTTPS_BIG" --body "$VHOST_TPUT_BODY" --tls >"$PEER_DIR/srv-https-big.log" 2>&1 &
+  echo $! > "$PEER_DIR/srv-https-big.pid"
+  for p in "$T_HTTP" "$T_HTTPS" "$t_big" "$T_HTTPS_BIG"; do
     wait_port 127.0.0.1 "$p" 15 || { err "源站 $p 未就绪"; ls "$PEER_DIR"/srv-*.log | xargs -r tail -5; return 1; }
   done
   # ★端口归属校验:wait_port 只证明"有人在这个端口上听",不证明是**本次**
@@ -261,18 +269,19 @@ vhost_client() {  # <a_addr> <cid> <secret>
   # 一个 Python HTTP 服务(p50 8ms,把明文吞吐压低十倍),而日志里的
   # "address already in use" 没人看。绑定失败必须当场失败,不能带病出数。
   local port pid errlog
-  for port in "$T_HTTP" "$T_HTTPS" "$t_big"; do
+  for port in "$T_HTTP" "$T_HTTPS" "$t_big" "$T_HTTPS_BIG"; do
     case "$port" in
-      "$T_HTTP")  pid="$(cat "$PEER_DIR/srv-http.pid")";  errlog="$PEER_DIR/srv-http.log" ;;
-      "$T_HTTPS") pid="$(cat "$PEER_DIR/srv-https.pid")"; errlog="$PEER_DIR/srv-https.log" ;;
-      *)          pid="$(cat "$PEER_DIR/srv-big.pid")";   errlog="$PEER_DIR/srv-big.log" ;;
+      "$T_HTTP")      pid="$(cat "$PEER_DIR/srv-http.pid")";       errlog="$PEER_DIR/srv-http.log" ;;
+      "$T_HTTPS")     pid="$(cat "$PEER_DIR/srv-https.pid")";      errlog="$PEER_DIR/srv-https.log" ;;
+      "$t_big")       pid="$(cat "$PEER_DIR/srv-big.pid")";        errlog="$PEER_DIR/srv-big.log" ;;
+      *)              pid="$(cat "$PEER_DIR/srv-https-big.pid")";  errlog="$PEER_DIR/srv-https-big.log" ;;
     esac
     kill -0 "$pid" 2>/dev/null || {
       err "源站 $port 进程已退出(bind 失败?)"; tail -5 "$errlog" >&2; return 1; }
   done
   # 监听者必须是 vhostbench:用 ss 交叉确认,防止"端口被别的进程占着"
   if command -v ss >/dev/null 2>&1; then
-    for port in "$T_HTTP" "$T_HTTPS" "$t_big"; do
+    for port in "$T_HTTP" "$T_HTTPS" "$t_big" "$T_HTTPS_BIG"; do
       local owner
       owner="$(ss -ltnp 2>/dev/null | awk -v p=":$port" '$4 ~ (p"$"){print $0}' | grep -o 'vhostbench' | head -1)"
       [ "$owner" = "vhostbench" ] || {
@@ -281,7 +290,7 @@ vhost_client() {  # <a_addr> <cid> <secret>
         return 1; }
     done
   fi
-  info "源站就绪: $T_HTTP(4KiB) $T_HTTPS(4KiB+TLS) $t_big($VHOST_TPUT_BODY B)"
+  info "源站就绪: $T_HTTP(4KiB) $T_HTTPS(4KiB+TLS) $t_big($VHOST_TPUT_BODY B) $T_HTTPS_BIG($VHOST_TPUT_BODY B+TLS)"
 
   if [ "$VHOST_IMPL" = "frp" ]; then
     vhost_frp_client "$a_addr"
@@ -338,6 +347,13 @@ type = "https"
 localIP = "127.0.0.1"
 localPort = $T_HTTPS
 customDomains = ["$VHOST_DOMAIN"]
+
+[[proxies]]
+name = "web-https-big"
+type = "https"
+localIP = "127.0.0.1"
+localPort = $T_HTTPS_BIG
+customDomains = ["big.$VHOST_DOMAIN"]
 
 [[proxies]]
 name = "web-big"
@@ -437,6 +453,11 @@ vhost_drive() {  # <a_ip> <b_ip> <api_port> <token> <cid> [label]
     create_service "$API" "$token" \
       "{\"client_id\":\"$cid\",\"name\":\"vh-https\",\"kind\":\"https\",\"target_host\":\"127.0.0.1\",\"target_port\":$T_HTTPS,\"https\":{\"custom_domains\":[\"$VHOST_DOMAIN\"]},\"enabled\":true}" >/dev/null \
       || { err "https 规则失败"; return 1; }
+    # https vhost 的吞吐口径:SNI 透传到 TLS + 4 MiB 源站。
+    # 域名必须与明文 tput 一致(big.$VHOST_DOMAIN),否则 vhost 路由找不到。
+    create_service "$API" "$token" \
+      "{\"client_id\":\"$cid\",\"name\":\"vh-https-big\",\"kind\":\"https\",\"target_host\":\"127.0.0.1\",\"target_port\":$T_HTTPS_BIG,\"https\":{\"custom_domains\":[\"big.$VHOST_DOMAIN\"]},\"enabled\":true}" >/dev/null \
+      || { err "https big 规则失败"; return 1; }
   fi
 
   # ---------- 就绪门控 ----------
@@ -607,7 +628,8 @@ vhost_drive() {  # <a_ip> <b_ip> <api_port> <token> <cid> [label]
   run_pair qps  qps-tls         https "$VHOST_DOMAIN" "$T_HTTPS" --conns "$VHOST_QPS_CONNS" --dur "$VHOST_QPS_DUR"
   run_pair lat  lat-tls         https "$VHOST_DOMAIN" "$T_HTTPS" --count "$VHOST_LAT_COUNT" --warmup 200
   run_pair lat  lat-tls-newconn https "$VHOST_DOMAIN" "$T_HTTPS" --count 500 --newconn
-  run_pair tput tput-tls        https "$VHOST_DOMAIN" "$T_HTTPS" --conns "$VHOST_TPUT_CONNS" --dur "$VHOST_TPUT_DUR"
+  # 必须打 TLS + 4 MiB 源站:与明文 tput 同口径(否则是 4KiB vs 4MiB 的假对比)
+  run_pair tput tput-tls        https "$VHOST_DOMAIN" "$T_HTTPS_BIG" --conns "$VHOST_TPUT_CONNS" --dur "$VHOST_TPUT_DUR"
 
   # HTTPS 并发(单档 1024:交叉验证 TLS 握手在高并发下的表现)
   hdr "HTTPS 并发 1024"
