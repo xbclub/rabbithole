@@ -726,15 +726,15 @@ func cmdLat(args []string) {
 	sort.Float64s(lats)
 
 	out := map[string]any{
-		"role":     "lat",
-		"addr":     o.addr,
-		"tls":      o.tls,
-		"sni":      o.sni,
-		"host":     o.host,
-		"newconn":  *newconn,
-		"count":    len(lats),
-		"errors":   errs,
-		"samples":  len(lats),
+		"role":    "lat",
+		"addr":    o.addr,
+		"tls":     o.tls,
+		"sni":     o.sni,
+		"host":    o.host,
+		"newconn": *newconn,
+		"count":   len(lats),
+		"errors":  errs,
+		"samples": len(lats),
 	}
 	if len(lats) > 0 {
 		var sum float64
@@ -773,8 +773,8 @@ func cmdConc(args []string) {
 		emit(map[string]any{
 			"role": "conc",
 			"env_error": map[string]any{
-				"kind":   "fd_limit",
-				"hint":   fmt.Sprintf("fd 上限不足:需要 ~%d,可用 %d(硬上限 %d)", *conns, soft, hard),
+				"kind":    "fd_limit",
+				"hint":    fmt.Sprintf("fd 上限不足:需要 ~%d,可用 %d(硬上限 %d)", *conns, soft, hard),
 				"fd_soft": soft,
 				"fd_hard": hard,
 			},
