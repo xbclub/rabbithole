@@ -549,6 +549,13 @@ vhost_drive() {  # <a_ip> <b_ip> <api_port> <token> <cid> [label]
         tput)
           if ! printf '%s' "$out" | jq -e '(.bytes // 0) > 0 and (.gbps // 0) > 0' >/dev/null 2>&1; then
             valid=false; why="no_bytes"
+          elif ! printf '%s' "$out" | jq -e --argjson body "$VHOST_TPUT_BODY" \
+               '(.bytes / ((.requests // 1)|if . < 1 then 1 else . end)) >= ($body * 0.5)' >/dev/null 2>&1; then
+            # ★平均响应体必须接近 --body:这条闸专门抓「打错源站」。
+            # 实测踩过 tput-tls 隧道打到了 4 KiB 源站,requests=40436、
+            # bytes=165MB(平均 4 KiB),读数 0.13 Gbps,而直连同档 3.35 Gbps ——
+            # 若不校验,会被读成"HTTPS vhost 吞吐只有 1/25"。
+            valid=false; why="wrong_body_size"
           fi ;;
         lat)
           # 采样数必须达到请求数的 99%:新建连接场景下少量失败可容忍,
@@ -628,8 +635,12 @@ vhost_drive() {  # <a_ip> <b_ip> <api_port> <token> <cid> [label]
   run_pair qps  qps-tls         https "$VHOST_DOMAIN" "$T_HTTPS" --conns "$VHOST_QPS_CONNS" --dur "$VHOST_QPS_DUR"
   run_pair lat  lat-tls         https "$VHOST_DOMAIN" "$T_HTTPS" --count "$VHOST_LAT_COUNT" --warmup 200
   run_pair lat  lat-tls-newconn https "$VHOST_DOMAIN" "$T_HTTPS" --count 500 --newconn
-  # 必须打 TLS + 4 MiB 源站:与明文 tput 同口径(否则是 4KiB vs 4MiB 的假对比)
-  run_pair tput tput-tls        https "$VHOST_DOMAIN" "$T_HTTPS_BIG" --conns "$VHOST_TPUT_CONNS" --dur "$VHOST_TPUT_DUR"
+  # 吞吐必须同时满足两点,否则与明文 tput 不可比:
+  #   1. 打 TLS + 4 MiB 源站(19107),不是 4 KiB 的 19105
+  #   2. 域名用 big.$VHOST_DOMAIN —— **隧道侧靠 SNI 选路**,
+  #      用 bench.test 会被路由到 4 KiB 源站(实测:隧道 requests 40436
+  #      × 4 KiB = 165 MB,而直连 1002 × 4 MiB = 4.2 GB,相差 40 倍)。
+  run_pair tput tput-tls        https "big.$VHOST_DOMAIN" "$T_HTTPS_BIG" --conns "$VHOST_TPUT_CONNS" --dur "$VHOST_TPUT_DUR"
 
   # HTTPS 并发(单档 1024:交叉验证 TLS 握手在高并发下的表现)
   hdr "HTTPS 并发 1024"
