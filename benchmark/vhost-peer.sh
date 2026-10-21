@@ -255,6 +255,32 @@ vhost_client() {  # <a_addr> <cid> <secret>
   for p in "$T_HTTP" "$T_HTTPS" "$t_big"; do
     wait_port 127.0.0.1 "$p" 15 || { err "源站 $p 未就绪"; ls "$PEER_DIR"/srv-*.log | xargs -r tail -5; return 1; }
   done
+  # ★端口归属校验:wait_port 只证明"有人在这个端口上听",不证明是**本次**
+  # 启动的 vhostbench。踩过两次:上一轮遗留的 python3 target.py / 旧版
+  # vhostbench 占着 19104,新源站 bind 失败静默退出,于是 QPS 档实际测的是
+  # 一个 Python HTTP 服务(p50 8ms,把明文吞吐压低十倍),而日志里的
+  # "address already in use" 没人看。绑定失败必须当场失败,不能带病出数。
+  local port pid errlog
+  for port in "$T_HTTP" "$T_HTTPS" "$t_big"; do
+    case "$port" in
+      "$T_HTTP")  pid="$(cat "$PEER_DIR/srv-http.pid")";  errlog="$PEER_DIR/srv-http.log" ;;
+      "$T_HTTPS") pid="$(cat "$PEER_DIR/srv-https.pid")"; errlog="$PEER_DIR/srv-https.log" ;;
+      *)          pid="$(cat "$PEER_DIR/srv-big.pid")";   errlog="$PEER_DIR/srv-big.log" ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || {
+      err "源站 $port 进程已退出(bind 失败?)"; tail -5 "$errlog" >&2; return 1; }
+  done
+  # 监听者必须是 vhostbench:用 ss 交叉确认,防止"端口被别的进程占着"
+  if command -v ss >/dev/null 2>&1; then
+    for port in "$T_HTTP" "$T_HTTPS" "$t_big"; do
+      local owner
+      owner="$(ss -ltnp 2>/dev/null | awk -v p=":$port" '$4 ~ (p"$"){print $0}' | grep -o 'vhostbench' | head -1)"
+      [ "$owner" = "vhostbench" ] || {
+        err "端口 $port 的监听者不是 vhostbench,拒绝用这个源站出数:"
+        ss -ltnp 2>/dev/null | awk -v p=":$port" '$4 ~ (p"$")' >&2
+        return 1; }
+    done
+  fi
   info "源站就绪: $T_HTTP(4KiB) $T_HTTPS(4KiB+TLS) $t_big($VHOST_TPUT_BODY B)"
 
   if [ "$VHOST_IMPL" = "frp" ]; then
