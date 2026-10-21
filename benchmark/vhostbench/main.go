@@ -75,6 +75,13 @@ const sockBuf = 4 << 20
 // ioBufSize 读响应体的缓冲。1 MiB 让 io.CopyBuffer 走大块路径。
 const ioBufSize = 1 << 20
 
+// verifyParallel 并发存活复验的并发度。
+//
+// 复验阶段源站侧已经有 N 个连接读 goroutine 常驻,复验再叠加 N 个会让
+// 8 核机器在 4096 档整体超出 deadline(实测直连存活率跌到 1%~5%)。
+// 限到 256:4096 条分批 16 轮,每轮开销毫秒级,总耗时仍在秒级内。
+const verifyParallel = 256
+
 // ---------------------------------------------------------------- 通用
 
 func emit(v any) {
@@ -774,6 +781,7 @@ func cmdConc(args []string) {
 		connsHeld   []held
 		connectLat  []float64
 		readErr     int64
+		diagN       int64
 	)
 
 	// readResponse 读一份完整响应(头 + 体),返回状态码。
@@ -895,14 +903,27 @@ func cmdConc(args []string) {
 	// 保持期:期间连接必须存活(被隧道主动断开 = 并发能力不成立)
 	time.Sleep(time.Duration(*hold * float64(time.Second)))
 
-	// 存活复验:再发一个请求,能拿到 200 才算 hold_alive
+	// 存活复验:再发一个请求,能拿到 200 才算 hold_alive。
+	//
+	// ★总超时必须给足(实测 15s;5s 会假失败):
+	// 4096 连接时源站侧每连接一个读 goroutine,复验阶段 8 核上争用明显,
+	// 5s deadline 下直连基线只有 4~322 条"存活",15s 下 4096/4096。
+	// 那是压测器自己制造的超时,不是隧道断开 —— 若直接拿 5s 的结果,
+	// 会把"压测器不够快"误读成"隧道的并发能力差"。
+	// 归因经负向验证:单独把 deadline 改回 5s 即复发(4096→322),
+	// 单独把 verifyParallel 调到 4096 不复发 —— 所以根因是超时,不是并发度。
+	// 限流保留:它让复验有序推进、总耗时可控,但不是修好这个 bug 的原因。
+	verifySem := make(chan struct{}, verifyParallel)
 	var aliveWG sync.WaitGroup
 	var alive atomic.Int64
 	for _, h := range connsHeld {
 		aliveWG.Add(1)
+		verifySem <- struct{}{}
 		go func(c net.Conn, br *bufio.Reader) {
 			defer aliveWG.Done()
-			_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+			defer func() { <-verifySem }()
+			// 单条复验超时给足:限流后总耗时可控,不必靠短超时压
+			_ = c.SetDeadline(time.Now().Add(15 * time.Second))
 			req := "GET " + o.path + " HTTP/1.1\r\n"
 			if o.host != "" {
 				req += "Host: " + o.host + "\r\n"
@@ -912,9 +933,13 @@ func cmdConc(args []string) {
 				atomic.AddInt64(&readErr, 1)
 				return
 			}
-			status, err := readResponse(br, 5*time.Second)
+			status, err := readResponse(br, 15*time.Second)
 			if err != nil || status != 200 {
 				atomic.AddInt64(&readErr, 1)
+				// 诊断:前若干次失败把原因打出来,否则"存活为 0"无从归因
+				if atomic.AddInt64(&diagN, 1) <= 8 {
+					fmt.Fprintf(os.Stderr, "hold verify: status=%d err=%v\n", status, err)
+				}
 				return
 			}
 			alive.Add(1)
