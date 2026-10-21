@@ -539,6 +539,11 @@ pub async fn publish_spec_in_place(
     revision: u64,
 ) -> bool {
     *rt.spec.write().await = spec.clone();
+    // 与 spec 同步维护无锁快路径标记(见 ProxyRuntime::has_group)
+    rt.has_group.store(
+        crate::state::ProxyManager::group_key(spec).is_some(),
+        Ordering::Relaxed,
+    );
     rt.latest_revision.store(revision, Ordering::Relaxed);
     // 规则变更:上游连接池里的连接可能仍指向旧目标(改 target_host /
     // target_port 后复用旧连接会把请求转发到错误后端)。整池丢弃,

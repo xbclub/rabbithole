@@ -870,6 +870,14 @@ pub struct ProxyRuntime {
     pub conns_current: AtomicI64,
     /// M2 HTTP 静态缓存(仅 http 规则使用)。
     pub http_cache: std::sync::Mutex<HttpCache>,
+    /// 本规则是否属于负载均衡分组(无锁快路径)。
+    ///
+    /// `group_pick()` 每请求都要读 `spec.read().await` 才能拿到 group_key,
+    /// 而绝大多数规则**没有分组**(group 为空),那次 async 读锁纯属浪费,
+    /// 且在高并发下是明确的争用点。这里用 AtomicBool 做无锁预判:
+    /// 非分组规则直接跳过整个 group_pick。
+    /// 与 spec 由同一写入点(runtime::publish_spec_in_place)同步维护。
+    pub has_group: AtomicBool,
     /// HTTP vhost 上游连接池(仅 http/https 规则使用)。
     ///
     /// 修前每个 HTTP 请求都 `hyper::client::conn::http1::handshake` 新建
@@ -882,6 +890,9 @@ pub struct ProxyRuntime {
 
 impl ProxyRuntime {
     pub fn new(id: u64, client_id: String, spec: ProxySpec) -> Self {
+        // 从 spec 初始化无锁快路径标记:无论从 API / recovery / 测试哪条
+        // 路径创建,标记都与 spec 一致(不依赖调用方记得设置)。
+        let has_group = ProxyManager::group_key(&spec).is_some();
         Self {
             id,
             client_id,
@@ -897,6 +908,7 @@ impl ProxyRuntime {
             bytes_out: AtomicU64::new(0),
             conns_current: AtomicI64::new(0),
             http_cache: std::sync::Mutex::new(HttpCache::default()),
+            has_group: AtomicBool::new(has_group),
             http_upstream: crate::vhost::UpstreamPool::default(),
             tcp_listener: Mutex::new(None),
             serve_handle: Mutex::new(None),

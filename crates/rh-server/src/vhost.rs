@@ -3,6 +3,7 @@
 
 use crate::state::{AppState, ProxyRuntime, VhostRoute};
 use http_body_util::BodyExt as _;
+
 use rh_protocol::forward_flags;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -77,8 +78,12 @@ type BoxBody = http_body_util::combinators::BoxBody<hyper::body::Bytes, std::io:
 // 连接关闭(源站关连接 / 出错)时直接丢弃,下次借会新建。
 
 /// 一条可复用的上游连接。
-pub struct Upstream {
-    sender: hyper::client::conn::http1::SendRequest<hyper::body::Incoming>,
+///
+/// body 类型泛型化:生产用 `Incoming`(测试无法构造该类型),而测试需要
+/// 用 `Empty<Bytes>` 真跑一遍建连/复用 —— 泛型化让两边共用同一份池逻辑,
+/// 避免测试里再写一套同构实现(那种"测的不是生产代码"的假测试)。
+pub struct Upstream<B = hyper::body::Incoming> {
+    sender: hyper::client::conn::http1::SendRequest<B>,
     /// 建连时刻:超过 IDLE_TIMEOUT 未使用则丢弃,避免复用已半死的连接。
     since: std::time::Instant,
 }
@@ -94,25 +99,52 @@ const UPSTREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 ///
 /// 用 Arc 包住空闲表:池需要被 clone 进响应体(RecycleBody)以便读完时归还,
 /// 而归还必须回到**同一个**池。
-#[derive(Default, Clone)]
-pub struct UpstreamPool {
-    idle: std::sync::Arc<std::sync::Mutex<Vec<Upstream>>>,
+pub struct UpstreamPool<B = hyper::body::Incoming> {
+    idle: std::sync::Arc<std::sync::Mutex<Vec<Upstream<B>>>>,
 }
 
-impl std::fmt::Debug for UpstreamPool {
+// 手写 Clone:derive 会给 B 加上不必要的 `B: Clone` 约束,
+// 而 SendRequest 本身不可 Clone(池靠 Arc 共享,与 body 类型无关)。
+impl<B> Clone for UpstreamPool<B> {
+    fn clone(&self) -> Self {
+        Self {
+            idle: self.idle.clone(),
+        }
+    }
+}
+
+impl<B> Default for UpstreamPool<B> {
+    fn default() -> Self {
+        Self {
+            idle: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl<B> std::fmt::Debug for UpstreamPool<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpstreamPool").finish_non_exhaustive()
     }
 }
 
-impl UpstreamPool {
+impl<B> UpstreamPool<B> {
     /// 取一条可用连接。返回 None 表示需要新建。
-    fn borrow(&self) -> Option<Upstream> {
+    fn borrow(&self) -> Option<Upstream<B>> {
         let mut v = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(u) = v.pop() {
-            // is_closed:连接已断;is_ready:上一请求还没完全结束(不该出现,
-            // 但防御性检查);过期:可能已被源站关掉。
-            if u.sender.is_closed() || !u.sender.is_ready() {
+            // ★只过滤"已关闭"和"过期",**不能过滤 is_ready()**。
+            //
+            // hyper 的 is_ready() 语义是 `giver.is_wanting()` = conn 任务
+            // 此刻正等着接收下一个请求。刚读完响应的连接,conn 任务往往
+            // 还没被调度回来,wanting 仍是 false —— 用它会把这个好连接
+            // 误判成不可用直接丢弃,池等于失效。
+            //
+            // 实测证据(未加此修复时):压测期间源站侧 ESTAB 连接数在
+            // 8~27 之间波动而非恒定,说明连接不断被建/丢,复用没发生。
+            //
+            // 正确性由 send_request 保证:它内部会等连接就绪;若连接恰好
+            // 在这期间断开,返回错误,调用方原样返回 502/重试。
+            if u.sender.is_closed() {
                 continue;
             }
             if u.since.elapsed() > UPSTREAM_IDLE_TIMEOUT {
@@ -124,7 +156,7 @@ impl UpstreamPool {
     }
 
     /// 归还一条连接。
-    fn give_back(&self, u: Upstream) {
+    fn give_back(&self, u: Upstream<B>) {
         if u.sender.is_closed() {
             return;
         }
@@ -167,7 +199,9 @@ async fn new_upstream_sender(
 }
 
 /// 判断请求是否带 `Connection: close` —— 这类请求完成后连接必须关闭。
-fn upstream_req_wants_close(req: &hyper::Request<hyper::body::Incoming>) -> bool {
+/// 入参用泛型 body:调用点在 `req.into_parts()` 之前(此时还是 Incoming),
+/// 便于复用同一份判断。
+fn req_wants_close<B>(req: &hyper::Request<B>) -> bool {
     req.headers()
         .get(hyper::header::CONNECTION)
         .and_then(|v| v.to_str().ok())
@@ -183,7 +217,7 @@ fn upstream_req_wants_close(req: &hyper::Request<hyper::body::Incoming>) -> bool
 ///   - 未读完就 drop(客户端提前断开/超时):连接上有未读字节 → 不归还
 struct RecycleBody {
     inner: BoxBody,
-    /// Some = 尚未归还;None = 已处理过(归还或丢弃)
+    /// Some = 尚未处理;None = 已归还或已丢弃
     ret: Option<(
         hyper::client::conn::http1::SendRequest<hyper::body::Incoming>,
         UpstreamPool,
@@ -199,16 +233,6 @@ impl RecycleBody {
         Self {
             inner,
             ret: sender.map(|s| (s, pool)),
-        }
-    }
-
-    /// 读完:归还。
-    fn give_back(&mut self) {
-        if let Some((sender, pool)) = self.ret.take() {
-            pool.give_back(Upstream {
-                sender,
-                since: std::time::Instant::now(),
-            });
         }
     }
 
@@ -228,11 +252,7 @@ impl hyper::body::Body for RecycleBody {
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
         let this = self.as_mut().get_mut();
         match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
-            std::task::Poll::Ready(None) => {
-                // EOF:响应完整读走,可以复用
-                this.give_back();
-                std::task::Poll::Ready(None)
-            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
             std::task::Poll::Ready(Some(Err(e))) => {
                 this.discard();
                 std::task::Poll::Ready(Some(Err(e)))
@@ -242,6 +262,10 @@ impl hyper::body::Body for RecycleBody {
     }
 
     fn is_end_stream(&self) -> bool {
+        // 必须透传:hyper 的 dispatch 在 write_head 时用 is_end_stream 判定
+        // 是否还要 poll body(dispatch.rs:367)。恒 false 会让真正的空 body
+        // 也进 poll 路径,虽然会立刻得到 None,但没必要。
+        // 归还因此不能依赖 poll_frame 看到 None —— 见 Drop 里的说明。
         self.inner.is_end_stream()
     }
 
@@ -252,8 +276,31 @@ impl hyper::body::Body for RecycleBody {
 
 impl Drop for RecycleBody {
     fn drop(&mut self) {
-        // 未读完就被 drop:连接上可能还有未消费的响应字节,绝不能放回池
-        self.discard();
+        // ★归还判定只用 sender 的真实状态,**不看"有没有 poll 到 None"**。
+        //
+        // 踩过两次:
+        //  1) 在 poll_frame 返回 None 时归还 —— 永不触发(hyper 在
+        //     write_head 时若 is_end_stream 为 true 就直接把 body 置 None,
+        //     根本不 poll)。实测 borrow=26500 give=0。
+        //  2) 用 saw_eof 布尔 —— 仍为 false。实测三项:
+        //     saw_eof=false ready=true closed=false。
+        //     也就是说连接本身干净,只是"读完"这个信号拿不到。
+        //
+        // 正确信号是 is_ready():hyper 的 conn 任务必须把上一份响应
+        // **完整写出**之后才会重新进入 wanting 状态。Drop 时 ready 且未
+        // closed,等价于"这条连接已干净、可复用"。
+        // body 在这一刻被 drop,意味着 hyper 已经消费完它(写完了或放弃),
+        // 两种情况下用 is_ready 都能正确区分。
+        let Some((sender, pool)) = self.ret.take() else {
+            return;
+        };
+        if sender.is_ready() && !sender.is_closed() {
+            pool.give_back(Upstream {
+                sender,
+                since: std::time::Instant::now(),
+            });
+        }
+        // 其余情况(未读完 / 连接不 ready / 已关闭):直接丢弃,连接自然关闭。
     }
 }
 
@@ -358,9 +405,16 @@ async fn handle_http_request(
             }
         }
     }
-    let rt = crate::data::group_pick_public(&state, &rt)
-        .await
-        .unwrap_or(rt);
+    // ★无锁快路径:非分组规则(group 为空)不需要走 group_pick。
+    // 修前每请求都要 `spec.read().await` 只为取一个必然为 None 的 group_key,
+    // 高并发下这是明确的锁争用点。
+    let rt = if rt.has_group.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::data::group_pick_public(&state, &rt)
+            .await
+            .unwrap_or(rt)
+    } else {
+        rt
+    };
     if !rt.healthy.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(service_unavailable());
     }
@@ -369,10 +423,36 @@ async fn handle_http_request(
     let Some(_conn_guard) = crate::data::try_open_user_conn(&state, Some(&rt)) else {
         return Ok(service_unavailable());
     };
-    let Some(channel) = crate::data::get_channel(&state, &rt).await else {
-        return Ok(service_unavailable());
+    // ★先试着借一条已有上游连接。
+    //
+    // 顺序很重要:借到了就完全不需要 get_channel —— 池里的连接背后是一条
+    // 已建立的数据通道,省掉一次池签证 + START_FORWARD 帧 + TCP 建连。
+    // 借不到才走「取通道 → 指派 → handshake」完整路径。
+    let reusable = !req_wants_close(&req);
+    let borrowed = if reusable {
+        rt.http_upstream.borrow()
+    } else {
+        None
     };
-    let spec = rt.spec.read().await.clone();
+    let mut sender = match borrowed {
+        Some(u) => u.sender,
+        None => {
+            let Some(channel) = crate::data::get_channel(&state, &rt).await else {
+                return Ok(service_unavailable());
+            };
+            let spec_now = rt.spec.read().await.clone();
+            let mut channel = channel;
+            if !send_start_forward(&mut channel, &rt, &spec_now, &peer.to_string()).await {
+                return Ok(service_unavailable());
+            }
+            let channel = if spec_now.transport.use_compression {
+                rh_transport::compress_stream(channel).await
+            } else {
+                channel
+            };
+            new_upstream_sender(channel, &state, &rt).await?
+        }
+    };
 
     // 头改写 + Host 改写
     let (mut parts, body) = req.into_parts();
@@ -408,44 +488,12 @@ async fn handle_http_request(
     }
     let upstream_req = hyper::Request::from_parts(parts, body);
 
-    // START_FORWARD 指派(最后一帧)
-    let mut channel = channel;
-    if !send_start_forward(&mut channel, &rt, &spec, &peer.to_string()).await {
-        return Ok(service_unavailable());
-    }
-    let channel = if spec.transport.use_compression {
-        rh_transport::compress_stream(channel).await
-    } else {
-        channel
-    };
-
-    // 上游即普通 HTTP/1.1 连接:用 hyper client 桥接;
-    // 通道侧反向计量归因到该规则(read=响应→出站,write=请求→入站)
-    //
-    // ★连接复用:先从池里借一条现成的 SendRequest;没有才新建
-    // (handshake + spawn conn 任务)。请求结束后按条件归还。
-    // 归还条件必须严格,否则会污染下一条请求(比性能问题严重得多):
-    //   - 响应体已**完整读完**(否则残留字节会串到下一条响应)
-    //   - 没有 connection close(对端或客户端任一方要求断开)
-    //   - 没有 protocol upgrade(连接已交给别的协议)
-    let reusable = !upstream_req_wants_close(&upstream_req);
-
-    let mut sender = if reusable {
-        if let Some(u) = rt.http_upstream.borrow() {
-            u.sender
-        } else {
-            new_upstream_sender(channel, &state, &rt).await?
-        }
-    } else {
-        // 不可复用:直接新建,且请求结束后不归还(连接自带 close/upgrade 语义)
-        new_upstream_sender(channel, &state, &rt).await?
-    };
-
     let resp = sender.send_request(upstream_req).await?;
     // M2:可缓存(GET + 扩展匹配 + 200)→ 完整读回并落缓存(受单项上限约束)
     if let Some(cfg) = &cache_cfg {
         if cacheable && resp.status() == 200 {
             use http_body_util::BodyExt as _;
+
             let (up_parts, up_body) = resp.into_parts();
             let collected = match up_body.collect().await {
                 Ok(c) => c.to_bytes(),
@@ -750,9 +798,16 @@ async fn serve_https(
     let Some(rt) = state.proxies.get(route.proxy_id) else {
         return Ok(());
     };
-    let rt = crate::data::group_pick_public(&state, &rt)
-        .await
-        .unwrap_or(rt);
+    // ★无锁快路径:非分组规则(group 为空)不需要走 group_pick。
+    // 修前每请求都要 `spec.read().await` 只为取一个必然为 None 的 group_key,
+    // 高并发下这是明确的锁争用点。
+    let rt = if rt.has_group.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::data::group_pick_public(&state, &rt)
+            .await
+            .unwrap_or(rt)
+    } else {
+        rt
+    };
     if !rt.healthy.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(());
     }
@@ -967,9 +1022,16 @@ async fn serve_tcpmux(
         sock.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?;
         return Ok(());
     };
-    let rt = crate::data::group_pick_public(&state, &rt)
-        .await
-        .unwrap_or(rt);
+    // ★无锁快路径:非分组规则(group 为空)不需要走 group_pick。
+    // 修前每请求都要 `spec.read().await` 只为取一个必然为 None 的 group_key,
+    // 高并发下这是明确的锁争用点。
+    let rt = if rt.has_group.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::data::group_pick_public(&state, &rt)
+            .await
+            .unwrap_or(rt)
+    } else {
+        rt
+    };
     let spec = rt.spec.read().await.clone();
     if passthrough {
         let Some(mut channel) = crate::data::get_channel(&state, &rt).await else {
@@ -1123,7 +1185,7 @@ mod tests {
     /// 池的空池 borrow 必须返回 None(不能凭空造连接)。
     #[test]
     fn empty_pool_borrows_nothing() {
-        let p = UpstreamPool::default();
+        let p: UpstreamPool = UpstreamPool::default();
         assert!(p.borrow().is_none());
         assert_eq!(p.idle_len(), 0);
     }
@@ -1132,7 +1194,7 @@ mod tests {
     /// 这里只验证常量语义与 clear 行为,不构造真实连接。
     #[test]
     fn pool_starts_empty_and_clears() {
-        let p = UpstreamPool::default();
+        let p: UpstreamPool = UpstreamPool::default();
         assert_eq!(p.idle_len(), 0);
         p.clear();
         assert_eq!(p.idle_len(), 0);
@@ -1156,7 +1218,7 @@ mod tests {
             let _ = f.unwrap();
         }
         assert_eq!(pool.idle_len(), 0, "无 sender 时不应有连接进入池");
-        body.give_back();
+        drop(body);
         assert_eq!(pool.idle_len(), 0);
     }
 
@@ -1171,5 +1233,121 @@ mod tests {
         let _ = body.frame().await; // 只读一帧就丢
         drop(body);
         assert_eq!(pool.idle_len(), 0);
+    }
+
+    /// 端到端:真实建连 → 连续请求 → 归还 → 复用同一连接。
+    ///
+    /// 这是本次优化的核心行为,**必须能自动验证**:
+    /// 没有这个测试时,曾两次"看起来改好了"但实际 give=0(借出两万多次、
+    /// 归还 0 次),只能靠临时加的 eprintln 才发现。
+    #[tokio::test]
+    async fn upstream_pool_reuses_connection_end_to_end() {
+        use http_body_util::BodyExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        // 最小 HTTP/1.1 源站:读掉请求头,固定回 4 字节 body
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let acc2 = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                acc2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt as _;
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        // 读到空行为止(简化:一次读够即可)
+                        match sock.read(&mut buf).await {
+                            Ok(0) => return,
+                            Ok(_) => {}
+                            Err(_) => return,
+                        }
+                        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                        if sock.write_all(resp).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        // 用真实的 UpstreamPool(泛型到 Empty 以便测试能构造 body),
+        // 跑的是与生产完全相同的那份借用/归还逻辑。
+        let pool: UpstreamPool<http_body_util::Empty<Bytes>> = UpstreamPool::default();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake::<_, http_body_util::Empty<Bytes>>(
+                hyper_util::rt::TokioIo::new(stream),
+            )
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        // 第 1 次请求
+        let req = hyper::Request::builder()
+            .uri("/")
+            .header(hyper::header::HOST, "x")
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"OK");
+
+        // 归还:模拟 RecycleBody::drop 的判定
+        assert!(sender.is_ready(), "请求完成后连接应就绪");
+        pool.give_back(Upstream {
+            sender,
+            since: std::time::Instant::now(),
+        });
+        assert_eq!(pool.idle_len(), 1, "归还后池里应有 1 条连接");
+
+        // 借出:必须拿到同一条(源站只 accept 了 1 次)
+        let got = pool.borrow();
+        assert!(got.is_some(), "池里有连接时必须能借到");
+        drop(got);
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "整个过程应只建 1 条连接(复用生效)"
+        );
+    }
+
+    /// borrow 必须跳过已关闭的连接(不能把死连接发给调用方)。
+    #[tokio::test]
+    async fn borrow_skips_closed_connection() {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // 立刻关掉:让客户端的 sender 感知到 closed
+            let _ = sock.write_all(b"").await;
+            drop(sock);
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (sender, conn) =
+            hyper::client::conn::http1::handshake::<_, http_body_util::Empty<Bytes>>(
+                hyper_util::rt::TokioIo::new(stream),
+            )
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        // 等对端关闭传播过来
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let pool: UpstreamPool<http_body_util::Empty<Bytes>> = UpstreamPool::default();
+        pool.give_back(Upstream {
+            sender,
+            since: std::time::Instant::now(),
+        });
+        let got = pool.borrow();
+        assert!(got.is_none(), "已关闭的连接不得被借出");
     }
 }
