@@ -103,7 +103,10 @@ pub fn split_boxed_io(io: BoxedIo) -> Result<(BoxedIo, BoxedIo), BoxedIo> {
     let (r, w) = (*ts).into_split();
     // OwnedReadHalf/OwnedWriteHalf 各自只实现单方向 trait,用专用包装
     // 补齐另一方向(运行时永远不会走到,纯为满足 `Io` 的 supertrait)。
-    Ok((Box::new(HalfRead(r)) as BoxedIo, Box::new(HalfWrite(w)) as BoxedIo))
+    Ok((
+        Box::new(HalfRead(r)) as BoxedIo,
+        Box::new(HalfWrite(w)) as BoxedIo,
+    ))
 }
 
 /// 取消信号(共享):完成即结束转发。规则禁用/删除级联用;
@@ -192,7 +195,7 @@ impl std::future::Future for AbortOnDropHandle {
 const DEFAULT_HALFCLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 半关闭兜底上限(env 可覆盖,进程内只解析一次)。
-pub(crate) fn halfclose_grace() -> std::time::Duration {
+pub fn halfclose_grace() -> std::time::Duration {
     static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         match std::env::var("RH_HALFCLOSE_GRACE_SECS")
@@ -414,6 +417,18 @@ impl fmt::Display for Protocol {
     }
 }
 
+/// 默认 ALPN 标识。
+///
+/// **默认用 `h2` 而不用 `rhtp`**:ALPN 位于 ClientHello,是**明文**的
+/// (实测可见:扩展类型 0x0010 后紧跟 UTF-8 字节串)。用项目专属名字会让
+/// 任何被动 DPI 一眼认出"这是 rabbithole"。`h2` 是 HTTP/2 的标准标识,
+/// 属于最常见的 TLS 流量之一,不构成可区分的指纹。
+///
+/// 代价:若服务端是真正的 HTTP/2 服务,双方会协商成功但应用层数据不通 ——
+/// 本项目的端口只跑自己的协议,故不受影响。需要恢复专属标识或改成
+/// 其它值时,用 `alpn` 配置项/`RH_ALPN` 覆盖。
+pub const DEFAULT_ALPN: &str = "h2";
+
 /// 多载体池协议基线(round-10):单载体即可跑到路径上限,故恒 1。
 ///
 /// # 这是默认 K 的唯一来源(round-45 / round-73)
@@ -444,20 +459,49 @@ impl fmt::Display for Protocol {
 /// 把同一份流量摊到多条四元组上,每条都要各自爬拥塞窗口,而单条 10GbE
 /// 路径上单载体的窗口本来就足够——多开只增加成本、不增加上限。
 ///
-/// 保留 `hardware_cap` 探测与服务端 `max_carriers` 收敛:它们约束的是
-/// **用户显式请求**的 K(`RH_MUX_POOL_SIZE`/配置文件),不是默认路径。
-/// 默认路径因此重新回到"单载体,不建池"。
+/// # 2026-10-20:默认改回 2(推翻 round-73)
 ///
-/// QUIC/KCP 自带多路复用(单 UDP 连接承载全部流),同样恒 1。
+/// round-73 的结论只覆盖**低 RTT** 实验床,且当时对照的是 K=1 vs K=4
+/// (4 条载体在低 BDP 下分摊成本高)。本轮三机复测(直连 2.6-2.9 G、
+/// 单载体隧道封顶 2.1-2.2 G 且**与流数无关**)重新给出可测缺口:
+///
+/// | 方向×流 | K=1 | K=2 | K=4 | frp |
+/// |---|---:|---:|---:|---:|
+/// | up×4 | 2072 | 2213 | 2184 | 2095-2354 |
+/// | up×16 | 2178 | 2306 | 2323 | 2248-2386 |
+/// | dn×16 | 2206 | 2418 | 2390 | 2133-2279 |
+///
+/// 单载体封顶的机理不是 CPU(服务端均值 0.26 核),而是**单条 TCP 流的
+/// 拥塞窗 + yamux 单 FlushTask 串行**。K=2 恰好把这个串行点劈成两条,
+/// K=4 不再有额外收益(只增加每条连接的爬窗成本)。
+///
+/// 保留 `hardware_cap` 探测与服务端 `max_carriers` 收敛。
+///
+/// QUIC/KCP 自带多路复用(单 UDP 连接承载全部流);KCP 的端到端背压
+/// 语义还依赖单通道(见 `b08_public_mux_stalled_reader_backpressure_and_recovery`),
+/// 二者同样恒 1。
 ///
 /// 该值只是**期望值**,最终 K 还要经硬件探测与服务端 `max_carriers` 收敛
 /// (见 rh-client 的 pool sizing);此处不读环境/配置。
 pub fn default_carriers(protocol: Protocol) -> usize {
+    // 2026-10-20 三机 A/B(deep-review-r3,Go loadgen,5×15s 取中位):
+    //
+    //   K=1  TCP 4 流 2072 / 16 流 2178;16 流对 frp 0.95-0.97
+    //   K=2  TCP 4 流 2213 / 16 流 2306;4 流 1.06 / 16 流 0.97-1.07
+    //   K=4  与 K=2 持平(2184 / 2323),只增成本
+    //
+    // 单载体在 2.1-2.2 G 封顶且**与流数无关**——瓶颈是 yamux 发送侧
+    // 单 FlushTask 串行 + 单 TCP 流的拥塞窗上限,不是 CPU(服务端 0.26 核
+    // 平均)。K=2 用两条物理连接各持一套发送侧,把该串行点劈开。
+    //
+    // 之前"单载体已到路径上限"的结论来自 round-73 的低 RTT 实验床;
+    // 本轮直连可到 2.6-2.9 G,隧道 2.2 G,上限并未触及。
+    //
+    // QUIC/KCP 自带多路复用(单 UDP 连接承载全部流),且 KCP 的端到端
+    // 背压语义依赖单通道,保持 1。
     match protocol {
-        // 单 UDP 连接即多路复用,多载体无意义。
         Protocol::Quic | Protocol::Kcp => 1,
-        // tcp/tls/ws/wss:单载体已到路径上限(round-73 实测,见上)。
-        _ => 1,
+        _ => 2,
     }
 }
 
@@ -519,6 +563,44 @@ pub fn carriers_for_rtt(rtt: std::time::Duration) -> usize {
     }
 }
 
+/// 探针用的拨号时钟前缀:让 `probe_rtt` 与真实拨号走**同一条路径**。
+///
+/// 真实拨号在 [`tcp::dial_tcp`] 里按 `cfg.proxy_url` 决定直连还是经代理;
+/// 探针若总是直连,走代理的部署会恒失败 → 自适应静默失效,还白等一个
+/// 超时。这里把「拨号函数」抽成可替换的,探针与真实拨号共用同一实现。
+pub type DialFn = fn(
+    SocketAddr,
+    Option<String>,
+) -> futures::future::BoxFuture<'static, std::io::Result<tokio::net::TcpStream>>;
+
+fn dial_fn() -> DialFn {
+    DIAL.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(default_dial)
+}
+
+static DIAL: std::sync::Mutex<Option<DialFn>> = std::sync::Mutex::new(None);
+
+/// 默认拨号:与 [`tcp::dial_tcp`] 同语义(有 `proxy_url` 走代理)。
+fn default_dial(
+    addr: SocketAddr,
+    proxy_url: Option<String>,
+) -> futures::future::BoxFuture<'static, std::io::Result<tokio::net::TcpStream>> {
+    Box::pin(async move {
+        match proxy_url {
+            Some(url) => {
+                let proxy = crate::proxy_dial::ProxyUrl::parse(&url)?;
+                crate::proxy_dial::dial_via_proxy(&proxy, addr).await
+            }
+            None => tokio::net::TcpStream::connect(addr).await,
+        }
+    })
+}
+
+/// **仅测试**:替换探针的拨号函数(用于计数与注入失败)。
+#[cfg(test)]
+pub fn probe_set_dial(f: Option<DialFn>) {
+    *DIAL.lock().unwrap_or_else(|e| e.into_inner()) = f;
+}
+
 /// 测量到服务端的 RTT(round-77):基于 TCP 建连耗时估计。
 ///
 /// # 这是估计,不是精确测量
@@ -527,17 +609,24 @@ pub fn carriers_for_rtt(rtt: std::time::Duration) -> usize {
 /// 代理量,因为:
 ///
 /// - 建连本身就是一次往返,量级与后续 RTT 同源(同一路径、同一队列);
-/// - 零额外流量、零协议改动,失败不影响连接(探针失败按"无法判定"处理,
-///   退回 [`default_carriers`] 的单载体保守值)。
+/// - 零额外流量、零协议改动,失败不影响连接。
+///
+/// **走与真实拨号相同的路径**:`proxy_url` 存在时经代理拨号,否则直连。
+/// 修前探针无条件直连,走代理的部署必然探测失败。
 ///
 /// 已知偏差:SYN 队列排队、服务端 accept backlog 满、NAT 冷启动都会让
 /// 建连耗时**偏大**;而 RTT 缓存命中时会偏小。因此阈值取得比较宽松
 /// (5ms / 15ms 两档),只用来区分"局域网级"与"广域网级",不追求精确。
 ///
 /// 返回 `None` = 无法判定(拨号失败),调用方退回保守默认。
-pub async fn probe_rtt(addr: SocketAddr, timeout: std::time::Duration) -> Option<std::time::Duration> {
+pub async fn probe_rtt(
+    addr: SocketAddr,
+    timeout: std::time::Duration,
+    proxy_url: Option<String>,
+) -> Option<std::time::Duration> {
     let start = std::time::Instant::now();
-    let conn = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+    let dial = dial_fn();
+    let conn = tokio::time::timeout(timeout, dial(addr, proxy_url))
         .await
         .ok()?
         .ok()?;
@@ -546,17 +635,73 @@ pub async fn probe_rtt(addr: SocketAddr, timeout: std::time::Duration) -> Option
     Some(elapsed)
 }
 
-/// 依据实测 RTT 选择载体数(round-77);探针失败时退回协议基线。
+/// 进程内 RTT 探测缓存:键为 `(server_addr, proxy_url)`。
+///
+/// 修前**每次重连**都探一次(accept 完立刻断),断线抖动时会变成周期性
+/// 小冲击。探针结果在原地不变的前提下没有时效性,缓存即可。
+type RttCache = std::collections::HashMap<(SocketAddr, Option<String>), usize>;
+
+fn rtt_cache() -> &'static std::sync::Mutex<RttCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<RttCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(RttCache::new()))
+}
+
+/// 清空 RTT 缓存(**测试与诊断**用)。
+///
+/// 始终编译:它只清一张进程内 map,生产不会调用;但下游 crate(rh-client)
+/// 的集成测试需要它来隔离用例。不是 `#[cfg(test)]` —— 那样只有
+/// rh-transport 自身的测试能看到,下游看不见(实测编译失败)。
+pub fn probe_cache_clear() {
+    rtt_cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// 本进程内**真实发生过**的探测次数(缓存命中不计)。
+///
+/// 用于断言「非 tcp 协议 / 显式配置 / 重复重连」没有触发探测。计数器
+/// 在每次未命中缓存时 `Relaxed` 自增,生产开销可忽略。
+pub fn probe_call_count() -> usize {
+    probe_calls().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn probe_calls() -> &'static std::sync::atomic::AtomicUsize {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &N
+}
+
+/// 依据实测 RTT 选择载体数(round-77);探针失败时退回**单载体**(不是
+/// 协议基线 —— 协议基线由调用方的 `default_carriers` 另外参与 `max`)。
+///
+/// 结果按 `(server_addr, proxy_url)` 缓存在进程内:同一目标只探一次,
+/// 后续重连直接复用。显式配置的短路在调用方(`initial_k_for_async`)完成。
 ///
 /// **显式配置优先**:调用方必须在调用本函数**之前**处理
 /// `RH_MUX_POOL_SIZE` / 配置文件里的 `mux_pool_size`,不要把两者混在一处。
-pub async fn auto_carriers(addr: SocketAddr, timeout: std::time::Duration) -> usize {
-    match probe_rtt(addr, timeout).await {
+pub async fn auto_carriers(
+    addr: SocketAddr,
+    timeout: std::time::Duration,
+    proxy_url: Option<String>,
+) -> usize {
+    let key = (addr, proxy_url.clone());
+    if let Some(hit) = rtt_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied()
+    {
+        return hit;
+    }
+    probe_calls().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let k = match probe_rtt(addr, timeout, proxy_url).await {
         Some(rtt) => carriers_for_rtt(rtt),
         // 探针失败(拨号不通/超时):不臆测,退回单载体。真正的拨号会
         // 在随后由 connect/connect_pool 执行并给出真实错误。
         None => 1,
-    }
+    };
+    rtt_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, k);
+    k
 }
 
 /// TLS 客户端选项。
@@ -570,6 +715,16 @@ pub struct TlsClientOptions {
     pub insecure_skip_verify: bool,
     /// 固定服务端叶子证书 SHA-256 指纹(hex)。设置时优先于 CA 链校验。
     pub pin_sha256: Option<String>,
+    /// 由 `secret` 验证对端身份:握手阶段不校验证书,认证成功后由服务端
+    /// 用 `secret` 派生的密钥加密下发它自己的证书,客户端解出后与握手实际
+    /// 看到的对端证书比对。
+    ///
+    /// 这样客户端**首次连接即能识破中间人**,且不需要 CA、不需要 pin、
+    /// 不写任何状态文件 —— 信任完全来自客户端已经持有的 `secret`。
+    ///
+    /// 前提:上层必须真的执行比对(见 `rh_protocol::certprov`)。
+    /// 只置位不比对,安全性与 `insecure_skip_verify` 等同。
+    pub secret_verified: bool,
 }
 
 /// TLS 服务端选项。
@@ -600,6 +755,12 @@ pub struct ClientTransportConfig {
     pub alpn: Vec<String>,
     /// 拨号总超时。
     pub connect_timeout: std::time::Duration,
+    /// 握手完成后写入**对端叶子证书 DER**(首个成功拨号者置入)。
+    ///
+    /// 供上层做证书下发比对:客户端解密服务端下发的证书后,与此处记录的
+    /// 实际对端证书逐字节比对,不一致即说明中间有人在转发。
+    /// `None` = 调用方不需要该信息,传输层不做额外工作。
+    pub peer_cert_sink: Option<Arc<std::sync::OnceLock<Vec<u8>>>>,
 }
 
 impl Default for ClientTransportConfig {
@@ -610,8 +771,9 @@ impl Default for ClientTransportConfig {
             multiplex: false,
             tls: TlsClientOptions::default(),
             proxy_url: None,
-            alpn: vec!["rhtp".to_string()],
+            alpn: vec![DEFAULT_ALPN.to_string()],
             connect_timeout: std::time::Duration::from_secs(10),
+            peer_cert_sink: None,
         }
     }
 }
@@ -633,7 +795,7 @@ impl Default for ServerTransportConfig {
             bind_addr: "0.0.0.0:7000".parse().unwrap(),
             multiplex: false,
             tls: TlsServerOptions::default(),
-            alpn: vec!["rhtp".to_string()],
+            alpn: vec![DEFAULT_ALPN.to_string()],
         }
     }
 }
@@ -1032,7 +1194,7 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
 /// # K 的取值(round-45 修正)
 ///
 /// 本函数**不决定** K,由调用方显式传入。默认值见
-/// [`default_carriers`]:六个协议全部为 1(round-73 起)。
+/// [`default_carriers`]:tcp/tls/ws/wss 为 2,quic/kcp 为 1。
 /// 显式配置见 `rh-client` 的 `mux_pool_size`(env `RH_MUX_POOL_SIZE`)。
 ///
 /// 曾经此处写「推荐 K = 4」并引用一个从未被读取的常量,那与实现不符——
@@ -1054,27 +1216,194 @@ pub async fn connect_pool(
 mod carrier_baseline_tests {
     use super::*;
 
-    // T-C1(round-10,round-54 修订,round-73 回退):协议基线六变体全覆盖。
+    // ---- RTT 探针(carriers_for_rtt 阈值见下方既有测试)------------------
+
+    // 探针用例的注入状态**全部是线程局部**。
+    //
+    // 修前用 `static AtomicUsize`:持锁窗口只覆盖了 `probe_setup`,而用例
+    // 在窗口内还会改 `DIAL_MS`(测两档 RTT)。并行跑其它 crate 的探针
+    // 用例时,同一进程里两边互相改对方的注入值——实测全量偶发
+    // `probe_result_matches_thresholds` 得到 K=2(应为 1)。
+    // tokio 的 current_thread 测试在单线程内跑,线程局部即可隔离。
+    // 注入状态用**进程级全局原子**,不用 thread_local。
+    //
+    // 理由:`#[tokio::test]` 不保证整个测试跑在同一线程(multi_thread 下
+    // 会跨 worker 迁移)。thread_local 在那种场景下 setUp 与 setUp 之间
+    // 看得见的不是同一份状态,断言会随机失败。正确做法是全局 + 一把
+    // async 锁把「设置 → 运行 → 断言」整个窗口串行化(`PROBE_LOCK`)。
+    static DIALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static DIAL_MS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static DIAL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    static LAST_PROXY: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+
+    fn dials() -> usize {
+        DIALS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn counting_dial(
+        _addr: SocketAddr,
+        proxy: Option<String>,
+    ) -> futures::future::BoxFuture<'static, std::io::Result<tokio::net::TcpStream>> {
+        DIALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *LAST_PROXY.lock().unwrap_or_else(|e| e.into_inner()) = Some(proxy);
+        let ms = DIAL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64;
+        let ok = DIAL_OK.load(std::sync::atomic::Ordering::Relaxed);
+        Box::pin(async move {
+            if ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+            if !ok {
+                return Err(std::io::Error::other("injected dial failure"));
+            }
+            // 返回一条真实但已断的 loopback 连接:探针只测"建连耗时",
+            // 拿到后立刻 drop,不需要可用会话。
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let a = l.local_addr()?;
+            let c = tokio::net::TcpStream::connect(a).await?;
+            Ok(c)
+        })
+    }
+
+    /// 缓存仍是**进程级全局**(生产语义如此),故仍需串行;但注入量已
+    /// 线程局部,窗口内改 RTT 不再影响别的用例。
+    static PROBE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn probe_setup(ok: bool, ms: usize) -> tokio::sync::MutexGuard<'static, ()> {
+        let g = PROBE_LOCK.lock().await;
+        probe_cache_clear();
+        DIALS.store(0, std::sync::atomic::Ordering::Relaxed);
+        DIAL_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+        DIAL_OK.store(ok, std::sync::atomic::Ordering::Relaxed);
+        *LAST_PROXY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        probe_set_dial(Some(counting_dial));
+        g
+    }
+
+    fn probe_teardown() {
+        probe_set_dial(None);
+        probe_cache_clear();
+        DIAL_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        DIAL_OK.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn addr() -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, 1], 7000))
+    }
+
+    /// 连续重连 10 次:只应发生 1 次真实探测(结果按 (addr,proxy) 缓存)。
+    #[tokio::test]
+    async fn repeated_reconnects_probe_only_once() {
+        let _g = probe_setup(true, 1).await;
+        let mut ks = Vec::new();
+        for _ in 0..10 {
+            ks.push(auto_carriers(addr(), std::time::Duration::from_secs(2), None).await);
+        }
+        assert!(
+            ks.iter().all(|k| *k == ks[0]),
+            "缓存命中必须返回同一结果,实际 {ks:?}"
+        );
+        assert_eq!(
+            dials(),
+            1,
+            "连续 10 次重连应只探测 1 次,实际探测了 {} 次",
+            dials()
+        );
+        probe_teardown();
+    }
+
+    /// 缓存键含 proxy_url:同一地址不同代理必须分别探测(结果可能不同)。
+    #[tokio::test]
+    async fn cache_key_includes_proxy_url() {
+        let _g = probe_setup(true, 1).await;
+        auto_carriers(addr(), std::time::Duration::from_secs(2), None).await;
+        auto_carriers(addr(), std::time::Duration::from_secs(2), None).await;
+        assert_eq!(dials(), 1);
+
+        auto_carriers(
+            addr(),
+            std::time::Duration::from_secs(2),
+            Some("http://127.0.0.1:3128".into()),
+        )
+        .await;
+        assert_eq!(
+            dials(),
+            2,
+            "不同 proxy_url 必须各自探测一次"
+        );
+        probe_teardown();
+    }
+
+    /// 探针必须把 proxy_url 传给拨号函数(修前是完全忽略)。
+    #[tokio::test]
+    async fn probe_passes_proxy_url_to_dialer() {
+        let _g = probe_setup(true, 1).await;
+        let proxy = Some("socks5://127.0.0.1:1080".to_string());
+        auto_carriers(addr(), std::time::Duration::from_secs(2), proxy.clone()).await;
+        let seen = LAST_PROXY.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            seen,
+            Some(proxy),
+            "探针必须把 proxy_url 原样传给拨号函数,实际 {seen:?}"
+        );
+        probe_teardown();
+    }
+
+    /// 探针失败不得阻断:返回 1(单载体),不 panic、不阻塞调用方。
+    #[tokio::test]
+    async fn probe_failure_degrades_to_single_carrier() {
+        let _g = probe_setup(false, 0).await;
+        let k = auto_carriers(addr(), std::time::Duration::from_secs(2), None).await;
+        assert_eq!(k, 1, "探测失败必须退回单载体");
+        // 失败结果也要缓存:避免断线时每次重连都白等超时
+        let k2 = auto_carriers(addr(), std::time::Duration::from_secs(2), None).await;
+        assert_eq!(k2, 1);
+        assert_eq!(
+            dials(),
+            1,
+            "失败结果也必须缓存"
+        );
+        probe_teardown();
+    }
+
+    /// 不同 RTT 给出不同 K,且与 carriers_for_rtt 一致。
+    ///
+    /// 注意:同一把锁**不能嵌套获取**(`probe_setup` 会 `lock().await`)。
+    /// 两档 RTT 用不同地址区分,共用一次持锁窗口。
+    #[tokio::test]
+    async fn probe_result_matches_thresholds() {
+        let _g = probe_setup(true, 1).await;
+        // 1ms → 局域网档 → K=1
+        let lan = auto_carriers(addr(), std::time::Duration::from_secs(2), None).await;
+        assert_eq!(lan, carriers_for_rtt(std::time::Duration::from_millis(1)));
+        assert_eq!(lan, 1);
+
+        // 改注入延迟为 20ms(不重新取锁),清缓存后换一个地址再探
+        DIAL_MS.store(20, std::sync::atomic::Ordering::Relaxed);
+        probe_cache_clear();
+        let wan_addr = SocketAddr::from(([203, 0, 113, 2], 7000));
+        let wan = auto_carriers(wan_addr, std::time::Duration::from_secs(2), None).await;
+        assert_eq!(wan, carriers_for_rtt(std::time::Duration::from_millis(20)));
+        assert_eq!(wan, 4);
+        probe_teardown();
+    }
+
+    // T-C1(round-10 → round-54 → round-73 → 2026-10-20):协议基线六变体全覆盖。
     //
     // round-10 原值:tcp/ws = 1、tls/wss = 2、quic/kcp = 1。
     // round-54 改成 tcp/tls/ws/wss = 4、quic/kcp = 1——依据是一组后来被
-    //   证伪的测量(iperf3 接收端先饱和,详见 [`default_carriers`] 文档)。
-    // round-73 **全部回退为 1**:同一窗口内严格交替 K=1/K=4 各 6 次,
-    //   K=1 从未更慢,下行稳定快 15~20%。
+    //   证伪的测量(iperf3 接收端先饱和)。
+    // round-73 全部回退为 1——低 RTT 床上 K=1/K=4 交替 6 次,K=1 不慢。
+    // 2026-10-20 三机复测(Go loadgen,直连 2.6-2.9G):单载体隧道封顶
+    //   2.1-2.2G 且与流数无关,K=2 把 4/16 流提到 frp 水平,K=4 无额外
+    //   收益。故 tcp-base 默认改为 2;QUIC/KCP 仍为 1(自带多路复用,
+    //   KCP 的背压语义还依赖单通道)。
     //
     // 本测试锁的是"每个协议的默认值",任何改动都必须同步更新这里——
     // 它是一处**有意的**重复,用来防止默认值漂移无声通过。
     #[test]
     fn default_carriers_covers_all_protocols() {
-        for p in [
-            Protocol::Tcp,
-            Protocol::Tls,
-            Protocol::Ws,
-            Protocol::Wss,
-            Protocol::Quic,
-            Protocol::Kcp,
-        ] {
-            assert_eq!(default_carriers(p), 1, "{p:?} 的默认载体数应为 1");
+        for p in [Protocol::Tcp, Protocol::Tls, Protocol::Ws, Protocol::Wss] {
+            assert_eq!(default_carriers(p), 2, "{p:?} 的默认载体数应为 2");
         }
         // 红线 1 的形式化:非 tcp-based 恒 1(自带多路复用,多载体无意义)。
         for p in [Protocol::Quic, Protocol::Kcp] {

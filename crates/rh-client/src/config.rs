@@ -34,6 +34,11 @@ pub struct ClientConfig {
     pub server_name: Option<String>,
     pub tls_insecure_skip_verify: bool,
     pub tls_pin_sha256: Option<String>,
+    /// TLS ALPN 标识列表;留空 = 用 [`rh_transport::DEFAULT_ALPN`]("h2")。
+    ///
+    /// ALPN 在 ClientHello 里是明文,项目专属名字会被 DPI 识别,故默认用
+    /// 最常见的 `h2`。**必须与服务端一致**,否则 TLS 握手失败。
+    pub alpn: Vec<String>,
     /// HTTP/SOCKS5 代理拨号(http://user:pass@host:port 或 socks5://…)。
     pub proxy_url: Option<String>,
     /// XTCP 打洞 STUN 服务器;空 = 以本机地址作候选。
@@ -61,6 +66,7 @@ impl Default for ClientConfig {
             proxy_url: None,
             stun_server: None,
             dns_server: None,
+            alpn: Vec::new(),
             log_level: "info".into(),
         }
     }
@@ -101,10 +107,20 @@ impl ClientConfig {
                 server_name: self.server_name.clone(),
                 insecure_skip_verify: self.tls_insecure_skip_verify,
                 pin_sha256: self.tls_pin_sha256.clone(),
+                // 没有 CA 也没有 pin 时,靠 secret 认证后下发证书来验证对端。
+                // 这是"零配置也能防中间人"的路径,见 rh_protocol::certprov。
+                secret_verified: self.tls_pin_sha256.is_none()
+                    && self.trusted_ca_file.is_none()
+                    && !self.tls_insecure_skip_verify,
             },
             proxy_url: self.proxy_url.clone(),
-            alpn: vec!["rhtp".into()],
+            alpn: if self.alpn.is_empty() {
+                vec![rh_transport::DEFAULT_ALPN.into()]
+            } else {
+                self.alpn.clone()
+            },
             connect_timeout: std::time::Duration::from_secs(10),
+            peer_cert_sink: None,
         })
     }
 
@@ -145,6 +161,14 @@ impl ClientConfig {
         }
         if let Some(v) = s("RH_SERVER_NAME") {
             self.server_name = Some(v);
+        }
+        if let Some(v) = s("RH_ALPN") {
+            // 逗号分隔;空串视为"用默认值"(对 Docker 传空变量更友好)
+            self.alpn = v
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
         }
         if let Some(v) = s("RH_PROXY_URL") {
             self.proxy_url = Some(v);
@@ -316,7 +340,7 @@ mod tests {
         // (tcp=1)。断言真正参与定容的 initial_k_for_with,而不是已删除的
         // ClientTransportConfig::carriers。
         let (k, _cap) = crate::session::initial_k_for_with(&c, rh_transport::Protocol::Tcp, 8);
-        assert_eq!(k, 1, "None(自动定容)在 tcp 协议下取协议基线 K=1(round-73)");
+        assert_eq!(k, 2, "None(自动定容)在 tcp 协议下取协议基线 K=2");
 
         // 有 env:覆盖默认;布尔解析大小写不敏感
         std::env::set_var("RH_SERVER", "127.0.0.1:7100");
@@ -412,7 +436,7 @@ secret = "s"
         let absent: ClientConfig = toml::from_str(base).unwrap();
         assert_eq!(absent.mux_pool_size, None, "未配置 = 自动定容");
         let (k, _) = crate::session::initial_k_for_with(&absent, rh_transport::Protocol::Tls, 8);
-        assert_eq!(k, 1, "未配置时取协议基线 K=1(round-73)");
+        assert_eq!(k, 2, "未配置时取协议基线 K=2");
 
         let explicit: ClientConfig = toml::from_str(&format!("{base}mux_pool_size = 3\n")).unwrap();
         assert_eq!(explicit.mux_pool_size, Some(3));
@@ -423,6 +447,65 @@ secret = "s"
         assert_eq!(one.mux_pool_size, Some(1));
         let (k, _) = crate::session::initial_k_for_with(&one, rh_transport::Protocol::Tls, 8);
         assert_eq!(k, 1, "显式 1 覆盖协议基线(单载体)");
+    }
+
+    // 证书下发校验的**开关判定**:只有 `secret_verified` 才该装 sink 并
+    // 执行比对。曾经用的是 `protocol.is_encrypted()`,后果是:
+    //   - insecure 的客户端(明文自签调试、E2E 全部用例)被强制 fail-closed,
+    //     收不到帧就拒绝连接 → tls/wss/quic 在 E2E 里全红;
+    //   - 没有降级防护之外的任何收益:pin/CA 已在握手内认证完毕。
+    // 本测试逐态锁定"哪些配置会走 secret 验证"。
+    #[test]
+    fn secret_verified_only_when_nothing_else_trusts() {
+        let mk = |ca: Option<&str>, pin: Option<&str>, insecure: bool| ClientConfig {
+            trusted_ca_file: ca.map(str::to_string),
+            tls_pin_sha256: pin.map(str::to_string),
+            tls_insecure_skip_verify: insecure,
+            ..ClientConfig::default()
+        };
+
+        // 默认(零配置):唯一走 secret 下发的路径
+        assert!(
+            mk(None, None, false)
+                .transport_cfg()
+                .unwrap()
+                .tls
+                .secret_verified
+        );
+
+        // 三种"已有别的信任来源"的配置都不得走 secret 校验
+        assert!(
+            !mk(Some("/dev/null"), None, false)
+                .transport_cfg()
+                .unwrap()
+                .tls
+                .secret_verified,
+            "配了 trusted_ca 就走 CA 链,不该再依赖下发帧"
+        );
+        assert!(
+            !mk(None, Some("00"), false)
+                .transport_cfg()
+                .unwrap()
+                .tls
+                .secret_verified,
+            "配了 pin 就走指纹固定,不该再依赖下发帧"
+        );
+        assert!(
+            !mk(None, None, true)
+                .transport_cfg()
+                .unwrap()
+                .tls
+                .secret_verified,
+            "insecure 是显式放弃校验,不得被强制 fail-closed"
+        );
+        assert!(
+            !mk(Some("/dev/null"), None, true)
+                .transport_cfg()
+                .unwrap()
+                .tls
+                .secret_verified,
+            "insecure + CA 同样不走 secret 校验"
+        );
     }
 
     // T-C3(round-10,勘误版):硬件上限纯函数四态覆盖——能读到队列数时

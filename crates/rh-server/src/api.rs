@@ -105,13 +105,20 @@ async fn login(
     ConnectInfo(peer): ConnectInfo<crate::WebAddr>,
     Json(req): Json<LoginReq>,
 ) -> Response {
-    // 登录限速:每 IP+用户名 5 次/分钟(governor)。
-    // 用户名截断防任意长度 key 撑内存。
+    // C7:登录限速改为两级 —— 每 IP 一个宽桶 + 每 IP+用户名一个小桶。
+    //
+    // 修前只有 `{ip}|{user}` 单键:攻击者轮换用户名即可绕过 IP 限制,
+    // 且键随"用户名"无限增长(无淘汰)。现在 IP 维度的桶先兜住洪峰,
+    // 用户名截断仍然保留。
     let uname: String = req.username.chars().take(64).collect();
     if state
         .login_limiter
-        .check_key(&format!("{peer}|{uname}"))
+        .check_key(&format!("ip|{peer}"))
         .is_err()
+        || state
+            .login_limiter_user
+            .check_key(&format!("{peer}|{uname}"))
+            .is_err()
     {
         state
             .events
@@ -122,9 +129,12 @@ async fn login(
     let user = match state.db.get_user(&req.username).await {
         Ok(Some(u)) => u,
         _ => {
-            // 对不存在的用户也执行一次等价 argon2 校验,消除时序侧信道枚举
+            // 对不存在的用户也执行一次等价 argon2 校验,消除时序侧信道枚举。
+            // C6:argon2id 是 CPU 密集的同步计算,必须放到 blocking 池 ——
+            // 直接在 tokio worker 上跑会让并发登录把转发任务一起卡住。
             const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$OXRoZXJlYXJlZnJwaHJvbGl0Z$5ENkQGI9XCo8uUU6eW/y6vLzRnF8YD2NO6wanjaApfE";
-            let _ = verify_password(&req.password, DUMMY_HASH);
+            let pw = req.password.clone();
+            let _ = tokio::task::spawn_blocking(move || verify_password(&pw, DUMMY_HASH)).await;
             state
                 .events
                 .emit("warn", "auth", &format!("登录失败(用户不存在):{uname}"))
@@ -132,7 +142,13 @@ async fn login(
             return err(1001, "用户名或密码错误");
         }
     };
-    if !verify_password(&req.password, &user.1) {
+    // C6:同上 —— 真实校验也必须在 blocking 池。
+    let pw = req.password.clone();
+    let hash = user.1.clone();
+    let verified = tokio::task::spawn_blocking(move || verify_password(&pw, &hash))
+        .await
+        .unwrap_or(false);
+    if !verified {
         state
             .events
             .emit(
@@ -144,7 +160,9 @@ async fn login(
         return err(1001, "用户名或密码错误");
     }
     let ttl = chrono_hours(state.cfg.web.jwt_ttl_hours);
-    let token = match mint_jwt(&state, &req.username, ttl).await {
+    // B11:令牌携带签发时的 pwd_version,登出/改密递增后旧令牌立即 401。
+    let pv = state.db.user_pwd_version(&req.username).await.unwrap_or(0);
+    let token = match mint_jwt(&state, &req.username, ttl, pv).await {
         Ok(t) => t,
         Err(e) => return err(500, &format!("内部错误(jwt):{e}")),
     };
@@ -231,7 +249,12 @@ pub fn hash_password(plain: &str) -> anyhow::Result<String> {
         .to_string())
 }
 
-async fn mint_jwt(state: &Arc<AppState>, username: &str, ttl_hours: u64) -> anyhow::Result<String> {
+async fn mint_jwt(
+    state: &Arc<AppState>,
+    username: &str,
+    ttl_hours: u64,
+    pwd_version: i64,
+) -> anyhow::Result<String> {
     let secret = state.jwt_secret().await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -240,6 +263,7 @@ async fn mint_jwt(state: &Arc<AppState>, username: &str, ttl_hours: u64) -> anyh
         "sub": username,
         "iat": now,
         "exp": now + (ttl_hours as i64) * 3600,
+        "pv": pwd_version,
     });
     Ok(jsonwebtoken::encode(
         &jsonwebtoken::Header::default(),
@@ -271,12 +295,25 @@ async fn require_auth(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Stri
         &jsonwebtoken::Validation::default(),
     );
     match data {
-        Ok(d) => Ok(d
-            .claims
-            .get("sub")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()),
+        Ok(d) => {
+            let user = d
+                .claims
+                .get("sub")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if user.is_empty() {
+                return Err(Box::new(unauthorized()));
+            }
+            // B11:令牌版本必须与用户当前 pwd_version 一致。登出/改密递增
+            // 后,旧令牌在下一次请求即失效(无状态 JWT 的吊销点)。
+            let want = d.claims.get("pv").and_then(|v| v.as_i64()).unwrap_or(0);
+            let cur = state.db.user_pwd_version(&user).await.unwrap_or(0);
+            if want != cur {
+                return Err(Box::new(unauthorized()));
+            }
+            Ok(user)
+        }
         Err(_) => Err(Box::new(unauthorized())),
     }
 }
@@ -284,6 +321,10 @@ async fn require_auth(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Stri
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     match require_auth(&state, &headers).await {
         Ok(user) => {
+            // B11:登出即吊销 —— 递增 pwd_version,该用户全部既有令牌失效。
+            if let Err(e) = state.db.bump_user_pwd_version(&user).await {
+                tracing::warn!(error = %e, user = %user, "logout: bump pwd_version failed");
+            }
             state
                 .events
                 .emit("info", "auth", &format!("已登出:{user}"))
@@ -562,6 +603,7 @@ async fn update_client(
             let proxies = state.db.list_proxies(Some(&id)).await.unwrap_or_default();
             let visitors = state.db.list_visitors(Some(&id)).await.unwrap_or_default();
             let rev = state.db.bump_revision(&id).await.unwrap_or(0);
+            state.bump_cfg_gen(&id);
             for (pid, _, _spec) in &proxies {
                 crate::runtime::teardown_runtime(&state, *pid as u64).await;
                 if let Some(sess) = state.sessions.get(&id) {
@@ -825,8 +867,7 @@ async fn create_service_inner(
             let proto = spec.kind.as_str();
             let gkey = crate::state::ProxyManager::group_key(spec);
             if state
-                .proxies
-                .port_in_use(proto, bind_ip, spec.bind_port, None, gkey.clone())
+                .port_in_use_full(proto, bind_ip, spec.bind_port, None, gkey.clone())
                 .await
             {
                 return Err((2006, "PORT_CONFLICT:端口已被占用".into()));
@@ -915,11 +956,16 @@ async fn update_service(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-    Json(mut spec): Json<ProxySpec>,
+    Json(spec): Json<ProxySpec>,
 ) -> Response {
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }
+    update_service_inner(&state, id, spec).await
+}
+
+/// update 的实现本体(抽出以便单测直接驱动,A5)。
+async fn update_service_inner(state: &Arc<AppState>, id: i64, mut spec: ProxySpec) -> Response {
     spec.id = id as u64;
     // 名称校验与创建一致(名字是 visitor 目标解析的稳定键)
     if spec.name.is_empty()
@@ -973,6 +1019,55 @@ async fn update_service(
     if spec.kind.uses_bind_port() && spec.bind_port == 0 {
         return err(3006, "bind_port 不能为 0(仅创建时支持自动分配)");
     }
+    // ★A5:enabled 由 true → false 必须**真的拆运行态**。
+    //
+    // 修前走下面 `!port_changed` 分支:只落库 enabled=0 + publish_spec_in_place
+    // (仅下发 Update 快照),既不 teardown 也不发 ServiceRemove。后果:
+    //   - 端口继续监听(用户以为已停用);
+    //   - `port_in_use` 只统计 enabled 运行态 → 该端口可被**新规则再次占用**,
+    //     形成双占冲突。
+    // 对照 disable 端点(api.rs 的 disable_service_inner)有完整 teardown。
+    //
+    // 这里直接复用 disable_service_inner 的语义(落库 + bump + teardown +
+    // ServiceRemove + 事件),避免两条路径再次分叉。
+    if old.enabled && !spec.enabled {
+        // 先把非 enabled 字段落库(用户同时改了 target 等),再走停用。
+        if let Err(e) = state.db.update_proxy(id, &spec, port_auto).await {
+            return err(500, &format!("{e}"));
+        }
+        let (code, msg) = disable_service_locked(state, id).await;
+        if code != 0 {
+            return err(code, &msg);
+        }
+        let rev = state
+            .db
+            .get_client(&client_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.config_revision.max(0) as u64)
+            .unwrap_or(0);
+        return ok(json!({"updated": true, "disabled": true, "revision": rev}));
+    }
+    // 同理:false → true 走 enable 的完整路径(重建运行态 + 下发)
+    if !old.enabled && spec.enabled {
+        if let Err(e) = state.db.update_proxy(id, &spec, port_auto).await {
+            return err(500, &format!("{e}"));
+        }
+        let (code, msg) = enable_service_locked(state, id).await;
+        if code != 0 {
+            return err(code, &msg);
+        }
+        let rev = state
+            .db
+            .get_client(&client_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.config_revision.max(0) as u64)
+            .unwrap_or(0);
+        return ok(json!({"updated": true, "enabled": true, "revision": rev}));
+    }
     // 非端口字段变更(§4.3):listener/池不动,原位发布快照 + 入队
     let port_changed =
         spec.kind != old.kind || spec.bind_port != old.bind_port || spec.bind_ip != old.bind_ip;
@@ -986,7 +1081,7 @@ async fn update_service(
                 Ok(r) => r,
                 Err(e) => return err(500, &format!("{e}")),
             };
-            crate::runtime::publish_spec_in_place(&state, &rt, &spec, rev).await;
+            crate::runtime::publish_spec_in_place(state, &rt, &spec, rev).await;
             return ok(json!({"updated": true, "revision": rev}));
         }
     }
@@ -1012,8 +1107,7 @@ async fn update_service(
         }
         let gkey = crate::state::ProxyManager::group_key(&spec);
         if state
-            .proxies
-            .port_in_use(
+            .port_in_use_full(
                 spec.kind.as_str(),
                 new_ip,
                 spec.bind_port,
@@ -1033,7 +1127,7 @@ async fn update_service(
             };
         if !trial_ok {
             let msg = bind_failure_message(
-                &state,
+                state,
                 "端口绑定失败",
                 spec.kind.as_str(),
                 new_ip,
@@ -1052,8 +1146,8 @@ async fn update_service(
         Err(e) => return err(500, &format!("{e}")),
     };
     // 端口/类型变更:重建运行态(在途连接由 rule_cancel 级联关闭)
-    crate::runtime::teardown_runtime(&state, id as u64).await;
-    crate::runtime::spawn_runtime(&state, &client_id, &spec, rev).await;
+    crate::runtime::teardown_runtime(state, id as u64).await;
+    crate::runtime::spawn_runtime(state, &client_id, &spec, rev).await;
     ok(json!({"updated": true, "revision": rev}))
 }
 
@@ -1116,6 +1210,7 @@ async fn enable_service(
         }
     }
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     crate::runtime::teardown_runtime(&state, id as u64).await;
     crate::runtime::spawn_runtime(&state, &client_id, &spec, rev).await;
     ok(json!({"enabled": true, "revision": rev}))
@@ -1246,8 +1341,7 @@ async fn create_bind_checked(
     }
     let gkey = crate::state::ProxyManager::group_key(spec);
     if state
-        .proxies
-        .port_in_use(
+        .port_in_use_full(
             spec.kind.as_str(),
             bind_ip,
             spec.bind_port,
@@ -1304,6 +1398,7 @@ async fn disable_service(
     };
     state.db.set_proxy_enabled(id, false).await.ok();
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     crate::runtime::teardown_runtime(&state, id as u64).await;
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove};
@@ -1346,6 +1441,7 @@ async fn delete_service(
         return err(3001, "转发规则不存在");
     };
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     crate::runtime::teardown_runtime(&state, id as u64).await;
     if let Err(e) = state.db.delete_proxy(id).await {
         return err(500, &format!("{e}"));
@@ -1408,6 +1504,12 @@ async fn enable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
+    enable_service_locked(state, id).await
+}
+
+/// 启用的实现本体,**要求调用方已持有 serial_lock**(理由同
+/// [`disable_service_locked`])。
+async fn enable_service_locked(state: &Arc<AppState>, id: i64) -> (i32, String) {
     let Some((_, client_id, mut spec, port_auto)) = state.db.get_proxy(id).await.ok().flatten()
     else {
         return (3001, "not found".into());
@@ -1415,6 +1517,7 @@ async fn enable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
     state.db.set_proxy_enabled(id, true).await.ok();
     spec.enabled = true;
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     let client_enabled = state
         .db
         .get_client(&client_id)
@@ -1450,13 +1553,26 @@ async fn enable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
 }
 
 async fn disable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
-    let Some((_, client_id, spec, _)) = state.db.get_proxy(id).await.ok().flatten() else {
+    let Some((_, client_id, _, _)) = state.db.get_proxy(id).await.ok().flatten() else {
         return (3001, "not found".into());
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
+    disable_service_locked(state, id).await
+}
+
+/// 停用的实现本体,**要求调用方已持有该客户端的 serial_lock**。
+///
+/// ★为什么必须拆出这一层(A5):`update_service_inner` 自己已经持锁,
+/// 若它直接调 [`disable_service_inner`] 会在同一把 `tokio::sync::Mutex`
+/// 上二次加锁 —— 直接死锁(不是 RwLock 的重入读,是写锁自锁)。
+async fn disable_service_locked(state: &Arc<AppState>, id: i64) -> (i32, String) {
+    let Some((_, client_id, spec, _)) = state.db.get_proxy(id).await.ok().flatten() else {
+        return (3001, "not found".into());
+    };
     state.db.set_proxy_enabled(id, false).await.ok();
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     crate::runtime::teardown_runtime(state, id as u64).await;
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove};
@@ -1482,6 +1598,7 @@ async fn delete_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     crate::runtime::teardown_runtime(state, id as u64).await;
     let _ = state.db.delete_proxy(id).await;
     if let Some(sess) = state.sessions.get(&client_id) {
@@ -1542,23 +1659,12 @@ struct CreateVisitorReq {
     spec: VisitorSpec,
 }
 
-async fn create_visitor(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<CreateVisitorReq>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
-    let mut spec = req.spec;
-    if spec.name.is_empty() || spec.bind_port == 0 {
-        return err(4001, "缺少 name 或 bind_port");
-    }
-    spec.id = 0;
-    // 密钥由目标规则单一管理:访问器一律不存储(连接时继承规则当前密钥),入参忽略
-    spec.secret_key = String::new();
-    // 解析目标代理归属(同名规则可能存在于多个客户端:优先当前在线的客户端,
-    // 全部离线时取创建序首个,并在歧义时告警)
+/// B15:解析 visitor 的目标代理归属(创建与更新共用)。
+///
+/// 同名规则可能存在于多个客户端:优先当前在线的客户端;全部离线时取
+/// 创建序首个,歧义时告警。修前 update 取"首个匹配"(不看在不在线),
+/// create 优先在线 —— 同名一在线一离线时,update 会把归属改到离线端。
+async fn resolve_visitor_target(state: &Arc<AppState>, spec: &VisitorSpec) -> Option<String> {
     let clients = state.db.list_clients().await.unwrap_or_default();
     let mut candidates: Vec<String> = Vec::new();
     for c in &clients {
@@ -1577,11 +1683,29 @@ async fn create_visitor(
             "visitor target proxy name ambiguous; preferring online client"
         );
     }
-    let target_client = candidates
+    candidates
         .iter()
         .find(|c| state.sessions.get(c).is_some())
         .or_else(|| candidates.first())
-        .cloned();
+        .cloned()
+}
+
+async fn create_visitor(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateVisitorReq>,
+) -> Response {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    let mut spec = req.spec;
+    if spec.name.is_empty() || spec.bind_port == 0 {
+        return err(4001, "缺少 name 或 bind_port");
+    }
+    spec.id = 0;
+    // 密钥由目标规则单一管理:访问器一律不存储(连接时继承规则当前密钥),入参忽略
+    spec.secret_key = String::new();
+    let target_client = resolve_visitor_target(&state, &spec).await;
     let target_proxy_found = target_client.is_some();
     if !target_proxy_found {
         return err(4002, "目标规则不存在(类型须匹配)");
@@ -1597,6 +1721,7 @@ async fn create_visitor(
         Err(e) => return err(500, &format!("{e}")),
     };
     let rev = state.db.bump_revision(&req.client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&req.client_id);
     spec.id = id as u64;
     // 下发
     if let Some(sess) = state.sessions.get(&req.client_id) {
@@ -1646,26 +1771,15 @@ async fn update_visitor(
     spec.id = id as u64;
     // 密钥由目标规则单一管理:访问器一律不存储(连接时继承规则当前密钥),入参忽略
     spec.secret_key = String::new();
-    // 重新解析目标:与创建同语义(名称 + 类型都须匹配,否则拒绝)
-    let clients = state.db.list_clients().await.unwrap_or_default();
-    let mut target_client = None;
-    for c in &clients {
-        if let Ok(list) = state.db.list_proxies(Some(&c.id)).await {
-            if list.iter().any(|(_, _, p)| {
-                p.name == spec.target_proxy_name && p.kind.as_str() == spec.kind.as_str()
-            }) {
-                target_client = Some(c.id.clone());
-                break;
-            }
-        }
-    }
-    let Some(target_client) = target_client else {
+    // B15:与创建同一解析器(名称 + 类型都须匹配,优先在线客户端)
+    let Some(target_client) = resolve_visitor_target(&state, &spec).await else {
         return err(4002, "目标规则不存在(类型须匹配)");
     };
     if let Err(e) = state.db.update_visitor(id, &target_client, &spec).await {
         return err(500, &format!("{e}"));
     }
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceUpdate, SyncEntity};
         let _ = sess
@@ -1727,6 +1841,7 @@ async fn toggle_visitor(state: Arc<AppState>, id: i64, enabled: bool) -> Respons
     state.db.set_visitor_enabled(id, enabled).await.ok();
     spec.enabled = enabled;
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove, ServiceUpdate, SyncEntity};
         if enabled {
@@ -1781,6 +1896,7 @@ async fn delete_visitor(
         return err(4003, "访问器不存在");
     }
     let rev = state.db.bump_revision(&client_id).await.unwrap_or(0);
+    state.bump_cfg_gen(&client_id);
     let _ = state.db.delete_visitor(id).await;
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove};
@@ -1881,6 +1997,8 @@ async fn get_server_config(State(state): State<Arc<AppState>>, headers: HeaderMa
                 .unwrap_or(serde_json::Value::Null),
         },
         "authorized_keys": authorized_keys,
+        // 重启生效项:ALPN 在监听器构建时固化(TLS acceptor),热改无效。
+        "alpn": state.cfg.alpn,
     }))
 }
 
@@ -1900,6 +2018,17 @@ struct ServerConfigUpdate {
     /// authorized_keys 文件全文(空串 = 清空;null = 不动)。
     #[serde(default)]
     authorized_keys: Option<String>,
+    /// TLS 相关(重启生效)。
+    #[serde(default)]
+    tls: Option<TlsUpdate>,
+}
+
+/// [tls] 段:目前只有 ALPN。改动需重启(监听器构建时固化)。
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct TlsUpdate {
+    /// ALPN 标识列表;空数组 = 用默认值(`h2`)。
+    alpn: Option<Vec<String>>,
 }
 
 /// [limits] 热改子集:全部字段可选,0 = 不限(max_pool_size 除外,见字段)。
@@ -2020,6 +2149,24 @@ async fn put_server_config(
         }
     }
 
+    if let Some(t) = &req.tls {
+        if let Some(list) = &t.alpn {
+            if list.len() > 8 {
+                return err(1002, "alpn 最多 8 项");
+            }
+            for item in list {
+                // RFC 7301:ALPN 标识是 1-255 字节的 opaque 字节串;
+                // 实际使用中都为可打印 ASCII,这里按可见 ASCII 收紧校验,
+                // 避免控制字符进入配置文件后无法编辑。
+                if item.is_empty() || item.len() > 255 {
+                    return err(1002, "alpn 每项须为 1-255 字节");
+                }
+                if !item.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+                    return err(1002, &format!("alpn 含非法字符(须为可见 ASCII):{item}"));
+                }
+            }
+        }
+    }
     if let Some(l) = &req.limits {
         if let Some(n) = l.max_mux_streams {
             if n > rh_transport::MUX_STREAMS_UNLIMITED {
@@ -2239,11 +2386,27 @@ async fn put_server_config(
         let _ = state.ssh_watch.0.send(u64::MAX);
     }
 
+    // ALPN:监听器构建时固化,无法热改 —— 写回文件并标记 restart_required。
+    let mut restart_required: Vec<String> = Vec::new();
+    if let Some(t) = &req.tls {
+        if let Some(list) = &t.alpn {
+            let norm: Vec<String> = list.iter().map(|s| s.trim().to_string()).collect();
+            if norm != state.cfg.alpn {
+                restart_required.push("alpn".into());
+            }
+        }
+    }
+
     // 回写配置文件:热子集合并进启动配置快照;原文件备份一次(.bak),注释会丢失
     let persist_err;
     {
         let hot = state.hot.read().await;
         let mut disk = state.cfg.as_ref().clone();
+        if let Some(t) = &req.tls {
+            if let Some(list) = &t.alpn {
+                disk.alpn = list.iter().map(|s| s.trim().to_string()).collect();
+            }
+        }
         disk.ports.allow_ports = hot.allow_ports.clone();
         disk.ports.max_services_per_client = hot.max_services_per_client;
         disk.log.level = hot.log_level.clone();
@@ -2269,14 +2432,14 @@ async fn put_server_config(
             .emit("warn", "server", &format!("配置已生效但写回文件失败:{e}"))
             .await;
         return ok(
-            json!({ "applied": applied, "restart_required": [], "persisted": false, "error": e }),
+            json!({ "applied": applied, "restart_required": restart_required, "persisted": false, "error": e }),
         );
     }
     state
         .events
         .emit("info", "server", "服务器配置已更新(热生效并写回文件)")
         .await;
-    ok(json!({ "applied": applied, "restart_required": [], "persisted": true }))
+    ok(json!({ "applied": applied, "restart_required": restart_required, "persisted": true }))
 }
 
 // ---------------- 证书管理(M3:SNI 服务端终结) ----------------
@@ -2479,7 +2642,7 @@ mod tests {
     }
 
     async fn auth_headers(state: &Arc<AppState>) -> HeaderMap {
-        let token = mint_jwt(state, "admin", 1).await.unwrap();
+        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
         let mut h = HeaderMap::new();
         h.insert(
             "authorization",
@@ -2827,5 +2990,127 @@ mod tests {
             .classify_port_occupation("tcp", LO, stale)
             .await
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod update_disable_teardown_tests {
+    //! A5 回归:update_service 置 enabled=false 必须**真的拆运行态**。
+    //!
+    //! 修前走 `!port_changed` 分支:只落库 enabled=0 + publish_spec_in_place,
+    //! 既不 teardown 也不发 ServiceRemove。后果:
+    //!   - 端口继续监听(用户以为已停用);
+    //!   - `port_in_use` 只统计 enabled 运行态 → 同端口可被新规则再次占用。
+    //!
+    //! 对照 disable 端点有完整 teardown,两条路径曾经分叉。
+    use super::*;
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    const CID: &str = "a5-client";
+
+    async fn setup() -> (Arc<AppState>, i64) {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "a5", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        (state, 0)
+    }
+
+    fn spec_enabled(port: u16, enabled: bool) -> rh_protocol::ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": "a5",
+            "kind": "tcp",
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": port,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": enabled,
+        }))
+        .unwrap()
+    }
+
+    /// 核心断言:update 置 false 后,运行时必须已从表里移除(teardown 生效)。
+    #[tokio::test]
+    async fn update_to_disabled_tears_down_runtime() {
+        let (state, _) = setup().await;
+        // 直接建一条运行态(绕过 HTTP,聚焦 update 的语义)
+        let spec = spec_enabled(23456, true);
+        let id = state
+            .db
+            .insert_proxy(CID, &spec, false, "console")
+            .await
+            .unwrap();
+        // 直接注册运行态(不做真实 bind —— spawn_runtime 会占端口且需客户端在线)
+        let rt = std::sync::Arc::new(crate::state::ProxyRuntime::new(
+            id as u64,
+            CID.into(),
+            spec.clone(),
+        ));
+        state.proxies.runtimes.insert(id as u64, rt);
+        assert!(
+            state.proxies.get(id as u64).is_some(),
+            "前置:运行态应已注册"
+        );
+
+        // update 里置 enabled=false
+        let mut upd = spec_enabled(23456, false);
+        upd.name = "a5".into();
+        let resp = update_service_inner(&state, id, upd).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], 0, "update 应成功: {body}");
+
+        assert!(
+            state.proxies.get(id as u64).is_none(),
+            "A5:update 置 enabled=false 必须 teardown 运行态(修前端口仍在监听)"
+        );
+        // 落库也必须是 disabled
+        let got = state.db.get_proxy(id).await.unwrap().unwrap();
+        assert!(!got.2.enabled, "DB 里必须 enabled=false");
+    }
+
+    /// 端口占用随之释放:禁用后同端口可被新规则占用(修前会双占)。
+    #[tokio::test]
+    async fn disabled_after_update_releases_port() {
+        let (state, _) = setup().await;
+        let spec = spec_enabled(23457, true);
+        let id = state
+            .db
+            .insert_proxy(CID, &spec, false, "console")
+            .await
+            .unwrap();
+        let rt = std::sync::Arc::new(crate::state::ProxyRuntime::new(
+            id as u64,
+            CID.into(),
+            spec.clone(),
+        ));
+        state.proxies.runtimes.insert(id as u64, rt);
+
+        let mut upd = spec_enabled(23457, false);
+        upd.name = "a5".into();
+        let resp = update_service_inner(&state, id, upd).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], 0, "update 应成功: {body}");
+
+        // ① 运行态必须已从表里消失(这是 teardown 的直接证据)
+        assert!(
+            state.proxies.get(id as u64).is_none(),
+            "A5:update 置 false 后运行态必须被移除(修前只改 spec,端口继续监听)"
+        );
+        // ② 端口占用随之释放(port_in_use 只统计 enabled 运行态)
+        assert!(
+            !state
+                .proxies
+                .port_in_use("tcp", "127.0.0.1".parse().unwrap(), 23457, None, None)
+                .await,
+            "A5:teardown 后端口必须报告未占用(否则新规则可与之双占)"
+        );
     }
 }

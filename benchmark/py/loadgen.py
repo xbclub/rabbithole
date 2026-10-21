@@ -700,7 +700,20 @@ def run_udp(args) -> dict:
     duration = args.duration
     drain_s = float(getattr(args, "drain", 5.0))
     rto = float(getattr(args, "rto", 2.0))
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # ★多源:每个源一个独立 UDP socket,绑定不同本地端口。
+    # 隧道侧据此产生多个并发"用户会话"(代理侧按用户源地址建会话+回写任务),
+    # 这正是多会话写路径的压测场景。sources=1 时与旧行为逐字节等价。
+    n_src = max(1, int(getattr(args, "sources", 1)))
+    socks: list[socket.socket] = []
+    for _ in range(n_src):
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sk.bind(("0.0.0.0", 0))  # 系统分配本地端口 → 独特的源地址
+        socks.append(sk)
+    # 回包可能落在任一源 socket 上;统一非阻塞轮询
+    for sk in socks:
+        sk.setblocking(False)
+    sock = socks[0]  # 兼容下面的错误路径引用(仅用于首包失败判定)
     addr = (args.host, args.port)
 
     sent = 0
@@ -750,14 +763,17 @@ def run_udp(args) -> dict:
             while outstanding < args.window:
                 dgram = expected(sent)
                 try:
-                    sock.sendto(dgram, addr)
+                    # 轮转源:保证每个 source 都有稳定流量,且同一 source
+                    # 的序号严格递增(隧道侧会话内保序可验证)。
+                    socks[sent % n_src].sendto(dgram, addr)
                 except OSError:
                     send_errors += 1
                     if sent == 0:
                         return {
                             "error": (f"sendto 失败(报文 {payload_size}B 可能超过本机 MTU;"
                                       f"Linux 隧道下建议 ≤ 60000)"),
-                            "packet_size": payload_size, "send_errors": send_errors,
+                            "packet_size": payload_size,
+                            "send_errors": send_errors,
                         }
                     break
                 pending[sent] = time.perf_counter()
@@ -765,25 +781,36 @@ def run_udp(args) -> dict:
                 outstanding += 1
                 if time.perf_counter() >= deadline:
                     break
-            try:
-                sock.settimeout(0.02)
-                data, _ = sock.recvfrom(65535)
-            except OSError:
-                continue
-            handle(data, time.perf_counter(), in_window=True)
+            got = False
+            for sk in socks:
+                try:
+                    data, _ = sk.recvfrom(65535)
+                except OSError:
+                    continue
+                handle(data, time.perf_counter(), in_window=True)
+                got = True
+                break
+            if not got:
+                time.sleep(0.001)
 
         send_end = time.perf_counter()
         # ---- 排空期(固定 drain_s):在途回包继续收,迟到首达单列 ----
         drain_until = send_end + drain_s
         while time.perf_counter() < drain_until:
-            try:
-                sock.settimeout(max(0.02, drain_until - time.perf_counter()))
-                data, _ = sock.recvfrom(65535)
-            except OSError:
-                continue
-            handle(data, time.perf_counter(), in_window=False)
+            got = False
+            for sk in socks:
+                try:
+                    data, _ = sk.recvfrom(65535)
+                except OSError:
+                    continue
+                handle(data, time.perf_counter(), in_window=False)
+                got = True
+                break
+            if not got:
+                time.sleep(0.001)
     finally:
-        sock.close()
+        for sk in socks:
+            sk.close()
 
     ended_us = int(time.time() * 1e6)
     recv_unique = len(seen)
@@ -800,6 +827,7 @@ def run_udp(args) -> dict:
         "loss_pct": round(lost * 100.0 / sent, 3) if sent else 0.0,
         "send_errors": send_errors,
         "packet_size": payload_size,
+        "sources": n_src,
         "seconds": round(duration, 3),
         "drain_seconds": round(drain_s, 3),
         "mbps": round(recv_unique * payload_size * 8 / max(send_dt, 1e-9) / 1e6, 2),
@@ -956,6 +984,9 @@ def main() -> int:
     p.add_argument("--size", type=int, default=0)
 
     p = sub.add_parser("udp")
+    p.add_argument("--sources", type=int, default=1,
+                   help="并发源地址数:每源一个独立 UDP socket(= 隧道侧一个用户会话)。"
+                        "默认 1 = 旧行为。用于压测多会话写路径。")
     p.add_argument("--size", type=int, default=1200,
                    help="数据报总字节数(含 8B 序号头;G4 口径 1200)")
     p.add_argument("--duration", type=float, default=10.0)

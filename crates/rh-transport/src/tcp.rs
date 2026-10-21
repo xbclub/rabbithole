@@ -292,9 +292,13 @@ pub async fn listen_stream(
     let listener = TcpListener::bind(cfg.bind_addr).await?;
     let local = listener.local_addr()?;
     let tls = if matches!(cfg.protocol, crate::Protocol::Tls | crate::Protocol::Wss) {
-        Some(tokio_rustls::TlsAcceptor::from(crate::tls::server_config(
-            &cfg.tls,
-        )?))
+        // 必须用 `server_config_with_alpn(cfg.alpn)`:早先误用了
+        // `server_config()`(内部固定取 DEFAULT_ALPN),导致配置里的
+        // `alpn` 列表**完全失效**——配了 ["h2","http/1.1"] 也只协商 h2,
+        // 且客户端只提 http/1.1 时服务端回 no_application_protocol 警报。
+        Some(tokio_rustls::TlsAcceptor::from(
+            crate::tls::server_config_with_alpn(&cfg.tls, &cfg.alpn)?,
+        ))
     } else {
         None
     };
@@ -389,8 +393,22 @@ pub async fn listen_stream(
 pub async fn connect_stream(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>> {
     if cfg.multiplex || cfg.protocol.always_muxed() {
         let (io, write_dup) = dial_io(cfg).await?;
-        // 客户端为开流方:超限是单流报错(不杀会话),取"不限制"即可,
-        // 真正的策略上限由服务端在 DATA_CHANNEL_HELLO 处执行。
+        // 客户端为开流方,取"不限制"即可 —— 但**理由不是"超限只影响单流"**。
+        //
+        // 修前这里写「超限是单流报错(不杀会话)」,那是错的:yamux 的
+        // `TooManyStreams` 是**连接级**错误。实测(限 4 开第 5 条)该载体上
+        // 已开的 4 条流全部失效,后续开流返回 "mux driver gone"。代码路径:
+        // `SendHalf::poll_new_outbound` 返回 `Err` → `send_driver` 先
+        // `dead.store(true)` 再终结驱动(见 mux.rs send_driver);对端收到
+        // 超限 SYN 更是直接 `Action::Terminate`(vendor connection.rs)。
+        //
+        // 因此客户端**不能**用 yamux 硬顶做自我限流:一旦触发就是整条
+        // 会话断,而限流本该是"拒绝新流、保留老流"的干净拒绝。
+        //
+        // 正确的分层:策略上限由服务端在 DATA_CHANNEL_HELLO 处以**应用层
+        // 计数器**执行(control.rs),其配额刻意钳到 `mux_streams - 1024`
+        // 以保证应用层永远先于 yamux 拒绝。客户端是开流方,限流是服务端
+        // 对客户端的约束,自己再设一道只会自伤。
         // round-E2:裸 TCP 持写侧 fd 副本 → 双载体 mux(零锁读∥写);
         // None(非 Tcp 协议 / try_clone 失败)→ 锁路径。
         Ok(match write_dup {
@@ -516,6 +534,9 @@ async fn dial_client_mux(
     shards: usize,
 ) -> io::Result<crate::mux::YamuxMultiplexer> {
     let (io, write_dup) = dial_io(cfg).await?;
+    // 同样取"不限制":yamux 硬顶在客户端一旦触发是**连接级**失败
+    // (杀掉该载体上所有已有流),不能当限流用。理由详见
+    // `connect_stream` 内同名字段处的长注释。
     Ok(match write_dup {
         Some(dup) => crate::mux::YamuxMultiplexer::new_duplex(
             io,
@@ -550,7 +571,8 @@ async fn dial_io(
                 ))
             }
             crate::Protocol::Tls | crate::Protocol::Wss => {
-                let (rust, verify) = crate::tls::client_config(&cfg.tls)?;
+                // 同服务端:必须传入 cfg.alpn,否则配置项被静默忽略。
+                let (rust, verify) = crate::tls::client_config_with_alpn(&cfg.tls, &cfg.alpn)?;
                 let connector = TlsConnector::from(rust);
                 let name = rustls_pki_types::ServerName::try_from(
                     cfg.tls
@@ -561,6 +583,17 @@ async fn dial_io(
                 .map_err(|e| other_err(format!("bad tls server name: {e}")))?
                 .to_owned();
                 let tls_stream = connector.connect(name, tcp).await?;
+                // 记录对端叶子证书:上层用它比对服务端加密下发的证书(防中间人)。
+                if let Some(sink) = &cfg.peer_cert_sink {
+                    if let Some(leaf) = tls_stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|c| c.first())
+                    {
+                        let _ = sink.set(leaf.as_ref().to_vec());
+                    }
+                }
                 // pin 模式:握手后、发任何数据前比对叶子证书指纹
                 if let crate::tls::ClientVerify::Pin(expected) = verify {
                     let certs = tls_stream

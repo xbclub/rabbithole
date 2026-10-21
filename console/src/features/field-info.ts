@@ -113,6 +113,10 @@ export const FIELD_INFO = {
   'settings.allow_ports': '逗号分隔,支持范围如 10000-20000,30000;空 = 不限制',
   'settings.max_services_per_client': '全局默认上限;单个客户端可在「客户端」页覆盖,0 = 不限',
   'settings.log_level': '服务端日志级别,保存立即生效',
+  'settings.alpn':
+    'TLS 握手中协商的应用层协议标识,位于 ClientHello 且为明文,任何抓包工具都能读到。' +
+    '项目专属名称(如 rhtp)会被直接识别成本项目,故默认用最常见的 h2。' +
+    '逗号分隔,最多 8 项;留空 = h2。客户端必须配置相同值,否则握手失败;改后需重启服务端',
   'settings.prometheus.enabled':
     '开启后启动独立端口的 /metrics 监听(无鉴权,默认仅本机可达),即时生效并写回配置文件;关闭即停止监听',
   'settings.prometheus.bind_addr':

@@ -130,12 +130,18 @@ pub async fn on_connect(sess: Arc<ClientSession>, m: NatHoleConnect, shutdown: C
             // 打洞窗口与拨号侧对齐:超出 2×punch 仍无对端报文即放弃,
             // 避免每次失败打洞泄漏一个永久等待任务与 socket
             let listen_wait = std::time::Duration::from_secs(punch_secs.saturating_mul(2));
-            match tokio::time::timeout(listen_wait, rh_transport::kcp::punch_listen(sock.clone()))
-                .await
+            // A7:listen 侧只接受服务端下发的 dial 候选来源。
+            let allow: Vec<SocketAddr> =
+                m.candidates.iter().filter_map(|c| c.parse().ok()).collect();
+            match tokio::time::timeout(
+                listen_wait,
+                rh_transport::kcp::punch_listen(sock.clone(), &allow),
+            )
+            .await
             {
                 Ok(Ok(mux)) => {
                     info!(tx = %m.transaction_id, "punch listen ok; serving direct");
-                    serve_direct(sess, mux, shutdown).await;
+                    serve_direct(sess, mux, shutdown, m.auth.clone(), m.nonce.clone()).await;
                 }
                 Ok(Err(e)) => {
                     warn!(tx = %m.transaction_id, error = %e, "punch listen failed");
@@ -159,23 +165,35 @@ async fn replay_waiting(
     m: &NatHoleConnect,
     mux: Arc<rh_transport::Multiplexer>,
 ) {
-    let entry = sess.waiting.lock().await.remove(&m.user_conn_id);
-    let Some((conn, visitor_id)) = entry else {
+    // 保留整条 entry(含登记时刻):回退重放时原样放回,不重置 TTL。
+    let entry = sess.take_waiting(m.user_conn_id).await;
+    let Some((conn, visitor_id, registered_at)) = entry else {
         return;
     };
     let vspec = sess.visitors.lock().await.get(&visitor_id).cloned();
     let Some(vspec) = vspec else { return };
-    match crate::visitor_run::xtcp_direct_stream_pub(sess, &mux, &vspec, m.user_conn_id, conn).await
+    match crate::visitor_run::xtcp_direct_stream_pub(
+        sess,
+        &mux,
+        &vspec,
+        m.auth.clone(),
+        m.user_conn_id,
+        conn,
+    )
+    .await
     {
         None => {
+            // A7:凭据与 mux 同步登记,后续连接复用同一凭据。
+            sess.punched_auth
+                .lock()
+                .await
+                .insert(visitor_id, m.auth.clone());
             sess.punched.lock().await.insert(visitor_id, mux);
         }
         Some(_conn) => {
-            // 直连失败:登记回等待并回退中继
-            sess.waiting
-                .lock()
-                .await
-                .insert(m.user_conn_id, (_conn, visitor_id));
+            // 直连失败:登记回等待并回退中继(沿用原登记时刻,不续命)
+            sess.requeue_waiting(m.user_conn_id, (_conn, visitor_id, registered_at))
+                .await;
             reissue_user_connect(sess, m).await;
         }
     }
@@ -184,10 +202,7 @@ async fn replay_waiting(
 async fn reissue_user_connect(sess: &Arc<ClientSession>, m: &NatHoleConnect) {
     // 等待连接重新可见:直接以原 user_conn_id 重发
     // 找回等待项所属 visitor(未消费的重放/回退场景)
-    let vid = {
-        let w = sess.waiting.lock().await;
-        w.get(&m.user_conn_id).map(|(_, v)| *v)
-    };
+    let vid = sess.waiting_visitor(m.user_conn_id).await;
     let Some(vid) = vid else {
         warn!(
             conn = m.user_conn_id,
@@ -211,12 +226,16 @@ async fn serve_direct(
     sess: Arc<ClientSession>,
     mux: Arc<rh_transport::Multiplexer>,
     shutdown: CancellationToken,
+    expect_auth: String,
+    nonce: String,
 ) {
     loop {
         tokio::select! {
             acc = mux.accept() => {
                 let Ok(mut stream) = acc else { return };
                 let s2 = sess.clone();
+                let expect_auth = expect_auth.clone();
+                let nonce = nonce.clone();
                 tokio::spawn(async move {
                     let mut buf = bytes::BytesMut::with_capacity(512);
                     let Ok((ty, payload)) = frame::read_frame(&mut stream, &mut buf).await else { return };
@@ -234,6 +253,17 @@ async fn serve_direct(
                         let _ = stream.shutdown().await;
                         return;
                     };
+                    // A7:直连首帧必须携带本次打洞事务的凭据。期望值来自
+                    // 服务端 NAT_HOLE_CONNECT(按目标规则密钥计算);缺失或
+                    // 不符立即断开,不拨本地目标。
+                    if !direct_auth_ok(&fwd.xtcp_auth, &expect_auth, &nonce) {
+                        warn!(
+                            proxy = %spec.name,
+                            "direct forward rejected: missing/mismatched xtcp auth"
+                        );
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
                     let fwd = StartForward {
                         proxy_id: spec.id,
                         user_src: fwd.user_src,
@@ -242,6 +272,7 @@ async fn serve_direct(
                         flags: 0,
                         proxy_proto: rh_protocol::message::ProxyProto::None,
                         proxy_name: spec.name.clone(),
+                        xtcp_auth: String::new(),
                     };
                     if let Err(e) = crate::forward::handle_start_forward(s2, stream, &spec, fwd, leftover).await {
                         warn!(error = %e, "direct forward failed");
@@ -259,4 +290,13 @@ fn find_by_name(
     name: &str,
 ) -> Option<ProxySpec> {
     proxies.values().find(|p| p.name == name).cloned()
+}
+
+/// A7 直连首帧凭据比对:恒定时间比较,长度不同直接失败。
+fn direct_auth_ok(got: &str, expect_auth: &str, nonce: &str) -> bool {
+    if expect_auth.is_empty() || nonce.is_empty() || got.is_empty() {
+        // 旧服务端不会下发凭据;此时拒绝直连(不静默降级认证语义)。
+        return false;
+    }
+    rh_transport::constant_time_eq(got.as_bytes(), expect_auth.as_bytes())
 }

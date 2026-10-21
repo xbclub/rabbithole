@@ -46,7 +46,18 @@ pub async fn close_proxy_channels(rt: &Arc<ProxyRuntime>) {
         let mut ready = p.ready.lock().await;
         ready.clear();
     }
-    *rt.udp_new_channel_tx.lock().await = None;
+    // ★A2:UDP 通道 sender **不置 None**。
+    //
+    // 置 None 会让 udp_serve_loop 的 `new_rx.recv()` 立刻返回 None,泵直接
+    // return;而泵只在 spawn_runtime / bind_error_retry 时启动,客户端重连
+    // 不会重建运行时 —— 于是重连后 UDP 规则永久收不到包(且 udp_on_channel
+    // 见 None 时**静默丢流**,线上完全没有痕迹)。
+    //
+    // 正确语义:泵的生死与**规则运行态**(rule_cancel)绑定,与会话在线解耦。
+    // 队列里可能残留旧会话的通道(对端已失效),但那由 pump 首帧读写失败
+    // 自然淘汰,不需要在这里主动清空 —— 主动清空反而会丢掉刚抵达的新通道。
+    //
+    // 注意:这里刻意只做"什么都不改"。字段保留 Some(sender),泵继续等下一个。
 }
 
 /// copy 路径读缓冲下/上限(R3 红线 2 常量锁:上限 64KiB 不得放宽)。
@@ -61,6 +72,10 @@ async fn claim_pool(pool: &Arc<TcpPool>, sess: &Arc<Session>) {
     let cur = pool.epoch.load(Ordering::Relaxed);
     if sess.epoch > cur {
         pool.epoch.store(sess.epoch, Ordering::Relaxed);
+        // B1:换 epoch 必须把旧会话遗留的在途计数清零。断连会打断在途
+        // CREATE,那些请求的 inflight 永不会减(交付路径已按 epoch 丢弃),
+        // 池会永久饥饿:ready+inflight 恒 ≥ want,再也不签发。
+        pool.inflight.store(0, Ordering::Relaxed);
         let mut ready = pool.ready.lock().await;
         let mut keep = VecDeque::with_capacity(ready.len());
         for entry in ready.drain(..) {
@@ -229,6 +244,7 @@ pub async fn assign_forward(
         flags,
         proxy_proto: conv_proxy_proto(spec.transport.proxy_proto),
         proxy_name: spec.name.clone(),
+        xtcp_auth: String::new(),
     };
     let payload = match serde_json::to_vec(&fwd) {
         Ok(p) => p,
@@ -955,13 +971,42 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountedUserIo<T
 
 /// TCP 监听服务循环(独享端口或组成员共享)。
 pub async fn tcp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, listener: TcpListener) {
+    // 独享端口:随本规则的 rule_cancel 退出(既有语义)。
+    tcp_serve_loop_inner(state, rt.clone(), listener, rt.rule_cancel.clone()).await
+}
+
+/// 共享监听(组)版本:退出条件由**组级** `serve_cancel` 决定。
+///
+/// ★A6:修前共享 serve loop 选的是**属主成员**的 `rule_cancel`
+/// (runtime.rs 里把 `rt2` 传进来,本函数 select 它的 rule_cancel)。
+/// 属主被禁用/改端口 → teardown 无条件 cancel → 监听 fd 释放,但
+/// `listener_bound` 仍是 true → 之后所有成员 spawn 时看到 true 就跳过重绑
+/// → 组端口**永久拒绝连接**。
+///
+/// 组监听的生命周期应属于组,不属于任何一个成员。
+pub async fn tcp_serve_loop_group(
+    state: Arc<AppState>,
+    rt: Arc<ProxyRuntime>,
+    listener: TcpListener,
+    group_cancel: tokio_util::sync::CancellationToken,
+) {
+    tcp_serve_loop_inner(state, rt, listener, group_cancel).await;
+}
+
+/// 两个入口共用的实现:`cancel` 是唯一的退出条件。
+async fn tcp_serve_loop_inner(
+    state: Arc<AppState>,
+    rt: Arc<ProxyRuntime>,
+    listener: TcpListener,
+    cancel: tokio_util::sync::CancellationToken,
+) {
     let local = listener.local_addr().ok();
     loop {
         tokio::select! {
             acc = listener.accept() => {
                 match acc {
                     Ok((sock, peer)) => {
-                                        let st = state.clone();
+                        let st = state.clone();
                         let rt2 = rt.clone();
                         tokio::spawn(serve_tcp_user(st, rt2, sock, peer, local));
                     }
@@ -971,7 +1016,7 @@ pub async fn tcp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, listene
                     }
                 }
             }
-            _ = rt.rule_cancel.cancelled() => return,
+            _ = cancel.cancelled() => return,
         }
     }
 }
@@ -1163,8 +1208,24 @@ pub async fn udp_on_channel(
     // 克隆 sender 后立即放锁:send 可能因 pump 忙而阻塞,
     // 不得让锁跨 await(close_proxy_channels 会被卡死)
     let tx = rt.udp_new_channel_tx.lock().await.clone();
-    if let Some(tx) = tx {
-        let _ = tx.send(stream).await;
+    match tx {
+        Some(tx) => {
+            if tx.send(stream).await.is_err() {
+                // 接收端已退出(泵没了):这条通道无法转发,必须留痕。
+                tracing::warn!(
+                    proxy = proxy_id,
+                    "udp channel arrived but pump receiver is gone; dropping channel"
+                );
+            }
+        }
+        None => {
+            // A2:泵未注册 sender。正常路径不该发生(泵在 spawn 时就写入),
+            // 一旦发生就是"UDP 规则静默不工作"——必须可见。
+            tracing::warn!(
+                proxy = proxy_id,
+                "udp channel arrived but no pump registered (tx=None); dropping channel"
+            );
+        }
     }
 }
 
@@ -1180,7 +1241,18 @@ fn udp_session_admit(
         return true;
     }
     let limit = state.limits.read().unwrap().max_udp_sessions_per_proxy;
-    limit == 0 || sessions.len() < limit
+    if limit != 0 && sessions.len() >= limit {
+        // B7:超限必须可见 —— 静默丢弃会让"UDP 不通"无从排查。
+        state.metrics.udp_sessions_rejected.inc();
+        tracing::warn!(
+            limit,
+            current = sessions.len(),
+            %addr,
+            "udp session table full, dropping new source"
+        );
+        return false;
+    }
+    true
 }
 
 pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: Arc<UdpSocket>) {
@@ -1192,7 +1264,22 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
     loop {
         // 等待第一条/重建通道
         let stream = tokio::select! {
-            s = new_rx.recv() => match s { Some(s) => s, None => return },
+            s = new_rx.recv() => match s {
+                Some(s) => s,
+                None => {
+                    // A2:发送端全部 drop 不代表规则该退出(规则仍 enabled,
+                    // 只是在等客户端重连后的新通道)。继续等 rule_cancel ——
+                    // 真正的退出条件只有规则取消 / 进程关闭。
+                    tracing::debug!(
+                        proxy = rt.id,
+                        "udp pump: channel senders gone, waiting for rule teardown"
+                    );
+                    tokio::select! {
+                        _ = rt.rule_cancel.cancelled() => return,
+                        _ = state.shutdown.cancelled() => return,
+                    }
+                }
+            },
             _ = rt.rule_cancel.cancelled() => return,
             _ = state.shutdown.cancelled() => return,
         };
@@ -2448,4 +2535,292 @@ mod tests {
             .expect("数据送达后 relay 必须收敛")
             .unwrap();
     }
+}
+
+#[cfg(test)]
+mod udp_pump_survives_reconnect_tests {
+    //! A2 回归:服务端 UDP 泵在客户端重连后**不得**永久失效。
+    //!
+    //! 修前 `close_proxy_channels` 把 `udp_new_channel_tx` 置 None →
+    //! `udp_serve_loop` 的 `new_rx.recv()` 立刻返回 None → 泵 return。
+    //! 泵只在 spawn_runtime / bind_error_retry 启动,客户端重连不重建运行时,
+    //! 于是重连后 UDP 规则永久不工作,且 `udp_on_channel` 见 None 时静默丢流。
+    //!
+    //! 修后:泵的生死只由 `rule_cancel` / `state.shutdown` 决定,sender 保留。
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::state::ProxyRuntime;
+
+    /// ProxySpec 无 Default;沿用 api.rs 测试里的 serde 构造法。
+    fn udp_spec() -> rh_protocol::ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": "udp-a2",
+            "kind": "udp",
+            "client_id": "cid",
+            "bind_ip": "127.0.0.1",
+            "bind_port": 0,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+        }))
+        .unwrap()
+    }
+
+    fn make_rt() -> Arc<ProxyRuntime> {
+        Arc::new(ProxyRuntime::new(1001, "cid".to_string(), udp_spec()))
+    }
+
+    /// 契约 1:close 之后 sender 仍在(旧实现会变成 None)。
+    #[tokio::test]
+    async fn close_proxy_channels_keeps_udp_sender() {
+        let rt = make_rt();
+        // 模拟泵启动时注册 sender
+        let (tx, _rx) = mpsc::channel::<BoxedIo>(4);
+        *rt.udp_new_channel_tx.lock().await = Some(tx);
+        assert!(rt.udp_new_channel_tx.lock().await.is_some());
+
+        close_proxy_channels(&rt).await;
+
+        assert!(
+            rt.udp_new_channel_tx.lock().await.is_some(),
+            "A2:close_proxy_channels 不得把 sender 置 None —— 否则泵退出后\
+             客户端重连也不会重建(泵只在 spawn_runtime 时启),UDP 永久失效"
+        );
+    }
+
+    /// 契约 2:发送端全 drop 后泵仍存活,只由 rule_cancel 退出。
+    #[tokio::test]
+    async fn pump_outlives_sender_drop_and_exits_on_rule_cancel() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::default(), db));
+        let rt = make_rt();
+        let sock = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind local udp"),
+        );
+        let h = tokio::spawn(udp_serve_loop(state.clone(), rt.clone(), sock));
+
+        // 等泵注册好 sender,然后丢掉它(模拟 close 之后没有新通道抵达)
+        for _ in 0..50 {
+            if rt.udp_new_channel_tx.lock().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        *rt.udp_new_channel_tx.lock().await = None;
+
+        // 旧实现:recv() 立即 None → return → 这里会 finished
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !h.is_finished(),
+            "A2:发送端 drop 后泵必须继续存活(等待重连后的新通道),\
+             不得因 recv()=None 就退出"
+        );
+
+        // 真正的退出条件:规则取消
+        rt.rule_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("rule_cancel 后泵必须退出(否则是泄漏)")
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod group_listener_ownership_tests {
+    //! A6 回归:组共享监听的生死属于**组**,不属于属主成员。
+    //!
+    //! 修前 `tcp_serve_loop` select 的是传入 `rt` 的 `rule_cancel`,而
+    //! runtime.rs 传的正是**属主成员**。属主被禁用/改端口 → teardown
+    //! 无条件 cancel → 监听 fd 释放,但 `listener_bound` 仍为 true →
+    //! 其余成员 spawn 时看到 true 跳过重绑 → 组端口**永久拒绝连接**。
+    //!
+    //! 修后:共享 loop 走 `tcp_serve_loop_group`,只由组级 `serve_cancel`
+    //! 退出;属主自己的 rule_cancel 取消不影响它。
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::state::ProxyRuntime;
+
+    fn group_spec(port: u16, group: &str) -> rh_protocol::ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": "g1",
+            "kind": "tcp",
+            "client_id": "cid",
+            "bind_ip": "127.0.0.1",
+            "bind_port": port,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "group": group,
+        }))
+        .unwrap()
+    }
+
+    /// 接线断言:runtime 给**组**绑定监听时,必须走 `tcp_serve_loop_group`
+    /// (组级 cancel),不能走随属主 `rule_cancel` 退出的独享版本。
+    ///
+    /// 这条是源码级检查 —— 前一版测试直接调 `tcp_serve_loop_group`,把接线
+    /// 回退成 `tcp_serve_loop` 后仍然通过,完全抓不住回归。接线才是缺陷所在。
+    #[test]
+    fn runtime_wires_group_listener_to_group_cancel() {
+        let src = include_str!("runtime.rs");
+        let marker = "let group_cancel = token.clone();";
+        let start = src
+            .find(marker)
+            .expect("共享监听分支必须用组级 cancel(见 A6)");
+        let rest = &src[start..];
+        let end = rest
+            .find("return Ok(());")
+            .expect("分支应以 return Ok 结束");
+        let branch = &rest[..end];
+        assert!(
+            branch.contains("tcp_serve_loop_group"),
+            "A6:共享监听必须走 tcp_serve_loop_group(组级 cancel);当前:\n{branch}"
+        );
+        assert!(
+            !branch.contains("crate::data::tcp_serve_loop("),
+            "A6:不得回退到随属主 rule_cancel 退出的独享版本;当前:\n{branch}"
+        );
+    }
+
+    /// 核心断言:属主 rule_cancel 取消后,共享 serve loop **仍能 accept**;
+    /// 只有组级 serve_cancel 才让它退出。
+    #[tokio::test]
+    async fn shared_listener_survives_owner_cancel() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::default(), db));
+        let spec = group_spec(0, "gA6");
+        let rt = Arc::new(ProxyRuntime::new(1, "cid".into(), spec));
+
+        // 绑定一个真实监听(端口 0 由系统分配)
+        let std_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_l.set_nonblocking(true).unwrap();
+        let addr = std_l.local_addr().unwrap();
+        let l = TcpListener::from_std(std_l).unwrap();
+
+        let group_cancel = tokio_util::sync::CancellationToken::new();
+        let h = tokio::spawn(tcp_serve_loop_group(
+            state.clone(),
+            rt.clone(),
+            l,
+            group_cancel.clone(),
+        ));
+
+        // 属主取消(teardown 会做的事)
+        rt.rule_cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !h.is_finished(),
+            "A6:属主 rule_cancel 取消后共享 serve loop 不得退出(组监听属于组)"
+        );
+
+        // 仍能建立 TCP 连接(监听 fd 还在)
+        let conn =
+            tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr))
+                .await
+                .expect("A6:属主取消后组端口必须仍可连接")
+                .expect("connect");
+        drop(conn);
+
+        // 只有组级取消才退出
+        group_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("组级 serve_cancel 后必须退出")
+            .unwrap();
+    }
+
+    /// 对照:独享端口的 serve loop 仍随自己的 rule_cancel 退出(语义未变)。
+    #[tokio::test]
+    async fn exclusive_listener_exits_on_own_rule_cancel() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::default(), db));
+        let spec = group_spec(0, ""); // 无组 = 独享
+        let rt = Arc::new(ProxyRuntime::new(2, "cid".into(), spec));
+
+        let std_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_l.set_nonblocking(true).unwrap();
+        let l = TcpListener::from_std(std_l).unwrap();
+
+        let h = tokio::spawn(tcp_serve_loop(state.clone(), rt.clone(), l));
+        rt.rule_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("独享端口必须随 rule_cancel 退出")
+            .unwrap();
+    }
+}
+
+// ---------------- B6:有界双向中继(裸 copy_bidirectional 的收敛替代) ----------------
+
+/// 双向中继,带半关闭有界兜底。
+///
+/// 替换裸 `tokio::io::copy_bidirectional`:`copy_bidirectional` 在一侧
+/// clean EOF 后会无限期等待对向 EOF —— 对端永不回 FIN 时 socket 永久停在
+/// FIN-WAIT-2/CLOSING,fd 与连接计数一起泄漏。这里保持"等对向结束"的语义,
+/// 只把等待上限交给 `halfclose_grace`(默认 30s,`RH_HALFCLOSE_GRACE_SECS`
+/// 可覆盖,0 = 旧行为)。
+///
+/// 与 [`copy_relay_pair`] 的差异:本函数不做字节计量/限速/失败归因,
+/// 用于 vhost / visitor 裸中继路径(这些路径的计量在 CountedUserIo 上)。
+///
+/// 注意:不用 `tokio::spawn` —— 入参是 `&mut`(非 'static),拆半句柄不能
+/// move 进独立任务。这里用 `select!` 在同一 future 内并发双向 copy:先完成
+/// 的一向关闭对向写半,然后在 `halfclose_grace` 内等第二向自然结束;超时
+/// 则直接返回(拆半句柄随函数返回 drop → fd 释放)。
+pub async fn copy_bidirectional_bounded<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut a_r, mut a_w) = tokio::io::split(a);
+    let (mut b_r, mut b_w) = tokio::io::split(b);
+    let up = async {
+        let n = tokio::io::copy(&mut a_r, &mut b_w).await.ok();
+        let _ = b_w.shutdown().await;
+        n
+    };
+    let down = async {
+        let n = tokio::io::copy(&mut b_r, &mut a_w).await.ok();
+        let _ = a_w.shutdown().await;
+        n
+    };
+    futures::pin_mut!(up, down);
+    // 先完成的一向决定后续等待上限
+    let (first_up, n) = tokio::select! {
+        n = &mut up => (true, n),
+        n = &mut down => (false, n),
+    };
+    let grace = rh_transport::halfclose_grace();
+    let second = if grace == std::time::Duration::MAX {
+        None
+    } else {
+        match tokio::time::timeout(grace, async {
+            if first_up {
+                (&mut down).await
+            } else {
+                (&mut up).await
+            }
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        grace_secs = grace.as_secs(),
+                        "half-close timeout: peer never completed close handshake; \
+                         aborting vhost/visitor relay to release the stream"
+                    );
+                });
+                None
+            }
+        }
+    };
+    let (u, d) = if first_up {
+        (n.unwrap_or(0), second.unwrap_or(0))
+    } else {
+        (second.unwrap_or(0), n.unwrap_or(0))
+    };
+    Ok((u, d))
 }

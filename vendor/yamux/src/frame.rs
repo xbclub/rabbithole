@@ -9,7 +9,7 @@
 // at https://opensource.org/licenses/MIT.
 
 pub mod header;
-mod io;
+pub(crate) mod io;
 
 use bytes::Bytes;
 use futures::future::Either;

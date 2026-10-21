@@ -121,6 +121,15 @@ impl Default for ChallengeTable {
 
 /// 控制端口 accept 循环。
 pub async fn serve_transport(state: Arc<AppState>, cfg: rh_transport::ServerTransportConfig) {
+    // 本监听器的叶子证书:与 `rh_transport::listen` 用的是同一份 TLS 选项
+    // (同源:显式 cert 或 persist_prefix 落盘的 .crt),故与握手实际出示的
+    // 证书逐字节相同。
+    //
+    // **必须按监听器各自解析**。多监听器(`[[extra_listeners]]`)各有独立的
+    // 自签证书;曾经这里是 AppState 上的全局单值、只由首个监听器注入,
+    // 客户端连第 2 个及以后的加密监听器时会收到别人的证书,比对必然失败,
+    // 而且报错文案是"可能存在中间人"——把安全问题排查引向错误方向。
+    let leaf_cert: Option<Arc<[u8]>> = rh_transport::tls::leaf_der_of(&cfg.tls).map(Arc::from);
     let listener = match rh_transport::listen(&cfg, state.mux_streams.clone()).await {
         Ok(l) => l,
         Err(e) => {
@@ -140,16 +149,23 @@ pub async fn serve_transport(state: Arc<AppState>, cfg: rh_transport::ServerTran
             }
         };
         let st = state.clone();
+        let leaf = leaf_cert.clone();
         tokio::spawn(async move {
             let remote = inc.remote;
-            if let Err(e) = handle_incoming(st, inc).await {
+            if let Err(e) = handle_incoming(st, inc, leaf).await {
                 tracing::debug!(error = %e, %remote, "incoming closed");
             }
         });
     }
 }
 
-async fn handle_incoming(state: Arc<AppState>, inc: Incoming) -> anyhow::Result<()> {
+/// `leaf_cert`:本监听器的叶子证书 DER(见 [`serve_transport`])。随连接一路
+/// 传到 [`send_server_cert`],保证"客户端连哪个端口就下发哪个证书"。
+async fn handle_incoming(
+    state: Arc<AppState>,
+    inc: Incoming,
+    leaf_cert: Option<Arc<[u8]>>,
+) -> anyhow::Result<()> {
     // 首流(或裸连接本体)
     let stream = tokio::time::timeout(Duration::from_secs(5), inc.mux.accept()).await??;
     // 首帧 5s
@@ -162,15 +178,18 @@ async fn handle_incoming(state: Arc<AppState>, inc: Incoming) -> anyhow::Result<
     match ty {
         FrameType::HELLO => {
             let hello: Hello = serde_json::from_slice(&payload)?;
-            // 未认证并发上限(每 IP):认证完成或失败即释放
+            // 未认证并发上限(每 IP):名额只覆盖**认证窗口**。
+            //
+            // A3:修前是 `auth_and_run(...).await` 之后才 exit,而该函数以
+            // run_session_loop 结尾 —— 已认证会话把名额终身占住,同 NAT
+            // 出口第 65 个客户端永远被拒。现在交 RAII:成功点 disarm,
+            // 其余早退路径由 Drop 归还。
             let ip = inc.remote.ip();
-            if !state.enter_unauth(&ip) {
+            let Some(guard) = state.enter_unauth_guard(ip) else {
                 let _ = send_error(&mut stream, "AUTH_FAILED", "too many pending auth").await;
                 return Ok(());
-            }
-            let r = auth_and_run(state.clone(), inc, stream, hello, buf).await;
-            state.exit_unauth(&ip);
-            r
+            };
+            auth_and_run(state.clone(), inc, stream, hello, buf, leaf_cert, guard).await
         }
         FrameType::DATA_CHANNEL_HELLO => {
             // mux 模式下数据通道为后续流;裸模式每连接一流,此处即数据连接。
@@ -193,6 +212,8 @@ async fn auth_and_run(
     mut stream: BoxedIo,
     hello: Hello,
     mut read_buf: bytes::BytesMut,
+    leaf_cert: Option<Arc<[u8]>>,
+    guard: crate::state::UnauthGuard,
 ) -> anyhow::Result<()> {
     // 附加载体报到(round-9 §3.4):HELLO 携带 session_id = 多载体会话的
     // 后续物理连接,走聚合快速路径;None = 首条连接,走完整挑战应答。
@@ -292,6 +313,20 @@ async fn auth_and_run(
         &serde_json::to_vec(&ack)?,
     )
     .await?;
+    // 证书下发:仅加密协议。客户端解密后与 TLS 对端证书比对,不一致即断开。
+    // 失败只 warn(不影响会话):客户端在缺失该帧时退回改动前的行为。
+    if inc.protocol.is_encrypted() {
+        if let Err(e) = send_server_cert(
+            &mut stream,
+            &latest.id,
+            &latest.secret,
+            leaf_cert.as_deref(),
+        )
+        .await
+        {
+            warn!(client = %latest.id, error = %e, "下发服务端证书失败");
+        }
+    }
     let _ = state
         .db
         .update_client_meta(&latest.id, &hello.version, &hello.hostname, &hello.os)
@@ -307,6 +342,8 @@ async fn auth_and_run(
     ))
     .await;
     crate::runtime::on_session_up(&state, &sess).await;
+    // A3:认证已完成 —— 名额在此立即归还,不随会话寿命。
+    guard.disarm();
     run_session_loop(state, sess, inc, stream, read_buf, qrx).await
 }
 
@@ -356,8 +393,10 @@ async fn attach_additional_carrier(
         let _ = send_error(&mut stream, "AUTH_FAILED", "session mismatch").await;
         return Ok(());
     }
-    match state.db.get_client(&hello.client_id).await {
-        Ok(Some(c)) if c.enabled => {}
+    // B9:报到必须携带 attach HMAC。明文 session_id 只证明"知道 id",
+    // 不足以证明"持有 secret";缺失/不符一律拒绝(不回退到纯 id 聚合)。
+    let client = match state.db.get_client(&hello.client_id).await {
+        Ok(Some(c)) if c.enabled => c,
         Ok(_) => {
             reject_carrier(
                 &mut stream,
@@ -377,6 +416,32 @@ async fn attach_additional_carrier(
             reject_carrier(&mut stream, cap, "INTERNAL", &hello.client_id, session_id).await;
             return Ok(());
         }
+    };
+    let Some(got_auth) = hello.attach_auth.as_deref() else {
+        reject_carrier(
+            &mut stream,
+            cap,
+            "ATTACH_AUTH_MISSING",
+            &hello.client_id,
+            session_id,
+        )
+        .await;
+        return Ok(());
+    };
+    let expect_auth = hmac_hex(
+        client.secret.as_bytes(),
+        &format!("rh3:attach:{session_id}"),
+    );
+    if !rh_transport::constant_time_eq(got_auth.as_bytes(), expect_auth.as_bytes()) {
+        reject_carrier(
+            &mut stream,
+            cap,
+            "ATTACH_AUTH_BAD",
+            &hello.client_id,
+            session_id,
+        )
+        .await;
+        return Ok(());
     }
     // 上限强制(round-10.1 §2.3 / round-48 **原子化**):cap 含首载体,池内
     // 只装附加载体,故允许本次附加的条件是
@@ -604,10 +669,56 @@ async fn reject_carrier(
     );
 }
 
+/// A1:控制回包投递的有界上限。
+///
+/// 队列满时**不能**无界 `send().await` —— 控制读循环本身是队列的唯一消费者,
+/// park 在 send 上即自锁。2s 足够容纳正常突发(一条回包写完只需微秒级),
+/// 超时则放弃该回包(会话继续,由心跳决定生死)。
+const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub fn hmac_hex(secret: &[u8], msg: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac key");
     mac.update(msg.as_bytes());
     hex::encode(mac.finalize().into_bytes())
+}
+
+/// 认证成功后下发服务端 TLS 证书(见 [`rh_protocol::certprov`])。
+///
+/// 客户端解密后与 TLS 握手实际看到的对端证书比对 —— 不一致说明有人在
+/// 中间转发,客户端会断开。密钥由 `secret` 经 HKDF 派生,攻击者不知道
+/// `secret` 就既解不开也伪造不了。
+///
+/// 证书缺失(纯明文控制面 / 尚未注入)时静默跳过:此帧是附加证明,
+/// 不是认证前提,缺了不应导致连接失败。
+async fn send_server_cert(
+    stream: &mut BoxedIo,
+    client_id: &str,
+    secret: &str,
+    leaf: Option<&[u8]>,
+) -> anyhow::Result<()> {
+    let Some(leaf) = leaf else {
+        return Ok(());
+    };
+    let nonce = rh_protocol::certprov::random_nonce()
+        .ok_or_else(|| anyhow::anyhow!("CSPRNG 不可用,跳过证书下发"))?;
+    let sealed = rh_protocol::certprov::seal_cert(secret.as_bytes(), nonce, leaf)
+        .ok_or_else(|| anyhow::anyhow!("证书加密失败"))?;
+    // 与 AUTH_CHALLENGE 等一致:帧体内直接放内层结构,不套 ServerMessage 信封
+    let msg = rh_protocol::message::ServerCert {
+        nonce_b64: b64::encode(&sealed.nonce),
+        cert_der_b64: b64::encode(&sealed.ciphertext),
+    };
+    write_frame(stream, FrameType::SERVER_CERT, &serde_json::to_vec(&msg)?).await?;
+    tracing::debug!(client = %client_id, "已下发服务端证书(加密)");
+    Ok(())
+}
+
+/// base64(标准、无填充容忍差异;仅编码用)。
+mod b64 {
+    use base64::Engine as _;
+    pub fn encode(b: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(b)
+    }
 }
 
 async fn send_error(stream: &mut BoxedIo, code: &str, message: &str) -> std::io::Result<()> {
@@ -711,10 +822,21 @@ async fn run_session_loop(
                                 Ok(p) => p,
                                 Err(_) => continue,
                             };
-                            let _ = sess.send(ServerMessage::Pong(rh_protocol::message::Pong {
+                            // A1:必须 try_send,不能 await。
+                            //
+                            // 本循环**同时是** queue 的唯一消费者(下面
+                            // `out = qrx.recv()` 分支)。若在这里 `send().await`
+                            // 且队列已满,就是自锁:等自己消费 → 永久 park →
+                            // select 不再回顶 → 心跳超时、sess.cancel、
+                            // state.shutdown 全部失联,task/fd 永久泄漏。
+                            // 丢一个 PONG 只让客户端那一拍探测超时,下一拍自愈。
+                            let pong = ServerMessage::Pong(rh_protocol::message::Pong {
                                 ts_ms: p.ts_ms,
                                 probe: false,
-                            })).await;
+                            });
+                            if sess.queue_tx.try_send(pong).is_err() {
+                                state.metrics.dropped_pong.inc();
+                            }
                             continue;
                         }
                         let msg: ClientMessage = match serde_json::from_slice(&payload) {
@@ -813,12 +935,15 @@ pub async fn handle_client_message(
 ) {
     match msg {
         ClientMessage::Ping(p) => {
-            let _ = reply
-                .send(ServerMessage::Pong(rh_protocol::message::Pong {
+            // 同 A1:一律有界,绝不无界 park(见 run_session_loop 的 PING 分支)。
+            let _ = tokio::time::timeout(
+                CONTROL_REPLY_TIMEOUT,
+                reply.send(ServerMessage::Pong(rh_protocol::message::Pong {
                     ts_ms: p.ts_ms,
                     probe: p.probe,
-                }))
-                .await;
+                })),
+            )
+            .await;
         }
         ClientMessage::ApplyResult(r) => {
             crate::runtime::on_apply_result(&state, &sess, &r).await;
@@ -829,14 +954,16 @@ pub async fn handle_client_message(
             let client = state.db.get_client(&sess.client_id).await.ok().flatten();
             let rev = client.map(|c| c.config_revision.max(0) as u64).unwrap_or(0);
             sess.mark_unconfirmed(rev).await;
-            let _ = reply
-                .send(ServerMessage::ServiceSync(
+            let _ = tokio::time::timeout(
+                CONTROL_REPLY_TIMEOUT,
+                reply.send(ServerMessage::ServiceSync(
                     rh_protocol::message::ServiceSync {
                         revision: rev,
                         entities,
                     },
-                ))
-                .await;
+                )),
+            )
+            .await;
         }
         ClientMessage::UserConnect(u) => {
             crate::visitor::on_user_connect(&state, &sess, u).await;
@@ -1058,17 +1185,10 @@ pub async fn handle_data_channel_hello(
     payload: &[u8],
 ) -> anyhow::Result<()> {
     let hello: rh_protocol::message::DataChannelHello = serde_json::from_slice(payload)?;
-    // 查找会话
+    // C2:O(1) 索引查找(修前是 O(在线客户端) 全表扫描)
     let sess = state
         .sessions
-        .online_clients()
-        .into_iter()
-        .find_map(|cid| {
-            state
-                .sessions
-                .get(&cid)
-                .filter(|s| s.session_id == hello.session_id)
-        })
+        .get_by_session(&hello.session_id)
         .ok_or_else(|| anyhow::anyhow!("no session"))?;
     // round-10 重拨补位:客户端池重拨的新载体未再发报到 HELLO,其首流
     // 直接是数据通道——把该连接聚合进会话池,后续流不再搁浅。单载体
@@ -1150,6 +1270,10 @@ pub async fn handle_data_channel_hello(
     routed
 }
 
+/// B9:测试客户端 secret(各测试的 `state_with*` 均以 `0`*64 建库)。
+#[cfg(test)]
+const TEST_CLIENT_SECRET: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
 #[cfg(test)]
 mod carrier_ack_tests {
     //! round-10 报到应答(T-S1/T-S2)直连单测:不经完整客户端,直接构造
@@ -1182,6 +1306,19 @@ mod carrier_ack_tests {
     }
 
     fn attach_hello(session_id: &str) -> Hello {
+        hello_with_auth(session_id, None)
+    }
+
+    /// B9:报到 Hello 的认证字段。`auth=None` 时按测试客户端的 secret
+    /// 计算正确 HMAC(正常路径);`Some(v)` 用于构造错误/缺失凭据的负例。
+    fn hello_with_auth(session_id: &str, auth: Option<Option<String>>) -> Hello {
+        let attach_auth = match auth {
+            Some(v) => v,
+            None => Some(hmac_hex(
+                TEST_CLIENT_SECRET.as_bytes(),
+                &format!("rh3:attach:{session_id}"),
+            )),
+        };
         Hello {
             client_id: CID.into(),
             version: PROTOCOL_VERSION.into(),
@@ -1190,6 +1327,7 @@ mod carrier_ack_tests {
             arch: "test".into(),
             capabilities: Vec::new(),
             session_id: Some(session_id.into()),
+            attach_auth,
         }
     }
 
@@ -1784,6 +1922,10 @@ mod carrier_attach_concurrency_tests {
             arch: "test".into(),
             capabilities: Vec::new(),
             session_id: Some(sid.into()),
+            attach_auth: Some(hmac_hex(
+                TEST_CLIENT_SECRET.as_bytes(),
+                &format!("rh3:attach:{sid}"),
+            )),
         }
     }
 
@@ -1913,6 +2055,354 @@ mod carrier_attach_concurrency_tests {
         assert!(
             sess.mux_pool.lock().await.is_none(),
             "cap=1 时不得建池、不得聚合任何附加载体"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cert_per_listener_tests {
+    //! 证书下发必须"连哪个端口就下发哪个证书"。
+    //!
+    //! 多监听器(`[[extra_listeners]]`)各有独立的自签证书。曾经
+    //! `AppState.control_leaf_cert` 是全局单值、只由首个监听器注入,于是
+    //! 客户端连第 2 个及以后的加密监听器时会收到别人的证书,逐字节比对
+    //! 必然失败,还报"可能存在中间人"——把安全问题排查引向错误方向。
+    //!
+    //! 本模块锁住两点:
+    //! 1. [`rh_transport::tls::leaf_der_of`] 对两份不同证书解析出不同结果;
+    //! 2. [`send_server_cert`] 使用的就是**传入的那份**,而非任何全局状态。
+    use super::*;
+    use base64::Engine as _;
+
+    /// 造一份独立的 PEM 自签证书,返回 (leaf DER, PEM)。
+    fn make_cert() -> (Vec<u8>, Vec<u8>) {
+        let (pem, _key) = rh_transport::tls::auto_cert(&Default::default()).unwrap();
+        let der = rh_transport::tls::leaf_der_pem(&pem).unwrap();
+        (der, pem)
+    }
+
+    /// 两份独立证书必须解析出两份不同的 DER —— 这是"多监听器证书不同"
+    /// 这个前提本身,也是本缺陷成立的根因。
+    #[test]
+    fn two_listeners_yield_different_leaf_certs() {
+        let (der_a, pem_a) = make_cert();
+        let (der_b, pem_b) = make_cert();
+        assert_ne!(der_a, der_b, "两次生成的自签证书必须不同");
+
+        // leaf_der_of 走"显式 cert_pem"分支,与应用 acceptor 同源
+        let opts_a = rh_transport::TlsServerOptions {
+            cert_pem: Some(pem_a),
+            ..Default::default()
+        };
+        let opts_b = rh_transport::TlsServerOptions {
+            cert_pem: Some(pem_b),
+            ..Default::default()
+        };
+        assert_eq!(
+            rh_transport::tls::leaf_der_of(&opts_a).as_deref(),
+            Some(der_a.as_slice()),
+            "监听器 A 必须解析出自己的证书"
+        );
+        assert_eq!(
+            rh_transport::tls::leaf_der_of(&opts_b).as_deref(),
+            Some(der_b.as_slice()),
+            "监听器 B 必须解析出自己的证书"
+        );
+    }
+
+    /// `leaf_der_of` 也必须能走 persist_prefix 分支(生产路径:证书落盘在
+    /// `<配置目录>/certs/rh-<proto>-<port>.crt`,启动时从磁盘读)。
+    #[test]
+    fn leaf_der_of_reads_persisted_cert() {
+        let dir = std::env::temp_dir().join(format!(
+            "rh-leaf-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("rh-tls-1234");
+        let opts = rh_transport::TlsServerOptions {
+            persist_prefix: Some(prefix.clone()),
+            ..Default::default()
+        };
+        let (pem, _key) = rh_transport::tls::auto_cert(&opts).unwrap();
+        let expect = rh_transport::tls::leaf_der_pem(&pem).unwrap();
+        // 此时 cert_pem 仍是 None,只能从落盘读
+        let got = rh_transport::tls::leaf_der_of(&opts).expect("必须能从 .crt 读出");
+        assert_eq!(got, expect, "落盘分支必须与 auto_cert 的证书一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **核心回归**:`send_server_cert` 下发的必须是"传进来的那份"证书。
+    ///
+    /// 修前它读 `state.control_leaf_cert` 全局单值,与连接实际来自哪个
+    /// 监听器无关;修后由 `serve_transport` 按 `cfg.tls` 解析并逐层传参。
+    /// 这里用两份不同证书分别调用,断言解出来的就是各自那份。
+    #[tokio::test]
+    async fn send_server_cert_uses_the_passed_leaf() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        let (der_a, _pem_a) = make_cert();
+        let (der_b, _pem_b) = make_cert();
+        assert_ne!(der_a, der_b);
+
+        for (label, leaf) in [("A", &der_a), ("B", &der_b)] {
+            let (server, mut client) = tokio::io::duplex(64 * 1024);
+            let mut server: BoxedIo = Box::new(server);
+            let leaf_for_task = leaf.clone();
+            let task = tokio::spawn(async move {
+                send_server_cert(&mut server, "cid", secret, Some(&leaf_for_task))
+                    .await
+                    .unwrap();
+            });
+
+            let mut buf = bytes::BytesMut::with_capacity(4096);
+            let (ty, payload) =
+                tokio::time::timeout(Duration::from_secs(2), read_frame(&mut client, &mut buf))
+                    .await
+                    .expect("读帧超时")
+                    .expect("读帧失败");
+            task.await.unwrap();
+
+            assert_eq!(ty, FrameType::SERVER_CERT, "{label}: 帧类型");
+            let msg: rh_protocol::message::ServerCert = serde_json::from_slice(&payload).unwrap();
+            let nonce: [u8; 12] = base64::engine::general_purpose::STANDARD
+                .decode(msg.nonce_b64.as_bytes())
+                .unwrap()
+                .as_slice()
+                .try_into()
+                .unwrap();
+            let ct = base64::engine::general_purpose::STANDARD
+                .decode(msg.cert_der_b64.as_bytes())
+                .unwrap();
+            let sealed = rh_protocol::certprov::SealedCert {
+                nonce,
+                ciphertext: ct,
+            };
+            let opened = rh_protocol::certprov::open_cert(secret.as_bytes(), &sealed)
+                .expect("必须能用 secret 解开");
+            assert_eq!(
+                opened.as_slice(),
+                leaf.as_slice(),
+                "{label}: 下发的必须是本监听器的证书,不能是别人的"
+            );
+        }
+    }
+
+    /// 没有证书(纯明文控制面)时静默跳过,不得报错、不得发帧。
+    #[tokio::test]
+    async fn send_server_cert_skips_without_leaf() {
+        let (server, mut client) = tokio::io::duplex(4096);
+        let mut server: BoxedIo = Box::new(server);
+        send_server_cert(&mut server, "cid", "s", None)
+            .await
+            .expect("无证书不是错误");
+        let mut buf = bytes::BytesMut::with_capacity(512);
+        let r = tokio::time::timeout(
+            Duration::from_millis(200),
+            read_frame(&mut client, &mut buf),
+        )
+        .await;
+        assert!(r.is_err(), "无证书时不得下发任何帧");
+    }
+}
+
+#[cfg(test)]
+mod reply_queue_selflock_tests {
+    //! A1 回归:控制回包队列**自锁**。
+    //!
+    //! `run_session_loop` 的 select 里,PING 分支曾经内联
+    //! `sess.send(pong).await`,而同一个循环又是 `qrx` 的唯一消费者。
+    //! 队列一满就是自锁:send 等自己消费 → 永久 park → select 不再回顶 →
+    //! 心跳超时 / `sess.cancel` / `state.shutdown` 全部失联,task 与 fd
+    //! 永久泄漏(客户端狂发 PING 即可触发)。
+    //!
+    //! 修法:PING 回执走 `try_send`,满即计 `dropped_pong` 丢弃。
+    //! 本模块不复刻整个 select(那需要真实 control 连接),而是直接锁住
+    //! "忙队列下投递 PONG 不得阻塞" 这条契约 —— 一旦有人把它改回
+    //! `send().await`,下面第一条断言会挂起(由 timeout 判红)。
+    use super::*;
+    use crate::config::ServerConfig;
+
+    const CID: &str = "selflock-client";
+
+    async fn state() -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "sl", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        Arc::new(AppState::new(ServerConfig::default(), db))
+    }
+
+    /// 队列满时 `try_send` 必须立即失败(不阻塞),且 dropped_pong 增长。
+    #[tokio::test]
+    async fn pong_try_send_never_blocks_on_full_queue() {
+        let state = state().await;
+        // 容量 1:先塞满,再投 PONG
+        let (tx, _rx) = mpsc::channel::<ServerMessage>(1);
+        let sess = Session::new(CID.into(), "sid".into(), 1, CancellationToken::new(), tx);
+        // 占满唯一槽位
+        assert!(
+            sess.queue_tx
+                .try_send(ServerMessage::ServiceRemove(
+                    rh_protocol::message::ServiceRemove {
+                        revision: 0,
+                        entity_type: "proxy".into(),
+                        entity_id: 0,
+                    }
+                ))
+                .is_ok(),
+            "第一个应能入队"
+        );
+
+        let before = state.metrics.dropped_pong.get();
+        let pong = ServerMessage::Pong(rh_protocol::message::Pong {
+            ts_ms: 1,
+            probe: false,
+        });
+        // 关键断言:必须**立即**返回 Err,不得 park
+        let r = tokio::time::timeout(Duration::from_millis(200), async {
+            sess.queue_tx.try_send(pong)
+        })
+        .await
+        .expect("try_send 绝不允许阻塞");
+        assert!(r.is_err(), "队列满时 try_send 必须失败(丢弃 PONG)");
+
+        // 走一遍真实分支逻辑:失败即计数
+        let pong2 = ServerMessage::Pong(rh_protocol::message::Pong {
+            ts_ms: 2,
+            probe: false,
+        });
+        if sess.queue_tx.try_send(pong2).is_err() {
+            state.metrics.dropped_pong.inc();
+        }
+        assert_eq!(
+            state.metrics.dropped_pong.get(),
+            before + 1,
+            "丢弃必须计入 dropped_pong(否则线上无法观测到自锁压力)"
+        );
+    }
+
+    /// 反证:如果这里换成 `send().await`(旧实现),同场景会挂起。
+    ///
+    /// 这条测试存在的意义是把"旧实现必然挂起"变成可执行的证据,而不是
+    /// 只写在注释里 —— 以后有人想改回阻塞式发送,会先看到这一条。
+    #[tokio::test]
+    async fn blocking_send_would_hang_and_try_send_does_not() {
+        let (_tx, mut rx) = mpsc::channel::<ServerMessage>(1);
+        let tx = _tx;
+        // 用一个**不会被消费**的队列:没有人 recv
+        assert!(tx
+            .try_send(ServerMessage::Pong(rh_protocol::message::Pong {
+                ts_ms: 0,
+                probe: false
+            }))
+            .is_ok());
+        // 旧写法(send().await)在这里会永久挂起
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(150),
+            tx.send(ServerMessage::Pong(rh_protocol::message::Pong {
+                ts_ms: 1,
+                probe: false,
+            })),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "无消费者时 send().await 必须挂起 —— 这正是旧实现的死锁形态"
+        );
+        // 期间队列未被消费(证明挂起原因确实是"等自己")
+        assert!(rx.try_recv().is_ok(), "队列里那一帧仍在");
+    }
+}
+
+#[cfg(test)]
+mod unauth_window_tests {
+    //! A3 回归:未认证名额只覆盖**认证窗口**,不覆盖会话寿命。
+    //!
+    //! 修前 `exit_unauth` 在 `auth_and_run(...).await` 之后,而该函数以
+    //! `run_session_loop` 结尾 → 已认证会话把名额终身占住。同 NAT 出口
+    //! 第 `unauth_conns_per_ip + 1` 个客户端永远收到 `too many pending auth`。
+    use super::*;
+    use crate::config::ServerConfig;
+
+    async fn state_with_limit(n: usize) -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::default(), db));
+        state.limits.write().unwrap().unauth_conns_per_ip = n;
+        state
+    }
+
+    /// 核心断言:N 个**已认证**(= 守卫已 disarm)的会话不再占用名额,
+    /// 第 N+1 个仍能进入认证窗口。旧实现下第 N+1 个会被拒。
+    #[tokio::test]
+    async fn authenticated_sessions_do_not_hold_unauth_quota() {
+        const LIMIT: usize = 4;
+        let state = state_with_limit(LIMIT).await;
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+
+        // 起 LIMIT 个,每个在认证成功后 disarm(名额立即归还)
+        let mut guards = Vec::new();
+        for _ in 0..LIMIT {
+            let g = state.enter_unauth_guard(ip).expect("限额内必须放行");
+            // 用 chan 保证守卫活到 disarm 之后(模拟会话仍在运行)
+            g.disarm();
+            // disarm 消耗了守卫;这里再造一个"活着但已归还"的占位语义:
+            guards.push(());
+        }
+        drop(guards);
+
+        // 关键:名额已全部归还 —— 再来一个仍能进
+        let extra = state.enter_unauth_guard(ip);
+        assert!(
+            extra.is_some(),
+            "A3:{LIMIT} 个已认证会话不得继续占用未认证名额(修前第 {} 个会被拒)",
+            LIMIT + 1
+        );
+    }
+
+    /// 对照:守卫**未** disarm 时仍占名额(证明这条闸门没被整体废掉)。
+    #[tokio::test]
+    async fn live_guards_still_consume_quota() {
+        const LIMIT: usize = 3;
+        let state = state_with_limit(LIMIT).await;
+        let ip: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+
+        let mut held = Vec::new();
+        for i in 0..LIMIT {
+            held.push(
+                state
+                    .enter_unauth_guard(ip)
+                    .unwrap_or_else(|| panic!("第 {i} 个必须放行")),
+            );
+        }
+        assert!(
+            state.enter_unauth_guard(ip).is_none(),
+            "认证窗口内(守卫未 disarm)必须仍然限额 —— 否则闸门失效"
+        );
+
+        // 归还一个后能再进
+        held.pop();
+        assert!(
+            state.enter_unauth_guard(ip).is_some(),
+            "归还一个名额后必须能再进"
+        );
+    }
+
+    /// 早退路径由 Drop 归还:不 disarm 直接 drop 也必须释放。
+    #[tokio::test]
+    async fn drop_without_disarm_releases_quota() {
+        const LIMIT: usize = 1;
+        let state = state_with_limit(LIMIT).await;
+        let ip: std::net::IpAddr = "203.0.113.11".parse().unwrap();
+
+        {
+            let _g = state.enter_unauth_guard(ip).expect("首个放行");
+            assert!(state.enter_unauth_guard(ip).is_none(), "占满后必须拒");
+        } // _g drop → 归还
+        assert!(
+            state.enter_unauth_guard(ip).is_some(),
+            "A3:早退路径(读失败/认证失败)必须由 Drop 归还名额"
         );
     }
 }

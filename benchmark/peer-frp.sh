@@ -34,6 +34,15 @@ PROTO="${PROTO:-tcp}"
 PEER_DIR="${PEER_DIR:-/tmp/frp-peer}"
 PEER_DURATION="${PEER_DURATION:-10}"
 
+# 吞吐压测工具(与 peer.sh 同一开关,保证两侧可比):
+#   THP_TOOL=iperf3(默认) | loadgen(仓库自带 Go 压测器)
+THP_TOOL="${THP_TOOL:-iperf3}"
+LOADGEN_BIN="${LOADGEN_BIN:-/tmp/rh-bin/loadgen}"
+if [ "$THP_TOOL" = "loadgen" ]; then
+  [ -x "$LOADGEN_BIN" ] || die "THP_TOOL=loadgen 但 LOADGEN_BIN 不可执行: $LOADGEN_BIN"
+fi
+export THP_TOOL LOADGEN_BIN
+
 CTL_PORT=17100; KCP_PORT=17101; QUIC_PORT=17102
 PROXY_BASE=20001
 T_IPERF=19101; T_TCP=19102; T_UDP=19103; T_HTTP=19104
@@ -117,7 +126,11 @@ frp_client() {  # <a_ip>
   echo $! > "$PEER_DIR/target.pid"
   wait_port 127.0.0.1 "$T_TCP" 15 || { err "目标服务未就绪"; cat "$PEER_DIR/target.log"; return 1; }
 
-  iperf3 -s -p "$T_IPERF" >"$PEER_DIR/iperf.log" 2>&1 &
+  if [ "$THP_TOOL" = "loadgen" ]; then
+    "$LOADGEN_BIN" sink "$T_IPERF" 7200 200000 >"$PEER_DIR/iperf.log" 2>&1 &
+  else
+    iperf3 -s -p "$T_IPERF" >"$PEER_DIR/iperf.log" 2>&1 &
+  fi
   echo $! > "$PEER_DIR/iperf.pid"
   wait_port 127.0.0.1 "$T_IPERF" 10 || { err "iperf3 未就绪"; return 1; }
 
@@ -201,20 +214,36 @@ PYEOF
   rec() { echo "$1" >> "$out_file"; }
 
   # ---------- 吞吐 ----------
-  hdr "吞吐 (iperf3, 每档 ${PEER_DURATION}s)"
+  # thp <host> <port> <streams> <rev> → Mbps 整数(0 = 无效,如实记录不造数)
+  thp() {
+    local host="$1" port="$2" streams="$3" rev="$4" out
+    if [ "$THP_TOOL" = "loadgen" ]; then
+      # loadgen 仅单向发送,rev(下行)无对应能力 → 与 peer.sh 同口径
+      out="$("$LOADGEN_BIN" src "$host:$port" "$PEER_DURATION" "$streams" 2>/dev/null \
+        | jq -r '(.gbps // 0)*1000|floor' 2>/dev/null)"
+    else
+      out="$(iperf3 -c "$host" -p "$port" -t "$PEER_DURATION" -P "$streams" $rev -J 2>/dev/null \
+        | jq -r '.end.sum_received.bits_per_second/1e6|floor // 0' 2>/dev/null)"
+    fi
+    [ -n "$out" ] && [ "$out" != "null" ] || out=0
+    printf '%s' "$out"
+  }
+
+  # 重复配对次数,与 peer.sh 的 PEER_REPEAT 同语义、同默认值 —— 两侧轮数
+  # 不一致会让"取中位数"与"单次采样"混比,对比失效。
+  local repeat="${PEER_REPEAT:-3}" sample
+  hdr "吞吐 (${THP_TOOL}, 每档 ${PEER_DURATION}s × ${repeat} 次配对)"
+  for sample in $(seq 1 "$repeat"); do
   for spec in "1:upload:" "1:download:-R" "4:upload:" "4:download:-R" "16:upload:" "16:download:-R"; do
     local streams dir rev mbps
     streams="${spec%%:*}"; rest="${spec#*:}"; dir="${rest%%:*}"; rev="${rest#*:}"
-    mbps="$(iperf3 -c "$b_ip" -p "$T_IPERF" -t "$PEER_DURATION" -P "$streams" $rev -J 2>/dev/null \
-      | jq -r '.end.sum_received.bits_per_second/1e6|floor // 0' 2>/dev/null)"
-    [ -n "$mbps" ] || mbps=0
-    rec "{\"metric\":\"throughput\",\"path\":\"direct\",\"dir\":\"$dir\",\"streams\":$streams,\"mbps\":$mbps,\"proto\":\"frp-$PROTO\"}"
-    log "  直连  ${streams}s $dir: ${mbps} Mbps"
-    mbps="$(iperf3 -c "$a_ip" -p "$P_IPERF" -t "$PEER_DURATION" -P "$streams" $rev -J 2>/dev/null \
-      | jq -r '.end.sum_received.bits_per_second/1e6|floor // 0' 2>/dev/null)"
-    [ -n "$mbps" ] || mbps=0
-    rec "{\"metric\":\"throughput\",\"path\":\"tunnel\",\"dir\":\"$dir\",\"streams\":$streams,\"mbps\":$mbps,\"proto\":\"frp-$PROTO\"}"
-    log "  隧道  ${streams}s $dir: ${mbps} Mbps"
+    mbps="$(thp "$b_ip" "$T_IPERF" "$streams" "$rev")"
+    rec "{\"metric\":\"throughput\",\"path\":\"direct\",\"dir\":\"$dir\",\"streams\":$streams,\"mbps\":$mbps,\"sample\":$sample,\"proto\":\"frp-$PROTO\"}"
+    log "  直连  ${streams}s $dir 第${sample}次: ${mbps} Mbps"
+    mbps="$(thp "$a_ip" "$P_IPERF" "$streams" "$rev")"
+    rec "{\"metric\":\"throughput\",\"path\":\"tunnel\",\"dir\":\"$dir\",\"streams\":$streams,\"mbps\":$mbps,\"sample\":$sample,\"proto\":\"frp-$PROTO\"}"
+    log "  隧道  ${streams}s $dir 第${sample}次: ${mbps} Mbps"
+  done
   done
 
   # ---------- 延迟 ----------

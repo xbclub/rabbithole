@@ -198,8 +198,18 @@ impl Config {
 
     /// Set the max. payload size used when sending data frames. Payloads larger
     /// than the configured max. will be split.
+    ///
+    /// # 上限强制钳制到接收侧帧体上限(A10)
+    ///
+    /// 接收侧对**每一帧**做 `body_len > MAX_FRAME_BODY_LEN (1 MiB)` 检查,
+    /// 超限即 `FrameTooLarge` → `begin_fatal` **拆掉整条载体**(其上全部流)。
+    /// 若发送侧允许更大分片,任何 >1MiB 的写(控制面 `write_all` 无上限,
+    /// 如超大 ApplyResult / 配置回显)都会把载体写死。
+    ///
+    /// 修前这里直接存 `n`;中继路径靠 `up_chunk_cap` 恰好压在 1MiB 才没炸
+    /// —— 那是巧合,不是约束。现在把约束写进配置层,两处不会再脱钩。
     pub fn set_split_send_size(&mut self, n: usize) -> &mut Self {
-        self.split_send_size = n;
+        self.split_send_size = n.min(crate::frame::io::MAX_FRAME_BODY_LEN);
         self
     }
 
@@ -334,5 +344,38 @@ impl quickcheck::Arbitrary for Config {
             // 分片数保持默认(分片行为由专项测试显式构造)
             shard_workers: 4,
         }
+    }
+}
+
+#[cfg(test)]
+mod split_send_size_clamp_tests {
+    //! A10 回归:发送分片帽不得超过接收侧帧体上限。
+    //!
+    //! 接收侧对每帧做 `body_len > MAX_FRAME_BODY_LEN (1 MiB)` 检查,超限即
+    //! `FrameTooLarge` → `begin_fatal` **拆掉整条载体**(其上全部流)。修前
+    //! `set_split_send_size(6 MiB)` 允许发出 6MiB 的帧,任何 >1MiB 的写
+    //! (控制面 `write_all` 无上限)都会把载体写死。
+    use super::*;
+
+    #[test]
+    fn split_send_size_is_clamped_to_receive_limit() {
+        let mut cfg = Config::default();
+        // 复现 rh-transport 的既有取值
+        cfg.set_split_send_size(6 * 1024 * 1024);
+        assert_eq!(
+            cfg.split_send_size,
+            crate::frame::io::MAX_FRAME_BODY_LEN,
+            "A10:6MiB 分片帽必须被钳到接收上限 1MiB,否则大帧会拆掉整条载体"
+        );
+        assert_eq!(cfg.split_send_size, crate::MIB);
+    }
+
+    #[test]
+    fn smaller_send_size_is_left_alone() {
+        let mut cfg = Config::default();
+        cfg.set_split_send_size(64 * 1024);
+        assert_eq!(cfg.split_send_size, 64 * 1024, "小于上限的值不得被抬高");
+        cfg.set_split_send_size(crate::MIB);
+        assert_eq!(cfg.split_send_size, crate::MIB, "等于上限应原样保留");
     }
 }

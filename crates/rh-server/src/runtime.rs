@@ -38,7 +38,13 @@ pub async fn on_session_up(state: &Arc<AppState>, sess: &Arc<Session>) {
 }
 
 /// 会话断开:关池与通道,状态落 offline。
+///
+/// B2:`on_session_up`(注册新会话)持 `serial_lock(client_id)`,本函数也
+/// 必须持同一把锁:否则"判定未被替换 → 新会话注册 → 本函数写 Offline"
+/// 的交错会把刚上线的规则永久钉在 Offline(没有后续事件自愈)。
 pub async fn on_session_down(state: &Arc<AppState>, sess: &Arc<Session>) {
+    let lock = state.serial_lock(&sess.client_id);
+    let _g = lock.lock().await;
     let proxies = match state.db.list_proxies(Some(&sess.client_id)).await {
         Ok(p) => p,
         Err(_) => return,
@@ -361,11 +367,15 @@ async fn tcp_bind_and_serve(
         rt.bound.store(true, Ordering::Relaxed);
         let st2 = state.clone();
         let rt2 = rt.clone();
+        // ★A6:共享 serve loop 的退出条件必须是**组级** serve_cancel。
+        //
+        // 修前这里传的是 rt2(属主成员),而 tcp_serve_loop 内部 select 的是
+        // `rt.rule_cancel` —— 属主被禁用/改端口即无条件 cancel,监听 fd 释放,
+        // 但 listener_bound 仍为 true → 其余成员 spawn 时跳过重绑 →
+        // 组端口永久拒绝连接。组监听属于组,不属于任何单个成员。
+        let group_cancel = token.clone();
         tokio::spawn(async move {
-            tokio::select! {
-                _ = crate::data::tcp_serve_loop(st2, rt2, l) => {}
-                _ = token.cancelled() => {}
-            }
+            crate::data::tcp_serve_loop_group(st2, rt2, l, group_cancel).await;
         });
         return Ok(());
     }
@@ -375,9 +385,11 @@ async fn tcp_bind_and_serve(
     *rt.tcp_listener.lock().await = marker_listener();
     let rt2 = rt.clone();
     let st2 = state.clone();
-    tokio::spawn(async move {
+    // A6 顺带:记录句柄,供下次重建前收敛(避免 EADDRINUSE 窗口)。
+    let h = tokio::spawn(async move {
         crate::data::tcp_serve_loop(st2, rt2, l).await;
     });
+    *rt.serve_handle.lock().await = Some(h);
     Ok(())
 }
 
@@ -457,6 +469,19 @@ pub async fn teardown_runtime(state: &Arc<AppState>, proxy_id: u64) {
             state.proxies.leave_group(&k, proxy_id).await;
         }
         rt.rule_cancel.cancel();
+        // A6 顺带:等 serve loop 真正退出(带超时),再让调用方去重建。
+        // 否则旧 loop 尚未释放监听 fd,新绑定偶发 EADDRINUSE。
+        if let Some(h) = rt.serve_handle.lock().await.take() {
+            if tokio::time::timeout(std::time::Duration::from_secs(2), h)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    proxy = proxy_id,
+                    "serve loop did not converge within 2s during teardown"
+                );
+            }
+        }
         crate::data::close_proxy_channels(&rt).await;
         // 失效该规则在途 CREATE 请求:迟到回显不得进入新运行时(§4.5 代次隔离)
         if let Some(sess) = state.sessions.get(&rt.client_id) {
@@ -514,7 +539,16 @@ pub async fn publish_spec_in_place(
     revision: u64,
 ) -> bool {
     *rt.spec.write().await = spec.clone();
+    // 与 spec 同步维护无锁快路径标记(见 ProxyRuntime::has_group)
+    rt.has_group.store(
+        crate::state::ProxyManager::group_key(spec).is_some(),
+        Ordering::Relaxed,
+    );
     rt.latest_revision.store(revision, Ordering::Relaxed);
+    // 规则变更:上游连接池里的连接可能仍指向旧目标(改 target_host /
+    // target_port 后复用旧连接会把请求转发到错误后端)。整池丢弃,
+    // 后续请求重建。代价是一次冷启动,正确性优先。
+    rt.http_upstream.clear();
     if let Some(sess) = state.sessions.get(&rt.client_id) {
         sess.mark_unconfirmed(revision).await;
         let _ = sess

@@ -2700,6 +2700,7 @@ name = "rh-protocol"
 version = "0.4.1"
 dependencies = [
  "bytes",
+ "ring",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

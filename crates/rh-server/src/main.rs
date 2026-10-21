@@ -168,6 +168,46 @@ fn tls_opts_or_auto(
     Ok(o)
 }
 
+/// 若该监听点会走 TLS,打印叶子证书指纹供客户端 pin。
+///
+/// **为什么必须打印**:自签证书的指纹是客户端唯一的身份锚点。
+/// 不打印的话,`tls_pin_sha256` 只能靠 `openssl x509` 从服务端文件系统里挖,
+/// 容器部署下更是拿不到——用户于是只能退化成 `tls_insecure_skip_verify`
+/// 或依赖 TOFU 首连不设防。这一行日志把「安全接入」的成本降到复制粘贴。
+///
+/// 证书来源可能是显式配置的文件,也可能是刚落盘的自签证书;后者在
+/// `auto_cert` 里生成,此处读取落盘结果即可(已存在则直接复用)。
+fn log_cert_fingerprint(opts: &TlsServerOptions, proto: Protocol, label: &str) {
+    if !matches!(proto, Protocol::Tls | Protocol::Wss | Protocol::Quic) {
+        return;
+    }
+    let pem = match &opts.cert_pem {
+        Some(p) => Some(p.clone()),
+        None => opts.persist_prefix.as_ref().and_then(|prefix| {
+            let crt = prefix.with_extension("crt");
+            std::fs::read(crt).ok()
+        }),
+    };
+    let Some(pem) = pem else { return };
+    match rh_transport::tls::leaf_fingerprint_pem(&pem) {
+        Ok(fp) => info!(
+            listener = %label,
+            fingerprint = %fp,
+            "TLS 证书指纹(客户端可用 tls_pin_sha256 / RH_TLS_PIN_SHA256 钉死此值)"
+        ),
+        Err(e) => warn!(listener = %label, error = %e, "读取 TLS 证书指纹失败"),
+    }
+}
+
+/// 生效的 ALPN 列表:配置为空时用默认值。
+fn alpn_list(configured: &[String]) -> Vec<String> {
+    if configured.is_empty() {
+        vec![rh_transport::DEFAULT_ALPN.to_string()]
+    } else {
+        configured.to_vec()
+    }
+}
+
 fn load_control_cfgs(cfg: &config::ServerConfig) -> anyhow::Result<Vec<ServerTransportConfig>> {
     let cfg_dir = cfg
         .config_path
@@ -177,17 +217,32 @@ fn load_control_cfgs(cfg: &config::ServerConfig) -> anyhow::Result<Vec<ServerTra
     let mut out = Vec::new();
     let main_proto = Protocol::parse(&cfg.bind_protocol)
         .ok_or_else(|| anyhow::anyhow!("bad bind_protocol {}", cfg.bind_protocol))?;
+    let main_tls = tls_opts_or_auto(&cfg.tls, main_proto, cfg_dir.join("certs/rh-main"))?;
+    // 触发落盘(缺失时生成),随后才能读到证书算指纹。
+    if main_tls.cert_pem.is_none() {
+        let _ = rh_transport::tls::auto_cert(&main_tls);
+    }
+    log_cert_fingerprint(
+        &main_tls,
+        main_proto,
+        &format!("{}:{}", cfg.bind_addr, cfg.bind_port),
+    );
     out.push(ServerTransportConfig {
         protocol: main_proto,
         bind_addr: format!("{}:{}", cfg.bind_addr, cfg.bind_port).parse()?,
         multiplex: cfg.multiplex,
-        tls: tls_opts_or_auto(&cfg.tls, main_proto, cfg_dir.join("certs/rh-main"))?,
-        alpn: vec!["rhtp".into()],
+        tls: main_tls,
+        alpn: crate::alpn_list(&cfg.alpn),
     });
     for l in &cfg.extra_listeners {
         let proto = Protocol::parse(&l.protocol)
             .ok_or_else(|| anyhow::anyhow!("bad listener protocol {}", l.protocol))?;
         let prefix = cfg_dir.join(format!("certs/rh-{}-{}", l.protocol, l.bind_port));
+        let tls = tls_opts_or_auto(&l.tls, proto, prefix)?;
+        if tls.cert_pem.is_none() {
+            let _ = rh_transport::tls::auto_cert(&tls);
+        }
+        log_cert_fingerprint(&tls, proto, &format!("{}:{}", l.protocol, l.bind_port));
         out.push(ServerTransportConfig {
             protocol: proto,
             bind_addr: format!(
@@ -197,8 +252,8 @@ fn load_control_cfgs(cfg: &config::ServerConfig) -> anyhow::Result<Vec<ServerTra
             )
             .parse()?,
             multiplex: l.multiplex.unwrap_or(cfg.multiplex),
-            tls: tls_opts_or_auto(&l.tls, proto, prefix)?,
-            alpn: vec!["rhtp".into()],
+            tls,
+            alpn: crate::alpn_list(&cfg.alpn),
         });
     }
     Ok(out)
@@ -253,6 +308,13 @@ async fn main() -> anyhow::Result<()> {
             std::fs::write(dir.join("cert.pem"), &cert)?;
             std::fs::write(dir.join("key.pem"), &key)?;
             println!("cert written to {}", dir.display());
+            // 同一份证书被写了两处:dir/cert.pem 供用户配置 cert_file,
+            // dir/rh-server.crt 是 persist_prefix 的落盘名。打印指纹方便
+            // 直接配到客户端 tls_pin_sha256(容器场景常拿不到文件系统)。
+            match rh_transport::tls::leaf_fingerprint_pem(&cert) {
+                Ok(fp) => println!("sha256 fingerprint: {fp}"),
+                Err(e) => eprintln!("warning: compute fingerprint failed: {e}"),
+            }
             return Ok(());
         }
         None => {}
@@ -264,10 +326,13 @@ async fn main() -> anyhow::Result<()> {
     bootstrap_initial_admin(&state).await;
     // 启动恢复:双方 enabled 的规则重新绑定。
     recovery::recover_all(&state).await;
-    // 控制面监听
-    for tc in load_control_cfgs(&cfg)? {
+    // 控制面监听。每个监听器的叶子证书**随监听器**交给 serve_transport:
+    // 多监听器各有独立自签证书,认证后必须下发"客户端连的那个端口"的证书,
+    // 否则逐字节比对必然失败并被误报为中间人。
+    let control_cfgs = load_control_cfgs(&cfg)?;
+    for tc in control_cfgs.iter() {
         info!(addr = %tc.bind_addr, proto = ?tc.protocol, "control listener starting");
-        tokio::spawn(control::serve_transport(state.clone(), tc));
+        tokio::spawn(control::serve_transport(state.clone(), tc.clone()));
     }
     // vhost 监听
     if cfg.vhost.http_port > 0 {

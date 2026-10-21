@@ -570,3 +570,96 @@ async fn backlog_orphan_close_is_observable_after_write() {
         .await
         .expect("test deadline (8s)");
 }
+
+/// 回归:`listen_stream` 必须使用 `cfg.alpn`,而不是内部默认值。
+///
+/// 由来:服务端曾用 `server_config()`(固定取 DEFAULT_ALPN)构建 acceptor,
+/// 导致配置里的 alpn 列表被**静默忽略** —— 配 ["h2","http/1.1"] 实际只
+/// 协商 h2,客户端只提 http/1.1 时服务端回 no_application_protocol。
+/// 配置项形同虚设且无任何报错,只能靠真实握手发现,故在此锁死。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listen_stream_honors_configured_alpn() {
+    use tokio_rustls::rustls::pki_types::ServerName;
+    use tokio_rustls::TlsConnector;
+
+    let cfg = ServerTransportConfig {
+        protocol: Protocol::Tls,
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        multiplex: false,
+        alpn: vec!["h2".into(), "http/1.1".into()],
+        ..Default::default()
+    };
+    let listener = tcp::listen_stream(&cfg, mux_streams())
+        .await
+        .expect("listen");
+    let addr = listener.local_addr().expect("local_addr");
+
+    // 只提非首项 http/1.1,若服务端忽略配置就会握手失败
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    let _ = &mut roots;
+    let client = tokio_rustls::rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+    let mut client = client;
+    client.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let tcp = TcpStream::connect(addr).await.expect("connect");
+    let connector = TlsConnector::from(Arc::new(client));
+    let name = ServerName::try_from("localhost").unwrap();
+    let stream = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+        .await
+        .expect("handshake deadline")
+        .expect("handshake must succeed when server offers http/1.1");
+    assert_eq!(
+        stream.get_ref().1.alpn_protocol(),
+        Some(&b"http/1.1"[..]),
+        "协商结果必须是客户端提出的 http/1.1"
+    );
+}
+
+#[derive(Debug)]
+struct NoVerify;
+impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _e: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _i: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+        _s: &tokio_rustls::rustls::pki_types::ServerName<'_>,
+        _o: &[u8],
+        _n: tokio_rustls::rustls::pki_types::UnixTime,
+    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error>
+    {
+        Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _m: &[u8],
+        _c: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _d: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _m: &[u8],
+        _c: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _d: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+        vec![
+            tokio_rustls::rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            tokio_rustls::rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            tokio_rustls::rustls::SignatureScheme::ED25519,
+            tokio_rustls::rustls::SignatureScheme::RSA_PSS_SHA256,
+        ]
+    }
+}

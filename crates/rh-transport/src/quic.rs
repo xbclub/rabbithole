@@ -1,4 +1,4 @@
-//! QUIC 载体(quinn):原生多流,一连接多流;ALPN "rhtp"。
+//! QUIC 载体(quinn):原生多流,一连接多流;ALPN 默认见 `DEFAULT_ALPN`。
 
 use crate::{
     other_err, BoxedIo, ClientTransportConfig, Incoming, Multiplexer, MultiplexerInner,
@@ -148,22 +148,45 @@ pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>
         .await
         .map_err(|_| other_err("quic handshake timeout"))?
         .map_err(|e| other_err(format!("quic handshake: {e}")))?;
+    // 记录对端叶子证书:上层(rh-client)用它比对服务端用 secret 加密下发的
+    // 证书,不一致即说明中间有人在转发。与 tcp/tls 路径(sink 在握手后立刻
+    // 写入)对齐——不写 sink 时上层 `peer_cert.get()` 恒为 None,而
+    // `secret_verified` 模式下"取不到对端证书"就是拒绝连接,表现为 QUIC
+    // 握手成功却无限重连。
+    //
+    // `peer_identity()` 返回 None(对端未出示证书)或类型不符时不写 sink:
+    // 保持"取不到即失败"的语义,绝不塞一个空证书进去充当比对成功。
+    if let Some(sink) = &cfg.peer_cert_sink {
+        if let Ok(Some(leaf)) = peer_leaf_cert(&conn) {
+            let _ = sink.set(leaf);
+        }
+    }
     // pin 模式:握手后比对叶子证书指纹
     if let crate::tls::ClientVerify::Pin(expected) = verify {
-        let identity = conn
-            .peer_identity()
-            .ok_or_else(|| other_err("quic: no peer certificate"))?;
-        let certs = identity
-            .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
-            .map_err(|_| other_err("quic: unexpected peer identity type"))?;
-        let leaf = certs
-            .first()
-            .ok_or_else(|| other_err("quic: empty certificate chain"))?;
-        crate::tls::verify_pin(&expected, leaf.as_ref())?;
+        let leaf = peer_leaf_cert(&conn)?.ok_or_else(|| other_err("quic: no peer certificate"))?;
+        crate::tls::verify_pin(&expected, &leaf)?;
     }
     Ok(Arc::new(Multiplexer {
         inner: MultiplexerInner::Quic(QuicConnection::new(conn)),
     }))
+}
+
+/// 取 QUIC 对端叶子证书 DER。
+///
+/// 抽出来供 sink 记录与 pin 比对共用,避免两处各写一遍 downcast 而漂移。
+/// 返回 `Ok(None)` 表示**对端没有出示证书**(quinn 在未要求客户端证书时
+/// 仍会保留服务端证书,故实际多为 `Some`);类型不符/空链是硬错误。
+fn peer_leaf_cert(conn: &quinn::Connection) -> io::Result<Option<Vec<u8>>> {
+    let Some(identity) = conn.peer_identity() else {
+        return Ok(None);
+    };
+    let certs = identity
+        .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
+        .map_err(|_| other_err("quic: unexpected peer identity type"))?;
+    let leaf = certs
+        .first()
+        .ok_or_else(|| other_err("quic: empty certificate chain"))?;
+    Ok(Some(leaf.as_ref().to_vec()))
 }
 
 /// quinn 连接包装:开流/收流 + 关闭状态位。
@@ -277,7 +300,7 @@ mod tests {
                 key_pem: Some(key),
                 ..Default::default()
             },
-            alpn: vec!["rhtp".into()],
+            alpn: vec![crate::DEFAULT_ALPN.into()],
         };
         let mut listener = listen(
             &server_cfg,
@@ -314,5 +337,101 @@ mod tests {
         s.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"quic-ok!");
         srv.await.unwrap();
+    }
+
+    /// `secret_verified` 模式下上层靠 `peer_cert_sink` 拿到对端证书做比对。
+    /// QUIC 曾经不写 sink → 上层 `peer_cert.get()` 为 None → 握手成功也
+    /// 拒绝连接,表现为无限重连。本测试锁住"QUIC 与 tcp/tls 一样写入 sink",
+    /// 且写入的正是服务端叶子证书(逐字节相等,上层才可能比对通过)。
+    #[tokio::test]
+    async fn quic_writes_peer_cert_sink_in_secret_verified_mode() {
+        let (cert, key) = crate::tls::auto_cert(&Default::default()).unwrap();
+        let expect_leaf = crate::tls::leaf_der_pem(&cert).unwrap();
+        let server_cfg = ServerTransportConfig {
+            protocol: Protocol::Quic,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            multiplex: true,
+            tls: crate::TlsServerOptions {
+                cert_pem: Some(cert),
+                key_pem: Some(key),
+                ..Default::default()
+            },
+            alpn: vec![crate::DEFAULT_ALPN.into()],
+        };
+        let mut listener = listen(
+            &server_cfg,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr;
+        let srv = tokio::spawn(async move {
+            let _inc = listener.accept().await.unwrap();
+            // 保持连接存活,避免客户端侧 sink 读取前连接被关
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let sink: std::sync::Arc<std::sync::OnceLock<Vec<u8>>> = Default::default();
+        let client = ClientTransportConfig {
+            protocol: Protocol::Quic,
+            server_addr: addr,
+            multiplex: true,
+            // 默认配置(无 CA / 无 pin / 非 insecure)下的真实路径:
+            // 握手不校验,完全依赖上层 secret 下发比对 —— 前提是 sink 有值。
+            tls: crate::TlsClientOptions {
+                secret_verified: true,
+                ..Default::default()
+            },
+            peer_cert_sink: Some(sink.clone()),
+            ..Default::default()
+        };
+        let _mux = crate::connect(&client).await.unwrap();
+        let got = sink.get().expect("QUIC 必须在握手后写入 peer_cert_sink");
+        assert_eq!(
+            got.as_slice(),
+            expect_leaf.as_slice(),
+            "sink 必须是服务端叶子证书"
+        );
+        srv.abort();
+    }
+
+    /// 未设置 sink 时不应额外做事,更不应让连接失败(调用方不需要该信息)。
+    #[tokio::test]
+    async fn quic_connect_without_sink_still_ok() {
+        let (cert, key) = crate::tls::auto_cert(&Default::default()).unwrap();
+        let server_cfg = ServerTransportConfig {
+            protocol: Protocol::Quic,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            multiplex: true,
+            tls: crate::TlsServerOptions {
+                cert_pem: Some(cert),
+                key_pem: Some(key),
+                ..Default::default()
+            },
+            alpn: vec![crate::DEFAULT_ALPN.into()],
+        };
+        let mut listener = listen(
+            &server_cfg,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr;
+        let srv = tokio::spawn(async move {
+            let _inc = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+        let client = ClientTransportConfig {
+            protocol: Protocol::Quic,
+            server_addr: addr,
+            multiplex: true,
+            tls: crate::TlsClientOptions {
+                secret_verified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        crate::connect(&client).await.unwrap();
+        srv.abort();
     }
 }

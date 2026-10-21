@@ -80,6 +80,26 @@ function isValidIp(value: string): boolean {
   return groups.every((group) => /^[0-9a-fA-F]{1,4}$/.test(group) || isValidIp(group));
 }
 
+/**
+ * ALPN 列表校验:逗号分隔的可见 ASCII,每项 1-255 字节,最多 8 项。
+ *
+ * 与后端校验一致(`put_server_config` 的 TlsUpdate 分支)。留空合法 ——
+ * 等价于用默认值 "h2"。之所以要在这里拦一遍:ALPN 不一致会让 TLS 握手
+ * 直接失败,配错了不是"性能差"而是"连不上",值得在提交前就提示。
+ */
+const ALPN_INVALID_MSG = 'ALPN 须为逗号分隔的可见 ASCII,每项 1-255 字符,最多 8 项';
+
+function alpnListValid(raw: string): boolean {
+  const items = raw
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean);
+  if (items.length > 8) return false;
+  return items.every(
+    (it) => it.length >= 1 && it.length <= 255 && /^[\x21-\x7e]+$/.test(it),
+  );
+}
+
 /** 服务器配置(热生效子集):SSH 网关 / 端口策略 / 日志级别 / 公钥白名单。 */
 const serverSchema = z.object({
   ssh_enabled: z.boolean(),
@@ -102,6 +122,8 @@ const serverSchema = z.object({
   limit_control_send_queue: intInRange(16, 65536, '控制帧队列'),
   limit_udp_packet_size: intInRange(0, 65536, 'UDP 包缓冲'),
   limit_pool_wait_timeout_ms: intInRange(100, 600000, '等池超时'),
+  // TLS/ALPN(重启生效)。逗号分隔;留空 = 用默认值 "h2"。
+  alpn: z.string().trim().refine(alpnListValid, ALPN_INVALID_MSG),
 });
 
 type ServerFormValues = z.infer<typeof serverSchema>;
@@ -194,6 +216,7 @@ const EMPTY_SERVER_FORM: ServerFormValues = {
   limit_control_send_queue: '256',
   limit_udp_packet_size: '0',
   limit_pool_wait_timeout_ms: '10000',
+  alpn: '',
 };
 
 /** 保存结果统一提示:写回失败时运行时仍已生效(与旧版口径一致)。 */
@@ -266,6 +289,7 @@ function ServerConfigCard() {
       limit_control_send_queue: String(hot.limits?.control_send_queue ?? 256),
       limit_udp_packet_size: String(hot.limits?.udp_packet_size ?? 0),
       limit_pool_wait_timeout_ms: String(hot.limits?.pool_wait_timeout_ms ?? 10000),
+      alpn: (cfgQ.data.alpn ?? []).join(','),
     });
   }, [cfgQ.data, form]);
 
@@ -297,6 +321,12 @@ function ServerConfigCard() {
           pool_wait_timeout_ms: Number(values.limit_pool_wait_timeout_ms),
         },
         authorized_keys: values.authorized_keys,
+        tls: {
+          alpn: values.alpn
+            .split(',')
+            .map((x) => x.trim())
+            .filter(Boolean),
+        },
       }),
     onSuccess: (result, values) => {
       notifyResult(result);
@@ -469,6 +499,37 @@ function ServerConfigCard() {
                     <FormControl>
                       <Input className="w-32" min={0} max={10000} type="number" {...field} />
                     </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </section>
+
+            <section className="space-y-4">
+              <div className="space-y-1">
+                <h3 className="text-sm font-semibold">TLS</h3>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  ALPN 位于 TLS 握手的 ClientHello 中且<strong>不经加密</strong>,
+                  任何抓包工具都能直接读到。用项目专属名称会被识别为 rabbithole,
+                  故默认值用最常见的 <code className="font-mono">h2</code>。
+                  改动<strong>必须与客户端一致</strong>,否则 TLS 握手直接失败。
+                </p>
+              </div>
+              <FormField
+                control={form.control}
+                name="alpn"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>
+                      <InfoLabel title="ALPN 标识" infoKey="settings.alpn" />
+                    </FormLabel>
+                    <FormControl>
+                      <Input className="w-64 font-mono" placeholder="h2" {...field} />
+                    </FormControl>
+                    <FormDescription>
+                      逗号分隔,最多 8 项;留空 = 使用默认值 h2。改后需
+                      <strong>重启服务端</strong>生效(监听器构建时固化)。
+                    </FormDescription>
                     <FormMessage />
                   </FormItem>
                 )}

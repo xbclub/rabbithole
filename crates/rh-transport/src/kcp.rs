@@ -79,11 +79,14 @@ const MAX_BACKLOG_BYTES: usize = 64 * 1024;
 /// (立即退出),该定时仅兜底无生产者路径(测试/异常构造),上限 500ms。
 const BACKLOG_RECHECK_MAX: Duration = Duration::from_millis(500);
 
+/// KCP 内部时钟(毫秒)。**必须单调**:KCP 用它对 RTO/重传/flush 做差分,
+/// 墙钟回拨(NTP 校时、手工改时间)会让 `now - last` 下溢,重传计时停滞。
+/// 以进程启动时刻为锚取 `Instant` 差值(u32 毫秒约 49.7 天回绕,KCP 本身
+/// 按 `wrapping_sub` 处理差分,周期回绕安全)。
 fn now_ms() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u32)
-        .unwrap_or(0)
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    start.elapsed().as_millis() as u32
 }
 
 // ---------------- 诊断计数(零行为变更,仅观测) ----------------
@@ -1116,22 +1119,147 @@ struct DemuxCtl {
     /// 的僵尸会话污染 accept 队列);ready 满拒绝短退避,防止单 conv
     /// 洪泛逐包「注册→spawn→拒绝→移除」的任务创建风暴,同时保留
     /// 「队列腾出后 kcp 重传触发重建」的恢复路径。
-    retired: Mutex<HashMap<u32, std::time::Instant>>,
+    ///
+    /// A8:固定容量(条目数上限)+ FIFO 驱逐。修前是"超过 1024 才 retain
+    /// 已过期条目",唯一 conv 洪水(90s 内每次退出插一个新 conv)会让表
+    /// 单调增长,且每次插入 O(n) 扫描。
+    retired: Mutex<RetiredTable>,
+    /// A8:预认证资源闸。会话在**首包**即注册(HELLO 之前),随机源地址
+    /// 洪泛会直接放大成"2 任务 + 256 槽通道"×N。这里限制全局在建会话数
+    /// 与每 IP 建会话速率。
+    gate: SessionGate,
+}
+
+/// 退休表容量与驱逐粒度。超过容量即按插入顺序驱逐最旧条目;被驱逐的
+/// conv 若很快重传会重新建会话(极小概率,退让一次,语义可接受)。
+const RETIRED_CAPACITY: usize = 4096;
+
+#[derive(Default)]
+struct RetiredTable {
+    map: HashMap<u32, std::time::Instant>,
+    /// 插入顺序(只增不删的环形序号 → conv),按序驱逐最旧。
+    order: std::collections::VecDeque<u32>,
+}
+
+impl RetiredTable {
+    fn insert(&mut self, conv: u32, until: std::time::Instant) {
+        if self.map.insert(conv, until).is_some() {
+            // 重复 conv:沿用原有序位置(避免同 conv 反复插入撑大 order)
+            return;
+        }
+        self.order.push_back(conv);
+        while self.order.len() > RETIRED_CAPACITY {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+
+    fn is_retired(&mut self, conv: u32) -> bool {
+        let now = std::time::Instant::now();
+        match self.map.get(&conv) {
+            Some(&until) if until > now => true,
+            Some(_) => {
+                // 惰性清理:过期即删,顺带把 order 里的位置留下(entry 已不在
+                // map,pop 时是 no-op),避免每次查询都全表扫描。
+                self.map.remove(&conv);
+                false
+            }
+            None => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// A8 预认证闸参数:全局在建会话上限 + 每 IP 每秒新建数。
+#[derive(Debug, Clone, Copy)]
+pub struct SessionGateConfig {
+    pub max_sessions: usize,
+    pub new_sessions_per_ip_per_sec: f64,
+}
+
+impl Default for SessionGateConfig {
+    fn default() -> Self {
+        Self {
+            // 与 ready 队列(512)+ 合理突发对齐;超出即拒绝新 conv,存量
+            // 会话不受影响(kcp 重传会在腾出后成功)。
+            max_sessions: 4096,
+            new_sessions_per_ip_per_sec: 32.0,
+        }
+    }
+}
+
+struct SessionGate {
+    cfg: SessionGateConfig,
+    /// 全局在建会话计数(注册 +1,会话退出 -1)。
+    live: std::sync::atomic::AtomicUsize,
+    /// 每 IP 令牌桶(惰性创建,随 IP 数量增长;按最近使用淘汰到上限)。
+    per_ip: Mutex<HashMap<std::net::IpAddr, (f64, std::time::Instant)>>,
+}
+
+impl SessionGate {
+    fn new(cfg: SessionGateConfig) -> Self {
+        Self {
+            cfg,
+            live: std::sync::atomic::AtomicUsize::new(0),
+            per_ip: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 准入:全局上限 + 每 IP 速率。返回 true 才允许注册新会话。
+    fn admit(&self, ip: std::net::IpAddr) -> bool {
+        use std::sync::atomic::Ordering;
+        let cur = self.live.load(Ordering::Relaxed);
+        if cur >= self.cfg.max_sessions {
+            return false;
+        }
+        let mut g = self.per_ip.lock().unwrap();
+        let now = std::time::Instant::now();
+        let cap = self.cfg.new_sessions_per_ip_per_sec.max(1.0);
+        let e = g.entry(ip).or_insert((cap, now));
+        let elapsed = now.duration_since(e.1).as_secs_f64();
+        e.0 = (e.0 + elapsed * cap).min(cap);
+        e.1 = now;
+        if e.0 < 1.0 {
+            return false;
+        }
+        e.0 -= 1.0;
+        // 惰性淘汰:超过 4096 个 IP 时清掉令牌满(即长期未用)的条目,
+        // 避免随机源地址洪泛把 per_ip 表撑成无界内存。
+        if g.len() > 4096 {
+            g.retain(|_, (tokens, last)| {
+                *tokens < cap || now.duration_since(*last) < Duration::from_secs(1)
+            });
+        }
+        self.live.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// 会话退出:全局计数 -1(由清理路径调用一次)。
+    fn release(&self) {
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .live
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
 }
 
 impl DemuxCtl {
     fn retire(&self, conv: u32, ttl: Duration) {
-        let mut r = self.retired.lock().unwrap();
-        if r.len() > 1024 {
-            let now = std::time::Instant::now();
-            r.retain(|_, until| *until > now);
-        }
-        r.insert(conv, std::time::Instant::now() + ttl);
+        self.retired
+            .lock()
+            .unwrap()
+            .insert(conv, std::time::Instant::now() + ttl);
     }
 
     fn is_retired(&self, conv: u32) -> bool {
-        let now = std::time::Instant::now();
-        matches!(self.retired.lock().unwrap().get(&conv), Some(&until) if until > now)
+        self.retired.lock().unwrap().is_retired(conv)
     }
 }
 
@@ -1203,7 +1331,8 @@ pub async fn listen(
     let ctl = Arc::new(DemuxCtl {
         closing: std::sync::atomic::AtomicBool::new(false),
         wake: Notify::new(),
-        retired: Mutex::new(HashMap::new()),
+        retired: Mutex::new(RetiredTable::default()),
+        gate: SessionGate::new(SessionGateConfig::default()),
     });
     let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
     tokio::spawn(demux_loop(
@@ -1289,6 +1418,13 @@ async fn demux_loop(
                 None if ctl.closing.load(Ordering::Acquire) => Route::Skip,
                 // 已退休 conv(刚退出/刚被满队列拒绝):不重建
                 None if ctl.is_retired(conv) => Route::Skip,
+                // A8:预认证闸 —— 只对**新**会话生效(存量会话已在上面的
+                // Existing 分支放行)。全局上限与每 IP 速率都在此判定,避免
+                // 随机源地址把会话表/任务数放大成无界。
+                None if !ctl.gate.admit(peer.ip()) => {
+                    tracing::debug!(%peer, conv, "kcp session gate: rejected new session");
+                    Route::Skip
+                }
                 None => {
                     let (tx, rx) = mpsc::channel::<SessionCmd>(256);
                     g.insert(conv, (tx.clone(), peer));
@@ -1356,6 +1492,7 @@ fn spawn_server_session(
         // 先退休再移除:退休先于 map 删除生效,窗口期内的同 conv 报文
         // 命中「Existing→closed 通道丢弃」,移除后命中退休表,均不重建
         cleanup_ctl.retire(conv, RETIRE_AFTER_EXIT);
+        cleanup_ctl.gate.release();
         // 仅当表内仍是本会话时移除,避免误删同 conv 重建的新会话
         let mut g = cleanup_sessions.lock().unwrap();
         if let Some((cur, _)) = g.get(&conv) {
@@ -1488,14 +1625,30 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
 
 /// 打洞 listen 角色:在已绑定 socket 上被动接受首个 kcp 会话。
 /// 首个 kcp 消息约定为打洞哨兵(dial 侧重传它作为打洞包),此处剥离。
-pub async fn punch_listen(udp: Arc<UdpSocket>) -> std::io::Result<Arc<Multiplexer>> {
+///
+/// A7:`allowed` 是服务端下发的对端候选地址集合。打洞窗口内只有来自该集合
+/// 的首包能锁定会话;候选集合为空(旧服务端/无候选)时退化为任意来源并
+/// 记 warn —— 该退化只出现在新旧混连,不与 A7 的认证路径叠加。
+pub async fn punch_listen(
+    udp: Arc<UdpSocket>,
+    allowed: &[SocketAddr],
+) -> std::io::Result<Arc<Multiplexer>> {
     const SENTINEL: &[u8] = b"RHTP-PUNCH!";
-    // 1. 等待首个合法 kcp 包
+    if allowed.is_empty() {
+        tracing::warn!("punch listen: empty candidate set, source pinning disabled");
+    }
+    // 1. 等待首个合法 kcp 包(来源必须属于候选集合)
     let mut buf = vec![0u8; 65536];
     let (n, peer) = loop {
         let (n, from) = udp.recv_from(&mut buf).await?;
-        if n >= KCP_OVERHEAD && (81..=84).contains(&buf[4]) {
+        if n >= KCP_OVERHEAD
+            && (81..=84).contains(&buf[4])
+            && (allowed.is_empty() || allowed.contains(&from))
+        {
             break (n, from);
+        }
+        if !allowed.is_empty() && n >= KCP_OVERHEAD && (81..=84).contains(&buf[4]) {
+            tracing::debug!(%from, "punch listen: drop non-candidate source");
         }
     };
     let conv = kcp::get_conv(&buf[..n]);
@@ -1736,6 +1889,7 @@ pub async fn punch_dial(
     // 与 connect(send().await 背压)/demux(丢包不断流)语义对齐。
     let inbound = Arc::new(tokio::sync::Notify::new());
     let learned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cands_for_inbound = candidates.to_vec();
     // 两个独立 abort 通道 + notify_one(permit 语义):notify_waiters 无
     // permit,任务处于「检查后、select 注册前」执行段时通知永久丢失,
     // 轮询任务将永生并每 800ms 向全部候选发包(结构性泄漏)。
@@ -1758,6 +1912,12 @@ pub async fn punch_dial(
                         COUNTERS.recvfrom_calls.fetch_add(1, Ordering::Relaxed);
                         let pkt = &buf[..n];
                         if n >= KCP_OVERHEAD && (81..=84).contains(&pkt[4]) {
+                            // A7:只接受服务端下发的候选来源,拒绝打洞窗口内
+                            // 第三方注入(否则首个合法包即可劫持 dial 侧)。
+                            if !cands_for_inbound.iter().any(|c| c == &from) {
+                                tracing::debug!(%from, "punch dial: drop non-candidate source");
+                                continue;
+                            }
                             if peer.learn(from) {
                                 learned.store(true, Ordering::Relaxed);
                                 inbound.notify_one();
@@ -1923,7 +2083,9 @@ mod punch_tests {
         let listen_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let cand = listen_sock.local_addr().unwrap();
         let dial_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let listener = tokio::spawn(async move { punch_listen(listen_sock).await });
+        let dial_addr = dial_sock.local_addr().unwrap();
+        // A7:listen 侧只接受候选来源(此处即 dial 的本地地址)
+        let listener = tokio::spawn(async move { punch_listen(listen_sock, &[dial_addr]).await });
         let dialer = tokio::spawn(async move { punch_dial(dial_sock, &[cand], 8).await });
         // 服务端先就位,接受首个流并回显
         let srv = tokio::spawn(async move {
@@ -3846,7 +4008,8 @@ mod unaccepted_tests {
         let ctl = Arc::new(DemuxCtl {
             closing: std::sync::atomic::AtomicBool::new(false),
             wake: Notify::new(),
-            retired: Mutex::new(HashMap::new()),
+            retired: Mutex::new(RetiredTable::default()),
+            gate: SessionGate::new(SessionGateConfig::default()),
         });
         // 容量 1 且预填满:try_send 必然 Full(无等待中的接收者)
         let (accept_tx, mut accept_rx) = mpsc::channel::<ReadyItem>(1);
@@ -3954,7 +4117,8 @@ mod unaccepted_tests {
         let ctl = Arc::new(DemuxCtl {
             closing: std::sync::atomic::AtomicBool::new(false),
             wake: Notify::new(),
-            retired: Mutex::new(HashMap::new()),
+            retired: Mutex::new(RetiredTable::default()),
+            gate: SessionGate::new(SessionGateConfig::default()),
         });
         let (accept_tx, mut accept_rx) = mpsc::channel::<ReadyItem>(8);
         let demux = tokio::spawn(demux_loop(
@@ -4099,7 +4263,8 @@ mod independent_full_tests {
         let ctl = Arc::new(DemuxCtl {
             closing: std::sync::atomic::AtomicBool::new(false),
             wake: Notify::new(),
-            retired: Mutex::new(HashMap::new()),
+            retired: Mutex::new(RetiredTable::default()),
+            gate: SessionGate::new(SessionGateConfig::default()),
         });
         let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn(demux_loop(
@@ -4155,7 +4320,8 @@ mod independent_full_tests {
         let ctl = Arc::new(DemuxCtl {
             closing: std::sync::atomic::AtomicBool::new(false),
             wake: Notify::new(),
-            retired: Mutex::new(HashMap::new()),
+            retired: Mutex::new(RetiredTable::default()),
+            gate: SessionGate::new(SessionGateConfig::default()),
         });
         let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn(demux_loop(
@@ -4206,7 +4372,8 @@ mod punch_audit_tests {
         Arc::new(DemuxCtl {
             closing: std::sync::atomic::AtomicBool::new(false),
             wake: Notify::new(),
-            retired: Mutex::new(HashMap::new()),
+            retired: Mutex::new(RetiredTable::default()),
+            gate: SessionGate::new(SessionGateConfig::default()),
         })
     }
 
@@ -4360,7 +4527,8 @@ mod punch_audit_tests {
         let cand = listen_sock.local_addr().unwrap();
         let dial_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let ls = listen_sock.clone();
-        let listener = tokio::spawn(async move { punch_listen(ls).await });
+        let dial_addr = dial_sock.local_addr().unwrap();
+        let listener = tokio::spawn(async move { punch_listen(ls, &[dial_addr]).await });
         let dialer = tokio::spawn(async move { punch_dial(dial_sock, &[cand], 8).await });
         let mux_l = tokio::time::timeout(Duration::from_secs(10), listener)
             .await
@@ -4479,7 +4647,8 @@ mod punch_audit_tests {
         let cand = listen_sock.local_addr().unwrap();
         let dial_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let ls = listen_sock.clone();
-        let listener = tokio::spawn(async move { punch_listen(ls).await });
+        let dial_addr = dial_sock.local_addr().unwrap();
+        let listener = tokio::spawn(async move { punch_listen(ls, &[dial_addr]).await });
         let sock_for_dial = dial_sock.clone();
         let dialer = tokio::spawn(async move { punch_dial(sock_for_dial, &[cand], 8).await });
         let mux_l = tokio::time::timeout(Duration::from_secs(10), listener)
@@ -5441,5 +5610,150 @@ mod c84_closure_tests {
         );
         task.abort();
         let _ = task.await;
+    }
+    // ---------------- A8 预认证资源闸回归 ----------------
+
+    /// 退休表必须固定容量:FIFO 驱逐最旧条目,表长永远 ≤ RETIRED_CAPACITY。
+    /// 修前是"超过 1024 才 retain 未过期条目",90s 窗口内单 conv 洪水可单调
+    /// 增长到任意长度,且每次插入 O(n) 扫描。
+    #[test]
+    fn a8_retired_table_is_bounded() {
+        let mut tbl = RetiredTable::default();
+        for i in 0..(RETIRED_CAPACITY as u32 * 2) {
+            tbl.insert(i, std::time::Instant::now() + Duration::from_secs(90));
+        }
+        assert!(
+            tbl.len() <= RETIRED_CAPACITY,
+            "退休表超过容量: {}",
+            tbl.len()
+        );
+        // 最旧的 conv 已被驱逐(允许极小概率重退让)
+        assert!(!tbl.is_retired(0), "最旧条目必须被驱逐");
+        // 最新的仍在
+        assert!(
+            tbl.is_retired(RETIRED_CAPACITY as u32 * 2 - 1),
+            "最新条目必须保留"
+        );
+    }
+
+    /// 过期条目惰性删除:同一 conv 在 TTL 之后不再命中。
+    #[test]
+    fn a8_retired_entry_expires() {
+        let mut tbl = RetiredTable::default();
+        tbl.insert(7, std::time::Instant::now() + Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!tbl.is_retired(7), "过期条目必须不再命中");
+        assert_eq!(tbl.len(), 0, "过期条目必须在查询时删除");
+    }
+
+    /// 预认证闸:同一 IP 短时间内建会话数受速率限制,且全局计数可用。
+    #[test]
+    fn a8_session_gate_limits_per_ip_rate() {
+        let g = SessionGate::new(SessionGateConfig {
+            max_sessions: 1024,
+            new_sessions_per_ip_per_sec: 4.0,
+        });
+        let ip: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+        let mut admitted = 0;
+        for _ in 0..16 {
+            if g.admit(ip) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 4, "同 IP 首秒只应放行桶容量 4 个");
+        // 另一个 IP 不受影响
+        let ip2: std::net::IpAddr = "10.1.2.4".parse().unwrap();
+        assert!(g.admit(ip2), "不同源 IP 必须独立计量");
+    }
+
+    /// 全局在建会话上限:达到 max_sessions 后新会话一律拒绝。
+    #[test]
+    fn a8_session_gate_global_cap() {
+        let g = SessionGate::new(SessionGateConfig {
+            max_sessions: 3,
+            new_sessions_per_ip_per_sec: 1000.0,
+        });
+        let ip: std::net::IpAddr = "10.9.9.9".parse().unwrap();
+        assert!(g.admit(ip));
+        assert!(g.admit(ip));
+        assert!(g.admit(ip));
+        assert!(!g.admit(ip), "超过全局上限必须拒绝");
+        g.release();
+        assert!(g.admit(ip), "释放名额后应重新放行");
+    }
+
+    /// A7:punch_listen 只接受候选来源。第三方(非候选)首发 kcp 包不得锁定
+    /// 会话;候选来源随后仍能正常建流。
+    #[tokio::test]
+    async fn a7_punch_listen_rejects_non_candidate_source() {
+        let listen_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let listen_addr = listen_sock.local_addr().unwrap();
+        // 候选来源 = dial 侧真实 socket 地址(服务端从 STUN/本地候选得知)
+        let dial_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dial_addr = dial_sock.local_addr().unwrap();
+        let attacker = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let ls = listen_sock.clone();
+        let listener = tokio::spawn(async move { punch_listen(ls, &[dial_addr]).await });
+
+        // 第三方先用伪造的 kcp 包头(conv + PUSH)敲门:不得锁定会话
+        let mut bogus = vec![0u8; KCP_OVERHEAD + 4];
+        bogus[0..4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        bogus[4] = 81;
+        let _ = attacker.send_to(&bogus, listen_addr).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !listener.is_finished(),
+            "非候选来源不得让 punch_listen 完成会话锁定"
+        );
+
+        // 候选来源接手:正常打洞应成功
+        let dialer = tokio::spawn(async move { punch_dial(dial_sock, &[listen_addr], 8).await });
+        let mux = tokio::time::timeout(Duration::from_secs(10), dialer)
+            .await
+            .expect("dial join")
+            .expect("dial task")
+            .expect("punch dial");
+        let _mux_l = tokio::time::timeout(Duration::from_secs(10), listener)
+            .await
+            .expect("listen join")
+            .expect("listen task")
+            .expect("punch listen");
+        drop(mux);
+    }
+
+    /// A7:punch_dial 只从服务端下发的候选集合 learn 对端。非候选来源
+    /// 的首个合法 kcp 包不得锁定对端;候选来源仍能完成打洞。
+    #[tokio::test]
+    async fn a7_punch_dial_rejects_non_candidate_source() {
+        let listen_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let cand = listen_sock.local_addr().unwrap();
+        let dial_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dial_addr = dial_sock.local_addr().unwrap();
+        let attacker = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let ls = listen_sock.clone();
+        let listener = tokio::spawn(async move { punch_listen(ls, &[dial_addr]).await });
+        // 攻击者先向 dial 侧发合法 kcp 包头
+        let ds = dial_sock.clone();
+        let dialer = tokio::spawn(async move { punch_dial(ds, &[cand], 8).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut bogus = vec![0u8; KCP_OVERHEAD + 4];
+        bogus[0..4].copy_from_slice(&0x0bad_f00du32.to_le_bytes());
+        bogus[4] = 81;
+        let _ = attacker.send_to(&bogus, dial_addr).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let mux = tokio::time::timeout(Duration::from_secs(10), dialer)
+            .await
+            .expect("dial join")
+            .expect("dial task")
+            .expect("候选来源仍必须能完成打洞");
+        let _mux_l = tokio::time::timeout(Duration::from_secs(10), listener)
+            .await
+            .expect("listen join")
+            .expect("listen task")
+            .expect("punch listen");
+        drop(mux);
     }
 }

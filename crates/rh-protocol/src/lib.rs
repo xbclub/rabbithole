@@ -3,6 +3,7 @@
 //! 本 crate 零 IO、零业务状态,可被服务端、客户端与测试共用。
 //! 帧格式见 `frame` 模块文档;消息定义见 `message` 模块。
 
+pub mod certprov;
 pub mod frame;
 pub mod message;
 pub mod proxy;

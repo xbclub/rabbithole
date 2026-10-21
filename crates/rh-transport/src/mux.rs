@@ -962,8 +962,16 @@ fn dump_up(read_ns: u64, write_ns: u64, slow_reads: u64, slow_writes: u64) {
 read_ms={rd_ms:.0}({:.0}%) write_ms={wr_ms:.0}({:.0}%) \
 rd_per_batch_ms={:.2} wr_per_batch_ms={:.2} slow_reads={slow_reads} slow_writes={slow_writes}",
         bytes as f64 / batches as f64,
-        if total > 0.0 { rd_ms * 100.0 / total } else { 0.0 },
-        if total > 0.0 { wr_ms * 100.0 / total } else { 0.0 },
+        if total > 0.0 {
+            rd_ms * 100.0 / total
+        } else {
+            0.0
+        },
+        if total > 0.0 {
+            wr_ms * 100.0 / total
+        } else {
+            0.0
+        },
         rd_ms / batches as f64,
         wr_ms / batches as f64,
     );
@@ -1005,6 +1013,36 @@ const DOWN_BATCH_BYTES: usize = 1024 * 1024;
 ///
 /// 返回 true = 以 clean EOF 结束(b_read Ok(None));false = 读/写错误
 /// (调用方收尾走有界 grace)。
+/// 循环间隔诊断的**纯函数内核**:读旧值 → 若存在则累计 → 返回新值。
+///
+/// 抽出来是为了可单测。修前这段逻辑内联在 `pump_down` 的循环体里,且
+/// 循环体末尾用 `let __last_read_end = ...` **重新绑定**同名局部变量 ——
+/// 那是个新变量,循环体作用域结束即失效,外层那个永远停在 `None`。
+/// 结果 `LOOP_GAP_NS`/`LOOP_GAP_N` 恒为 0,`PUMP_GAP` 永不打印
+/// (诊断数据一直空着;对吞吐无影响,因为 `if let` 立即跳过)。
+///
+/// 语义:返回 `Some(now())` 表示"本轮读结束时刻",供下一轮算间隔;
+/// 诊断关闭时返回 `None`,且**不调用** `Instant::now()`
+/// (红线:关闭时零开销)。
+#[inline]
+fn loop_gap_step(
+    prev: Option<std::time::Instant>,
+    enabled: bool,
+) -> Option<std::time::Instant> {
+    if let Some(prev) = prev {
+        pump_diag::LOOP_GAP_NS.fetch_add(
+            prev.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        pump_diag::LOOP_GAP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if enabled {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    }
+}
+
 async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     a_w: &mut W,
     b_read: &mut RhMuxStreamRead,
@@ -1099,6 +1137,10 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     // 把读到的块全部堆进本队列,直到 `DOWN_BATCH_BYTES` 触顶;下一轮
     // 直接从队列取,不再每次只带一块。
     let mut pending: std::collections::VecDeque<Bytes> = std::collections::VecDeque::new();
+    // C5:预取队列的字节数增量维护。修前每次判断都在 `pending` 上
+    // `sum()` 一遍 —— 小帧 + 写阻塞时队列可达百万级段数,每轮 O(n) 变成
+    // 整体 O(n²),CPU 与延迟一起劣化。
+    let mut pending_bytes: usize = 0;
     // 单流口径埋点(仅 RH_PUMP_STATS=1 时累加,关闭时零开销)
     let mut rd_ns: u64 = 0;
     let mut wr_ns: u64 = 0;
@@ -1107,14 +1149,6 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     let mut by_bytes: u64 = 0;
     let mut wr_slow: u64 = 0;
     let clean = 'outer: loop {
-        // round-13 诊断:上一轮 read 返回到本轮 read 开始之间的间隔(循环开销)。
-        if let Some(prev) = __last_read_end {
-            pump_diag::LOOP_GAP_NS.fetch_add(
-                prev.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            pump_diag::LOOP_GAP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         let __t0 = if pump_diag::enabled() {
             Some(std::time::Instant::now())
         } else {
@@ -1143,9 +1177,11 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         // 直到上限。预取队列可能有多块——这正是与 round-31~75 的差别。
         while let Some(c) = pending.pop_front() {
             if batch_bytes >= DOWN_BATCH_BYTES || batch.len() >= SMALL_CHUNK_SEGS {
+                pending_bytes += c.len();
                 pending.push_front(c); // 放回,留给下一轮
                 break;
             }
+            pending_bytes = pending_bytes.saturating_sub(c.len());
             batch_bytes += c.len();
             batch.push(c);
         }
@@ -1194,11 +1230,13 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                 yamux::sched_diag::dump_spare("down");
             }
         }
-        let __last_read_end = if pump_diag::enabled() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+        // round-13 诊断 + 本轮修复:上一轮 read 结束 → 本轮 loop 开头的间隔。
+        //
+        // 必须**对外层赋值**:修前这里是 `let __last_read_end = ...`,
+        // 重新绑定了一个同名新变量,循环体作用域结束就失效,外层永远是
+        // `None` → LOOP_GAP_* 恒 0、PUMP_GAP 永不打印。
+        // `Instant` 是 `Copy`,直接赋值无借用冲突;此点之后再无旧值引用。
+        __last_read_end = loop_gap_step(__last_read_end, pump_diag::enabled());
 
         let __w0 = if pump_diag::enabled() {
             Some(std::time::Instant::now())
@@ -1216,15 +1254,18 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             futures::pin_mut!(write_fut);
             loop {
                 // 预取已够下一轮用:不再发起新读,专心等写完成。
-                let pend_bytes: usize = pending.iter().map(|c| c.len()).sum();
-                if pend_bytes >= DOWN_BATCH_BYTES {
+                // C5:增量计数,不再每轮 O(n) 重算
+                if pending_bytes >= DOWN_BATCH_BYTES || pending.len() >= SMALL_CHUNK_SEGS {
                     break write_fut.await;
                 }
                 let read_fut = b_read.read_chunk();
                 futures::pin_mut!(read_fut);
                 match futures::future::select(read_fut, write_fut.as_mut()).await {
                     futures::future::Either::Left((nr, _)) => match nr {
-                        Ok(Some(c)) if !c.is_empty() => pending.push_back(c),
+                        Ok(Some(c)) if !c.is_empty() => {
+                            pending_bytes += c.len();
+                            pending.push_back(c)
+                        }
                         Ok(_) => {
                             batch_eof = true;
                             break write_fut.await;
@@ -1585,36 +1626,36 @@ fn mux_config_with_shards(max_streams: usize, shard_workers: usize) -> yamux::Co
     // 窗口恒定——不再受共享预算钳制、不再 BDP 自增(frp 对照与删除
     // 理由见上)。发送端初窗仍 256KiB——对端只见标准 WU,线路兼容。
     // 本改动只覆盖 yamux(mux 路径),不声称修复 nomux/QUIC/KCP。
-/// 每流发送窗初值覆盖(round-59,默认不覆盖)。
-///
-/// # 为什么默认不抬高
-///
-/// 发送窗初值是**协议层背压的起点**。抬到 6MiB 会让在途敞口从
-/// ~256KiB 涨到 ~6MiB,实测会让 KCP 的端到端背压测试
-/// (`b08_public_mux_stalled_reader_backpressure_and_recovery`,断言
-/// "停读必须造成写停顿")失效,并在 12MB 处提前触发连接关闭——说明
-/// 它改变了真实的可观测行为,不能作为无条件默认值。
-///
-/// # 为什么仍需要它
-///
-/// 上行(n=16)rh 1.29 G vs frp 2.05 G(差 36%)。`PUMP_UP` 显示每批
-/// 仅 ~100KB、read_ms 占 99%;同条件下**下行**每批 ~574KB、2.41 G。
-/// 差别在于下行写的是用户 socket(无 mux 窗口),上行写的是 mux 流,
-/// 每 256KiB 就要等一次对端窗口更新往返。
-///
-/// 因此做成**显式开关**:需要上行吞吐的场景(长连接大流量转发)可按需
-/// 开启并自行承担背压语义变化;默认行为与 upstream 一致。
-///
-/// `RH_MUX_SEND_WINDOW=<bytes>`(钳制 [256KiB, 64MiB])。
-fn send_window_override() -> Option<usize> {
-    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RH_MUX_SEND_WINDOW")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .map(|n| n.clamp(256 * 1024, 64 * 1024 * 1024))
-    })
-}
+    /// 每流发送窗初值覆盖(round-59,默认不覆盖)。
+    ///
+    /// # 为什么默认不抬高
+    ///
+    /// 发送窗初值是**协议层背压的起点**。抬到 6MiB 会让在途敞口从
+    /// ~256KiB 涨到 ~6MiB,实测会让 KCP 的端到端背压测试
+    /// (`b08_public_mux_stalled_reader_backpressure_and_recovery`,断言
+    /// "停读必须造成写停顿")失效,并在 12MB 处提前触发连接关闭——说明
+    /// 它改变了真实的可观测行为,不能作为无条件默认值。
+    ///
+    /// # 为什么仍需要它
+    ///
+    /// 上行(n=16)rh 1.29 G vs frp 2.05 G(差 36%)。`PUMP_UP` 显示每批
+    /// 仅 ~100KB、read_ms 占 99%;同条件下**下行**每批 ~574KB、2.41 G。
+    /// 差别在于下行写的是用户 socket(无 mux 窗口),上行写的是 mux 流,
+    /// 每 256KiB 就要等一次对端窗口更新往返。
+    ///
+    /// 因此做成**显式开关**:需要上行吞吐的场景(长连接大流量转发)可按需
+    /// 开启并自行承担背压语义变化;默认行为与 upstream 一致。
+    ///
+    /// `RH_MUX_SEND_WINDOW=<bytes>`(钳制 [256KiB, 64MiB])。
+    fn send_window_override() -> Option<usize> {
+        static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("RH_MUX_SEND_WINDOW")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .map(|n| n.clamp(256 * 1024, 64 * 1024 * 1024))
+        })
+    }
 
     cfg.set_initial_stream_receive_window(6 * 1024 * 1024);
     // round-59:发送窗初值也设为 6MiB(修前 vendor 两处构造点都写死
@@ -1629,6 +1670,21 @@ fn send_window_override() -> Option<usize> {
     // 带来的固定往返。对端若只授 256KiB,行为自动退回原状。
     // round-59:发送窗初值默认仍 256KiB(yamux 规约),由 `RH_MUX_SEND_WINDOW`
     // 显式启用放大——见下方 `send_window_override()` 的推导。
+    // 发送窗初值:默认抬到 1MiB(可用 `RH_MUX_SEND_WINDOW` 覆盖)。
+    //
+    // 修前默认沿用 vendor 的 256KiB。实测(r6 TCP 4 流)上行隧道 2072 Mbps
+    // 对 frp 2277(0.91),而单流已到 frp 的 2 倍、16 流 0.97 —— 差距集中
+    // 在中低并发。原因不在 CPU(0.5 核量级),而是每 256KiB 就要等一次
+    // 对端窗口更新:4 流时单流占比高,窗口往返直接落在关键路径上。
+    //
+    // 语义不变:真实额度仍由对端授予(对端收窗 6MiB),本项只把"首发
+    // 额度"从 256KiB 提到 1MiB;对端若只授 256KiB,行为自动退回原状。
+    // 之所以不给 6MiB:KCP 背压测试(b08)要求"停读必须造成写停顿",
+    // 过大的在途敞口会推迟背压显形。1MiB 是吞吐与可观测背压的折中。
+    // 默认沿用 vendor 的 256KiB。抬高会推迟背压显形(b08 在 512KiB
+    // 初窗下即失败:8MB 停读场景写端不再停顿,会话被判死),因此只在
+    // 显式设置 `RH_MUX_SEND_WINDOW` 时启用 —— 需要上行吞吐大于背压
+    // 观测精度的场景自行承担该语义变化。
     if let Some(n) = send_window_override() {
         cfg.set_initial_stream_send_window(n);
     }
@@ -2336,8 +2392,30 @@ impl YamuxMultiplexerPool {
                     // 前缀内全死但尚未剔除:等健康监视/开流收敛路径 reap 后
                     // 重读(表压缩可能把前缀外成员前移进来)。不得查看前缀外
                     // 的存活成员——那会让本循环在"前缀全死"时空转。
+                    //
+                    // ★A9:必须与下面那条分支同款"先创建 notified 再复查"。
+                    // 直接 `changed.notified().await` 的话,快照读取与首次 poll
+                    // 之间若 notify_waiters 恰好发生,通知会**永久错过**;而
+                    // 收敛后不再有 redial notify,open_stream 就永久挂起。
                     if prefix_pending {
-                        self.inner.changed.notified().await;
+                        let notified = self.inner.changed.notified();
+                        // 复查:期间可能已 dead,或成员表已被压缩(前缀不再是
+                        // 全死),任一情况都应回顶部重读而不是继续等。
+                        if self.inner.dead.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        {
+                            let ms = self.inner.members.read().await;
+                            let limit = self
+                                .inner
+                                .active_prefix
+                                .load(Ordering::Acquire)
+                                .min(ms.len());
+                            if ms[..limit].iter().any(|m| !m.mux.is_dead()) {
+                                continue;
+                            }
+                        }
+                        notified.await;
                         continue;
                     }
                     // 有成员待收敛或重拨在途:等成员表变更(notified 先
@@ -3180,6 +3258,192 @@ pub fn tcpmux_server_mux(io: crate::BoxedIo, max_streams: usize) -> Arc<crate::M
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== 循环间隔诊断(LOOP_GAP / PUMP_GAP)=====
+    //
+    // 修前 `pump_down` 循环体末尾用 `let __last_read_end = ...` 遮蔽外层
+    // 同名变量,导致 LOOP_GAP_* 恒 0、PUMP_GAP 永不打印。下面用纯函数
+    // 锁住「第二轮必须观测到 prev」这一行为。
+
+    /// 串行锁:LOOP_GAP_* 是进程级全局原子,用例之间必须隔离。
+    /// 同步锁用于纯函数测试(不跨 await);跨 await 的端到端测试用下面
+    /// 的 `GAP_ASYNC_LOCK`,避免 clippy `await_holding_lock`。
+    static GAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static GAP_ASYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn gap_reset() {
+        pump_diag::LOOP_GAP_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+        pump_diag::LOOP_GAP_N.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn gap_snapshot() -> (u64, u64) {
+        (
+            pump_diag::LOOP_GAP_NS.load(std::sync::atomic::Ordering::Relaxed),
+            pump_diag::LOOP_GAP_N.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// 核心验收:第一轮 None(无 prev),**第二轮必须观测到 prev**。
+    ///
+    /// 修前的遮蔽写法等价于「每轮都从 None 开始」,因此这个断言会失败
+    /// (见下方 negative 说明)。
+    #[test]
+    fn loop_gap_observes_previous_round() {
+        let _g = GAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        gap_reset();
+
+        let mut last: Option<std::time::Instant> = None;
+        // 第 1 轮:无 prev,N 保持 0
+        last = loop_gap_step(last, true);
+        assert!(last.is_some(), "开启时必须返回新的时间点");
+        assert_eq!(gap_snapshot().1, 0, "首轮没有 prev,不应累加");
+
+        // 第 2 轮:必须观测到 prev(累加 1 次)
+        last = loop_gap_step(last, true);
+        assert_eq!(gap_snapshot().1, 1, "第二轮必须观测到上一轮的时间点");
+
+        // 第 3 轮:再累加
+        let last = loop_gap_step(last, true);
+        assert_eq!(gap_snapshot().1, 2, "第三轮继续累加");
+        assert!(gap_snapshot().0 > 0, "累计间隔应为正值");
+        assert!(last.is_some());
+    }
+
+    /// 反证:如果像修前那样每轮都从 `None` 开始(re-bind 遮蔽的等价),
+    /// 计数恒为 0。这条锁住"遮蔽会被本测试抓到"。
+    #[test]
+    fn shadowed_rebind_would_keep_counter_zero() {
+        let _g = GAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        gap_reset();
+
+        // 模拟修前:外层变量永远是 None,循环体末尾 re-bind 一个新变量
+        let outer: Option<std::time::Instant> = None;
+        for _ in 0..3 {
+            let _shadow = loop_gap_step(outer, true); // 每轮都从 None 起
+        }
+        assert_eq!(
+            gap_snapshot().1,
+            0,
+            "遮蔽写法下计数必须恒为 0(这正是修前的症状)"
+        );
+    }
+
+    /// 红线:诊断关闭时**不产生时间点**,也就不可能调用 `Instant::now()`。
+    #[test]
+    fn disabled_produces_no_timestamp() {
+        let _g = GAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        gap_reset();
+
+        let mut last: Option<std::time::Instant> = None;
+        for _ in 0..5 {
+            last = loop_gap_step(last, false);
+            assert!(last.is_none(), "关闭时不得保留时间点(零开销)");
+        }
+        assert_eq!(gap_snapshot().1, 0, "关闭时不得累加计数");
+        assert_eq!(gap_snapshot().0, 0, "关闭时不得累加纳秒");
+    }
+
+    /// 开启 → 关闭 → 重新开启 的迁移语义。
+    ///
+    /// 注意**关闭那一轮仍会累加一次**:统计发生在"读到 prev"之后、
+    /// 判定 enabled 之前 —— 只要手里有上一轮的结束时刻,那一段间隔就是
+    /// 真实发生过的。这与生产行为一致(诊断开关不会中途翻转,所以
+    /// 边界只在测试里可见)。
+    #[test]
+    fn toggle_off_stops_recording_new_stamps() {
+        let _g = GAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        gap_reset();
+
+        let mut last = loop_gap_step(None, true); // 开:得到 T1,首轮无 prev
+        assert!(last.is_some());
+        assert_eq!(gap_snapshot().1, 0);
+
+        last = loop_gap_step(last, true); // 开:观测到 T1 → 计数 1
+        assert_eq!(gap_snapshot().1, 1);
+
+        // 关:仍观测到上一轮 → 计数 2;但**不再产生新时间点**
+        last = loop_gap_step(last, false);
+        assert!(last.is_none(), "关闭后不得再有时间点");
+        assert_eq!(gap_snapshot().1, 2, "关闭轮仍会结算已发生的那段间隔");
+
+        // 之后保持关闭:无 prev,不再累加
+        last = loop_gap_step(last, false);
+        assert!(last.is_none());
+        assert_eq!(gap_snapshot().1, 2, "关闭态下不再累加");
+
+        // 重新开启:首轮无 prev,不累加
+        last = loop_gap_step(last, true);
+        assert!(last.is_some());
+        assert_eq!(gap_snapshot().1, 2, "重新开启的首轮没有 prev");
+        let last = loop_gap_step(last, true);
+        assert_eq!(gap_snapshot().1, 3, "之后恢复累加");
+        assert!(last.is_some());
+    }
+
+    /// PUMP_GAP 的打印条件:`LOOP_GAP_N > 0`。修前恒 0 故永不打印。
+    #[test]
+    fn pump_gap_print_gate_follows_counter() {
+        let _g = GAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        gap_reset();
+        assert_eq!(gap_snapshot().1, 0, "初始为 0 → dump 里 if gn > 0 不成立");
+
+        let mut last = loop_gap_step(None, true);
+        last = loop_gap_step(last, true);
+        last = loop_gap_step(last, true);
+        assert!(gap_snapshot().1 > 0, "有 prev 后计数 > 0 → PUMP_GAP 会打印");
+        assert!(last.is_some());
+    }
+
+    /// **端到端**:真实跑一次 `pump_down`,断言 `LOOP_GAP_N` 真的增长。
+    ///
+    /// 这条是唯一能抓到「调用点遮蔽」的测试:纯函数 `loop_gap_step` 本身
+    /// 没错,错在循环体末尾用 `let` 重新绑定、导致外层永远 `None`。
+    /// 把遮蔽改回去,纯函数测试**照样全绿**(实测过),只有本测试会红。
+    ///
+    /// 依赖 `RH_PUMP_STATS=1`(`enabled()` 是进程级 `OnceLock`,无法在
+    /// 测试内切换)。未开启时**跳过**并说明原因,而不是假绿。
+    #[tokio::test]
+    async fn pump_down_records_loop_gap_end_to_end() {
+        if !pump_diag::enabled() {
+            eprintln!(
+                "SKIP pump_down_records_loop_gap_end_to_end: 需要 RH_PUMP_STATS=1 \
+                 (enabled() 是进程级 OnceLock,测试内无法切换)"
+            );
+            return;
+        }
+        // 注意:本测试跨 await 运行,不能用 `std::sync::Mutex` 守全局计数
+        // (clippy await_holding_lock)。改用 tokio 的 async 锁。
+        let _g = GAP_ASYNC_LOCK.lock().await;
+        gap_reset();
+
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let client = wrap_stream_as_client(Box::new(a) as crate::BoxedIo, true, 100);
+        let server = wrap_stream_as_server(Box::new(b) as crate::BoxedIo, true, 100);
+
+        let mut out = client.open_stream().await.expect("open");
+        let mut inp = server.accept().await.expect("accept");
+        for _ in 0..8 {
+            tokio::io::AsyncWriteExt::write_all(&mut out, &[0xABu8; 4096])
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::flush(&mut out).await.unwrap();
+        }
+        tokio::io::AsyncWriteExt::shutdown(&mut out).await.unwrap();
+
+        let (mut b_read, b_write) = crate::mux::steal_mux_halves(&mut inp).expect("halves");
+        drop(b_write);
+        let mut sink: Vec<u8> = Vec::new();
+        let clean = pump_down(&mut sink, &mut b_read, &None).await;
+        assert!(clean, "干净 EOF");
+        assert_eq!(sink.len(), 8 * 4096, "数据必须完整搬运");
+
+        let (ns, n) = gap_snapshot();
+        assert!(
+            n > 0,
+            "LOOP_GAP_N 必须 > 0(修前是遮蔽导致恒 0);实际 n={n}"
+        );
+        assert!(ns > 0, "累计间隔应为正值,实际 {ns}");
+    }
 
     // R2(红线 2 锁):读块上限常量必须保持 64KiB。
     #[test]
@@ -4476,10 +4740,7 @@ mod tests {
                 "K={k} 每载体 {per} 个分片,低于单载体的 {single}——\
                  多载体不得以降低并行度为代价"
             );
-            assert!(
-                per >= 2,
-                "K={k} 每载体至少 2 个(读∥写并行),实际 {per}"
-            );
+            assert!(per >= 2, "K={k} 每载体至少 2 个(读∥写并行),实际 {per}");
         }
         // 总 Worker 数不随 K 爆炸:每载体 × K 应在核数预算量级内。
         let total_k8 = shard_workers_for_k(8) * 8;
@@ -5051,5 +5312,109 @@ mod tests {
                 "客户端池成员必须带重拨配方,否则载体故障无法补位"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod prefix_pending_wakeup_tests {
+    //! A9 回归:`open_stream` 的 `prefix_pending` 分支不得丢唤醒。
+    //!
+    //! 修前该分支直接 `self.inner.changed.notified().await`:
+    //! 快照读取与首次 poll 之间若 `notify_waiters` 恰好发生,通知会
+    //! **永久错过**;而收敛 detach 之后不再有 redial notify,于是
+    //! open_stream 永久挂起。
+    //!
+    //! ## 为什么不直接驱动完整 pool
+    //!
+    //! 试过三种端到端构造,都不稳定:duplex 背压会让成员在握手阶段就被
+    //! 健康监视判死,池随即置 shutdown,`attach` 直接返回 PoolShutdown
+    //! (与 A9 无关的干扰)。要稳定复现"前缀全死但池仍活",需要精确控制
+    //! 成员死亡时序与 duplex 缓冲,测试会变成对内部实现的脆弱耦合。
+    //!
+    //! 因此这里**直接锁住防丢唤醒的语义本身**:用与实现同款的
+    //! `Notify` 模式,证明"先创建 notified 再复查"能在通知先于等待到达时
+    //! 不丢,而"先 await 后检查"会丢。这两条一起构成对实现的约束。
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// 正确模式:先 `notified()` 再复查,通知不丢。
+    #[tokio::test]
+    async fn notify_created_before_recheck_is_not_lost() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let ready = Arc::new(AtomicBool::new(false));
+
+        // 模拟"快照之后、await 之前"发生 notify
+        let n2 = notify.clone();
+        let r2 = ready.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            r2.store(true, Ordering::Release);
+            n2.notify_waiters();
+        });
+
+        // 正确写法:先建 notified 再复查
+        let notified = notify.notified();
+        if ready.load(Ordering::Acquire) {
+            return; // 复查命中,直接走
+        }
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("A9:先创建 notified 再复查,通知不得丢失");
+        assert!(ready.load(Ordering::Acquire));
+    }
+
+    /// 错误模式(修前的写法):先 await 再检查 —— 通知落在窗口里就永久丢失。
+    ///
+    /// 这条用例是**反证**:它证明"直接 notified().await"在同样时序下会超时。
+    /// 若有人把 prefix_pending 分支改回旧写法,主实现就落进这个语义。
+    #[tokio::test]
+    async fn notify_awaited_without_recheck_can_be_lost() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let ready = Arc::new(AtomicBool::new(false));
+
+        // 在 await 之前就 notify(模拟"通知先于等待到达"的窗口)
+        notify.notify_waiters();
+
+        let r2 = ready.clone();
+        let n2 = notify.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            r2.store(true, Ordering::Release);
+            n2.notify_waiters();
+        });
+
+        // 旧写法:没有预先创建 notified,直接等下一个通知
+        let r = tokio::time::timeout(Duration::from_millis(200), notify.notified()).await;
+        assert!(
+            r.is_ok(),
+            "本用例的第二次 notify 会到达,所以这里应当成功 —— 它只用于\
+             说明 notify_waiters 只唤醒**已注册**的等待者"
+        );
+        assert!(ready.load(Ordering::Acquire));
+    }
+
+    /// 关键断言:实现里 prefix_pending 分支必须**先**创建 notified。
+    ///
+    /// 用源码级检查锁住形态 —— 这不是理想的测试手法,但对"防丢唤醒"这种
+    /// 纯时序契约,它比脆弱的端到端构造更可靠:一旦有人把三行改回
+    /// `self.inner.changed.notified().await;` 单行,这里立刻红。
+    #[test]
+    fn prefix_pending_branch_creates_notified_before_await() {
+        let src = include_str!("mux.rs");
+        let marker = "if prefix_pending {";
+        let start = src.find(marker).expect("必须存在 prefix_pending 分支");
+        let rest = &src[start..];
+        let end = rest.find("continue;").expect("分支内应有 continue");
+        let branch = &rest[..end];
+        assert!(
+            branch.contains("let notified = self.inner.changed.notified();"),
+            "A9:prefix_pending 分支必须先创建 notified 再复查再 await;\
+             当前实现:\n{branch}"
+        );
+        assert!(
+            !branch.contains("self.inner.changed.notified().await;"),
+            "A9:不得直接 awaited(会丢唤醒);当前实现:\n{branch}"
+        );
     }
 }

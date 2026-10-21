@@ -65,11 +65,49 @@ T_TCP="${T_TCP:-19102}"
 T_UDP="${T_UDP:-19103}"
 T_HTTP="${T_HTTP:-19104}"
 
-# IPERF3_BIN:压测用 iperf3(绝对路径或命令名)。系统 3.9 单线程,
-# -P 不扩展吞吐;三机已分发 /tmp/rh-bin/iperf3(3.17.1 多线程)。
+# 吞吐压测工具。默认 iperf3(保持既有行为与历史数据可比)。
+#   THP_TOOL=iperf3   系统 iperf3 单线程,-P 不扩展吞吐;多线程版见 IPERF3_BIN
+#   THP_TOOL=loadgen  仓库自带 Go 压测器(benchmark/loadgen)
+#
+# ★为什么需要 loadgen:TLS 下的吞吐量级会显著高于明文,
+# iperf3 3.9 单线程与 Python loadgen 的天花板都在 2 Gbps 量级;
+# 用它去测 TLS 会把两边都压到同一数字,测到的是压测器瓶颈而不是产品差异
+# (见 benchmark/loadgen/main.go 顶部注释,该坑在明文场景已踩过一次)。
+# loadgen 与 iperf3 的字节口径一致(只计有效载荷),结果可对照。
+# 数据通道是否开启端到端 snappy 压缩(use_compression)。
+#   PEER_COMPRESS=0  默认,规则不开压缩(走 splice / chunk 快路径)
+#   PEER_COMPRESS=1  规则开压缩 → 客户端恒回落 forward::splice 的 copy 路径
+#
+# ★为什么需要这个开关:压缩规则走的是 `forward.rs::splice()`(服务端压缩流
+# 包着通道,客户端必须解压,故不能 splice 零拷贝),而这条路径承接了
+# 所有 use_compression=true 的规则、relay_mode=copy 的 A/B 对照、全部插件
+# 规则与全部 visitor 流量。要度量这条路径的改动(如 round-69 的无锁拆分)
+# 就必须能在同一套 peer 拓扑上把它打开 —— 否则只能另写压测脚本,那会丢掉
+# 证据采集(CPU 采样/端点实况/nofile/无效样本留痕)。
+PEER_COMPRESS="${PEER_COMPRESS:-0}"
+
+# UDP 并发源地址数(每个源 = 隧道侧一个用户会话)。
+#   1(默认)= 单会话,旧行为
+#   >1      = 多会话,用于压测"每源一个回写任务"的写路径(锁争用/队头阻塞)
+# 代理侧按用户源地址建会话,单源压测永远测不到多会话争用。
+PEER_UDP_SOURCES="${PEER_UDP_SOURCES:-1}"
+
+THP_TOOL="${THP_TOOL:-iperf3}"
 IPERF3_BIN="${IPERF3_BIN:-iperf3}"
-command -v "$IPERF3_BIN" >/dev/null 2>&1 \
-  || die "iperf3 不可用: IPERF3_BIN=$IPERF3_BIN (三机上 /tmp/rh-bin/iperf3 可用)"
+LOADGEN_BIN="${LOADGEN_BIN:-/tmp/rh-bin/loadgen}"
+# 必须 export:run_iperf 在 `$(...)` 子 shell 里执行,未导出的普通变量
+# 在那里不可见 —— 会导致 THP_TOOL 回落成 iperf3,而解析分支仍按 loadgen
+# 判断(空 JSON → 全部 INVALID(exit=0))。这个不一致极难从输出看出来。
+# PEER_COMPRESS 同样必须 export(role_* 由 `$(...)`/子 shell 分派,
+# 未导出时预算里的压缩开关在子进程看不到 → 规则静默不开压缩,
+# 与 THP_TOOL 曾踩的坑同型)。
+export THP_TOOL LOADGEN_BIN PEER_COMPRESS PEER_UDP_SOURCES
+if [ "$THP_TOOL" = "loadgen" ]; then
+  [ -x "$LOADGEN_BIN" ] || die "THP_TOOL=loadgen 但 LOADGEN_BIN 不可执行: $LOADGEN_BIN"
+else
+  command -v "$IPERF3_BIN" >/dev/null 2>&1 \
+    || die "iperf3 不可用: IPERF3_BIN=$IPERF3_BIN (三机上 /tmp/rh-bin/iperf3 可用)"
+fi
 
 # 并发最高档 → 本轮 fd 需求(每连接 1 fd + 余量 512;4096 档即 ≥4608,
 # 统一推荐 65535。见 docs/performance-repair-acceptance.md §1.2/§5 P3.0)
@@ -117,12 +155,26 @@ run_iperf() {
   local j="$RAW_DIR/$id.json" e="$RAW_DIR/$id.stderr" x="$RAW_DIR/$id.exit"
   local t0 t1 rc mbps
   t0="$(epoch_us)"
-  "$IPERF3_BIN" -c "$dst" -p "$port" -t "$PEER_DURATION" -P "$streams" $rev -J >"$j" 2>"$e"
-  rc=$?
+  if [ "$THP_TOOL" = "loadgen" ]; then
+    # loadgen src <host:port> <seconds> <conns>:与 iperf3 -c/-P 语义对齐。
+    # 它只有单向发送(sink 读空),故忽略 $rev —— 下行样本会如实记为同口径
+    # 的单向数据,而不是伪装成双向。
+    "$LOADGEN_BIN" src "$dst:$port" "$PEER_DURATION" "$streams" >"$j" 2>"$e"
+    rc=$?
+  else
+    "$IPERF3_BIN" -c "$dst" -p "$port" -t "$PEER_DURATION" -P "$streams" $rev -J >"$j" 2>"$e"
+    rc=$?
+  fi
   t1="$(epoch_us)"
   printf '%s\n' "$rc" >"$x"
-  if [ "$rc" -eq 0 ] && jq -e '(.end.sum_received.bits_per_second // 0) > 0' "$j" >/dev/null 2>&1; then
-    mbps="$(jq -r '.end.sum_received.bits_per_second/1e6|floor' "$j")"
+  local ok_expr='(.end.sum_received.bits_per_second // 0) > 0'
+  local mbps_expr='.end.sum_received.bits_per_second/1e6|floor'
+  if [ "$THP_TOOL" = "loadgen" ]; then
+    ok_expr='(.gbps // 0) > 0'
+    mbps_expr='.gbps*1000|floor'
+  fi
+  if [ "$rc" -eq 0 ] && jq -e "$ok_expr" "$j" >/dev/null 2>&1; then
+    mbps="$(jq -r "$mbps_expr" "$j")"
     jq -cn --argjson mbps "$mbps" --argjson t0 "$t0" --argjson t1 "$t1" --arg id "$id" \
       '{valid:true,mbps:$mbps,exit:0,window_start_us:$t0,window_end_us:$t1,
         raw_json:("raw/"+$id+".json"),raw_stderr:("raw/"+$id+".stderr"),raw_exit:("raw/"+$id+".exit")}'
@@ -231,9 +283,18 @@ peer_client() {  # <a_addr> <client_id> <secret>
   echo $! > "$PEER_DIR/target.pid"
   wait_port 127.0.0.1 "$T_TCP" 15 || { err "目标服务未就绪"; cat "$PEER_DIR/target.log"; return 1; }
 
-  "$IPERF3_BIN" -s -p "$T_IPERF" >"$PEER_DIR/iperf.log" 2>&1 &
-  echo $! > "$PEER_DIR/iperf.pid"
-  wait_port 127.0.0.1 "$T_IPERF" 10 || { err "iperf3 未就绪"; return 1; }
+  if [ "$THP_TOOL" = "loadgen" ]; then
+    # loadgen sink 只读不答(推送式压测),与 iperf3 的请求/响应协议不兼容,
+    # 故换工具时 B 侧必须成对切换。端口沿用 T_IPERF,drive 无需感知。
+    # 秒数给足:过期后 sink 静默退出会让后续样本全为 0。
+    "$LOADGEN_BIN" sink "$T_IPERF" 7200 200000 >"$PEER_DIR/iperf.log" 2>&1 &
+    echo $! > "$PEER_DIR/iperf.pid"
+    wait_port 127.0.0.1 "$T_IPERF" 15 || { err "loadgen sink 未就绪"; cat "$PEER_DIR/iperf.log"; return 1; }
+  else
+    "$IPERF3_BIN" -s -p "$T_IPERF" >"$PEER_DIR/iperf.log" 2>&1 &
+    echo $! > "$PEER_DIR/iperf.pid"
+    wait_port 127.0.0.1 "$T_IPERF" 10 || { err "iperf3 未就绪"; cat "$PEER_DIR/iperf.log"; return 1; }
+  fi
 
   gen_client_config "$PEER_DIR" "$a_addr" "$PROTO" "$cid" "$secret" "relay_mode = \"$RELAY\""
   "$BENCH_BIN/rh-client" --config "$PEER_DIR/client.toml" >"$PEER_DIR/client.log" 2>&1 &
@@ -286,7 +347,12 @@ peer_drive() {  # <a_ip> <b_ip> <api_port> <token> <client_id> [label]
   local cli_ver iperf_ver
   cli_ver="$(curl -s -m 10 -H "Authorization: Bearer $token" "$API/api/clients" \
     | jq -r --arg id "$cid" '.data[] | select(.id==$id) | .client_version // ""' 2>/dev/null)"
-  iperf_ver="$("$IPERF3_BIN" --version 2>/dev/null | head -1)"
+  # 证据里记录**实际使用的**压测器版本(换工具后仍可追溯)
+  if [ "$THP_TOOL" = "loadgen" ]; then
+    iperf_ver="loadgen($LOADGEN_BIN)"
+  else
+    iperf_ver="$("$IPERF3_BIN" --version 2>/dev/null | head -1)"
+  fi
   # ★A9:client_version 为空即中止本轮(版本不可信 → 全部数据不可信)
   if [ -z "$cli_ver" ]; then
     rec "$(jq -cn --arg run_id "$PEER_RUN_ID" --arg lbl "$label" \
@@ -326,11 +392,15 @@ peer_drive() {  # <a_ip> <b_ip> <api_port> <token> <client_id> [label]
   done
   [ -n "$old_ids" ] && sleep 2
 
+  # 压缩开关:打开时规则带 transport.use_compression=true,客户端该通道
+  # 回落 forward::splice 的 copy 路径(压缩流无法零拷贝)。
+  local COMPRESS_JSON=""
+  if [ "$PEER_COMPRESS" = "1" ]; then COMPRESS_JSON=',"transport":{"use_compression":true}'; fi
   create_service "$API" "$token" \
-    "{\"client_id\":\"$cid\",\"name\":\"tcp\",\"kind\":\"tcp\",\"bind_port\":$P_TCP,\"target_host\":\"127.0.0.1\",\"target_port\":$T_TCP,\"pool_size\":4,\"enabled\":true}" >/dev/null \
+    "{\"client_id\":\"$cid\",\"name\":\"tcp\",\"kind\":\"tcp\",\"bind_port\":$P_TCP,\"target_host\":\"127.0.0.1\",\"target_port\":$T_TCP,\"pool_size\":4${COMPRESS_JSON},\"enabled\":true}" >/dev/null \
     || { err "tcp 规则失败"; return 1; }
   create_service "$API" "$token" \
-    "{\"client_id\":\"$cid\",\"name\":\"iperf\",\"kind\":\"tcp\",\"bind_port\":$P_IPERF,\"target_host\":\"127.0.0.1\",\"target_port\":$T_IPERF,\"pool_size\":4,\"enabled\":true}" >/dev/null \
+    "{\"client_id\":\"$cid\",\"name\":\"iperf\",\"kind\":\"tcp\",\"bind_port\":$P_IPERF,\"target_host\":\"127.0.0.1\",\"target_port\":$T_IPERF,\"pool_size\":4${COMPRESS_JSON},\"enabled\":true}" >/dev/null \
     || { err "iperf 规则失败"; return 1; }
   create_service "$API" "$token" \
     "{\"client_id\":\"$cid\",\"name\":\"udp\",\"kind\":\"udp\",\"bind_port\":$P_UDP,\"target_host\":\"127.0.0.1\",\"target_port\":$T_UDP,\"enabled\":true}" >/dev/null \
@@ -399,6 +469,7 @@ PYEOF
     for path in direct tunnel; do
       if [ "$path" = direct ]; then host="$b_ip" port="$T_UDP"; else host="$a_ip" port="$P_UDP"; fi
       d_u="$(run_loadgen "udp-$label-s${sample}-$path" --host "$host" --port "$port" udp \
+        --sources "$PEER_UDP_SOURCES" \
         --size 1200 --duration 8 --window 32 --drain "$PEER_UDP_DRAIN")"
       loadgen_failed "$d_u" || true
       rec "$(printf '%s' "$d_u" | jq -c \

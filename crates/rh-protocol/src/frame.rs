@@ -49,6 +49,10 @@ impl FrameType {
     /// 附加载体报到应答(round-10):仅出现在报到流上,旧客户端不会读到,
     /// 旧服务端不会发送——线格式对既有两个方向零影响。
     pub const CARRIER_ATTACH_ACK: FrameType = FrameType(0x0109);
+    /// 证书下发(见 [`crate::certprov`]):认证成功后,服务端用 secret 派生的
+    /// 密钥加密自己的 TLS 证书发来,客户端解密后与 TLS 对端证书比对。
+    /// 仅在加密协议(tls/wss/quic)上发送。
+    pub const SERVER_CERT: FrameType = FrameType(0x010A);
     pub const NAT_HOLE_PREPARE: FrameType = FrameType(0x0110);
     pub const NAT_HOLE_CONNECT: FrameType = FrameType(0x0112);
     pub const ERROR: FrameType = FrameType(0x0199);
