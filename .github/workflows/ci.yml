@@ -7,8 +7,10 @@
 # 观测量。此前 `release.yml` 只构建、不测试,这条用例在 CI 里从未执行过 ——
 # 也就是说那个修复在 CI 上**零覆盖**,回归了也没人知道。
 #
-# 本 job 只跑一次(Linux x86_64),不做平台矩阵:矩阵在 release.yml 里已经
-# 覆盖编译面,这里的目的是执行测试本身。
+# 本 workflow 有两个 job:
+# * `test`(Linux x86_64):执行测试与 clippy —— release.yml 只构建不测试;
+# * `windows-check`(Windows x86_64):**只做编译检查,不跑测试**。
+#   见该 job 内的说明(v0.4.0 的 msvc 目标曾同时红)。
 #
 # **刻意不含 `cargo fmt --check`**:仓库当前有 93 处 fmt 差异(24 个文件),
 # 是既有状态。加进去会让门禁一上线就红,而"红的门禁"很快就会被无视 ——
@@ -61,3 +63,52 @@ jobs:
         # 反过来**不要**在这里造一个占位 dist —— 那会打开 embed_ui,
         # 让 CI 跑在与本地不同的代码路径上。
         run: cargo test --workspace --no-fail-fast
+
+  # Windows 编译门禁。
+  #
+  # # 为什么必须有(而不是"release 时会发现")
+  #
+  # v0.4.0 首次发版时两个 msvc 目标**同时红**,原因是
+  # `crates/rh-transport/src/tcp.rs` 的 `try_dup_tcp` 无条件 `use
+  # std::os::fd::AsFd`(Unix 专属模块,Windows 无 fd 概念)。本地
+  # `cargo test` 全绿,发版流水线才炸,而发版失败要删标签重打,代价很高。
+  #
+  # release.yml 的 build 矩阵**只在打标签时**才跑 Windows,也就是说
+  # 这类错误能潜伏整个开发周期。本 job 让它在 PR 阶段就暴露。
+  #
+  # # 为什么只 check 不 test
+  #
+  # Windows 上跑全量测试需要 `ss` 等 Linux 工具(背压测试)、以及大量
+  # 依赖 Unix 语义的用例(虽已 cfg 门控,但跑起来收益低)。这里的目标
+  # **只是编译面**:`cargo check --all-targets` 会编译 lib/bin/tests/examples
+  # 全部 target,能抓到的正是 v0.4.0 那类错误。
+  #
+  # `--all-targets` 很关键:`#[cfg(test)]` 里的代码同样参与编译,
+  # 只 check lib 会漏掉测试代码里的 Unix 依赖。
+  #
+  # # 这个 job 是唯一能验证 Windows 的地方
+  #
+  # 开发机是 macOS,`rustup target add x86_64-pc-windows-msvc` 会因
+  # 组件下载失败而装不上,**本地无法交叉验证**。所以本 job 不是"锦上添花",
+  # 而是 Windows 编译面**唯一**的验证点(打标签前的最后一道)。
+  # 提交涉及平台相关代码时,请等它绿了再合。
+  windows-check:
+    name: 编译检查 (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 Rust 工具链
+        run: |
+          rustup show active-toolchain
+          rustup target add x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-windows
+
+      - name: cargo check --all-targets
+        # 不加 `-D warnings`:Windows 上偶有仅该平台可见的 dead_code
+        # 提示(如只有 unix 分支才调用的辅助函数),那不是缺陷。
+        # 编译**错误**会让本步失败,这才是要拦的东西。
+        run: cargo check --workspace --all-targets

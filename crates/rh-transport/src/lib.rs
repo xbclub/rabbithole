@@ -625,9 +625,44 @@ pub async fn probe_rtt(
         .await
         .ok()?
         .ok()?;
-    let elapsed = start.elapsed();
+    let elapsed = measure_elapsed(start);
     drop(conn);
     Some(elapsed)
+}
+
+/// 时钟读数来源(默认 `Instant::elapsed`)。
+///
+/// # 为什么需要它
+///
+/// `probe_rtt` 量的是**真实建连耗时**。测试里注入的拨号函数靠 `sleep`
+/// 模拟延迟,于是测到的 RTT = sleep 时长 **+ 调度抖动**。在 CI 或测试
+/// 并发时抖动可以轻松超过 5ms 阈值,把「1ms → K=1」判成「6ms → K=2」——
+/// 这就是 `probe_result_matches_thresholds` 偶发失败的根因(实测 5 轮全量
+/// 里红 1 次,单独跑 8 次全绿)。
+///
+/// 换成可注入的时钟后,测试直接**返回确定的 RTT**,不再依赖真实耗时;
+/// 生产路径保持 `Instant::elapsed` 不变(默认值),零开销。
+/// 注入的固定耗时(微秒);`None` = 用真实 `Instant::elapsed`。
+///
+/// 用「固定值」而不是闭包:`fn` 指针无法捕获变量,而测试需要的恰恰是
+/// 「这次探测固定算 X 微秒」。一个原子量足够,且不引入任何锁。
+static CLOCK_OVERRIDE_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// 读一次探针耗时(生产=真实 elapsed;测试可替换为固定值)。
+fn measure_elapsed(start: std::time::Instant) -> std::time::Duration {
+    let us = CLOCK_OVERRIDE_US.load(std::sync::atomic::Ordering::Relaxed);
+    if us == u64::MAX {
+        start.elapsed()
+    } else {
+        std::time::Duration::from_micros(us)
+    }
+}
+
+/// **仅测试**:把探针耗时固定成 `us` 微秒;传 `None` 恢复真实时钟。
+#[cfg(test)]
+pub fn probe_set_clock(us: Option<u64>) {
+    CLOCK_OVERRIDE_US.store(us.unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 进程内 RTT 探测缓存:键为 `(server_addr, proxy_url)`。
@@ -1291,6 +1326,7 @@ mod carrier_baseline_tests {
 
     fn probe_teardown() {
         probe_set_dial(None);
+        probe_set_clock(None);
         probe_cache_clear();
         DIAL_MS.store(0, std::sync::atomic::Ordering::Relaxed);
         DIAL_OK.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1377,23 +1413,53 @@ mod carrier_baseline_tests {
 
     /// 不同 RTT 给出不同 K,且与 carriers_for_rtt 一致。
     ///
-    /// 注意:同一把锁**不能嵌套获取**(`probe_setup` 会 `lock().await`)。
-    /// 两档 RTT 用不同地址区分,共用一次持锁窗口。
+    /// ★用**注入时钟**而不是真实 sleep。
+    ///
+    /// 修前靠 `DIAL_MS` 真 sleep + `Instant::elapsed` 测量:RTT = sleep 时长
+    /// **+ 调度抖动**。抖动在 CI 或测试并发时能轻松超过 5ms 阈值,把
+    /// 「1ms → K=1」判成「6ms → K=2」。实测 5 轮全量里红 1 次、单独跑 8 次
+    /// 全绿 —— 典型的环境依赖型 flaky。
+    ///
+    /// 现在拨号注入**不 sleep**,时钟注入直接返回确定值:测的是分档逻辑
+    /// 本身,与机器快慢、并发度无关。
     #[tokio::test]
     async fn probe_result_matches_thresholds() {
-        let _g = probe_setup(true, 1).await;
+        let _g = probe_setup(true, 0).await;
         // 1ms → 局域网档 → K=1
+        probe_set_clock(Some(1_000)); // 1ms
         let lan = auto_carriers(addr(), std::time::Duration::from_secs(2), None).await;
         assert_eq!(lan, carriers_for_rtt(std::time::Duration::from_millis(1)));
         assert_eq!(lan, 1);
 
-        // 改注入延迟为 20ms(不重新取锁),清缓存后换一个地址再探
-        DIAL_MS.store(20, std::sync::atomic::Ordering::Relaxed);
+        // 改成 20ms(不重新取锁),清缓存后换一个地址再探
+        probe_set_clock(Some(20_000)); // 20ms
         probe_cache_clear();
         let wan_addr = SocketAddr::from(([203, 0, 113, 2], 7000));
         let wan = auto_carriers(wan_addr, std::time::Duration::from_secs(2), None).await;
         assert_eq!(wan, carriers_for_rtt(std::time::Duration::from_millis(20)));
         assert_eq!(wan, 4);
+        probe_teardown();
+    }
+
+    /// 三个分档边界各走一遍,全部用注入时钟(确定性)。
+    ///
+    /// 上面那条只覆盖 1ms / 20ms 两档;5ms 与 15ms 是**边界**,历史上
+    /// 反复调整过(round-10 → 54 → 73 → 2026-10-20),单独锁一遍。
+    #[tokio::test]
+    async fn probe_boundaries_are_deterministic_under_injected_clock() {
+        let _g = probe_setup(true, 0).await;
+        for (ms, want) in [(0u64, 1usize), (4, 1), (5, 2), (14, 2), (15, 4), (200, 4)] {
+            probe_set_clock(Some(ms * 1_000)); // ms → µs
+            probe_cache_clear();
+            let got = auto_carriers(
+                SocketAddr::from(([203, 0, 113, 9], 7000)),
+                std::time::Duration::from_secs(2),
+                None,
+            )
+            .await;
+            assert_eq!(got, want, "RTT {ms}ms 应给 K={want},实际 {got}");
+            assert_eq!(got, carriers_for_rtt(std::time::Duration::from_millis(ms)));
+        }
         probe_teardown();
     }
 
