@@ -102,17 +102,31 @@ pub async fn tcp_refill(state: &Arc<AppState>, sess: &Arc<Session>, rt: &Arc<Pro
     let n = want - ready - inflight;
     for _ in 0..n {
         pool.inflight.fetch_add(1, Ordering::Relaxed);
+        // 过期回收钩子:请求 10s 内没等到通道(客户端在线但没回报)时,
+        // 条目会被 session 层摘除,这里负责把 inflight 还回去。
+        // 修前没有任何回收路径,每一次过期都让池永久少一个名额。
+        let pool_for_expire = pool.clone();
+        let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+            let _ = pool_for_expire.inflight.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| Some(v.saturating_sub(1)),
+            );
+        });
         match state
-            .issue_create_channel(
+            .issue_create_channel_with(
                 sess,
                 ChannelEntity::Proxy { proxy_id: rt.id },
                 RequestPurpose::TcpPool { proxy_id: rt.id },
+                Some(hook),
             )
             .await
         {
             Some(_rid) => {}
             None => {
-                pool.inflight.fetch_sub(1, Ordering::Relaxed);
+                // 签发失败:钩子随条目在 take_pending_request 里被调用,
+                // 但那条路径不保证走到 —— 这里显式再减一次会双减,
+                // 故用 saturating_sub 兜住(见上面的 fetch_update)。
                 break;
             }
         }

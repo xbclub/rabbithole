@@ -439,7 +439,7 @@ async fn verify_server_cert(
     buf: &mut bytes::BytesMut,
     cfg: &ClientConfig,
     peer_cert: &Arc<std::sync::OnceLock<Vec<u8>>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<u8>> {
     use base64::Engine as _;
     // 短超时:该帧紧接 HELLO_ACK,不应久等。**超时即拒绝**(见下方 Err 分支)——
     // 不是"没收到就放过",否则中间人只要把这一帧拖住/丢掉就能让比对静默跳过。
@@ -482,9 +482,9 @@ async fn verify_server_cert(
     let seen = peer_cert
         .get()
         .ok_or_else(|| anyhow::anyhow!("未能取得本次 TLS 会话的对端证书,无法完成比对——拒绝连接"))?;
-    compare_announced_cert(cfg.secret.as_bytes(), &sealed, seen)?;
+    let announced = compare_announced_cert(cfg.secret.as_bytes(), &sealed, seen)?;
     tracing::debug!("服务端证书比对通过");
-    Ok(())
+    Ok(announced)
 }
 
 /// 比对"服务端加密自称的证书"与"握手实际看到的对端证书"。
@@ -495,7 +495,7 @@ fn compare_announced_cert(
     secret: &[u8],
     sealed: &rh_protocol::certprov::SealedCert,
     seen: &[u8],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<u8>> {
     let announced = rh_protocol::certprov::open_cert(secret, sealed).ok_or_else(|| {
         anyhow::anyhow!("服务端证书下发帧无法解密(secret 不符,或对端不是真服务端)——拒绝连接")
     })?;
@@ -507,6 +507,33 @@ fn compare_announced_cert(
             seen.len()
         );
     }
+    Ok(announced)
+}
+
+/// 校验**每一条**载体的对端证书都与下发证书一致。
+///
+/// 修前只校验控制载体:`connect_pool` 为 K 条载体各做一次独立 TLS 握手
+/// (默认 K=2),而 `peer_cert_sink` 是 `OnceLock` 只留首次写入 —— 附加载体
+/// 的证书无人比对。中间人可**只截断附加载体**,控制流照常工作、不会察觉,
+/// 而落到该载体上的数据已明文可读。
+///
+/// 任一载体不一致即整体失败(触发重连),绝不"只丢弃那条载体继续跑"——
+/// 那等于把被截断的载体当作可用。
+fn verify_all_carrier_certs(expected: &[u8], seen_all: &[Vec<u8>]) -> anyhow::Result<()> {
+    if seen_all.is_empty() {
+        anyhow::bail!("未能取得任何载体的对端证书:秘密验证模式下无法完成比对——拒绝连接");
+    }
+    for (i, seen) in seen_all.iter().enumerate() {
+        if seen.as_slice() != expected {
+            anyhow::bail!(
+                "载体 #{i} 的服务端证书与下发证书不一致(下发 {} 字节,该载体 {} 字节),\
+                 可能存在中间人截断了附加载体——拒绝连接",
+                expected.len(),
+                seen.len()
+            );
+        }
+    }
+    tracing::debug!(carriers = seen_all.len(), "全部载体证书比对通过");
     Ok(())
 }
 
@@ -524,8 +551,14 @@ pub async fn connect_and_run(
     // verify_server_cert 调用点)。pin/CA/insecure 下装了也没人读,却要求
     // 传输层每种载体都支持写 sink —— quic 曾因没写而让默认配置无法连接。
     let peer_cert: Arc<std::sync::OnceLock<Vec<u8>>> = Arc::new(std::sync::OnceLock::new());
+    // 多载体:记录**每一条**载体的对端证书,报到阶段逐条比对。
+    // 只记控制载体(上面的 OnceLock)时,中间人可只截断附加载体 TLS,
+    // 读走落到该载体的数据明文。
+    let peer_cert_all: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     if cert_binding_required(tcfg.protocol, tcfg.tls.secret_verified) {
         tcfg.peer_cert_sink = Some(peer_cert.clone());
+        tcfg.peer_cert_sink_all = Some(peer_cert_all.clone());
     }
     // 三段式定容(round-10):显式值/协议基线先过硬件上限,报到后再按
     // 服务端应答收敛。QUIC/KCP 与非 multiplex 不建池(恒单载体)。
@@ -652,8 +685,10 @@ pub async fn connect_and_run(
     //
     // 历史:这里曾用 `is_encrypted()` 判定,导致 insecure 的客户端也被
     // fail-closed 打死(E2E 的 quic/tls/wss 用例正是踩在这里)。
+    // 下发的证书(用于逐条载体校验;仅 secret_verified 有)
+    let mut announced_cert: Option<Vec<u8>> = None;
     if cert_binding_required(tcfg.protocol, tcfg.tls.secret_verified) {
-        verify_server_cert(&mut control, &mut buf, &cfg, &peer_cert).await?;
+        announced_cert = Some(verify_server_cert(&mut control, &mut buf, &cfg, &peer_cert).await?);
     }
     info!(server = %cfg.server_addr, session = %session_id, "connected");
 
@@ -758,6 +793,22 @@ pub async fn connect_and_run(
     // (`tcp.rs` 的 `shard_workers_for_k(carriers)`)是两次独立计算，
     // 只因当前输入恰好相同才碰巧一致；一旦 `connect_pool` 的入参漂移
     // (例如改用收敛后的 final_k)，日志就会与实际不符。
+    // ★每条载体都必须做过证书绑定校验。
+    //
+    // 修前只在控制载体上调用一次 `verify_server_cert`
+    // 656 行),而 `connect_pool` 会为 K 条载体各做一次独立 TLS 握手
+    // (默认 K=2)。`peer_cert_sink` 是 `OnceLock`,只保留首次写入,附加载体的
+    // 证书无人比对 —— 中间人可**只截断附加载体**的 TLS,读走落到该载体上的
+    // 数据明文(控制流仍然正常,不会察觉)。
+    //
+    // 这里在报到结束后整体校验:每条成功拨号的载体证书都必须与下发证书一致。
+    // 不一致即整会话失败(触发重连),绝不"只丢弃那条载体"继续跑 ——
+    // 那等于把被截断的载体当作可用。
+    if let Some(expected) = announced_cert.as_ref() {
+        let seen_all = peer_cert_all.lock().map(|v| v.clone()).unwrap_or_default();
+        verify_all_carrier_certs(expected, &seen_all)?;
+    }
+
     if initial_k > 1 {
         // 先收缩分派集合,再摘除多余成员。待摘除集合 = 失败身份 ∪ 超出
         // 保留额的成功载体,见 [`plan_detach_set`]。`set_active_prefix` 同时
@@ -1852,6 +1903,48 @@ mod cert_binding_tests {
         let sealed = seal(SECRET, cert);
         let e = compare_announced_cert(b"wrong-local-secret", &sealed, cert).unwrap_err();
         assert!(e.to_string().contains("无法解密"), "实际: {e}");
+    }
+}
+
+#[cfg(test)]
+mod multi_carrier_cert_tests {
+    use super::*;
+
+    /// 所有载体证书都一致 → 通过。
+    #[test]
+    fn all_carriers_matching_passes() {
+        let cert = vec![1u8; 32];
+        let seen = vec![cert.clone(), cert.clone(), cert.clone()];
+        assert!(verify_all_carrier_certs(&cert, &seen).is_ok());
+    }
+
+    /// **只有附加载体**不一致 → 必须失败。
+    ///
+    /// 这正是修前的漏洞:控制载体(第 0 条)正常,附加载体被中间人替换,
+    /// 而旧代码只校验第 0 条,于是整体放行。
+    #[test]
+    fn one_tampered_extra_carrier_fails() {
+        let cert = vec![1u8; 32];
+        let mitm = vec![2u8; 32];
+        let seen = vec![cert.clone(), mitm, cert.clone()];
+        let e = verify_all_carrier_certs(&cert, &seen).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("载体 #1"), "必须指出是第 1 条载体: {msg}");
+        assert!(msg.contains("中间人"), "必须说明可能被截断: {msg}");
+    }
+
+    /// 一个证书都没记录 → 失败(不得当作"无需校验")。
+    #[test]
+    fn empty_seen_list_fails() {
+        let cert = vec![1u8; 32];
+        assert!(verify_all_carrier_certs(&cert, &[]).is_err());
+    }
+
+    /// 单载体正常路径不能误杀。
+    #[test]
+    fn single_carrier_ok() {
+        let cert = vec![9u8; 16];
+        assert!(verify_all_carrier_certs(&cert, std::slice::from_ref(&cert)).is_ok());
     }
 }
 

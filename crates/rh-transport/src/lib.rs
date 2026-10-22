@@ -755,7 +755,21 @@ pub struct ClientTransportConfig {
     /// 供上层做证书下发比对:客户端解密服务端下发的证书后,与此处记录的
     /// 实际对端证书逐字节比对,不一致即说明中间有人在转发。
     /// `None` = 调用方不需要该信息,传输层不做额外工作。
+    ///
+    /// **只记首个**:它是控制载体的用途。多载体池的**每一条**载体都得校验
+    /// (否则中间人可只截断附加载体),那份全量记录在
+    /// [`Self::peer_cert_sink_all`]。
     pub peer_cert_sink: Option<Arc<std::sync::OnceLock<Vec<u8>>>>,
+    /// 多载体场景:记录**每一条**成功拨号的载体证书(按建立顺序追加)。
+    ///
+    /// 为什么需要两份:sink 是 `OnceLock`,只保留首次写入,而
+    /// `connect_pool` 会建 K 条独立 TLS 连接(默认 K=2),每条各有自己的
+    /// 握手与对端证书。只校验控制载体时,中间人可以对附加载体做 TLS 截断,
+    /// 读走落到该载体的数据明文。
+    ///
+    /// 由传输层在每次成功握手后 push;上层在报到阶段逐条比对下发证书。
+    /// `None` = 不需要(single-carrier 或非 secret_verified 模式)。
+    pub peer_cert_sink_all: Option<Arc<std::sync::Mutex<Vec<Vec<u8>>>>>,
 }
 
 impl Default for ClientTransportConfig {
@@ -769,6 +783,7 @@ impl Default for ClientTransportConfig {
             alpn: vec![DEFAULT_ALPN.to_string()],
             connect_timeout: std::time::Duration::from_secs(10),
             peer_cert_sink: None,
+            peer_cert_sink_all: None,
         }
     }
 }

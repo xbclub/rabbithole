@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ClientConfig {
     pub server_addr: String,
@@ -46,6 +46,38 @@ pub struct ClientConfig {
     /// 自定义 DNS 服务器(host:port);空 = 系统解析。
     pub dns_server: Option<String>,
     pub log_level: String,
+}
+
+/// 手写 `Debug`:**遮蔽 `secret` 与 `proxy_url`(可能含口令)**。
+///
+/// 原先 `#[derive(Debug)]` 会让一句 `debug!("{:?}", cfg)` 把客户端密钥写进
+/// 日志 —— 而日志会被收集、上报、贴进工单。当前代码里没有这样的调用点,
+/// 但这是"离事故只差一行"的隐患,遮蔽成本极低。
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("server_addr", &self.server_addr)
+            .field("protocol", &self.protocol)
+            .field("multiplex", &self.multiplex)
+            .field("relay_mode", &self.relay_mode)
+            .field("mux_pool_size", &self.mux_pool_size)
+            .field("client_id", &self.client_id)
+            .field("secret", &"<redacted>")
+            .field("trusted_ca_file", &self.trusted_ca_file)
+            .field("server_name", &self.server_name)
+            .field("tls_insecure_skip_verify", &self.tls_insecure_skip_verify)
+            .field("tls_pin_sha256", &self.tls_pin_sha256)
+            .field("alpn", &self.alpn)
+            // proxy_url 常带 user:pass,同样遮蔽
+            .field(
+                "proxy_url",
+                &self.proxy_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("stun_server", &self.stun_server)
+            .field("dns_server", &self.dns_server)
+            .field("log_level", &self.log_level)
+            .finish()
+    }
 }
 
 impl Default for ClientConfig {
@@ -121,6 +153,7 @@ impl ClientConfig {
             },
             connect_timeout: std::time::Duration::from_secs(10),
             peer_cert_sink: None,
+            peer_cert_sink_all: None,
         })
     }
 
@@ -602,5 +635,41 @@ secret = "s"
         assert_eq!(super::rx_queue_count(), None);
         #[cfg(target_os = "linux")]
         assert!(super::rx_queue_count().is_some(), "Linux 必须能读 sysfs");
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    /// `Debug` 不得输出 secret 与代理口令。
+    ///
+    /// 原先 `#[derive(Debug)]` 会把密钥原样写进日志。当前没有这样的调用点,
+    /// 但一句 `debug!("{:?}", cfg)` 就够泄露 —— 这条断言把隐患钉死。
+    #[test]
+    fn debug_redacts_secret_and_proxy_credentials() {
+        let cfg = ClientConfig {
+            secret: "SUPER-SECRET-VALUE".into(),
+            proxy_url: Some("http://user:hunter2@proxy:8080".into()),
+            client_id: "cid-1".into(),
+            ..Default::default()
+        };
+        let s = format!("{cfg:?}");
+        assert!(
+            !s.contains("SUPER-SECRET-VALUE"),
+            "secret 必须被遮蔽: {s}"
+        );
+        assert!(!s.contains("hunter2"), "代理口令必须被遮蔽: {s}");
+        // 非敏感字段照常可读(诊断不受影响)
+        assert!(s.contains("cid-1"), "client_id 应可见: {s}");
+        assert!(s.contains("<redacted>"), "应有遮蔽标记: {s}");
+    }
+
+    /// 没有 secret 时也不能把空串之外的东西带出来。
+    #[test]
+    fn debug_redacts_even_when_secret_empty() {
+        let cfg = ClientConfig::default();
+        let s = format!("{cfg:?}");
+        assert!(s.contains("<redacted>"), "无论密钥是否为空都遮蔽");
     }
 }

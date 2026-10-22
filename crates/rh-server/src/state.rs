@@ -1390,12 +1390,28 @@ impl AppState {
         entity: ChannelEntity,
         purpose: crate::session::RequestPurpose,
     ) -> Option<u64> {
+        self.issue_create_channel_with(sess, entity, purpose, None).await
+    }
+
+    /// 同 [`Self::issue_create_channel`],但可指定**过期回收钩子**。
+    ///
+    /// TCP 池路径必须传:`tcp_refill` 在签发前已 `inflight.fetch_add(1)`,
+    /// 而只有交付路径或 send 失败才减。客户端在线但 10s 不回报通道时,
+    /// 过期条目被静默删除,inflight 永久 +1 → 池慢性饿死。
+    pub async fn issue_create_channel_with(
+        &self,
+        sess: &Arc<Session>,
+        entity: ChannelEntity,
+        purpose: crate::session::RequestPurpose,
+        on_expire: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Option<u64> {
         let rid = sess.alloc_request_id();
         sess.add_pending_request(
             rid,
             crate::session::PendingRequest {
                 expires: Instant::now() + std::time::Duration::from_secs(10),
                 purpose,
+                on_expire,
             },
         )
         .await;
@@ -1408,7 +1424,10 @@ impl AppState {
         if ok {
             Some(rid)
         } else {
-            sess.take_pending_request(rid).await;
+            // 签发失败:摘掉条目但**不要**触发 on_expire 钩子 ——
+            // 调用方(tcp_refill)在拿到 None 后会自行归还 inflight。
+            // 两边都减会双减,把计数打到 0 以下。
+            sess.take_pending_request_quiet(rid).await;
             None
         }
     }
@@ -1447,6 +1466,7 @@ impl AppState {
                 crate::session::PendingRequest {
                     expires: ttl,
                     purpose: visitor_purpose,
+                    on_expire: None,
                 },
             )
             .await;
@@ -1456,6 +1476,7 @@ impl AppState {
                 crate::session::PendingRequest {
                     expires: ttl,
                     purpose: proxy_purpose,
+                    on_expire: None,
                 },
             )
             .await;

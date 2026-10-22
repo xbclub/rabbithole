@@ -24,6 +24,18 @@ pub struct PendingRequest {
     pub expires: Instant,
     /// TCP 池场景:通道到达后进入哪个池;UDP/visitor 由对应管理器领取。
     pub purpose: RequestPurpose,
+    /// 过期/被失效时调用的回收钩子。
+    ///
+    /// 修前 `add_pending_request` 只用 `retain` 删过期项、`invalidate_proxy_requests`
+    /// 直接按 proxy 删,两者都**不通知**任何记账方。而 `tcp_refill` 在签发前
+    /// 已经 `inflight.fetch_add(1)`,只有交付路径或 `send` 失败才减 ——
+    /// "客户端在线但 10s 内不回报通道"时,inflight 永久 +1,池慢性饿死
+    /// (`want` 通常 2~8,几次就再也签不出通道)。
+    ///
+    /// 这里存一个闭包:登记方(知道自己该减什么)负责回收,会话层只负责
+    /// 在删条目时调用它。不给会话层硬编码"减 inflight",因为它同时服务
+    /// UDP / visitor 等多条各有账本的路径。
+    pub on_expire: Option<Box<dyn FnOnce() + Send>>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,32 +114,89 @@ impl Session {
 
     /// 登记一个在途数据通道请求。
     pub async fn add_pending_request(&self, id: u64, req: PendingRequest) {
+        // 摘出过期项并**调用它们的回收钩子**。
+        //
+        // 修前只 `retain` 删掉,不通知任何记账方 —— 而 `tcp_refill` 在签发前
+        // 已 `inflight.fetch_add(1)`,只有交付或 send 失败才减。于是"客户端
+        // 在线但 10s 不回报通道"会让 inflight 永久 +1,池慢性饿死。
+        //
+        // 锁内只做摘除,回调在锁外执行(钩子可能 await 或持别的锁)。
+        let expired: Vec<PendingRequest> = {
+            let mut m = self.pending_requests.lock().await;
+            let now = Instant::now();
+            let mut keep = std::collections::BTreeMap::new();
+            let mut drop_list = Vec::new();
+            for (k, v) in std::mem::take(&mut *m) {
+                if v.expires > now {
+                    keep.insert(k, v);
+                } else {
+                    drop_list.push(v);
+                }
+            }
+            *m = keep;
+            drop_list
+        };
+        for mut p in expired {
+            if let Some(f) = p.on_expire.take() {
+                f();
+            }
+        }
         let mut m = self.pending_requests.lock().await;
-        // 顺带清理过期项
-        let now = Instant::now();
-        m.retain(|_, v| v.expires > now);
         m.insert(id, req);
     }
 
     /// 一次性消费 request_id;迟到/过期/未知一律 None。
     /// 失效某规则的全部在途数据通道请求(规则重建/删除的代次隔离)。
     pub async fn invalidate_proxy_requests(&self, proxy_id: u64) {
+        // 同 add_pending_request:被失效的条目也要跑回收钩子,否则规则重建/
+        // 删除时在途 CREATE 的 inflight 永久泄漏。
+        let removed: Vec<PendingRequest> = {
+            let mut m = self.pending_requests.lock().await;
+            let mut keep = std::collections::BTreeMap::new();
+            let mut drop_list = Vec::new();
+            for (k, v) in std::mem::take(&mut *m) {
+                let hit = matches!(
+                    v.purpose,
+                    crate::session::RequestPurpose::UdpChannel { proxy_id: id }
+                        | crate::session::RequestPurpose::RelayProxy { proxy_id: id, .. }
+                        | crate::session::RequestPurpose::TcpPool { proxy_id: id }
+                    if id == proxy_id
+                );
+                if hit {
+                    drop_list.push(v);
+                } else {
+                    keep.insert(k, v);
+                }
+            }
+            *m = keep;
+            drop_list
+        };
+        for mut p in removed {
+            if let Some(f) = p.on_expire.take() {
+                f();
+            }
+        }
+    }
+
+    /// 摘掉条目但**不**触发 `on_expire` 钩子(调用方自行回收资源)。
+    ///
+    /// 用于"签发失败"路径:调用方已经知道失败并会自己归还记账,
+    /// 若这里也调钩子就会双减。
+    pub async fn take_pending_request_quiet(&self, id: u64) {
         let mut m = self.pending_requests.lock().await;
-        m.retain(|_, p| {
-            !matches!(
-                p.purpose,
-                crate::session::RequestPurpose::UdpChannel { proxy_id: id }
-                    | crate::session::RequestPurpose::RelayProxy { proxy_id: id, .. }
-                    | crate::session::RequestPurpose::TcpPool { proxy_id: id }
-                if id == proxy_id
-            )
-        });
+        m.remove(&id);
     }
 
     pub async fn take_pending_request(&self, id: u64) -> Option<PendingRequest> {
-        let mut m = self.pending_requests.lock().await;
-        let req = m.remove(&id)?;
+        let mut req = {
+            let mut m = self.pending_requests.lock().await;
+            m.remove(&id)?
+        };
         if req.expires < Instant::now() {
+            // 过期消费:同样要回收(此前直接 return None,资源无人释放)
+            if let Some(f) = req.on_expire.take() {
+                f();
+            }
             return None;
         }
         Some(req)
@@ -466,5 +535,113 @@ mod session_index_tests {
             1,
             "50 次重连后索引必须恒为 1 条(修前会累积成 50 条)"
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_expire_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AO};
+    use std::sync::Arc;
+
+    fn make_sess() -> Arc<Session> {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        Session::new(
+            "c".into(),
+            "sid".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        )
+    }
+
+    fn req(ttl_ms: u64, hook: Option<Box<dyn FnOnce() + Send>>) -> PendingRequest {
+        PendingRequest {
+            expires: Instant::now() + std::time::Duration::from_millis(ttl_ms),
+            purpose: RequestPurpose::TcpPool { proxy_id: 1 },
+            on_expire: hook,
+        }
+    }
+
+    /// 过期条目被清理时,`on_expire` 必须被调用。
+    ///
+    /// 修前 `add_pending_request` 只 `retain` 删掉,不通知任何记账方;
+    /// 而 `tcp_refill` 在签发前已 `inflight.fetch_add(1)`,于是每次过期都
+    /// 让池永久少一个名额,几次之后再也签不出通道。
+    #[tokio::test]
+    async fn expired_entry_runs_hook() {
+        let sess = make_sess();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        sess.add_pending_request(1, req(10, Some(Box::new(move || {
+            h.fetch_add(1, AO::SeqCst);
+        }))))
+        .await;
+        // 等过期,再登记一条新请求触发清理
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        sess.add_pending_request(2, req(10_000, None)).await;
+        assert_eq!(hits.load(AO::SeqCst), 1, "过期条目必须跑回收钩子");
+    }
+
+    /// 被 `invalidate_proxy_requests` 失效的条目也要跑钩子。
+    #[tokio::test]
+    async fn invalidated_entry_runs_hook() {
+        let sess = make_sess();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        sess.add_pending_request(1, req(10_000, Some(Box::new(move || {
+            h.fetch_add(1, AO::SeqCst);
+        }))))
+        .await;
+        sess.invalidate_proxy_requests(1).await;
+        assert_eq!(hits.load(AO::SeqCst), 1, "被失效的条目必须跑回收钩子");
+    }
+
+    /// 过期后被 `take_pending_request` 消费,也要跑钩子。
+    #[tokio::test]
+    async fn taken_expired_entry_runs_hook() {
+        let sess = make_sess();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        sess.add_pending_request(7, req(10, Some(Box::new(move || {
+            h.fetch_add(1, AO::SeqCst);
+        }))))
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert!(sess.take_pending_request(7).await.is_none(), "过期应返回 None");
+        assert_eq!(hits.load(AO::SeqCst), 1, "过期消费必须跑回收钩子");
+    }
+
+    /// `take_pending_request_quiet` **不得**跑钩子(调用方自行回收)。
+    #[tokio::test]
+    async fn quiet_take_does_not_run_hook() {
+        let sess = make_sess();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        sess.add_pending_request(9, req(10_000, Some(Box::new(move || {
+            h.fetch_add(1, AO::SeqCst);
+        }))))
+        .await;
+        sess.take_pending_request_quiet(9).await;
+        assert_eq!(
+            hits.load(AO::SeqCst),
+            0,
+            "quiet 版不得跑钩子,否则调用方会双减"
+        );
+    }
+
+    /// 未过期的条目不受影响,钩子不得提前触发。
+    #[tokio::test]
+    async fn live_entry_does_not_run_hook() {
+        let sess = make_sess();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        sess.add_pending_request(3, req(10_000, Some(Box::new(move || {
+            h.fetch_add(1, AO::SeqCst);
+        }))))
+        .await;
+        sess.add_pending_request(4, req(10_000, None)).await;
+        assert_eq!(hits.load(AO::SeqCst), 0, "未过期不得回收");
+        assert!(sess.take_pending_request(3).await.is_some(), "未过期应可取");
     }
 }

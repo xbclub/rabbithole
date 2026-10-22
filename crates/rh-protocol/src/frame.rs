@@ -195,3 +195,44 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod buffered_residue_tests {
+    use super::*;
+
+    /// `read_frame` 必须能消费**已缓冲**的字节,而不是只读新数据。
+    ///
+    /// 这条锁的是 rh-client 控制面的一处真实 bug:握手阶段用 `buf` 读帧,
+    /// 一次 `read_buf` 可能读进多帧(服务端正是背靠背写 HELLO_ACK →
+    /// SERVER_CERT → ServiceSync)。切到 `run_loop` 时若新建缓冲而丢弃
+    /// 残留,后续帧就永久丢失 —— 客户端从不发 SYNC_REQUEST、服务端也不重发,
+    /// 表现为"连上了但所有规则不启动"。局域网(NODELAY 下帧常被合并)最易触发。
+    ///
+    /// 修法是把这个 `buf` 传进 `run_loop`;本测试证明只要传进来,
+    /// `read_frame` 就会先吐缓冲里的帧。
+    #[tokio::test]
+    async fn read_frame_consumes_preseeded_buffer_before_reading() {
+        // 预填:两个完整帧,模拟"握手时一次读进多帧"的残留
+        let mut buf = BytesMut::new();
+        encode_frame(&mut buf, FrameType::SERVICE_SYNC, b"first");
+        encode_frame(&mut buf, FrameType::PING, b"second");
+
+        // 读端给一个立刻 EOF 的空流:只要还要读数据就会返回 UnexpectedEof
+        let mut empty: &[u8] = &[];
+
+        let (ty1, p1) = read_frame(&mut empty, &mut buf)
+            .await
+            .expect("第一帧应从预填缓冲取出,不得去流里读");
+        assert_eq!(ty1, FrameType::SERVICE_SYNC);
+        assert_eq!(&p1[..], b"first");
+
+        let (ty2, p2) = read_frame(&mut empty, &mut buf)
+            .await
+            .expect("第二帧同样应从缓冲取出");
+        assert_eq!(ty2, FrameType::PING);
+        assert_eq!(&p2[..], b"second");
+
+        // 缓冲耗尽后才去读,此时空流报 EOF
+        assert!(read_frame(&mut empty, &mut buf).await.is_err());
+    }
+}

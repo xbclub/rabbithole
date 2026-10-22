@@ -728,6 +728,20 @@ async fn list_services(
             let l = state.limits.read().unwrap();
             normalize_spec(&mut spec, l.default_pool_size, l.max_pool_size);
         }
+        // ★列表回显前抹掉 secret_key。
+        //
+        // 下方 `"spec": spec` 会把整个 ProxySpec 序列化给前端,而 stcp/sudp
+        // 的 `secret_key` 是访问密钥(与客户端 secret 同级敏感)。它"仅创建时
+        // 返回一次"是既有策略(见 rotate-secret),列表接口不该把它翻出来。
+        // 前端不需要该值:编辑时留空即表示"不修改"(update 路径按空值保留原密钥,
+        // 见 api.rs 里 `old...filter(|c| !c.secret_key.is_empty())`)。
+        let mut spec_view = spec.clone();
+        if let Some(secret_cfg) = spec_view.stcp.as_mut() {
+            secret_cfg.secret_key.clear();
+        }
+        if let Some(secret_cfg) = spec_view.sudp.as_mut() {
+            secret_cfg.secret_key.clear();
+        }
         let (status, reason) = match state.proxies.get(id as u64) {
             Some(rt) => {
                 let (st, r) = rt.snapshot_state().await;
@@ -768,7 +782,7 @@ async fn list_services(
             "status_reason": reason,
             "healthy": state.proxies.get(id as u64).map(|rt| rt.healthy.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(true),
             "pool_ready": pool_ready,
-            "spec": spec,
+            "spec": spec_view,
             // F1 分规则计量(用户侧口径;运行时不在(已禁用)则为 0)
             "bytes_in": rt_meter.map(|(i, _, _)| i).unwrap_or(0),
             "bytes_out": rt_meter.map(|(_, o, _)| o).unwrap_or(0),

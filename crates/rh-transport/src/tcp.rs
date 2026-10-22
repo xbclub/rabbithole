@@ -606,14 +606,21 @@ async fn dial_io(
                 .to_owned();
                 let tls_stream = connector.connect(name, tcp).await?;
                 // 记录对端叶子证书:上层用它比对服务端加密下发的证书(防中间人)。
-                if let Some(sink) = &cfg.peer_cert_sink {
-                    if let Some(leaf) = tls_stream
-                        .get_ref()
-                        .1
-                        .peer_certificates()
-                        .and_then(|c| c.first())
-                    {
-                        let _ = sink.set(leaf.as_ref().to_vec());
+                if let Some(leaf) = tls_stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|c| c.first())
+                {
+                    let der = leaf.as_ref().to_vec();
+                    if let Some(sink) = &cfg.peer_cert_sink {
+                        let _ = sink.set(der.clone());
+                    }
+                    // 多载体:逐条追加,供上层校验**每一条**载体
+                    if let Some(all) = &cfg.peer_cert_sink_all {
+                        if let Ok(mut v) = all.lock() {
+                            v.push(der);
+                        }
                     }
                 }
                 // pin 模式:握手后、发任何数据前比对叶子证书指纹
@@ -995,5 +1002,37 @@ mod pool_leak_tests {
         for (i, m) in members.iter().enumerate() {
             assert!(!m.is_dead(), "成功路径上成员 {i} 不得被置 dead");
         }
+    }
+}
+
+#[cfg(test)]
+mod peer_cert_all_tests {
+    /// 多载体证书必须**逐条记录**(sink_all),不能只有首个(OnceLock)。
+    ///
+    /// 修前只有 `peer_cert_sink`(`OnceLock`,只留首次写入):`connect_pool`
+    /// 建 K 条独立 TLS 连接,附加载体的证书无人记录 —— 上层也就无从比对,
+    /// 中间人可**只截断附加载体**读走数据明文(控制流照常,不会察觉)。
+    ///
+    /// 本测试锁定两种 sink 的语义差异(OnceLock 覆盖不到第 2 条),这是
+    /// 上面对每条载体做比对的前提。
+    #[test]
+    fn sink_all_accumulates_but_once_lock_does_not() {
+        let all: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        for i in 0..3u8 {
+            all.lock().unwrap().push(vec![i; 4]);
+        }
+        assert_eq!(all.lock().unwrap().len(), 3, "三条载体应全部记录");
+
+        // 对照:OnceLock 只保留首次,后两条静默丢弃 —— 正是修前的漏洞
+        let once: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        for i in 0..3u8 {
+            let _ = once.set(vec![i; 4]);
+        }
+        assert_eq!(
+            once.get().unwrap(),
+            &vec![0u8; 4],
+            "OnceLock 只留首次写入(第 2/3 条被静默丢弃)"
+        );
     }
 }

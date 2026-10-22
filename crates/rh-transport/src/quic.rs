@@ -195,6 +195,14 @@ pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>
     //
     // `peer_identity()` 返回 None(对端未出示证书)或类型不符时不写 sink:
     // 保持"取不到即失败"的语义,绝不塞一个空证书进去充当比对成功。
+    // 多载体:逐条追加(QUIC 恒单载体,这里为契约一致性保留)
+    if let Some(all) = &cfg.peer_cert_sink_all {
+        if let Ok(Some(leaf)) = peer_leaf_cert(&conn) {
+            if let Ok(mut v) = all.lock() {
+                v.push(leaf);
+            }
+        }
+    }
     if let Some(sink) = &cfg.peer_cert_sink {
         if let Ok(Some(leaf)) = peer_leaf_cert(&conn) {
             let _ = sink.set(leaf);
