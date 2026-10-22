@@ -51,6 +51,9 @@ pub struct TcpListenerShim {
     shutdown: tokio::sync::watch::Sender<()>,
     /// accept 泵任务句柄:唯一所有权,drop 时 abort(有界回收的硬兜底)。
     pump: Option<tokio::task::JoinHandle<()>>,
+    /// 在途握手许可(测试观测用:断言背压发生在 accept 之前)。
+    #[cfg(test)]
+    inflight: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl TcpListenerShim {
@@ -293,8 +296,25 @@ fn apply_carrier_sndbuf(stream: &tokio::net::TcpStream) {
 
 /// mux_streams:并发流上限的有效值(0 已折算),每连接 accept 时读取 → 热改对新连接生效。
 pub async fn listen_stream(
+    cfg: &crate::ServerTransportConfig,
+    mux_streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> io::Result<TcpListenerShim> {
+    listen_stream_with_cap(cfg, mux_streams, HANDSHAKE_MAX_INFLIGHT).await
+}
+
+/// 同 [`listen_stream`],可指定在途握手上限(测试用小值以便观测)。
+pub async fn listen_stream_with_cap(
+    cfg: &crate::ServerTransportConfig,
+    mux_streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    handshake_cap: usize,
+) -> io::Result<TcpListenerShim> {
+    listen_stream_impl(cfg, mux_streams, handshake_cap).await
+}
+
+async fn listen_stream_impl(
     cfg: &ServerTransportConfig,
     mux_streams: Arc<AtomicUsize>,
+    handshake_cap: usize,
 ) -> io::Result<TcpListenerShim> {
     let listener = TcpListener::bind(cfg.bind_addr).await?;
     let local = listener.local_addr()?;
@@ -324,12 +344,27 @@ pub async fn listen_stream(
     // 握手 child 由泵的 JoinSet 持有:完成即回收(panic/错误可观测,不悬空);
     // 泵退出时中止全部在途 child(结果已无消费者),连同行文 socket 一并释放。
     //
-    // 在途握手**有界**:ready 队列(512)只背压"已验证待交付",不背压在途
-    // 握手 —— 修前每秒可接无限多连接,每个 child 各持一条 socket 且最长
-    // HANDSHAKE_TIMEOUT(5s)才结束,建连洪水(尤其慢握手/半开 TCP)能在
-    // 5s 内堆积数万任务与 fd。这里用信号量把在途握手钳到与 ready 队列同量级,
-    // 满了就不 accept(内核 backlog 承接,新连接在内核侧排队而非耗用户态 fd)。
-    let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(HANDSHAKE_MAX_INFLIGHT));
+    // 在途握手**有界**,且背压点必须在 `accept()` **之前**。
+    //
+    // ready 队列(512)只背压"已验证待交付",不背压在途握手。修前每秒可接
+    // 无限多连接,每个 child 各持一条 socket 且最长 HANDSHAKE_TIMEOUT(5s)
+    // 才结束,建连洪水(慢握手/半开 TCP)能在 5s 内堆积数万任务与 fd。
+    //
+    // ★信号量在这里是"先拿票、再 accept":`acquire` 与 `accept` 绑成**一个**
+    // future 放进 `select!`。拿不到票时不会去 accept,连接留在内核 backlog
+    // 里排队(**不占用户态 fd**);拿到票才取连接,许可随 child 作用域归还。
+    //
+    // 若把 `acquire().await` 放进 spawn 出来的子任务(本实现的第一版就是
+    // 这样),accept 与 spawn 仍无条件发生 —— 只有**并发 verify 的工作量**
+    // 有界,已 accept 的任务与 fd 照样无界堆积,那正是这段要挡的东西。
+    //
+    // 也不能写成 select 的分支预条件(`if available_permits() > 0`):预条件
+    // 为假时该分支完全不参与轮询,而许可归还并不唤醒 select,accept 会
+    // 永久停摆(由 `accept_resumes_after_permit_returned` 锁住)。
+    let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(handshake_cap));
+    // pump 会 move 走 inflight;构造 shim 时要留一份观测句柄
+    #[cfg(test)]
+    let inflight_obs = inflight.clone();
     let pump = tokio::spawn(async move {
         let mut handshakes = tokio::task::JoinSet::new();
         loop {
@@ -347,8 +382,22 @@ pub async fn listen_stream(
                         }
                     }
                 }
-                res = listener.accept() => {
-                    let (stream, remote) = match res {
+                // ★先拿票、再 accept:两者绑成**一个** future 放进 select。
+                //
+                // 不能把 wait 写成分支预条件(`if inflight.available_permits()>0`):
+                // 预条件为假时该分支**完全不参与轮询**,而许可归还并不会唤醒
+                // `select!` —— 池一旦满过,accept 可能永久停摆(本实现第一版
+                // 正是如此,由 `accept_resumes_after_permit_returned` 抓住)。
+                //
+                // 绑成一个 future 后:`acquire` 未完成时不会有 accept 发生
+                // (背压回内核 backlog);`acquire` 完成才去取连接;两者
+                // 任一步被 shutdown/cancel 打断都由 select 正常收尾。
+                accepted = async {
+                    let permit = inflight.clone().acquire_owned().await.expect("semaphore never closed");
+                    let conn = listener.accept().await?;
+                    Ok::<_, std::io::Error>((conn, permit))
+                } => {
+                    let ((stream, remote), permit) = match accepted {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(error = %e, "tcp accept error");
@@ -359,15 +408,9 @@ pub async fn listen_stream(
                     let tx2 = tx.clone();
                     let tls2 = tls.clone();
                     let max_streams = mux_limit.load(Ordering::Relaxed);
-                    let inflight2 = inflight.clone();
                     handshakes.spawn(async move {
-                        // 在途握手配额:acquire 在这里(不是 select 前),因为
-                        // 只有拿到许可的 child 才真正开始耗 socket;许可随本
-                        // child 结束自动归还(_permit 由作用域持有)。
-                        let _permit = inflight2
-                            .acquire()
-                            .await
-                            .expect("handshake semaphore never closed");
+                        // 许可随本 child 结束自动归还(permit 由作用域持有)
+                        let _permit = permit;
                         match verify(stream, tls2, ws_upgrade, multiplex).await {
                             Ok((io, write_dup, yamux)) => {
                                 let vc = VerifiedConn {
@@ -406,6 +449,8 @@ pub async fn listen_stream(
         local,
         ready,
         shutdown: shutdown_tx,
+        #[cfg(test)]
+        inflight: inflight_obs,
         pump: Some(pump),
     })
 }
@@ -1034,5 +1079,118 @@ mod peer_cert_all_tests {
             &vec![0u8; 4],
             "OnceLock 只留首次写入(第 2/3 条被静默丢弃)"
         );
+    }
+}
+
+#[cfg(test)]
+mod handshake_backpressure_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn cfg_for() -> crate::ServerTransportConfig {
+        crate::ServerTransportConfig {
+            protocol: crate::Protocol::Tcp,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            multiplex: true,
+            tls: crate::TlsServerOptions::default(),
+            alpn: vec![crate::DEFAULT_ALPN.into()],
+        }
+    }
+
+    /// 内核 accept 队列长度(`Recv-Q`)。**仅 Linux**:靠 `ss` 读。
+    #[cfg(target_os = "linux")]
+    fn accept_backlog_len(port: u16) -> Option<usize> {
+        let out = std::process::Command::new("ss")
+            .args(["-ltnH", &format!("sport = :{port}")])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|q| q.parse::<usize>().ok())
+    }
+
+    /// 握手池满时,新连接必须留在**内核 accept 队列**里,不得被 accept 出队。
+    ///
+    /// # 为什么只能这样测
+    ///
+    /// 修前的实现把 `acquire().await` 放进 spawn 出来的子任务:accept 与
+    /// spawn 无条件发生 —— 只有**并发 verify 的量**有界,已 accept 的任务
+    /// 与 fd 照样无界堆积。注释里那句"不耗用户态 fd"根本不成立。
+    ///
+    /// 两种实现的"接收端可见行为"完全一致(回退版会把连接 accept 走后卡在
+    /// acquire),所以先前两版基于 `accept()` 是否返回、以及基于进程 fd 计数
+    /// 的测试都测不出差异(负向验证全绿 / 自身 fd 干扰)。唯一可靠的外部观测量
+    /// 是**内核 accept 队列长度**:
+    ///   - 正确实现:池满 → 不 accept → `Recv-Q > 0`,连接留在内核;
+    ///   - 回退实现:池满 → 已 accept → `Recv-Q == 0`。
+    ///
+    /// 用 `listen_stream_with_cap` 把上限压到 1,一条连接即可区分。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pool_full_keeps_connections_in_kernel_accept_queue() {
+        let streams = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut listener = listen_stream_with_cap(&cfg_for(), streams, 1)
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let held = listener.inflight.clone().try_acquire_owned().unwrap();
+        assert_eq!(listener.inflight.available_permits(), 0, "池应已占满");
+
+        let mut cli = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::AsyncWriteExt as _;
+        cli.write_all(b"PING").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let q = accept_backlog_len(port).expect("ss 应能查到该监听端口");
+        assert!(
+            q > 0,
+            "握手池满时连接应留在内核 accept 队列(Recv-Q>0),实际 Recv-Q={q} —— \
+             说明它已被 accept 出队(修前行为:permit 在 accept 之后才拿)"
+        );
+
+        drop(held);
+        let inc = tokio::time::timeout(
+            std::time::Duration::from_millis(3000),
+            listener.accept(),
+        )
+        .await
+        .expect("归还许可后应恢复 accept");
+        assert!(inc.is_ok());
+        drop(cli);
+    }
+
+    /// 跨平台的弱断言:池满→归还后必须**恢复**接受(不会因背压永久停摆)。
+    ///
+    /// 这条测不出"背压位置",但能抓住一类真实回归:若把等待写成 select
+    /// 分支预条件(`if available_permits()>0`),许可归还不唤醒 select,
+    /// accept 会永久停摆 —— 本实现的第一版正是如此。
+    #[tokio::test]
+    async fn accept_resumes_after_permit_returned() {
+        let streams = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut listener = listen_stream_with_cap(&cfg_for(), streams, 1)
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let held = listener.inflight.clone().try_acquire_owned().unwrap();
+
+        let mut cli = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::AsyncWriteExt as _;
+        cli.write_all(b"PING").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        drop(held);
+        let inc = tokio::time::timeout(
+            std::time::Duration::from_millis(3000),
+            listener.accept(),
+        )
+        .await
+        .expect("归还许可后应立即恢复 accept(不得因预条件不唤醒而停摆)");
+        assert!(inc.is_ok());
+        drop(cli);
     }
 }
