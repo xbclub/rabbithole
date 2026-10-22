@@ -493,6 +493,7 @@ async fn handle_http_request(
     let upstream_req = hyper::Request::from_parts(parts, body);
 
     let resp = sender.send_request(upstream_req).await?;
+
     // M2:可缓存(GET + 扩展匹配 + 200)→ 完整读回并落缓存(受单项上限约束)
     if let Some(cfg) = &cache_cfg {
         if cacheable && resp.status() == 200 {

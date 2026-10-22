@@ -47,6 +47,23 @@ struct Cli {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// 轻量随机数(仅用于重连抖动;不需要密码学强度)。
+///
+/// 用 `RandomState` 的哈希器播种:标准库已带、不引入新依赖,
+/// 且每次进程启动的种子不同(足以打散雷群)。
+fn rand_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    );
+    h.finish()
+}
+
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -154,8 +171,15 @@ async fn main() -> anyhow::Result<()> {
         if shutdown.is_cancelled() {
             return Ok(());
         }
-        let wait = std::time::Duration::from_secs(backoff_secs);
-        info!(retry_in = backoff_secs, "reconnecting");
+        // ★加抖动,避免"雷群":服务端重启时,所有客户端按同一确定性序列
+        // (1,2,4,...,60s)重连,会在同一秒形成尖峰把刚起来的服务端再压垮。
+        // 抖动取 ±25% 的均匀分布(整数秒,最小 1s)。
+        let base = backoff_secs.max(1);
+        let lo = base.saturating_sub(base / 4).max(1);
+        let hi = (base + base / 4).max(lo);
+        let wait_secs = lo + (rand_u64() % (hi - lo + 1));
+        let wait = std::time::Duration::from_secs(wait_secs);
+        info!(retry_in = wait_secs, backoff = base, "reconnecting");
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             _ = shutdown.cancelled() => return Ok(()),

@@ -949,8 +949,27 @@ async fn run_loop(
                     // 不再分配、不再拷贝 payload。
                     Some(bytes) => {
                         use tokio::io::AsyncWriteExt as _;
-                        if control.write_all(&bytes).await.is_err() {
-                            break;
+                        // ★写必须有界。
+                        //
+                        // 修前直接 `write_all(&bytes).await`:死链(NAT 老化/
+                        // 黑洞路由)下 TCP 写要 15~20 分钟才报错,而这一 await
+                        // 在 select 分支**内部**——期间读分支、心跳 tick、
+                        // 看门狗检查、cancel 全部轮不到。于是"看门狗 3×心跳
+                        // 主动断开"形同虚设,重连被拖到分钟级。
+                        //
+                        // 超时取看门狗周期(3×心跳):正常写的耗时应是毫秒级,
+                        // 卡满一个看门狗周期说明链路已死,交由外层重连。
+                        let w = tokio::time::timeout(watchdog, control.write_all(&bytes)).await;
+                        match w {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => break,
+                            Err(_) => {
+                                warn!(
+                                    after_secs = watchdog.as_secs(),
+                                    "control write timeout: link is dead, reconnecting"
+                                );
+                                break;
+                            }
                         }
                     }
                     None => break,

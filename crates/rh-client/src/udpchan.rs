@@ -112,10 +112,24 @@ where
 /// 回写任务经唯一写任务写帧;主循环读帧 + 探活。
 /// 每 60s 清理 60s 无活动的用户会话(源端口轮换的客户端会持续产生新条目)。
 pub async fn run_proxy_side(channel: BoxedIo, spec: ProxySpec, prefix: Vec<u8>) {
-    let target = format!("{}:{}", spec.target_host, spec.target_port);
-    let Ok(target) = target.parse::<std::net::SocketAddr>() else {
-        tracing::debug!(proxy = spec.name, "udp target unresolvable");
-        return;
+    // ★目标解析支持**域名**(经 TTL 缓存,与 TCP 路径同一入口)。
+    //
+    // 修前只 `parse::<SocketAddr>()` —— 域名直接失败,而且只打 `debug`
+    // 级日志(默认 info 下不可见)。表现为"UDP 规则配了域名就是不工作",
+    // 零线索。`forward::resolve` 已实现"IP 直连快路径 + 域名缓存 +
+    // 并发去重",直接复用。
+    let target = match crate::forward::resolve(&spec.target_host, spec.target_port).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(
+                proxy = spec.name,
+                host = %spec.target_host,
+                port = spec.target_port,
+                error = %e,
+                "udp target unresolvable (rule will not work)"
+            );
+            return;
+        }
     };
     let (mut r, w) = tokio::io::split(channel);
     let (tx, rx) = mpsc::channel::<Pending>(WRITE_QUEUE);

@@ -6,8 +6,35 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 pub async fn recover_all(state: &Arc<AppState>) {
-    let proxies = state.db.list_proxies(None).await.unwrap_or_default();
-    let clients = state.db.list_clients().await.unwrap_or_default();
+    // ★DB 错误必须显式告警,不能静默当成"没有规则"。
+    //
+    // 修前用 `unwrap_or_default()`:DB 读失败(锁、磁盘、迁移未完成)时得到
+    // 空列表,循环一条都不跑,服务"正常启动"但**所有规则都没恢复** ——
+    // 外部表现是"升级后规则全没了",而日志里零线索。
+    // 这里降级为"继续启动 + warn",仍不阻断进程(启动期硬失败会让运维更难
+    // 排查),但至少留痕并指明后果。
+    let proxies = match state.db.list_proxies(None).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "startup recovery: list_proxies failed — NO proxies will be restored; \
+                 check DB (rules are still in the database, a restart after fixing will recover them)"
+            );
+            Vec::new()
+        }
+    };
+    let clients = match state.db.list_clients().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "startup recovery: list_clients failed — all proxy restores will be skipped \
+                 (enabled-clients set is empty)"
+            );
+            Vec::new()
+        }
+    };
     let enabled_clients: std::collections::HashSet<String> = clients
         .iter()
         .filter(|c| c.enabled)

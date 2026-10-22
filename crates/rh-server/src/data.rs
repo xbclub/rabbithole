@@ -1074,12 +1074,36 @@ pub fn try_open_user_conn(
     let usage = proxy.map(|rt| state.client_usage(&rt.client_id));
     if let Some(u) = &usage {
         let q = u.quota.read().unwrap().clone();
-        if q.max_conns > 0 && u.conns.load(std::sync::atomic::Ordering::Relaxed) >= q.max_conns {
-            return None;
+        // ★max_conns 用 CAS 闭环,不能 load 判完再 fetch_add。
+        //
+        // 修前是典型的 check-then-act:`load() >= max` 与随后的 `fetch_add`
+        // 之间没有原子性,并发准入可同时看到未达上限、一起加,实际并发突破
+        // max_conns(溢出量 = 并发度)。配额是硬闸,必须精确。
+        // 用 `fetch_update`:在原子读-改-写里完成"判上限 + 自增"。
+        if q.max_conns > 0 {
+            let max = q.max_conns;
+            let admitted = u
+                .conns
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |cur| if cur >= max { None } else { Some(cur + 1) },
+                )
+                .is_ok();
+            if !admitted {
+                return None;
+            }
+        } else {
+            // 不限并发:直接加(与 max_conns=0 语义一致)
+            u.conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // 流量上限仍是"读快照"语义:bytes 是单调累计,超限即在下一块被切断,
+        // 这里只做早退优化,不承担精确性(精确拦截在 add_bytes 置 flow_cut)。
         if q.flow_limit > 0
             && u.bytes.load(std::sync::atomic::Ordering::Relaxed) >= q.flow_limit as u64
         {
+            // 回滚上面已经加的 conns
+            u.conns.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
     }
@@ -1091,9 +1115,7 @@ pub fn try_open_user_conn(
         rt.conns_current
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    if let Some(u) = &usage {
-        u.conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    let _ = &usage;
     Some(ConnGuard {
         metrics: state.metrics.clone(),
         proxy: proxy.cloned(),
@@ -1371,9 +1393,16 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                     // 否则源地址轮换的 UDP 对端会无界积累
                     let now = Instant::now();
                     sessions.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
-                }
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    let now = Instant::now();
+
+                    // ★保活与探活超时也挂在这个 **interval** 上。
+                    //
+                    // 修前这里另有一个 `_ = tokio::time::sleep(30s)` 分支:
+                    // `sleep` 在每次 select 迭代都重新创建,timer 从"本轮开始"
+                    // 计时,所以只要通道上有任何事件(socket 可读、帧到达)先就绪,
+                    // 这个分支就永远轮不到 —— 持续流量下 PING 保活与 90s 探活
+                    // 超时**双双失效**,死通道永不回收。
+                    // `gc` 是 `interval`(15s 固定节拍,与流量无关),合并进来即修复;
+                    // 保活判断仍按 >=30s 自己控节奏,gc 更快只是更及时。
                     if now.duration_since(last_ping_sent) >= Duration::from_secs(30) {
                         let ping = serde_json::to_vec(&rh_protocol::message::Ping { ts_ms: 0, probe: true }).unwrap();
                         if rh_protocol::write_frame(&mut ch_w, FrameType::PING, &ping).await.is_err() {

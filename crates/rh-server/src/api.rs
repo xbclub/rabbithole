@@ -1032,7 +1032,14 @@ async fn update_service_inner(state: &Arc<AppState>, id: i64, mut spec: ProxySpe
     }
     let client = state.db.get_client(&client_id).await.ok().flatten();
     let client_enabled = client.as_ref().map(|c| c.enabled).unwrap_or(false);
-    // 资格跳步:规则或客户端禁用 → 仅落库
+    // 资格跳步:规则或客户端禁用 → 仅落库。
+    //
+    // ★但 bind_port=0 的校验必须先做:修前这个早退分支在校验**之前**,
+    // 于是"停用状态下 PUT 一个 bind_port=0"能直接落库;之后 enable 时
+    // 绑到内核随机分配的临时端口,规则对外表现完全错乱(端口每次可能不同)。
+    if spec.kind.uses_bind_port() && spec.bind_port == 0 {
+        return err(3006, "bind_port 不能为 0(仅创建时支持自动分配)");
+    }
     if !old.enabled || !client_enabled {
         if let Err(e) = state.db.update_proxy(id, &spec, port_auto).await {
             return err(500, &format!("{e}"));

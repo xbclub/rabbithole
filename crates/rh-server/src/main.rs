@@ -330,9 +330,25 @@ async fn main() -> anyhow::Result<()> {
     // 多监听器各有独立自签证书,认证后必须下发"客户端连的那个端口"的证书,
     // 否则逐字节比对必然失败并被误报为中间人。
     let control_cfgs = load_control_cfgs(&cfg)?;
+    // ★先绑定,再 spawn:绑定失败必须让进程起不来。
+    //
+    // 修前 serve_transport 在任务内部 bind,失败只记 error! 就 return,
+    // 而 spawn 无人 join —— 端口被占时进程"启动成功"却没有控制面,
+    // systemd 显示 active、退出码 0,客户端全连不上且极难归因。
+    let mut bound = Vec::new();
     for tc in control_cfgs.iter() {
         info!(addr = %tc.bind_addr, proto = ?tc.protocol, "control listener starting");
-        tokio::spawn(control::serve_transport(state.clone(), tc.clone()));
+        let (listener, leaf) = control::bind_transport(&state, tc).await.map_err(|e| {
+            anyhow::anyhow!(
+                "control listen failed on {} ({:?}): {e}",
+                tc.bind_addr,
+                tc.protocol
+            )
+        })?;
+        bound.push((listener, leaf));
+    }
+    for (listener, leaf) in bound {
+        tokio::spawn(control::serve_transport_bound(state.clone(), listener, leaf));
     }
     // vhost 监听
     if cfg.vhost.http_port > 0 {

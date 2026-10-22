@@ -1231,8 +1231,15 @@ impl ProxyManager {
         let mut https = Vec::new();
         let mut tcpmux = Vec::new();
         let subdomain_host = self.cfg.vhost.subdomain_host.clone();
-        for e in self.runtimes.iter() {
-            let rt = e.value();
+        // ★先快照再遍历:dashmap 的 `iter()` 会持有**分片写锁**,而下面
+        // `rt.spec.read().await` 是 await 点 —— 守卫跨 await 会长期占住该分片,
+        // 其它 runtime 的增删/查找全被挡住。快照后立即释放。
+        let runtimes: Vec<Arc<ProxyRuntime>> = self
+            .runtimes
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+        for rt in runtimes.iter() {
             let spec_guard = rt.spec.read().await;
             let spec = &*spec_guard;
             if !spec.enabled {

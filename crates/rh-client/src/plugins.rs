@@ -441,7 +441,9 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() + 1 && i + 2 < b.len() + 1 {
+        // 修前这里是同一个条件写了两遍(`i + 2 < b.len() + 1`),
+        // 应为"后面确实还有两个十六进制位"——即 i+2 落在范围内。
+        if b[i] == b'%' && i + 2 < b.len() {
             if let (Some(h), Some(l)) = (hexval(b.get(i + 1)), hexval(b.get(i + 2))) {
                 out.push(h * 16 + l);
                 i += 3;
@@ -1044,4 +1046,29 @@ mod cache_tests {
 
     const TEST_CERT_PEM: &str = include_str!("testdata/cache-test.crt");
     const TEST_KEY_PEM: &str = include_str!("testdata/cache-test.key");
+}
+
+#[cfg(test)]
+mod percent_decode_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_valid_sequences() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("%41%42"), "AB");
+        assert_eq!(percent_decode("plain"), "plain");
+    }
+
+    /// 末尾的孤立 `%` 或不足两位的序列必须原样保留,不得越界 panic。
+    ///
+    /// 修前条件写成 `i + 2 < b.len() + 1` 且重复两遍,实际等价 `i + 2 <= len`,
+    /// 边界比正确值宽一格 —— 依赖的是 `b.get()` 返回 None 兜底,能跑但语义不清。
+    #[test]
+    fn keeps_invalid_trailing_sequences() {
+        assert_eq!(percent_decode("abc%"), "abc%");
+        assert_eq!(percent_decode("abc%2"), "abc%2");
+        assert_eq!(percent_decode("abc%zz"), "abc%zz");
+        // 恰好 3 字节的合法序列必须解码(边界内侧)
+        assert_eq!(percent_decode("%41"), "A");
+    }
 }

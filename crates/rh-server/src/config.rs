@@ -316,14 +316,47 @@ impl ServerConfig {
         Ok(cfg)
     }
 
+    /// 自动分配端口的候选范围。
+    ///
+    /// ★支持**逗号分隔的多段**(如 `"10000-20000,30000-40000"`)。
+    ///
+    /// 修前只调 `PortsRange::parse`(只认单段/单端口),多段输入整体返回
+    /// None,再被 `unwrap_or_default()` 吞成**空 vec** —— 表现为"配了
+    /// auto_range 却分配不出端口",而日志里零线索。现在逐段解析:
+    /// 非法段告警并跳过,全部非法才回落默认区间(附 warn)。
     pub fn auto_port_ranges(&self) -> Vec<PortsRange> {
-        match &self.ports.auto_range {
-            Some(s) => PortsRange::parse(s).map(|r| vec![r]).unwrap_or_default(),
-            None => vec![PortsRange {
+        let Some(raw) = &self.ports.auto_range else {
+            return vec![PortsRange {
                 start: 10000,
                 end: 25000,
-            }],
+            }];
+        };
+        let mut out = Vec::new();
+        for part in raw.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            match PortsRange::parse(part) {
+                Some(r) => out.push(r),
+                None => tracing::warn!(
+                    segment = part,
+                    raw,
+                    "auto_range: 无法解析该段(需形如 \"10000-20000\" 或 \"8080\"),已跳过"
+                ),
+            }
         }
+        if out.is_empty() {
+            tracing::warn!(
+                raw,
+                "auto_range: 没有任何有效区间,回落到默认 10000-25000"
+            );
+            return vec![PortsRange {
+                start: 10000,
+                end: 25000,
+            }];
+        }
+        out
     }
 }
 

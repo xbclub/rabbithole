@@ -69,9 +69,24 @@ impl ChallengeTable {
         // 顺手清理过期项(定期的清扫兜底,见 sweeper)
         let now = Instant::now();
         g.retain(|_, e| e.expires > now);
+        // ★表满时淘汰"最旧的一条",**不是**拒绝新挑战。
+        //
+        // 修前 `return String::new()`:空 nonce 让后续 consume 必然失败,
+        // 该连接被 AUTH_FAILED 拒绝。而 issue 在**认证之前**执行,所以
+        // 攻击者只要用足够多的 client_id 反复连接(每个 client_id 一个条目,
+        // 表内条目 30s 过期但可持续补充)把表填满,就能让**所有**客户端拿到
+        // 空 nonce —— 全服认证被拒。
+        //
+        // 淘汰最旧条目后,新挑战总能拿到 nonce;被淘汰的那一条若仍在等待
+        // 应答,会因 consume 失败而重连一次(自愈),代价远小于全服拒绝。
         if g.len() >= CHALLENGE_TABLE_CAP {
-            // 拒绝新挑战:空 nonce 使后续 consume 必然失败,连接被 AUTH_FAILED 拒绝
-            return String::new();
+            if let Some(oldest) = g
+                .iter()
+                .min_by_key(|(_, e)| e.expires)
+                .map(|(k, _)| k.clone())
+            {
+                g.remove(&oldest);
+            }
         }
         g.insert(
             nonce.clone(),
@@ -120,7 +135,18 @@ impl Default for ChallengeTable {
 }
 
 /// 控制端口 accept 循环。
-pub async fn serve_transport(state: Arc<AppState>, cfg: rh_transport::ServerTransportConfig) {
+/// 同步完成控制面监听绑定,返回 `(listener, leaf_cert)`。
+///
+/// ★绑定必须**在 spawn 之前**做,失败要能被调用方看见。
+///
+/// 修前 `serve_transport` 自己在任务内 bind,失败只 `tracing::error!` 然后
+/// `return` —— 而调用方是 `tokio::spawn`,没人 join。于是端口被占/权限不足
+/// 时进程照常"启动成功"(web/vhost/SSH 都在跑),但**没有任何控制面**:
+/// 客户端全部连不上,而 systemd 显示 active、退出码 0,极难归因。
+pub async fn bind_transport(
+    state: &Arc<AppState>,
+    cfg: &rh_transport::ServerTransportConfig,
+) -> std::io::Result<(rh_transport::TransportListener, Option<Arc<[u8]>>)> {
     // 本监听器的叶子证书:与 `rh_transport::listen` 用的是同一份 TLS 选项
     // (同源:显式 cert 或 persist_prefix 落盘的 .crt),故与握手实际出示的
     // 证书逐字节相同。
@@ -130,13 +156,16 @@ pub async fn serve_transport(state: Arc<AppState>, cfg: rh_transport::ServerTran
     // 客户端连第 2 个及以后的加密监听器时会收到别人的证书,比对必然失败,
     // 而且报错文案是"可能存在中间人"——把安全问题排查引向错误方向。
     let leaf_cert: Option<Arc<[u8]>> = rh_transport::tls::leaf_der_of(&cfg.tls).map(Arc::from);
-    let listener = match rh_transport::listen(&cfg, state.mux_streams.clone()).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(error = %e, proto = %cfg.protocol, "control listen failed");
-            return;
-        }
-    };
+    let listener = rh_transport::listen(cfg, state.mux_streams.clone()).await?;
+    Ok((listener, leaf_cert))
+}
+
+/// 在已绑定的 listener 上跑控制面接受循环(由调用方 spawn)。
+pub async fn serve_transport_bound(
+    state: Arc<AppState>,
+    listener: rh_transport::TransportListener,
+    leaf_cert: Option<Arc<[u8]>>,
+) {
     info!(addr = %listener.local_addr, proto = %listener.protocol, "control listener up");
     let mut listener = listener;
     loop {
