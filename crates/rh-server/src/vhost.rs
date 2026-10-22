@@ -329,7 +329,7 @@ async fn handle_http_request(
     // M2 静态缓存键:**含 query**。修前只用 path,`?id=1` 与 `?id=2` 命中
     // 同一条缓存 —— 第二个用户会拿到第一个人的数据。扩展名判定仍用 path
     // (query 不参与"是否可缓存"的判断)。
-    let cache_key = http_cache_key(&path, req.uri().query());
+    let cache_key = http_cache_key(&host, &path, req.uri().query());
 
     // 路由:域名 + locations 前缀(最长匹配)
     let routes = state.proxies.vhost_http.read().await.clone(); // C3: Arc 快照,O(1)
@@ -397,21 +397,12 @@ async fn handle_http_request(
     let Some(rt) = state.proxies.get(route.proxy_id) else {
         return Ok(not_found_response(&state));
     };
-    if cache_cfg.is_some() && cacheable {
-        {
-            if let Some(hit) = rt.http_cache.lock().unwrap().get(&cache_key) {
-                let resp = hyper::Response::builder()
-                    .status(hit.status)
-                    .header("content-type", hit.content_type.clone())
-                    .header("x-cache", "HIT")
-                    .body(full_body_body(hyper::body::Bytes::from(hit.body.to_vec())))?;
-                return Ok(resp);
-            }
-        }
-    }
-    // ★无锁快路径:非分组规则(group 为空)不需要走 group_pick。
-    // 修前每请求都要 `spec.read().await` 只为取一个必然为 None 的 group_key,
-    // 高并发下这是明确的锁争用点。
+    // ★先做组选路,再用**同一个 rt** 做缓存读写。
+    //
+    // 修前顺序反了:HIT 查 `route.proxy_id` 那条(组内固定一条),
+    // 而 MISS 把结果写进 `group_pick` 选出来的那条。组内成员不同时,
+    // 缓存**永远不会命中**(写 A 读 B),而且白占内存。
+    // 无锁快路径保留:非分组规则(group 为空)不走 group_pick。
     let rt = if rt.has_group.load(std::sync::atomic::Ordering::Relaxed) {
         crate::data::group_pick_public(&state, &rt)
             .await
@@ -419,6 +410,16 @@ async fn handle_http_request(
     } else {
         rt
     };
+    if cache_cfg.is_some() && cacheable {
+        if let Some(hit) = rt.http_cache.lock().unwrap().get(&cache_key) {
+            let resp = hyper::Response::builder()
+                .status(hit.status)
+                .header("content-type", hit.content_type.clone())
+                .header("x-cache", "HIT")
+                .body(full_body_body(hyper::body::Bytes::from(hit.body.to_vec())))?;
+            return Ok(resp);
+        }
+    }
     if !rt.healthy.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(service_unavailable());
     }
@@ -510,8 +511,23 @@ async fn handle_http_request(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/octet-stream")
                 .to_string();
-            if collected.len() as u64 > cfg.max_item_size_kb * 1024 {
-                // 超单项上限:不缓存,原样回给用户
+            // ★尊重上游的缓存指令,并避开带凭据的响应。
+            //
+            // 修前无条件缓存 200:上游明确 `Cache-Control: no-store/private`
+            // 的响应照样入池,而且 MISS 回放时把 `set-cookie` 一并重放给
+            // **其他用户**(缓存是按 host+path 共享的)—— 会话串号风险。
+            let cc = up_parts
+                .headers
+                .get(hyper::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let forbidden_by_cc =
+                cc.contains("no-store") || cc.contains("private") || cc.contains("no-cache");
+            let has_credentials = up_parts.headers.contains_key(hyper::header::SET_COOKIE);
+            let over_size = collected.len() as u64 > cfg.max_item_size_kb * 1024;
+            if forbidden_by_cc || has_credentials || over_size {
+                // 不可缓存:原样回给用户(不做 x-cache 标记)
                 let resp: hyper::Response<BoxBody> =
                     hyper::Response::from_parts(up_parts, full_body_body(collected.clone()));
                 return Ok(resp);
@@ -917,10 +933,13 @@ async fn peek_sni(sock: &TcpStream) -> anyhow::Result<Option<String>> {
 ///
 /// query 必须参与键 —— 修前只用 path,`?id=1` 与 `?id=2` 命中同一条缓存,
 /// 第二个用户直接拿到第一个人的响应体。
-fn http_cache_key(path: &str, query: Option<&str>) -> String {
+fn http_cache_key(host: &str, path: &str, query: Option<&str>) -> String {
+    // ★键必须含 **host**:缓存挂在 proxy 级(`rt.http_cache`),而多个域名
+    // 可以指向同一个 proxy。修前只按 path 分键,`a.com/index.html` 与
+    // `b.com/index.html` 会命中同一条缓存 —— 跨站内容串号。
     match query {
-        Some(q) => format!("{path}?{q}"),
-        None => path.to_string(),
+        Some(q) => format!("{host}\x00{path}?{q}"),
+        None => format!("{host}\x00{path}"),
     }
 }
 
@@ -1235,22 +1254,27 @@ mod tests {
     #[test]
     fn cache_key_includes_query() {
         assert_ne!(
-            http_cache_key("/a.js", Some("id=1")),
-            http_cache_key("/a.js", Some("id=2")),
+            http_cache_key("a.com", "/a.js", Some("id=1")),
+            http_cache_key("a.com", "/a.js", Some("id=2")),
             "不同 query 不得命中同一缓存条目"
         );
         assert_ne!(
-            http_cache_key("/a.js", Some("id=1")),
-            http_cache_key("/a.js", None),
+            http_cache_key("a.com", "/a.js", Some("id=1")),
+            http_cache_key("a.com", "/a.js", None),
             "带 query 与不带 query 必须分开"
         );
         assert_eq!(
-            http_cache_key("/a.js", Some("id=1")),
-            http_cache_key("/a.js", Some("id=1")),
+            http_cache_key("a.com", "/a.js", Some("id=1")),
+            http_cache_key("a.com", "/a.js", Some("id=1")),
             "同一 key 必须稳定命中"
         );
-        assert_eq!(http_cache_key("/a.js", None), "/a.js");
-        assert_eq!(http_cache_key("/a.js", Some("id=1")), "/a.js?id=1");
+        // ★跨 host 不得共享:缓存挂在 proxy 级,同一 proxy 可能服务多个域名
+        assert_ne!(
+            http_cache_key("a.com", "/a.js", None),
+            http_cache_key("b.com", "/a.js", None),
+            "不同域名不得命中同一缓存条目(修前会串内容)"
+        );
+        assert_eq!(http_cache_key("a.com", "/a.js", None), "a.com\x00/a.js");
     }
 
     // ---------------- parse_sni:vhost TLS 路由的关键路径 ----------------

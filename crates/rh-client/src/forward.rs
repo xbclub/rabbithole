@@ -56,17 +56,30 @@ pub async fn handle_start_forward(
     let mut local = dial_target(&sess, spec, &fwd).await?;
 
     // PROXY protocol 头(版本以 START_FORWARD 显式指派为准)
+    //
+    // ★源地址解析失败时必须**放弃发 PROXY 头并记录**,不能回落
+    // `127.0.0.1:0`。修前那样做会让上游看到"来自本机"—— 若有"仅信任
+    // loopback"的本地 ACL,等于把任意远端用户伪造成本机。
+    // 不发 PROXY 头时上游看到的是真实的对端地址(隧道出口),比伪造安全。
     if fwd.proxy_proto != rh_protocol::message::ProxyProto::None {
-        let info = ProxyProtoInfo {
-            src: fwd
-                .user_src
-                .parse()
-                .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()),
+        // 解析失败 → 不写 PROXY 头,继续正常转发(见下方注释)。
+        let src = fwd.user_src.parse::<std::net::SocketAddr>().ok();
+        if src.is_none() {
+            tracing::warn!(
+                proxy = %fwd.proxy_name,
+                user_src = %fwd.user_src,
+                "PROXY protocol: user_src 非法,跳过 PROXY 头(不伪造本机地址)"
+            );
+        }
+        let info = src.map(|src| ProxyProtoInfo {
+            src,
             dst: "127.0.0.1:0".parse().unwrap(),
-        };
-        let hdr = match fwd.proxy_proto {
-            rh_protocol::message::ProxyProto::V1 => proxyproto::encode_v1(&info),
-            rh_protocol::message::ProxyProto::V2 => proxyproto::encode_v2(&info),
+        });
+        let hdr = match (&info, fwd.proxy_proto) {
+            (Some(info), rh_protocol::message::ProxyProto::V1) => proxyproto::encode_v1(info),
+            (Some(info), rh_protocol::message::ProxyProto::V2) => proxyproto::encode_v2(info),
+            // 源地址不可用:不发 PROXY 头(见上)。上游看到的是真实隧道出口地址,
+            // 不会把远端用户伪造成本机。
             _ => Vec::new(),
         };
         if !hdr.is_empty() && local.write_all(&hdr).await.is_err() {
