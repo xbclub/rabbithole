@@ -1,5 +1,62 @@
 # 任务:为 rabbithole 补齐 `virtual_net` 插件(第 10 个客户端插件)
 
+> ## ⏸ 已搁置(2026-10-22)
+>
+> **用户决定:此功能不重要,暂时搁置。不实现,不排期。**
+>
+> 搁置前已完成源码核实,以下三条**是纠正本任务书原文的结论**,若将来重启
+> 请先读这里,不要直接按 §3 的清单动手:
+>
+> ### 1. §3 的改动清单**不完整**:frp 的 vnet 是「两个插件配对」
+>
+> 原文只列了 proxy 侧(`pkg/plugin/client/virtual_net.go`,92 行),漏了
+> **visitor 侧** `pkg/plugin/visitor/virtual_net.go`(约 210 行)—— 而那才是
+> 核心入口:
+>
+> ```
+> visitor 侧                          proxy 侧
+> VirtualNetVisitorPlugin             VirtualNetPlugin
+>   DestinationIP(必填)                (无参数)
+>   建 /32 host route                   StartServerConnReadLoop
+>        │                                    │
+>   clientRouter: dst IP → conn         serverRouter: src IP → conn
+>        └──────── 同一个 TUN 设备 ───────────┘
+> ```
+>
+> 只做 proxy 侧,`clientRouter` 恒为空表,任何包都落到 `no route found` ——
+> **功能等于不存在**。
+>
+> 而我们的 `VisitorKind` 只有 `Stcp/Sudp/Xtcp`(`rh-protocol/src/visitor.rs:8`),
+> **没有插件维度**。要支持 vnet visitor 得给 `VisitorSpec` 加插件字段,
+> 这是 RHTP 协议变更,超出「加一个插件」的范围。
+>
+> ### 2. §3 第 9 条「README 保持不变,改完后就是事实」**不成立**
+>
+> 按原清单改完,得到的是一个「能选中、运行时什么都不做」的插件 —— 比明确
+> 报错更糟。若重启,**路径 B 必须做成明确拒绝**(返回清晰错误),而不是静默。
+>
+> ### 3. 需要 root + 新依赖类别 + 三平台差异
+>
+> - frp 的 `virtualNet.address` 是**客户端配置项**(`config/v1/client.go:66`),
+>    要求以 root 运行;我们的 `ClientConfig` 无此概念;
+> - 仓库当前**零 TUN 依赖**(`grep tun Cargo.toml crates/*/Cargo.toml` 为空);
+> - Windows:frp 自己就返回错误(`tun_unsupported.go`),对齐即可,不需 wintun。
+>
+> ### 顺带记录:frp 侧实现有已知缺陷(重启时不要照抄)
+>
+> - `readLoopClient` 的 `c.tun.Write` 无任何错误恢复;
+> - `clientRouter.findConn` 线性遍历全部路由(O(n)),无前缀树;
+> - `Controller.Run` 读 TUN 出错即 `return`,无重连。
+>
+> ### 现状
+>
+> - `PluginKind` 仍为 9 个变体,**未加** `VirtualNet`;
+> - `README.md` 的「10 种客户端插件」是**按 frp 基线数的**,不是按我们的实现
+>   —— 这一点已在 `docs/not-supported.md` 中记录;
+> - `requirements-matrix.md` X1 保持 `experimental`。
+
+---
+
 ## 0. 先读这一段:任务可能比你以为的大
 
 **`virtual_net` 不是一个"连接处理器",它背后是一个协议子系统。**

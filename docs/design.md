@@ -739,7 +739,7 @@ trait DatagramCapable { fn max_datagram_size(&self) -> usize;
 
 **P2**：stcp/sudp visitor、xtcp P2P 打洞、**tcpmux**（HTTP CONNECT 按 host 分流）、客户端插件系统（unix socket/socks5/静态文件）、group 负载均衡、OIDC、**KCP 传输**、QUIC 传输（quinn + asport-quinn-hyphae 双许可 crate，走 §10 接口）、**SSH Tunnel Gateway**（`ssh -R` 直接注册）、**VirtualNet**（frp 侧为 Alpha，仅评估）。
 
-> 对齐状态：frp 8 种代理类型中 P0 覆盖 tcp/udp，P1 覆盖 http/https，P2 覆盖 stcp/sudp/xtcp/tcpmux；10 种客户端插件全部 P2；KCP/SSH Gateway/VirtualNet 在 P2/评估。
+> 对齐状态：frp 8 种代理类型中 P0 覆盖 tcp/udp，P1 覆盖 http/https，P2 覆盖 stcp/sudp/xtcp/tcpmux；**9 种客户端插件已实现**（frp 基线为 10 种，缺 `virtual_net` —— 已判定不做，见 `docs/not-supported.md` §4）；KCP/SSH Gateway 在 P2/评估。
 > **排除范围仅限协议兼容层**：v1/v2 双协议、INI legacy、与存量 frpc/frps 互操作，明确不做。其余 frp 业务能力未排期者状态为"待评估"，不视为排除。
 
 ## 13. 已知取舍

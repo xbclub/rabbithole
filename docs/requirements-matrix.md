@@ -74,7 +74,7 @@
 | E3 | 仪表盘/客户端/规则/visitor/事件页面 | — | `console/src/pages/`(总览/客户端/tcp/udp/域名/密钥/访问器/证书/设置) | 浏览器验收全链路 | `docs/screenshots/console-shadcn/` | done |
 | E4 | 一次性密钥展示/危险操作确认/校验/加载/空态/失败提示 | — | `console/`(凭据仅此一次展示/确认弹窗/表单校验/空态三件套) | 浏览器验收(创建/轮换凭据展示) | `docs/screenshots/console-shadcn/` | done |
 | **实验项(非稳定验收门槛)** |
-| X1 | VirtualNet(vnet) | pkg/virtual, Alpha | 不实现,不宣称 | — | — | experimental |
+| X1 | VirtualNet(vnet) | pkg/virtual, Alpha | **不做(2026-10-22 判定搁置)**。frp 侧是 proxy+visitor 双插件配对,本项目 visitor 无插件维度,需动 RHTP 协议;另需 TUN 设备与 root。依据见 `not-supported.md` §4 | — | not-supported.md §4 | experimental |
 | X2 | featureGates 实验开关 | client | 不实现 | — | — | experimental |
 | X3 | httpPlugins 服务端 HTTP 插件(Lua/OPA 类) | server httpPlugins | 不实现(超出范围) | — | — | experimental |
 

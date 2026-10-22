@@ -16,7 +16,7 @@
   控制台「设置」页可改密,改密后所有旧会话令牌立即失效);凭据轮换/撤销/会话替换
 - **运行能力**:连接预热池、TCP/HTTP 健康检查、group 负载均衡、带宽限制、
   snappy 压缩、PROXY protocol v1/v2、HTTP 头/Host 改写、端口白名单与自动分配、
-  IPv4/IPv6、10 种客户端插件、自定义 DNS、SSH Tunnel Gateway(`ssh -R`)
+  IPv4/IPv6、9 种客户端插件、自定义 DNS、SSH Tunnel Gateway(`ssh -R`)
 - **集中管理**:SQLite 存储;规则热更新(期望状态 + 幂等全量同步);
   在线状态/失败原因;全局/分客户端/分规则流量与连接统计;客户端级配额
   (并发/规则数/限速/流量上限);HTTPS 多证书(SNI 服务端终结);事件审计;

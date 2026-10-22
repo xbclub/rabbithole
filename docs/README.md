@@ -29,7 +29,7 @@
 | 文档 | 内容 |
 |---|---|
 | [review-2026-10-handoff.md](review-2026-10-handoff.md) | **最新交接**:2026-10-22 静态审查(1 P0 + 14 P1 + P2/P3)修复进度、未完成项、待决策 |
-| [HANDOFF-virtual-net-plugin.md](HANDOFF-virtual-net-plugin.md) | **待办任务书**:补齐第 10 个客户端插件 `virtual_net`(含工作量评估与全部落点) |
+| [HANDOFF-virtual-net-plugin.md](HANDOFF-virtual-net-plugin.md) | ⏸ **已搁置**(2026-10-22,用户判定不重要)。`virtual_net` 任务书 + 核实结论(frp 是双插件配对,原文清单缺 visitor 侧) |
 | [not-supported.md](not-supported.md) | **明确不做**的能力及 frp 源码证据(SOCKS5 BIND 等),防止被反复当成遗漏 |
 | [fixed-plugin-proxy-semantics.md](fixed-plugin-proxy-semantics.md) | `http_proxy` / `socks5` 插件语义重写(已完成并验收) |
 | [deep-review-ffd49d3-remediation-plan.md](deep-review-ffd49d3-remediation-plan.md) | 七路深审 A/B/C 三批修复方案与逐项状态 |

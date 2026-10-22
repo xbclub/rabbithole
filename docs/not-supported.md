@@ -139,7 +139,47 @@ frp 的 `Socks5PluginOptions` 只有 `Username` / `Password`
 
 ---
 
-## 4. 相关但**不属于**本文范围的项
+## 4. `virtual_net` 插件(第 10 个客户端插件)
+
+**不做(已搁置)。**
+
+### 背景
+
+`README.md` 写「10 种客户端插件」,但 `PluginKind` 只有 9 个变体。这个数字是
+按 **frp v0.71.0 基线**数的(frp 在 `pkg/plugin/client/` 下注册了 10 个),
+不是按本项目实现数的。
+
+### 为什么不做的理由与别的项不同
+
+前三条都是「frp 也做不到」。这一条是 **frp 能做,但我们判定不值得做** ——
+用户于 2026-10-22 明确决定搁置。
+
+技术上它是**唯一一个需要服务端参与数据面路由的插件**:不是「拿到连接 →
+转发 → 结束」,而是要开 TUN 设备、读 IP 包、维护 IP 路由表。
+
+### 核实过的三个关键事实(将来重启必读)
+
+1. **frp 的 vnet 是「两个插件配对」,不是一个插件**:
+   proxy 侧(`pkg/plugin/client/virtual_net.go`,92 行)+ **visitor 侧**
+   (`pkg/plugin/visitor/virtual_net.go`,约 210 行)。后者建 `/32` host
+   route,是真正的入口。只做 proxy 侧,`clientRouter` 恒为空表,所有包落到
+   `no route found` —— 功能等于不存在。
+2. **本项目没有 visitor 插件维度**:`VisitorKind` 只有 `Stcp/Sudp/Xtcp`
+   (`crates/rh-protocol/src/visitor.rs:8`)。要支持 vnet visitor 得给
+   `VisitorSpec` 加插件字段,属 RHTP 协议变更。
+3. **需要 root + 新依赖类别**:frp 的 `virtualNet.address` 是客户端配置项
+   (`config/v1/client.go:66`),要求 root 运行;仓库当前零 TUN 依赖。
+   Windows 上 frp 自己也返回错误(`tun_unsupported.go`),对齐即可。
+
+### 现状
+
+- `PluginKind` 仍为 9 个变体,**未加** `VirtualNet`;
+- `requirements-matrix.md` X1 保持 `experimental`;
+- 任务书与完整核实结论见 [HANDOFF-virtual-net-plugin.md](HANDOFF-virtual-net-plugin.md)。
+
+---
+
+## 5. 相关但**不属于**本文范围的项
 
 以下曾被误认为"不支持",实际是设计使然而非缺陷,一并说明以免混淆:
 
@@ -156,3 +196,4 @@ frp 的 `Socks5PluginOptions` 只有 `Username` / `Password`
 | 日期 | 内容 |
 |---|---|
 | 2026-10-22 | 建立本文。SOCKS5 BIND / UDP ASSOCIATE / 插件级代理链三项,经 frp 源码核实后判定不做 |
+| 2026-10-22 | 增补 §4:`virtual_net` 插件。用户判定不重要、暂时搁置;同时把 `README.md` 的「10 种客户端插件」改为「9 种」(实测 `PluginKind` 就是 9 个变体) |
