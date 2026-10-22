@@ -1241,6 +1241,16 @@ async fn stop_visitor(sess: &Arc<ClientSession>, id: u64) {
         c.cancel();
     }
     sess.sudp_deliver.lock().await.remove(&id);
+    // ★打洞直连的 mux 与其凭据必须随 visitor 一起释放。
+    //
+    // 修前只清 cancels 与 sudp_deliver:`punched`(visitor_id → 打洞成功的
+    // Multiplexer)与 `punched_auth` 会留到**整个会话结束**。而 mux 持有
+    // socket/fd,visitor 删除后它就是无人再用的资源 —— 慢泄漏。
+    //
+    // 注:`visitor_run.rs` 里确实有 remove,但那是"复用直连失败后自愈"的
+    // 路径(移除失效 mux 后回落中继),不是清理路径,不能替代这里。
+    sess.punched.lock().await.remove(&id);
+    sess.punched_auth.lock().await.remove(&id);
 }
 
 async fn start_health(sess: &Arc<ClientSession>, id: u64, spec: &ProxySpec) {

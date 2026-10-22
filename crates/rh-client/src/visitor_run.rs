@@ -258,7 +258,11 @@ async fn run_udp(
     let (tx, mut rx) = mpsc::channel::<BoxedIo>(1);
     sess.sudp_deliver.lock().await.insert(visitor_id, tx);
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut pending: Vec<(std::net::SocketAddr, Vec<u8>)> = Vec::new();
+    // ★VecDeque,不用 Vec:超限时要丢**最旧**的包,`Vec::remove(0)` 是 O(n)
+    // 整体搬移。容量上限 512 包 × 最大 65507B ≈ 32MiB,每来一个新包搬 32MiB
+    // 在 UDP 高 PPS 下是纯浪费。`pop_front` 是 O(1)。
+    let mut pending: std::collections::VecDeque<(std::net::SocketAddr, Vec<u8>)> =
+        std::collections::VecDeque::new();
     let mut pkt = vec![0u8; 65536];
     loop {
         tokio::select! {
@@ -276,9 +280,10 @@ async fn run_udp(
                         armed.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                pending.push((peer, pkt[..n].to_vec()));
+                pending.push_back((peer, pkt[..n].to_vec()));
+                // 超限丢最旧的(与修前语义一致,只是不再 O(n) 搬移)
                 if pending.len() > 512 {
-                    pending.remove(0);
+                    pending.pop_front();
                 }
             }
             c = rx.recv() => {
@@ -552,5 +557,48 @@ mod tests {
         })
         .await
         .expect("整个用例 deadline");
+    }
+}
+
+#[cfg(test)]
+mod pending_queue_tests {
+    use std::collections::VecDeque;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    /// 超限时丢**最旧**的包(与修前语义一致),且为 O(1)。
+    ///
+    /// 修前用 `Vec::remove(0)`:容量上限 512 包 × 最大 65507B ≈ 32MiB,
+    /// 每来一个新包就要搬移整个缓冲。UDP 高 PPS 下这是纯浪费。
+    /// 本测试锁住"丢最旧"这个语义,避免将来改成丢最新时悄悄改变行为。
+    #[test]
+    fn over_capacity_drops_oldest() {
+        let cap = 4usize; // 用极小容量表达语义
+        let mut pending: VecDeque<(SocketAddr, Vec<u8>)> = VecDeque::new();
+        let peer: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234);
+        for i in 0u8..6 {
+            pending.push_back((peer, vec![i]));
+            if pending.len() > cap {
+                pending.pop_front();
+            }
+        }
+        assert_eq!(pending.len(), cap, "长度必须被钳住");
+        // 留下的是 2,3,4,5(最旧的 0,1 被丢弃)
+        let got: Vec<u8> = pending.iter().map(|(_, d)| d[0]).collect();
+        assert_eq!(got, vec![2, 3, 4, 5], "必须丢最旧的,不能丢最新");
+    }
+
+    /// 未超限时不得丢弃任何包(顺序保持)。
+    #[test]
+    fn under_capacity_keeps_order() {
+        let mut pending: VecDeque<(SocketAddr, Vec<u8>)> = VecDeque::new();
+        let peer: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234);
+        for i in 0u8..4 {
+            pending.push_back((peer, vec![i]));
+            if pending.len() > 4 {
+                pending.pop_front();
+            }
+        }
+        let got: Vec<u8> = pending.iter().map(|(_, d)| d[0]).collect();
+        assert_eq!(got, vec![0, 1, 2, 3]);
     }
 }

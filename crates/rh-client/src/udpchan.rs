@@ -344,7 +344,7 @@ pub async fn run_visitor_side(
     channel: BoxedIo,
     sock: Arc<UdpSocket>,
     cancel: tokio_util::sync::CancellationToken,
-    pending: Vec<(std::net::SocketAddr, Vec<u8>)>,
+    pending: std::collections::VecDeque<(std::net::SocketAddr, Vec<u8>)>,
 ) {
     let (mut r, w) = tokio::io::split(channel);
     let (tx, rx) = mpsc::channel::<Pending>(WRITE_QUEUE);
