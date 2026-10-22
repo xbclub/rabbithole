@@ -65,6 +65,13 @@ pub struct Session {
     pub unconfirmed: Mutex<BTreeMap<u64, Instant>>,
     /// 客户端已应用到的 revision(APPLY_RESULT 上报)。
     pub applied_revision: AtomicU64,
+    /// 上次响应 `SyncRequest` 的时刻(限速用)。
+    ///
+    /// 客户端每发一条 SyncRequest 就触发一次 `build_sync_entities`
+    /// (全量 DB 扫描)。修前无任何限制:单连接可高频刷,把 DB 打满。
+    /// 这里做 1s 最小间隔 —— 正常客户端只在收到未知 revision 时才请求,
+    /// 秒级足够。
+    pub last_sync_request: Mutex<Option<Instant>>,
     /// 会话内单调 request_id。
     next_request_id: AtomicU64,
     /// 在途数据通道请求(request_id → 记录)。
@@ -99,6 +106,7 @@ impl Session {
             queue_tx,
             unconfirmed: Mutex::new(BTreeMap::new()),
             applied_revision: AtomicU64::new(0),
+            last_sync_request: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             pending_requests: Mutex::new(BTreeMap::new()),
             started_at: Instant::now(),

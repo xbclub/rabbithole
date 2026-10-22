@@ -336,12 +336,22 @@ async fn auth_and_run(
         heartbeat_interval_s: 30,
         server_version: PROTOCOL_VERSION.to_string(),
     };
-    write_frame(
+    // ★注册之后、run_session_loop 之前任何早退都必须注销会话。
+    //
+    // 修前这里 `?` 直接返回:会话已 `register`(map 里显示在线、指标 +1),
+    // 但控制流没有接管,永远不会被清理 —— 留下一个"在线"的僵尸会话,
+    // 直到客户端重连把它替换掉。若客户端不再重连,它就是永久泄漏。
+    if let Err(e) = write_frame(
         &mut stream,
         FrameType::HELLO_ACK,
         &serde_json::to_vec(&ack)?,
     )
-    .await?;
+    .await
+    {
+        warn!(client = %latest.id, error = %e, "HELLO_ACK 写出失败,注销刚注册的会话");
+        state.sessions.remove_if_current(&latest.id, &sess);
+        return Err(e.into());
+    }
     // 证书下发:仅加密协议。客户端解密后与 TLS 对端证书比对,不一致即断开。
     // 失败只 warn(不影响会话):客户端在缺失该帧时退回改动前的行为。
     if inc.protocol.is_encrypted() {
@@ -991,6 +1001,21 @@ pub async fn handle_client_message(
             crate::runtime::on_apply_result(&state, &sess, &r).await;
         }
         ClientMessage::SyncRequest {} => {
+            // ★限速:1s 内重复请求直接忽略。
+            //
+            // 每次请求都会 `build_sync_entities`(全量 DB 扫描 + 序列化)。
+            // 修前无任何限制,单连接高频刷即可把 DB 与 CPU 打满;
+            // 正常客户端只在收到未知 revision 时请求一次,1s 足够。
+            {
+                let mut last = sess.last_sync_request.lock().await;
+                let now = std::time::Instant::now();
+                if let Some(prev) = *last {
+                    if now.duration_since(prev) < std::time::Duration::from_secs(1) {
+                        return;
+                    }
+                }
+                *last = Some(now);
+            }
             // 全量重发
             let entities = state.build_sync_entities(&sess.client_id).await;
             let client = state.db.get_client(&sess.client_id).await.ok().flatten();

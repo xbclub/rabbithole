@@ -164,7 +164,12 @@ async fn login(
             .emit(
                 "warn",
                 "auth",
-                &format!("登录失败(密码错误):{}", req.username),
+                // ★用截断后的 uname,不用 req.username。
+                //
+                // 上面已把用户名截到 64 字符用于限速键,但这里用了原始值:
+                // 请求体可达 ~2MB,攻击者每次失败登录都能往 events 表写一条
+                // 2MB 记录,而 events 表**没有清理机制**(见 P3)。
+                &format!("登录失败(密码错误):{uname}"),
             )
             .await;
         return err(1001, "用户名或密码错误");

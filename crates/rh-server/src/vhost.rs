@@ -1102,6 +1102,14 @@ async fn serve_tcpmux(
         sock.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?;
         return Ok(());
     };
+    // ★与 http/https vhost 同口径:规则不健康就不接入。
+    //
+    // 修前 tcpmux 拿到 rt 后直接 relay,不看 `healthy` —— 规则被健康检查
+    // 摘除后,tcpmux 端口仍会把用户连接打过去,表现为"Web 页面显示异常、
+    // 但 tcpmux 还能连上",排查时极易误导。
+    if !rt.healthy.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
     // ★无锁快路径:非分组规则(group 为空)不需要走 group_pick。
     // 修前每请求都要 `spec.read().await` 只为取一个必然为 None 的 group_key,
     // 高并发下这是明确的锁争用点。

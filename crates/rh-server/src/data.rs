@@ -308,18 +308,34 @@ pub async fn assign_forward(
         channel
     };
     // 带宽限制(server 模式)
-    let bucket = spec
-        .transport
-        .bandwidth_limit
-        .as_ref()
-        .and_then(|s| rh_core::BandwidthQuantity::parse(s))
-        .filter(|_| {
-            matches!(
-                spec.transport.bandwidth_mode,
-                rh_protocol::BandwidthMode::Server
-            )
-        })
-        .map(|q| Arc::new(TokenBucket::new(q.bytes_per_sec() as f64)));
+    // ★解析失败要告警,不能静默关闭限速(与 rh-client 的 forward.rs 同修)。
+    //
+    // 修前 `.and_then(parse)` 失败直接得到 None:配置写错时规则级限速
+    // **完全不生效**,而运维以为已经限了 —— 没有任何信号。
+    let bucket = if matches!(
+        spec.transport.bandwidth_mode,
+        rh_protocol::BandwidthMode::Server
+    ) {
+        match spec
+            .transport
+            .bandwidth_limit
+            .as_ref()
+            .map(|s| rh_core::BandwidthQuantity::parse(s))
+        {
+            Some(Some(q)) => Some(Arc::new(TokenBucket::new(q.bytes_per_sec() as f64))),
+            Some(None) => {
+                tracing::warn!(
+                    proxy = rt.id,
+                    limit = ?spec.transport.bandwidth_limit,
+                    "带宽限速配置无法解析,规则级限速**未生效**(检查 bandwidth_limit 格式)"
+                );
+                None
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     // F2 客户端级限速(服务端侧,与规则级限速叠加)
     let client_bucket = state.client_usage(&rt.client_id).bucket();
     // Y1 零拷贝 mux 中继:通道为 RhMuxStream(mux 模式常态;B1 修复后

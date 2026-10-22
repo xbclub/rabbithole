@@ -322,6 +322,40 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState::new(cfg.clone(), db));
     // 挑战表周期清扫(回收未被消费的过期 nonce)
     tokio::spawn(state.challenge.clone().sweeper());
+    // events 表周期裁剪(保留最近 2 万条);此前完全是只增不减。
+    {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                match db.prune_events(20_000).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(removed = n, "events pruned"),
+                    Err(e) => tracing::warn!(error = %e, "events prune failed"),
+                }
+            }
+        });
+    }
+    // 登录限速器的 key 周期逐出。
+    //
+    // `governor` 的 keyed limiter 对每个**唯一 key 永久保留状态**。P0 修复
+    // 后 key 已不含端口,但扫描器轮换源 IP 时仍会让表缓慢增长。
+    // `retain_recent()` 只保留仍在窗口内的条目,10 分钟一次足够。
+    {
+        let lim_ip = state.login_limiter.clone();
+        let lim_user = state.login_limiter_user.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                lim_ip.retain_recent();
+                lim_user.retain_recent();
+            }
+        });
+    }
     // 首次启动引导:无任何用户时创建 admin + 随机密码,仅在控制台一次性展示。
     bootstrap_initial_admin(&state).await;
     // 启动恢复:双方 enabled 的规则重新绑定。

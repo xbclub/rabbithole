@@ -139,7 +139,15 @@ fn load_authorized_keys(path: Option<&PathBuf>) -> Arc<Vec<PublicKey>> {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            match PublicKey::from_openssh(line) {
+            // ★容忍带 options 的行(标准 authorized_keys 允许前置选项,
+            // 如 `command="..." ssh-ed25519 AAAA...`)。
+            //
+            // `PublicKey::from_openssh` 把第一个空格段当算法名,带 options 时
+            // 会解析失败并整行丢弃 —— 运维把现成的 authorized_keys 直接拷
+            // 过来时,带选项的密钥会静默失效。这里按 SSH 规范跳过前置 options
+            // (以逗号分隔、整体通常含 `=`,且出现在算法名之前)。
+            let key_part = strip_authorized_keys_options(line);
+            match PublicKey::from_openssh(key_part) {
                 Ok(k) => out.push(k),
                 Err(e) => tracing::warn!(%e, line, "ssh gateway: bad authorized_keys line"),
             }
@@ -148,6 +156,39 @@ fn load_authorized_keys(path: Option<&PathBuf>) -> Arc<Vec<PublicKey>> {
         tracing::warn!(path = %p.display(), "ssh gateway: authorized_keys unreadable");
     }
     Arc::new(out)
+}
+
+/// 跳过 `authorized_keys` 行首的可选 options,返回纯 `type base64 [comment]` 部分。
+///
+/// 标准格式:`[options] keytype base64 [comment]`。options 可能本身含空格
+/// (引号内),所以按**引号是否闭合**扫描而不是简单 split:找到第一个不在
+/// 引号内、且其后紧接已知密钥类型的空格位置。
+fn strip_authorized_keys_options(line: &str) -> &str {
+    const KEY_TYPES: [&str; 6] = [
+        "ssh-",
+        "ecdsa-",
+        "sk-",
+        "rsa-",
+        "dsa-",
+        "pkcs11:",
+    ];
+    let bytes = line.as_bytes();
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' {
+            in_quote = !in_quote;
+        } else if c == b' ' && !in_quote {
+            let rest = &line[i + 1..];
+            if KEY_TYPES.iter().any(|t| rest.starts_with(t)) {
+                return rest;
+            }
+        }
+        i += 1;
+    }
+    // 没有前置 options(或不是已知类型):原样返回,交给 from_openssh 报错
+    line
 }
 
 fn load_or_gen_host_key(dir: &PathBuf) -> anyhow::Result<PrivateKey> {
@@ -461,4 +502,43 @@ async fn pump(sock: tokio::net::TcpStream, mut channel: russh::Channel<russh::se
     let _ = sw.shutdown().await;
     let _ = t1.await;
     let _ = channel.close().await;
+}
+
+#[cfg(test)]
+mod authorized_keys_tests {
+    use super::*;
+
+    /// 带 options 的行必须能取出密钥本体。
+    #[test]
+    fn strips_leading_options() {
+        let line = r#"command="echo hi",no-pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI user@host"#;
+        assert_eq!(
+            strip_authorized_keys_options(line),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI user@host"
+        );
+    }
+
+    /// 无 options 的普通行原样返回。
+    #[test]
+    fn plain_line_unchanged() {
+        let line = "ssh-rsa AAAAB3NzaC1yc2EAAA user@host";
+        assert_eq!(strip_authorized_keys_options(line), line);
+    }
+
+    /// options 内含空格(引号内)时不得从引号中间切断。
+    #[test]
+    fn options_with_spaces_in_quotes() {
+        let line = r#"command="echo hello world" ssh-ed25519 AAAA test"#;
+        assert_eq!(
+            strip_authorized_keys_options(line),
+            "ssh-ed25519 AAAA test"
+        );
+    }
+
+    /// 没有任何密钥类型时原样返回(让上层报错,不静默吞掉)。
+    #[test]
+    fn unknown_type_returned_as_is() {
+        let line = "garbage line here";
+        assert_eq!(strip_authorized_keys_options(line), line);
+    }
 }

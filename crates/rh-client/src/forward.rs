@@ -113,11 +113,24 @@ pub async fn handle_start_forward(
         spec.transport.bandwidth_mode,
     ) {
         (Some(limit), rh_protocol::BandwidthMode::Client) => {
-            rh_core::bandwidth::BandwidthQuantity::parse(limit).map(|q| {
-                Arc::new(rh_core::ratelimit::TokenBucket::new(
-                    q.bytes_per_sec() as f64
-                ))
-            })
+            // ★解析失败必须告警,不能静默关闭限速。
+            //
+            // 修前 `.map(...)` 直接得到 None:配置写错(如 "100Mbps" 用了
+            // 不支持的写法)时**限速完全不生效**,而运维以为已经限了。
+            // 这是"配了没生效"里最难发现的一类 —— 没有任何信号。
+            match rh_core::bandwidth::BandwidthQuantity::parse(limit) {
+                Some(q) => Some(Arc::new(rh_core::ratelimit::TokenBucket::new(
+                    q.bytes_per_sec() as f64,
+                ))),
+                None => {
+                    tracing::warn!(
+                        proxy = %spec.name,
+                        limit = %limit,
+                        "带宽限速配置无法解析,本规则限速**未生效**(检查 bandwidth_limit 格式)"
+                    );
+                    None
+                }
+            }
         }
         _ => None,
     };

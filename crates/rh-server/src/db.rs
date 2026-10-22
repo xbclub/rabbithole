@@ -673,6 +673,29 @@ impl Db {
         Ok(())
     }
 
+    /// 删除超出保留量的旧事件(按 id 倒序保留最新 `keep` 条)。
+    ///
+    /// events 表此前**没有任何清理机制**:登录失败、配置变更、错误日志都往
+    /// 这里写,长期运行会无限增长(P5 修好了单条可达 2MB 的问题,但条数
+    /// 仍然只增不减)。返回删除行数,供日志观测。
+    pub async fn prune_events(&self, keep: i64) -> Result<u64> {
+        let keep = keep.max(100);
+        // 用 id 阈值一次删除,避免 `NOT IN (SELECT ... LIMIT)` 的二次扫描
+        let cutoff: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM events ORDER BY id DESC LIMIT 1 OFFSET ?1")
+                .bind(keep - 1)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((cutoff,)) = cutoff else {
+            return Ok(0); // 尚未超过保留量
+        };
+        let r = sqlx::query("DELETE FROM events WHERE id < ?1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
     pub async fn list_events(&self, limit: i64, level: Option<&str>) -> Result<Vec<EventRow>> {
         let rows = match level {
             Some(lv) => sqlx::query("SELECT id, ts, level, source, message, detail FROM events WHERE level=?1 ORDER BY id DESC LIMIT ?2")
