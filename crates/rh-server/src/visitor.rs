@@ -116,7 +116,6 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
         &pspec,
         &target_sess,
         u.user_conn_id,
-        u.src_addr.clone(),
     )
     .await;
 }
@@ -148,7 +147,6 @@ async fn relay_tcp(
     pspec: &ProxySpec,
     target_sess: &Arc<Session>,
     user_conn_id: u64,
-    src_addr: String,
 ) {
     // 压缩必须两端一致(服务端裸 splice):任一侧未开启则整体不压缩
     let compress = vspec.use_compression && pspec.transport.use_compression;
@@ -195,7 +193,7 @@ async fn relay_tcp(
                 return;
             }
         };
-        splice_relay(st, pspec2, src_addr, proxy_stream, visitor_stream).await;
+        splice_relay(st, pspec2, proxy_stream, visitor_stream).await;
     });
 }
 
@@ -389,11 +387,9 @@ async fn deliver_pair(state: &Arc<AppState>, session_id: &str, request_id: u64, 
 async fn splice_relay(
     state: Arc<AppState>,
     pspec: ProxySpec,
-    src_addr: String,
     proxy_stream: BoxedIo,
     visitor_stream: BoxedIo,
 ) {
-    let _ = src_addr;
     let mut a = proxy_stream;
     // 计量取 visitor 侧(用户口径),归因到目标代理(design-parity 决策 3)
     let rt = state.proxies.get(pspec.id);

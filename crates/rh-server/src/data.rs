@@ -227,7 +227,6 @@ pub async fn assign_forward(
     mut channel: BoxedIo,
     user: BoxedIo,
     user_src: &str,
-    local_addr_override: Option<SocketAddr>,
 ) {
     let spec = rt.spec.read().await.clone();
     let target_host = spec.target_host.clone();
@@ -342,7 +341,6 @@ pub async fn assign_forward(
             }
         }
     }
-    let _ = local_addr_override;
     state.metrics.count_relay_path("copy");
     debug!(proxy = rt.id, "relay path: copy");
     copy_relay_pair(
@@ -1000,7 +998,6 @@ async fn tcp_serve_loop_inner(
     listener: TcpListener,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    let local = listener.local_addr().ok();
     loop {
         tokio::select! {
             acc = listener.accept() => {
@@ -1008,7 +1005,7 @@ async fn tcp_serve_loop_inner(
                     Ok((sock, peer)) => {
                         let st = state.clone();
                         let rt2 = rt.clone();
-                        tokio::spawn(serve_tcp_user(st, rt2, sock, peer, local));
+                        tokio::spawn(serve_tcp_user(st, rt2, sock, peer));
                     }
                     Err(e) => {
                         warn!(error = %e, "tcp accept error");
@@ -1085,7 +1082,6 @@ async fn serve_tcp_user(
     rt: Arc<ProxyRuntime>,
     sock: TcpStream,
     peer: SocketAddr,
-    local: Option<SocketAddr>,
 ) {
     let _ = sock.set_nodelay(true);
     if !rt.healthy.load(Ordering::Relaxed) {
@@ -1123,7 +1119,6 @@ async fn serve_tcp_user(
         channel,
         Box::new(CountedUserIo::user(sock, &state, Some(target_rt.clone()))),
         &peer.to_string(),
-        local,
     )
     .await;
     state

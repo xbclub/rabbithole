@@ -871,13 +871,21 @@ async fn peek_sni(sock: &TcpStream) -> anyhow::Result<Option<String>> {
     Ok(parse_sni(&buf[..read]))
 }
 
+/// 从 ClientHello 提取 SNI(vhost TLS 按域名路由;不解密、不验签)。
+///
+/// 返回值统一 `to_lowercase()`:路由查表与证书校核都按小写域名比较。
+///
+/// **不校验 length 字段是有意的**:record length(`buf[3..5]`)与
+/// handshake length(`buf[6..9]`)都只用于判断"包是否完整",而调用方
+/// [`peek_sni`] 已用 5s deadline 累计读到完整 ClientHello 才交给本函数,
+/// 再做一次长度校验只会重复劳动。本函数只保证**不越界**:
+/// 每个字段读取前都检查剩余长度,任意前缀输入都返回 None 而非 panic
+/// (对应 `parse_sni_never_panics_on_truncation`)。
 fn parse_sni(buf: &[u8]) -> Option<String> {
     // TLS record: type(1) ver(2) len(2) handshake...
     if buf.len() < 43 || buf[0] != 0x16 {
         return None;
     }
-    let hs_len = u32::from_be_bytes([0, buf[3], buf[4], 0]) as usize; // not used directly
-    let _ = hs_len;
     // handshake header: type(1)=0x01 len(3)
     if buf[5] != 0x01 {
         return None;
@@ -1166,6 +1174,148 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http_body_util::Full;
+
+    // ---------------- parse_sni:vhost TLS 路由的关键路径 ----------------
+    //
+    // 这段代码手工计算 20+ 个偏移量(session_id / cipher_suites /
+    // compression_methods / extensions 各自"长度前缀 + 内容"),任何一个写错
+    // 都不会崩溃,只会静默返回 None —— 表现为「HTTPS 偶尔路由不到」,极难
+    // 归因。所以这里既测正常取值,也做**逐字节截断**,保证任意长度都不 panic。
+    //
+    // 注:record length(buf[3..5])与 handshake length(buf[6..9])目前**不校验**。
+    // 调用方 peek_sni 已用 5s deadline 累计读到完整 ClientHello 才解析,
+    // 再校验意义不大;这里按现状把行为钉住,避免误以为漏了边界检查。
+
+    /// 构造一个最小但结构合法的 ClientHello(带可选 SNI 扩展)。
+    ///
+    /// `sni = None` 时仍写入一个 type=0 但**不含** host_name 的扩展,用于
+    /// 验证「有 SNI 扩展位却没给出主机名」这一分支返回 None。
+    fn client_hello(sni: Option<&str>) -> Vec<u8> {
+        // 扩展体:SNI(list_len + type=0 + name_len + name)
+        fn sni_ext(name: &str) -> Vec<u8> {
+            let n = name.as_bytes();
+            let mut ext = Vec::new();
+            ext.extend_from_slice(&((n.len() + 3) as u16).to_be_bytes()); // list_len
+            ext.push(0x00); // name_type = host_name
+            ext.extend_from_slice(&(n.len() as u16).to_be_bytes());
+            ext.extend_from_slice(n);
+            ext
+        }
+
+        let mut ext_list = Vec::new();
+        match sni {
+            // 特殊值:构造 ext_len == 0 的 ClientHello(无 extensions 字段内容)
+            Some("") => {}
+            Some(host) => {
+                let body = sni_ext(host);
+                ext_list.extend_from_slice(&0x0000u16.to_be_bytes()); // type = server_name
+                ext_list.extend_from_slice(&(body.len() as u16).to_be_bytes());
+                ext_list.extend_from_slice(&body);
+            }
+            None => {
+                // type=0 但 body 不足(list_len 声明有、实际没有 host_name)
+                ext_list.extend_from_slice(&0x0000u16.to_be_bytes());
+                ext_list.extend_from_slice(&0u16.to_be_bytes());
+            }
+        }
+
+        // handshake body: client_version(2) random(32) sid_len(1)
+        //                 cipher_suites(2+n) cm_len(1+n) ext_len(2+n)
+        let mut hs = Vec::new();
+        hs.extend_from_slice(&[0x03, 0x03]); // client_version
+        hs.extend_from_slice(&[0x11; 32]); // random
+        hs.push(0); // session_id_len = 0
+        hs.extend_from_slice(&2u16.to_be_bytes()); // cipher_suites len
+        hs.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        hs.push(1); // compression_methods len
+        hs.push(0); // null
+        hs.extend_from_slice(&(ext_list.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&ext_list);
+
+        // record: type(1)=0x16 ver(2) len(2)
+        let mut rec = Vec::new();
+        rec.push(0x16); // handshake
+        rec.extend_from_slice(&[0x03, 0x01]); // legacy record version
+        rec.extend_from_slice(&((hs.len() + 4) as u16).to_be_bytes());
+        // handshake header: type(1)=0x01 len(3)
+        rec.push(0x01);
+        let hl = hs.len() as u32;
+        rec.extend_from_slice(&hl.to_be_bytes()[1..]); // 3 字节长度
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    #[test]
+    fn parse_sni_extracts_hostname() {
+        let buf = client_hello(Some("Bench.Test"));
+        // 手工确认构造合法(长度前缀自洽)
+        assert_eq!(buf[0], 0x16, "record type 必须是 handshake");
+        assert_eq!(buf[5], 0x01, "handshake type 必须是 ClientHello");
+        // 返回值统一小写:vhost 路由与证书校核都按小写比较
+        assert_eq!(parse_sni(&buf).as_deref(), Some("bench.test"));
+    }
+
+    #[test]
+    fn parse_sni_without_sni_extension_is_none() {
+        let buf = client_hello(None);
+        assert_eq!(parse_sni(&buf), None, "无 SNI 扩展必须返回 None");
+    }
+
+    #[test]
+    fn parse_sni_rejects_non_tls() {
+        assert_eq!(parse_sni(b""), None, "空输入");
+        assert_eq!(parse_sni(b"GET / HTTP/1.1\r\n"), None, "明文 HTTP");
+        // 长度够但不是 0x16
+        let mut junk = vec![0u8; 300];
+        junk[0] = 0x17; // application_data
+        assert_eq!(parse_sni(&junk), None);
+    }
+
+    #[test]
+    fn parse_sni_rejects_bad_handshake_type() {
+        let mut buf = client_hello(Some("a.test"));
+        buf[5] = 0x02; // ServerHello 而非 ClientHello
+        assert_eq!(parse_sni(&buf), None);
+    }
+
+    /// 边界:`ext_len == 0`(无扩展)时,`p + 2 == buf.len()` 恰好成立。
+    ///
+    /// 这是全函数唯一"合法且贴边"的输入。注入验证的结论值得记下来:
+    /// 把这处的 `p + 2 > buf.len()` 改成 `>=` 会让本用例**仍然绿** ——
+    /// 因为无扩展时结构上不可能解析出 SNI,两种写法都返回 None,属等价重构。
+    /// 也就是说这处差一在本函数的语义下**无法被测试区分**,不是漏洞。
+    ///
+    /// 真正能被抓到的是"漏检查"和"方向写反":实测把 `p >= buf.len()` 删掉、
+    /// 或改成 `p > buf.len()`,逐字节截断用例都会 panic
+    /// (`index out of bounds: the len is 46 but the index is 48`)。
+    #[test]
+    fn parse_sni_handles_empty_extension_block() {
+        let buf = client_hello(Some(""));
+        // 确认构造确实落在 ext_len == 0 这个边界上
+        assert_eq!(buf[buf.len() - 2], 0x00, "ext_len 高字节");
+        assert_eq!(buf[buf.len() - 1], 0x00, "ext_len 低字节");
+        assert_eq!(parse_sni(&buf), None, "无扩展时不得 panic,且应返回 None");
+    }
+
+    /// 逐字节截断:任意前缀长度都不得 panic,且截断到不完整时一律 None。
+    ///
+    /// 这是唯一能系统暴露所有偏移量计算错误的方法 —— 某个 `p + n > len`
+    /// 写成 `p + n >= len` 之类的差一错误,只有在这里才会显形。
+    #[test]
+    fn parse_sni_never_panics_on_truncation() {
+        let full = client_hello(Some("truncate.test"));
+        for cut in 0..full.len() {
+            let part = &full[..cut];
+            // 不 panic 即可;截断后语义上不应解析出完整域名
+            let got = parse_sni(part);
+            assert!(
+                got.is_none() || cut == full.len(),
+                "截断到 {cut} 字节仍解析出 {got:?},说明边界检查有洞"
+            );
+        }
+        // 完整输入必须能解析出来(反面参照,防止上面循环因 assert 写反而永真)
+        assert_eq!(parse_sni(&full).as_deref(), Some("truncate.test"));
+    }
 
     /// Connection: close 判定 —— 复用的开关条件之一。
     /// 写错会让带 close 的请求完成后连接被错误复用。
