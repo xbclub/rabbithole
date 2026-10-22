@@ -60,6 +60,17 @@ RFC1929 失败、非 CONNECT 命令、地址拆分与 origin-form 归一化。
   补了一句「目的地由用户请求决定」。
 - **协议**:`ProxySpec` / `PluginSpec` 零变更,不涉及迁移。
 
+### 明确不支持(已核实,非待办)
+
+| 能力 | 结论 | 依据 |
+|---|---|---|
+| SOCKS5 `BIND`(0x02) | 不做,回 `0x07` | frp 用的 `go-socks5` 该函数只有 `// TODO: Support bind` + 无条件 `commandNotSupported`;且架构上无可回连地址 |
+| SOCKS5 `UDP ASSOCIATE`(0x03) | 不做,回 `0x07` | 同上(`// TODO: Support associate`);需独立 UDP 通道,300~500 行 |
+| 插件级代理链(插件再连上游代理) | 不做 | frp 的 `Socks5PluginOptions` / `HTTPProxyPluginOptions` **无任何 upstream 字段**,插件解析出目的地后直接 `net.Dial` |
+
+三项均已在 [not-supported.md](not-supported.md) 里写清源码证据与技术原因。
+`0x07` 是 RFC 1928 规定的正确应答,**不是缺陷**。
+
 ## 与原记录的差异(两处判断修正)
 
 1. 原记录说「需要实现 HTTP `CONNECT host:port` 与 SOCKS5 握手的服务端侧

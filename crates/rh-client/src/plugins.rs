@@ -598,8 +598,18 @@ async fn serve_http_proxy(mut io: tokio::io::DuplexStream, auth: Option<(String,
 
 /// 服务一条 SOCKS5 连接(RFC 1928 / RFC 1929 用户名密码认证)。
 ///
-/// 只实现 CONNECT:BIND / UDP ASSOCIATE 需要监听回连地址或维护 UDP 关联表,
-/// 与「隧道里的一条 TCP 流」模型不兼容,按 RFC 回 `0x07 Command not supported`。
+/// # 只实现 CONNECT —— 这是**决定**,不是没写完
+///
+/// BIND / UDP ASSOCIATE 需要监听回连地址或维护 UDP 关联表,与「隧道里的
+/// 一条 TCP 流」模型不兼容(插件在客户端进程内,没有可回连的公网入口),
+/// 按 RFC 回 `0x07 Command not supported` —— 这是规范规定的正确应答。
+///
+/// **与 frp 对齐**:frp 用的 `armon/go-socks5`
+/// (`v0.0.0-20160902184237-e75332964ef5`)里,`handleBind` 与
+/// `handleAssociate` 的完整实现就是一句 `// TODO: Support bind` 加无条件
+/// `commandNotSupported`,frp 侧也没有任何补救。
+///
+/// 完整证据见 `docs/not-supported.md` §1/§2。**不要再把这两项当待办。**
 async fn serve_socks5(mut io: tokio::io::DuplexStream, auth: Option<(String, String)>) {
     match socks5_handshake(&mut io, &auth).await {
         Ok((host, port)) => {

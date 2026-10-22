@@ -42,6 +42,7 @@
 | [0rtt-remediation.md](0rtt-remediation.md) | TLS 1.3 / QUIC 0-RTT 整改。代码已按此实现(`max_early_data_size=0` / `enable_early_data=false`),由 `tls.rs` 三条回归测试锁定 | 现役 |
 | [carriers-decision-analysis.md](carriers-decision-analysis.md) | `default_carriers=2` 与 RTT 自适应的冲突判断 | 参考 |
 | [multicarrier-autosizing-handoff.md](multicarrier-autosizing-handoff.md) | 多载体池自适应定容的前因后果与方案。**定容规则已两次演进**(协议基线改为恒 2、硬件上限 `cpus-1`、新增 RTT 自适应),现役口径见 README | 参考 |
+| [not-supported.md](not-supported.md) | **明确不做的能力**(SOCKS5 BIND/UDP ASSOCIATE、插件级代理链)。经 frp 源码核实,含证据链 —— 这些不是待办 | 现役 |
 
 ## 4. 专题:性能优化(单点结论)
 
@@ -122,3 +123,8 @@
   "⚠ 已被 X 取代"横幅。
 - 分阶段的过程日志(如逐轮实验记录)**不要长期堆积在 `docs/` 根目录**,
   它的价值在结论,不在过程。
+- 判定"不做"的能力,**写进 [not-supported.md](not-supported.md) 并给出依据**
+  (通常是 frp 源码位置),而不是只在讨论里说一句。否则它会被反复当成遗漏
+  重新提起。
+- `benchmark/runs/` 与 `*.jsonl` 不入库(见 `.gitignore`),文档引用这些路径时
+  应说明"原始证据在磁盘上,不入库"。
