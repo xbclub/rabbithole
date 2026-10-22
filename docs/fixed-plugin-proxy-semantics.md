@@ -54,9 +54,8 @@ RFC1929 失败、非 CONNECT 命令、地址拆分与 origin-form 归一化。
 
 ## 兼容性与行为变化
 
-- **配置**:已有规则里 `http_proxy`/`socks5` 的 `target_host`/`target_port`
-  从此被忽略。修前这些规则的实际行为是「连代理 → 让代理连它自己」的
-  回环(不转发用户流量),因此不存在「能用的配置变成不能用」。
+- **配置**:目的地取自用户请求,`http_proxy`/`socks5` 的
+  `target_host`/`target_port` 不再参与。
 - **控制台**:`target` 字段在启用插件时本就隐藏,无需改动;插件说明文案
   补了一句「目的地由用户请求决定」。
 - **协议**:`ProxySpec` / `PluginSpec` 零变更,不涉及迁移。
