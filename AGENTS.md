@@ -114,6 +114,94 @@
 - 不要在标签上直接改代码(标签指向的提交一变,产物就与源码不一致)。
 - 不要跳过第 6 步 —— 自动生成的说明只有一行链接,对使用者没有信息量。
 
+## 提交与 CI 工作流
+
+### 提交前:三道门必须全绿
+
+```bash
+cargo fmt --all -- --check                          # 格式
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+三者都在 `.github/workflows/ci.yml` 里跑,本地先过一遍能省一个来回。
+格式化提交已登记在 `.git-blame-ignore-revs`,`git blame` 会跳过它。
+
+### 提交:推送前先推 main,再追 CI
+
+**`main` 是唯一长期分支**,直接推,不建特性分支(本项目单人维护)。
+推送后**必须**确认 CI 绿了再走下一步:
+
+```bash
+git push origin main
+gh run list --limit 3                 # 找到刚才那次 run 的 id
+gh run view <run-id> --json jobs \
+  --jq '{status, conclusion, jobs: [.jobs[] | {name, conclusion}]}'
+```
+
+CI 有两个 job:
+
+| job | 做什么 | 能抓到什么 |
+|---|---|---|
+| `test + clippy (linux)` | fmt / clippy / 全量测试 | 逻辑错误;**只有 Linux 上能跑的那条背压测试**(靠 `ss` 读内核 accept 队列) |
+| `编译检查 (windows)` | `cargo check --all-targets` | **v0.4.0 那类 msvc 编译失败**(`std::os::fd` 等 Unix 专属用法漏了 `cfg`) |
+
+### 看失败日志
+
+`gh run view --log-failed` 可能因为终端转义序列被拒,用 API 直取:
+
+```bash
+JOB=$(gh api "repos/<owner>/<repo>/actions/runs/<run-id>/jobs" \
+  --jq '.jobs[] | select(.conclusion=="failure") | .id')
+gh api --allow-escape-sequences "repos/<owner>/<repo>/actions/jobs/$JOB/logs" \
+  | sed 's/\x1b\[[0-9;]*m//g' | grep -E "FAILED|panicked|thread '" -A 5
+```
+
+(`--allow-escape-sequences` 是必需的,否则 `gh` 直接拒绝输出。)
+
+### 本地绿 ≠ CI 绿:两类踩过的坑
+
+1. **内核参数差异**。`sndbuf_explicit_set_takes_effect` 曾硬编码 4 MiB,
+   而 Linux 的 `SO_SNDBUF` 受 `net.core.wmem_max` 约束、超出部分**静默截断**:
+   开发机 16 MiB(绿),GitHub Actions 容器 212992(红,
+   `target=4194304 got=425984`)。**断言不要依赖本机内核调参**,先读上限
+   再定目标。
+2. **平台条件编译**。macOS 上 `cargo test` 绿不代表 Windows 能编 ——
+   `std::os::fd` / `std::os::unix` 必须放在 `cfg(unix)` 内,`#[cfg(test)]`
+   里的代码同样参与编译。自查:
+
+   ```bash
+   grep -rn "std::os::fd\|std::os::unix" --include=*.rs crates/ vendor/
+   ```
+
+   逐个确认有 `cfg` 门控。这条**只能靠 `windows-check` job 验证** ——
+   开发机是 macOS,`rustup target add x86_64-pc-windows-msvc` 装不上,
+   本地无法交叉验证。
+
+### 什么时候不要加门禁
+
+**红的门禁比没有门禁更糟** —— 它很快会被无视。给 CI 加检查前先确认
+当前代码能过。反例:仓库曾有 94 处 `cargo fmt` 差异,当时就没加 fmt 检查;
+先把格式化单独做成一次提交(登记进 `.git-blame-ignore-revs`),再开门禁。
+
+### 提交信息
+
+写**为什么**,不写**做了什么**(diff 自己会说)。涉及判断的要写清依据:
+
+- 判定"不是缺陷"的,给出反证(哪段源码、哪次实测);
+- 判定"不做"的,写进 `docs/not-supported.md` 并给 frp 源码位置 ——
+  否则会被反复当成遗漏重新提起;
+- 承认修正的,直接写"我之前判错了,原因是什么",不要悄悄改掉。
+
+### 不要做的事
+
+- 不要 `git add -A` 后不看 `git status` 就提交 —— 工作区可能有别人的改动。
+  只 `git add` 自己动过的文件。
+- 不要把纯格式化与业务改动混在一个提交里(review 时真正要看的东西会被淹没)。
+- 不要用 tar 传源码给测试机(见下方"性能基准"第 1 步)—— 走 git,
+  保证结果能绑定到 commit。
+- 不要手动 `gh release create`。
+
 ## 性能基准(三机 peer 基准)
 
 所有性能结论必须来自 `benchmark/peer.sh`(rh)与 `benchmark/peer-frp.sh`(frp
