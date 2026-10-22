@@ -1,0 +1,13 @@
+# git blame 忽略清单
+#
+# 本文件登记**纯格式化 / 纯重命名**类提交。`git blame` 会跳过这些提交,
+# 把责任行归到真正做语义改动的那次提交上。
+#
+# 启用(每个 clone 做一次):
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub 网页端的 blame 视图会自动读取仓库根目录的本文件,无需配置。
+
+# style: cargo fmt --all(纯格式化,零语义变更)
+# 94 处 fmt 差异,24 个文件;格式化前后测试均 565 通过 / 0 失败。
+f25f0ff
