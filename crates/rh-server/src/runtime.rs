@@ -10,7 +10,7 @@ use rh_protocol::{ProxyKind, ProxySpec};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// 会话建立:重置确认、状态推进、预热。
 pub async fn on_session_up(state: &Arc<AppState>, sess: &Arc<Session>) {
@@ -98,17 +98,29 @@ pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &App
             }
         }
         sess.confirm_applied(r.revision, false).await;
-        // 全量重发
+        // 全量重发。
+        //
+        // ★try_send:本函数由控制读循环**内联** await(control.rs:966),
+        // 而那个循环同时是 `queue_tx` 的唯一消费者。队列满了再用
+        // `send().await` 就会 park 在"等自己消费"上 —— A1 描述的经典自锁。
+        // 队列满说明客户端已停读,此刻重发 SYNC 无意义。
         let entities = state.build_sync_entities(&sess.client_id).await;
         let client = state.db.get_client(&sess.client_id).await.ok().flatten();
         let rev = client.map(|c| c.config_revision.max(0) as u64).unwrap_or(0);
         sess.mark_unconfirmed(rev).await;
-        let _ = sess
-            .send(ServerMessage::ServiceSync(ServiceSync {
+        if sess
+            .queue_tx
+            .try_send(ServerMessage::ServiceSync(ServiceSync {
                 revision: rev,
                 entities,
             }))
-            .await;
+            .is_err()
+        {
+            debug!(
+                client_id = %sess.client_id,
+                "service sync (full resend) dropped: control queue full"
+            );
+        }
         return;
     }
     let still_waiting = sess.confirm_applied(r.revision, true).await;

@@ -230,11 +230,16 @@ impl LimitsConfig {
 
     /// 每客户端并发数据通道有效上限:配额(0=∞)钳制到 mux 顶 -1024,
     /// 保证应用层永远先于 yamux 干净拒绝(留 1024 给在途未完成 HELLO 的流)。
+    ///
+    /// ★结果至少为 1。修前 `saturating_sub(1024)` 在 `mux_streams <= 1024`
+    /// 时算出 0,而消费点用 `data_conn_limit()` 判 `1 > limit` 恒真 ——
+    /// 所有 DATA_CHANNEL_HELLO 被拒,控制面正常、规则显示 Running,
+    /// **转发静默全死**,且 api.rs 的校验只查上界不查这个下界。
     pub fn data_conn_limit(&self) -> usize {
-        let ceiling = self.mux_streams().saturating_sub(1024);
+        let ceiling = self.mux_streams().saturating_sub(1024).max(1);
         match self.max_data_conns_per_client {
             0 => ceiling,
-            n => n.min(ceiling),
+            n => n.min(ceiling).max(1),
         }
     }
 }
@@ -325,6 +330,48 @@ impl ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `data_conn_limit` 在 `max_mux_streams <= 1024` 时必须 ≥ 1。
+    ///
+    /// 修前 `saturating_sub(1024)` 算出 0,而消费点用 `1 > limit` 判定,
+    /// 恒真 —— 所有 DATA_CHANNEL_HELLO 被拒,控制面正常、规则显示 Running,
+    /// **转发静默全死**。这条下界在任何配置下都不能破。
+    #[test]
+    fn data_conn_limit_never_zero() {
+        for (mux, per) in [
+            (1usize, 0usize),
+            (512, 0),
+            (1024, 0),
+            (1023, 0),
+            (2048, 0),
+            (1024, 1),
+            (512, 4),
+        ] {
+            let lim = LimitsConfig {
+                max_mux_streams: mux,
+                max_data_conns_per_client: per,
+                ..Default::default()
+            };
+            assert!(
+                lim.data_conn_limit() >= 1,
+                "max_mux_streams={mux} per={per} 算出了 0 —— 数据面会静默全断"
+            );
+        }
+        // 正常配置仍按 mux-1024 收敛(不被 .max(1) 干扰)
+        let lim = LimitsConfig {
+            max_mux_streams: 4096,
+            max_data_conns_per_client: 0,
+            ..Default::default()
+        };
+        assert_eq!(lim.data_conn_limit(), 3072);
+        // 显式配额小于 ceiling 时取配额
+        let lim = LimitsConfig {
+            max_mux_streams: 4096,
+            max_data_conns_per_client: 100,
+            ..Default::default()
+        };
+        assert_eq!(lim.data_conn_limit(), 100);
+    }
 
     // round-10:默认必须给 8(derive 会给 0 → 被钳成 1 = 关闭多载体),
     // 旧配置文件缺字段也落到 8;显式值与越界钳制可判。

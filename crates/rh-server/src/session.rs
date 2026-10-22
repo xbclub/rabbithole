@@ -223,7 +223,19 @@ impl SessionRegistry {
         let prev = self
             .map
             .insert(sess.client_id.clone(), (sess.clone(), sess.epoch));
-        // C2:维护 session_id 索引;旧会话的同名条目在替换时被覆盖
+        // C2:维护 session_id 索引。
+        //
+        // ★必须先摘掉旧会话的索引条目,再插入新条目。
+        // 每次认证都会生成**新的 UUID** session_id,旧 sid 是**不同的键**,
+        // 不做显式删除就永远不会"被覆盖"(旧注释如此声称,是错的);
+        // 而 `remove_if_current` 在"被替换"场景下 `was_current=false`
+        // 也不会清理它 —— 结果每次重连泄漏一条索引,长期运行无界增长,
+        // 持凭据者可高速重连放大。旧条目指向的 client_id 相同,而
+        // `get_by_session` 会复核 sid 一致性,提前删除不影响正确性。
+        if let Some((old, _)) = prev.as_ref() {
+            self.by_session
+                .remove_if(&old.session_id, |_k, v| v == &old.client_id);
+        }
         self.by_session
             .insert(sess.session_id.clone(), sess.client_id.clone());
         // 替换(in-place)不改变 len,但首次插入会;统一重算最稳妥。
@@ -274,6 +286,15 @@ impl SessionRegistry {
 
     pub fn count_online(&self) -> usize {
         self.map.len()
+    }
+
+    /// `by_session` 索引的条目数(**仅测试**用)。
+    ///
+    /// 必须直接看条目数:不能靠 `get_by_session` 断言 —— 它对残留条目也会
+    /// 因 `s.session_id == session_id` 复核而返回 None,测不出内存泄漏。
+    #[cfg(test)]
+    pub fn by_session_len(&self) -> usize {
+        self.by_session.len()
     }
 }
 
@@ -384,5 +405,66 @@ mod online_gauge_tests {
         );
         // 且注册表里确实还是新会话
         assert_eq!(reg.count_online(), 1);
+    }
+}
+
+#[cfg(test)]
+mod session_index_tests {
+    use super::*;
+
+    fn make_sess(client_id: &str, session_id: &str, epoch: u64) -> Arc<Session> {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        Session::new(
+            client_id.to_string(),
+            session_id.to_string(),
+            epoch,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        )
+    }
+
+    /// 重连替换会话时,旧 session_id 的索引条目必须被摘掉。
+    ///
+    /// 修前 `register` 只 `insert` 新条目,注释称"旧会话的同名条目在替换时
+    /// 被覆盖"——**这是错的**:每次认证都生成新的 UUID,旧 sid 是不同的键,
+    /// 永远不会被同名覆盖;而 `remove_if_current` 在替换场景下
+    /// `was_current=false` 也走不到清理分支。结果每次重连泄漏一条,
+    /// 长期运行无界增长。
+    #[test]
+    fn register_evicts_previous_session_index() {
+        let reg = SessionRegistry::new();
+        let s1 = make_sess("c1", "sid-A", 1);
+        assert!(reg.register(s1.clone()).is_none());
+
+        // 重连:同一 client_id,新 sid
+        let s2 = make_sess("c1", "sid-B", 2);
+        let prev = reg.register(s2.clone());
+        assert!(prev.is_some(), "替换必须返回旧会话");
+
+        assert!(reg.get_by_session("sid-B").is_some(), "新会话可查到");
+        // ★必须断言索引条目数:get_by_session 对残留条目也会因 sid 复核
+        // 返回 None,只看它测不出泄漏(负向验证时实测不变红)。
+        assert_eq!(
+            reg.by_session_len(),
+            1,
+            "索引里只应剩最新一条;修前会残留旧 sid,每次重连泄漏一条"
+        );
+    }
+
+    /// 反复重连不得让索引条目数持续增长。
+    #[test]
+    fn repeated_reconnect_does_not_grow_index() {
+        let reg = SessionRegistry::new();
+        for i in 0..50 {
+            let s = make_sess("c1", &format!("sid-{i}"), i as u64 + 1);
+            reg.register(s);
+        }
+        // 只剩最新一条
+        assert!(reg.get_by_session("sid-49").is_some());
+        assert_eq!(
+            reg.by_session_len(),
+            1,
+            "50 次重连后索引必须恒为 1 条(修前会累积成 50 条)"
+        );
     }
 }

@@ -267,14 +267,18 @@ async fn get_session(
             };
             // 地址字符串复用会话里那份,不再每包格式化。
             let payload = udp_packet::encode(&addr_str, &buf[..n]);
-            if tx2
-                .send(Pending {
+            // ★send 必须与 cancel 同一个 select:A4 修好了 recv 侧的退出,
+            // 但 send 一旦因队列满而阻塞,就再也观察不到 cancel ——
+            // 任务永久持有 sock2/tx2,`writer.await` 永挂,每次重连泄漏
+            // 整套通道。
+            let sent = tokio::select! {
+                r = tx2.send(Pending {
                     ty: FrameType::UDP_PACKET,
                     payload,
-                })
-                .await
-                .is_err()
-            {
+                }) => r.is_ok(),
+                _ = cancel.cancelled() => false,
+            };
+            if !sent {
                 break;
             }
         }

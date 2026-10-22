@@ -24,7 +24,8 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
     // 修前每条用户连接两次全表 DB 读 + 全量 JSON 反序列化,并且内联在
     // **控制读循环**里(visitor 连接建立速率一高就把控制面拖住)。配置只在
     // revision 变化时更新,缓存命中即为最新。
-    let resolve = match state.visitor_cache.get(&sess.client_id) {
+    let cache_key = (sess.client_id.clone(), u.visitor_id);
+    let resolve = match state.visitor_cache.get(&cache_key) {
         Some(c) if c.gen == state.cfg_gen(&sess.client_id) => c.clone(),
         _ => {
             let visitors = state
@@ -59,11 +60,11 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
             });
             state
                 .visitor_cache
-                .insert(sess.client_id.clone(), entry.clone());
+                .insert(cache_key.clone(), entry.clone());
             entry
         }
     };
-    // 缓存命中后仍需按请求的 visitor_id 校验(同一会话可能有多个访问器)
+    // 键已含 visitor_id,这里的复核退化为"配置是否仍启用"的兜底。
     if resolve.visitor_id != u.visitor_id || !resolve.vspec.enabled || !resolve.pspec.enabled {
         return;
     }

@@ -819,7 +819,7 @@ pub async fn connect_and_run(
     });
     let _ = shutdown.clone();
     let sweeper = sess.spawn_waiting_sweeper();
-    run_loop(sess.clone(), control, send_rx, shutdown).await;
+    run_loop(sess.clone(), control, send_rx, shutdown, buf).await;
     sess.cancel.cancel();
     sweeper.abort();
     Ok(())
@@ -854,8 +854,17 @@ async fn run_loop(
     mut control: BoxedIo,
     mut send_rx: mpsc::Receiver<bytes::Bytes>,
     shutdown: CancellationToken,
+    // 握手阶段累积的缓冲,可能已含后续帧的残留字节。
+    //
+    // `frame::read_frame` 内部用 `read_buf` 读,一次可能读进多帧;握手结束后
+    // 若像修前那样在这里 `BytesMut::with_capacity` 新建缓冲,残留字节就被
+    // 直接丢弃。而服务端正是**背靠背**写 HELLO_ACK → SERVER_CERT →
+    // ServiceSync:丢掉 ServiceSync 后客户端不会发 SYNC_REQUEST、服务端也
+    // 不重发,表现为"连上了但所有规则不启动"。局域网(NODELAY 下各帧常被
+    // 合并到同一批)恰恰是最容易触发的场景。数据通道侧早已用 PrependedIo
+    // 处理同款问题,控制面这里是唯一漏点。
+    mut buf: bytes::BytesMut,
 ) {
-    let mut buf = bytes::BytesMut::with_capacity(4096);
     let mut hb = tokio::time::interval(Duration::from_secs(sess.heartbeat_s as u64));
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let _ = hb.tick().await;

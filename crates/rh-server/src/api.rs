@@ -100,6 +100,14 @@ struct LoginReq {
     password: String,
 }
 
+/// 登录限速的两级键:(每 IP, 每 IP+用户名)。
+///
+/// **只含 IP,绝不含端口** —— 见 `login` 里的详细说明。抽成纯函数是为了
+/// 让"键里不许有端口"这条约束可被单测钉住(见 `login_rate_keys_ignores_port`)。
+fn login_rate_keys(ip: std::net::IpAddr, uname: &str) -> (String, String) {
+    (format!("ip|{ip}"), format!("{ip}|{uname}"))
+}
+
 async fn login(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<crate::WebAddr>,
@@ -110,15 +118,17 @@ async fn login(
     // 修前只有 `{ip}|{user}` 单键:攻击者轮换用户名即可绕过 IP 限制,
     // 且键随"用户名"无限增长(无淘汰)。现在 IP 维度的桶先兜住洪峰,
     // 用户名截断仍然保留。
+    //
+    // ★限速键必须只含 **IP**,不能含端口:`WebAddr` 的 Display 直通
+    // `SocketAddr`(main.rs:467),输出带临时端口。每次请求新建 TCP 连接
+    // (curl 默认行为)就是新键,两级限速全部落空 —— 而登录路径每次失败
+    // 都会跑一次 argon2id(约 20MB 内存 + 数十 ms CPU),governor 还会为
+    // 每个唯一键**永久保留**状态,构成未认证 DoS + 无界内存增长。
+    let ip = peer.0.ip();
     let uname: String = req.username.chars().take(64).collect();
-    if state
-        .login_limiter
-        .check_key(&format!("ip|{peer}"))
-        .is_err()
-        || state
-            .login_limiter_user
-            .check_key(&format!("{peer}|{uname}"))
-            .is_err()
+    let (k_ip, k_user) = login_rate_keys(ip, &uname);
+    if state.login_limiter.check_key(&k_ip).is_err()
+        || state.login_limiter_user.check_key(&k_user).is_err()
     {
         state
             .events
@@ -2601,6 +2611,66 @@ pub(crate) async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> Re
         buffer,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod login_rate_key_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// 限速键**只含 IP,不含端口**。
+    ///
+    /// 这条修的是 P0:修前键用 `peer`(`WebAddr` 直通 `SocketAddr` 的 Display,
+    /// 带临时端口)。攻击者每次新建 TCP 连接就换一个键,两级限速全部落空,
+    /// 而每次尝试都要跑 argon2id,构成未认证 DoS + 限速器内存无界增长。
+    ///
+    /// 断言方式:同一 IP 不同端口必须产生**完全相同**的键。
+    #[test]
+    fn login_rate_keys_ignores_port() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        // 同一 IP:无论源端口怎么变,键都必须一致
+        let (a_ip, a_user) = login_rate_keys(ip, "admin");
+        let (b_ip, b_user) = login_rate_keys(ip, "admin");
+        assert_eq!(a_ip, b_ip);
+        assert_eq!(a_user, b_user);
+
+        // 键里不得出现冒号(IPv4 带端口的形式);IPv6 本身含冒号,单独测
+        assert!(
+            !a_ip.contains(':'),
+            "IPv4 限速键不得含端口: {a_ip}"
+        );
+        assert_eq!(a_ip, "ip|203.0.113.7");
+        assert_eq!(a_user, "203.0.113.7|admin");
+    }
+
+    /// 不同 IP 必须得到不同键(不能把所有人合成一个桶)。
+    #[test]
+    fn login_rate_keys_separates_ips() {
+        let a = login_rate_keys(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)), "u");
+        let b = login_rate_keys(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)), "u");
+        assert_ne!(a.0, b.0);
+        assert_ne!(a.1, b.1);
+    }
+
+    /// 同一 IP 不同用户名:IP 级键相同(共享宽桶),用户级键不同(独立小桶)。
+    #[test]
+    fn login_rate_keys_splits_by_username_at_second_level() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
+        let (ip_a, user_a) = login_rate_keys(ip, "alice");
+        let (ip_b, user_b) = login_rate_keys(ip, "bob");
+        assert_eq!(ip_a, ip_b, "IP 级桶必须共享");
+        assert_ne!(user_a, user_b, "用户级桶必须分开");
+    }
+
+    /// IPv6 也要稳定(不含端口):同一地址的键恒定。
+    #[test]
+    fn login_rate_keys_stable_for_ipv6() {
+        let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let a = login_rate_keys(ip, "root");
+        let b = login_rate_keys(ip, "root");
+        assert_eq!(a, b);
+        assert_eq!(a.0, "ip|::1");
+    }
 }
 
 #[cfg(test)]

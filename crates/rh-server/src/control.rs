@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// nonce 表:nonce_hex → (client_id, expires)。
 /// 绑定签发连接:仅在签发连接上被消费。
@@ -334,13 +334,30 @@ async fn auth_and_run(
     let entities = state.build_sync_entities(&latest.id).await;
     let rev = latest.config_revision.max(0) as u64;
     sess.mark_unconfirmed(rev).await;
-    sess.send(ServerMessage::ServiceSync(
-        rh_protocol::message::ServiceSync {
-            revision: rev,
-            entities,
-        },
-    ))
-    .await;
+    // ★用 try_send,不用 send().await。
+    //
+    // 本函数在控制读循环里**内联** await(control.rs:849),而那个循环同时是
+    // `queue_tx` 的**唯一消费者**。一旦队列(256)被填满,`send().await` 就会
+    // park 在"等自己消费"上 —— 与 A1 注释描述的自锁形态完全一致:PING 早已
+    // 改成 try_send,但这里是同一个循环里的另一处裸 send,远程持凭据客户端
+    // 停读控制流即可触发,之后心跳超时与 cancel 全部失联,任务与 fd 永久泄漏。
+    // 队列满说明客户端已经不读了,SYNC 晚一点到没有意义,丢弃即可(客户端
+    // 重连或下次配置变更会重新下发)。
+    if sess
+        .queue_tx
+        .try_send(ServerMessage::ServiceSync(
+            rh_protocol::message::ServiceSync {
+                revision: rev,
+                entities,
+            },
+        ))
+        .is_err()
+    {
+        debug!(
+            client_id = %sess.client_id,
+            "service sync dropped: control queue full (client not reading)"
+        );
+    }
     crate::runtime::on_session_up(&state, &sess).await;
     // A3:认证已完成 —— 名额在此立即归还,不随会话寿命。
     guard.disarm();
@@ -1266,7 +1283,16 @@ pub async fn handle_data_channel_hello(
         }
     }
     let routed = route_data_stream(state, sess, stream, payload, None).await;
-    drop(rejected_mux);
+    // 被拒载体在这里正式关停。
+    //
+    // 修前只 `drop(rejected_mux)` —— 而 `YamuxMultiplexer` **没有 impl Drop**,
+    // drop 只 detach driver 的 JoinHandle,driver 继续持有 socket 跑下去
+    // (这正是 round-43 写下的红线:"不得退回无人驱动的连接")。
+    // 该载体不入池,路由结束后已无人需要它,必须显式关停才能释放 fd;
+    // 此处数据流已由 `stream` 走完,不影响它。
+    if let Some(y) = rejected_mux {
+        y.shutdown_after_flush(REJECT_FLUSH_GRACE).await;
+    }
     routed
 }
 

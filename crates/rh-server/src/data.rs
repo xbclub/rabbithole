@@ -133,12 +133,22 @@ pub async fn tcp_on_channel(
     let Some(pool) = rt.pool.lock().await.clone() else {
         return;
     };
-    pool.inflight.fetch_sub(1, Ordering::Relaxed);
-    // 旧会话晚到的通道(会话已替换/重连):直接丢弃
+    // ★先判 epoch,再减 inflight —— 顺序不能反。
+    //
+    // `claim_pool` 换 epoch 时会把 inflight `store(0)`(断连打断了在途
+    // CREATE,那些请求永远不会有人来减)。若本函数先无条件 `fetch_sub`,
+    // 旧会话的通道恰在清零之后到达,计数就从 0 回绕到 `u64::MAX`,
+    // 此后 `ready + inflight >= want` 恒成立 —— 预热池永久饥饿,
+    // 直到下一次换 epoch。原子减用 `fetch_update` 兜住下溢,双保险。
     let owner = pool.epoch.load(Ordering::Relaxed);
     if owner != 0 && owner != sess.epoch {
-        return;
+        return; // 旧会话晚到的通道:不碰新 epoch 的计数
     }
+    let _ = pool
+        .inflight
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
     // 有等待者直接交付;等待者已放弃(超时)则通道入池,不得丢弃
     let deliver = {
         let mut w = pool.waiters.lock().await;

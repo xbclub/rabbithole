@@ -49,9 +49,14 @@ pub struct AppState {
     unauth_conns: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
     /// 热生效配置子集(网页可管:端口策略/日志级别/SSH 网关)。
     pub hot: Arc<RwLock<HotConfig>>,
-    /// C1:visitor 解析缓存(client_id → 解析结果)。键内含配置版本,
-    /// 版本前进即视为失效。条目在插拔时按容量淘汰。
-    pub visitor_cache: dashmap::DashMap<String, std::sync::Arc<VisitorResolution>>,
+    /// C1:visitor 解析缓存((client_id, visitor_id) → 解析结果)。键内含
+    /// 配置版本,版本前进即视为失效。条目在插拔时按容量淘汰。
+    ///
+    /// ★键必须含 **visitor_id**。修前只按 client_id 存单条,而注释自己就写着
+    /// "同一会话可能有多个访问器":第二个 visitor 的连接会命中第一条缓存,
+    /// 随后 `resolve.visitor_id != u.visitor_id` 直接 return —— 无日志丢弃,
+    /// 表现为"同客户端的多个访问器只有一个能用"。
+    pub visitor_cache: dashmap::DashMap<(String, u64), std::sync::Arc<VisitorResolution>>,
     /// C1:每个客户端的本地配置版本(任何规则/访问器变更 +1)。比 DB 的
     /// config_revision 更廉价:纯内存原子,不需要每次解析都读 DB。
     pub client_cfg_gen: Arc<dashmap::DashMap<String, u64>>,
@@ -189,7 +194,15 @@ impl ClientUsage {
                 .map(|b| Arc::new(rh_core::TokenBucket::new(b.bytes_per_sec() as f64)));
             *self.rate_bucket.write().unwrap() = bucket;
         }
-        if q.flow_limit == 0 {
+        // ★`flow_cut` 只在"新上限尚未被超出"时才解除。
+        //
+        // 修前只有 `flow_limit == 0`(改成不限)才清标志:管理员把 1GB 调到
+        // 2GB 这种"加量"操作后,已置位的 flow_cut 会**永久**保持,所有连接
+        // 继续被杀(客户端侧 check flow_cut 直接 continue),只能重启进程
+        // 或先改 0 再改回来。改成按实际用量判定:加量到超过已用量即恢复。
+        let limit_unreached =
+            q.flow_limit == 0 || self.bytes.load(std::sync::atomic::Ordering::Relaxed) < q.flow_limit as u64;
+        if limit_unreached {
             self.flow_cut
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
@@ -260,7 +273,8 @@ impl AppState {
             .entry(client_id.to_string())
             .or_insert(0);
         *e = e.wrapping_add(1);
-        self.visitor_cache.remove(client_id);
+        // 键现在是 (client_id, visitor_id),按 client_id 前缀逐条摘除
+        self.visitor_cache.retain(|(cid, _), _| cid != client_id);
     }
 
     /// C1:读取客户端本地配置版本(0 = 从未变更)。
@@ -1523,5 +1537,88 @@ impl UnauthGuard {
 impl Drop for UnauthGuard {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    /// `flow_cut` 必须随"加量"解除,否则客户端永久断流。
+    ///
+    /// 修前只有 `flow_limit == 0`(改成不限)才清标志:管理员把 1GB 调到
+    /// 2GB 后,已置位的 flow_cut 会永久保持,所有连接继续被杀,只能重启
+    /// 进程或先改 0 再改回来。这条断言按"新上限是否高于已用量"判定。
+    #[test]
+    fn raising_flow_limit_clears_flow_cut() {
+        let u = ClientUsage::default();
+        // 用量 1.5GB,上限 1GB → 击穿
+        u.bytes
+            .store(1_500_000_000, std::sync::atomic::Ordering::Relaxed);
+        u.set_quota(ClientQuota {
+            rate_limit: String::new(),
+            max_conns: 0,
+            flow_limit: 1_000_000_000,
+        });
+        u.add_bytes(0); // 触发判定(总量已达上限)
+        assert!(
+            u.flow_cut.load(std::sync::atomic::Ordering::Relaxed),
+            "用量超上限必须置位 flow_cut"
+        );
+
+        // 加量到 2GB:新上限高于已用量 → 必须解除
+        u.set_quota(ClientQuota {
+            rate_limit: String::new(),
+            max_conns: 0,
+            flow_limit: 2_000_000_000,
+        });
+        assert!(
+            !u.flow_cut.load(std::sync::atomic::Ordering::Relaxed),
+            "加量后 flow_cut 必须解除(修前只有 flow_limit==0 才清,这里会留在 true)"
+        );
+    }
+
+    /// 调整配额后仍未超过新上限的,不得解除(防止白送额度)。
+    #[test]
+    fn lowering_or_equal_flow_limit_keeps_flow_cut() {
+        let u = ClientUsage::default();
+        u.bytes
+            .store(3_000_000_000, std::sync::atomic::Ordering::Relaxed);
+        u.set_quota(ClientQuota {
+            rate_limit: String::new(),
+            max_conns: 0,
+            flow_limit: 1_000_000_000,
+        });
+        u.add_bytes(0);
+        assert!(u.flow_cut.load(std::sync::atomic::Ordering::Relaxed));
+
+        // 上限仍低于用量:不得解除
+        u.set_quota(ClientQuota {
+            rate_limit: String::new(),
+            max_conns: 0,
+            flow_limit: 2_000_000_000,
+        });
+        assert!(
+            u.flow_cut.load(std::sync::atomic::Ordering::Relaxed),
+            "新上限仍低于已用量时不得解除 flow_cut"
+        );
+    }
+
+    /// 改成不限(0)必须无条件解除。
+    #[test]
+    fn zero_flow_limit_always_clears() {
+        let u = ClientUsage::default();
+        u.bytes
+            .store(9_000_000_000, std::sync::atomic::Ordering::Relaxed);
+        u.set_quota(ClientQuota {
+            rate_limit: String::new(),
+            max_conns: 0,
+            flow_limit: 1,
+        });
+        u.add_bytes(0);
+        assert!(u.flow_cut.load(std::sync::atomic::Ordering::Relaxed));
+
+        u.set_quota(ClientQuota::default()); // flow_limit = 0
+        assert!(!u.flow_cut.load(std::sync::atomic::Ordering::Relaxed));
     }
 }

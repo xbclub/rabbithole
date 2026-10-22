@@ -326,6 +326,10 @@ async fn handle_http_request(
         .unwrap_or("")
         .to_lowercase();
     let path = req.uri().path().to_string();
+    // M2 静态缓存键:**含 query**。修前只用 path,`?id=1` 与 `?id=2` 命中
+    // 同一条缓存 —— 第二个用户会拿到第一个人的数据。扩展名判定仍用 path
+    // (query 不参与"是否可缓存"的判断)。
+    let cache_key = http_cache_key(&path, req.uri().query());
 
     // 路由:域名 + locations 前缀(最长匹配)
     let routes = state.proxies.vhost_http.read().await.clone(); // C3: Arc 快照,O(1)
@@ -395,7 +399,7 @@ async fn handle_http_request(
     };
     if cache_cfg.is_some() && cacheable {
         {
-            if let Some(hit) = rt.http_cache.lock().unwrap().get(&path) {
+            if let Some(hit) = rt.http_cache.lock().unwrap().get(&cache_key) {
                 let resp = hyper::Response::builder()
                     .status(hit.status)
                     .header("content-type", hit.content_type.clone())
@@ -519,7 +523,7 @@ async fn handle_http_request(
                 body: collected.to_vec().into(),
             };
             rt.http_cache.lock().unwrap().put(
-                path.clone(),
+                cache_key.clone(),
                 entry,
                 (cfg.max_size_mb.max(1) * 1024 * 1024) as usize,
             );
@@ -746,10 +750,21 @@ async fn serve_https(
     };
     // M3:证书表命中该域名 → 服务端终结 TLS,明文 HTTP 走 vhost http 路由;
     // 未命中 → 维持原 passthrough 语义(端到端 TLS 到客户端)
-    {
+    //
+    // ★读锁只用于"找到并克隆 acceptor",必须在 accept/conn.await 之前释放。
+    // 修前守卫活到 `conn.await?`(整条 keep-alive/websocket 生命期),而
+    // tokio RwLock 写优先:证书 CRUD 等写锁期间**所有新 HTTPS 连接**都被
+    // 阻塞在读锁上 —— 只要有一条长命 TLS 连接在,证书热更新就冻结整个
+    // HTTPS vhost。
+    let acceptor = {
         let certs = state.certs.read().await;
-        if let Some(entry) = certs.iter().find(|c| c.matches(&sni)) {
-            let acceptor = tokio_rustls::TlsAcceptor::from(entry.cfg.clone());
+        certs
+            .iter()
+            .find(|c| c.matches(&sni))
+            .map(|entry| tokio_rustls::TlsAcceptor::from(entry.cfg.clone()))
+    };
+    if let Some(acceptor) = acceptor {
+        {
             // B5:TLS 握手必须有界(慢 ClientHello 会永久占用连接)
             let hs_to = state.cfg.vhost.http_timeout_s.max(1);
             let stream = match tokio::time::timeout(
@@ -869,6 +884,17 @@ async fn peek_sni(sock: &TcpStream) -> anyhow::Result<Option<String>> {
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
     Ok(parse_sni(&buf[..read]))
+}
+
+/// M2 静态缓存的键:path + query。
+///
+/// query 必须参与键 —— 修前只用 path,`?id=1` 与 `?id=2` 命中同一条缓存,
+/// 第二个用户直接拿到第一个人的响应体。
+fn http_cache_key(path: &str, query: Option<&str>) -> String {
+    match query {
+        Some(q) => format!("{path}?{q}"),
+        None => path.to_string(),
+    }
 }
 
 /// 从 ClientHello 提取 SNI(vhost TLS 按域名路由;不解密、不验签)。
@@ -1174,6 +1200,31 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http_body_util::Full;
+
+    /// M2 静态缓存键必须含 query。
+    ///
+    /// 修前键只用 path:`/a.js?id=1` 与 `/a.js?id=2` 命中同一条缓存,
+    /// 第二个用户拿到第一个人的响应体(越权读)。这条断言钉住 query 参与键。
+    #[test]
+    fn cache_key_includes_query() {
+        assert_ne!(
+            http_cache_key("/a.js", Some("id=1")),
+            http_cache_key("/a.js", Some("id=2")),
+            "不同 query 不得命中同一缓存条目"
+        );
+        assert_ne!(
+            http_cache_key("/a.js", Some("id=1")),
+            http_cache_key("/a.js", None),
+            "带 query 与不带 query 必须分开"
+        );
+        assert_eq!(
+            http_cache_key("/a.js", Some("id=1")),
+            http_cache_key("/a.js", Some("id=1")),
+            "同一 key 必须稳定命中"
+        );
+        assert_eq!(http_cache_key("/a.js", None), "/a.js");
+        assert_eq!(http_cache_key("/a.js", Some("id=1")), "/a.js?id=1");
+    }
 
     // ---------------- parse_sni:vhost TLS 路由的关键路径 ----------------
     //

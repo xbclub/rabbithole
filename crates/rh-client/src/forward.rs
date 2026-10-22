@@ -297,6 +297,12 @@ fn mk_client_limiter(
 }
 
 /// 拨号本地目标(插件优先)。
+///
+/// ★拨号目标以**本地配置 `spec` 为权威**,不使用线路下发的
+/// `fwd.target_host/port`。下发值只用于插件(插件语义由服务端规则定义,
+/// 且插件本身不做任意地址拨号)。而普通中继若照下发值拨号,一个被攻破的
+/// server 就能让 client 去拨内网任意地址(SSRF)。`nathole_cli` 的直连
+/// 路径早已这么做(用 spec 覆盖 fwd),这里补齐,两条路径口径一致。
 pub async fn dial_target(
     _sess: &Arc<ClientSession>,
     spec: &ProxySpec,
@@ -305,7 +311,7 @@ pub async fn dial_target(
     if let Some(plugin) = &spec.plugin {
         return crate::plugins::dial_plugin(plugin, fwd).await;
     }
-    let addr = resolve(&fwd.target_host, fwd.target_port).await?;
+    let addr = resolve(&spec.target_host, spec.target_port).await?;
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::net::TcpStream::connect(addr),
