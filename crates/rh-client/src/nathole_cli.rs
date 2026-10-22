@@ -47,7 +47,15 @@ pub async fn on_prepare(sess: Arc<ClientSession>, m: NatHolePrepare) {
             .await
             {
                 Ok(Ok(mapped)) => {
-                    candidates = vec![mapped.to_string()];
+                    // ★保留本机候选,把映射地址放在最先尝试。
+                    //
+                    // 修前直接 `candidates = vec![mapped]` —— 把 lan 候选丢了。
+                    // 同 NAT 后的双端本可以走内网直连(延迟远低于打洞-中继),
+                    // 丢了这个候选就只剩公网路径。
+                    // 顺序:映射地址优先(跨 NAT 最可能通),本机地址兜底。
+                    if !candidates.contains(&mapped.to_string()) {
+                        candidates.insert(0, mapped.to_string());
+                    }
                     behavior = format!("mapped={mapped}");
                 }
                 Ok(Err(e)) => behavior = format!("stun error: {e}"),

@@ -45,7 +45,7 @@ pub async fn recover_all(state: &Arc<AppState>) {
             continue;
         }
         {
-            let l = state.limits.read().unwrap();
+            let l = state.limits.read().unwrap_or_else(|e| e.into_inner());
             crate::db::normalize_spec(&mut spec, l.default_pool_size, l.max_pool_size);
         }
         // port_auto 被外部占用 → 立即重分配(同事务改库);

@@ -12,7 +12,31 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 /// 启动一个 visitor 的本地监听。
-pub async fn start(sess: Arc<ClientSession>, visitor_id: u64, spec: VisitorSpec) {
+/// 带重试的启动:吃掉"旧监听器尚未释放端口"的竞态窗口。
+///
+/// 配置变更时 `stop_visitor` 只 `cancel()`,监听任务的 listener 要等它跑到
+/// 下一次 accept 才 drop;紧接着 bind 同一端口会 `EADDRINUSE`。修前 bind
+/// 失败**只 warn 不重试**,规则从此永久失联(客户端不重启就不会恢复)。
+pub async fn start_with_retry(sess: Arc<ClientSession>, visitor_id: u64, spec: VisitorSpec) {
+    // 总预算 ~1s:足够覆盖 cancel 到 listener drop 的调度延迟,
+    // 又不会在端口真被别人占用时无限重试。
+    for attempt in 0..10 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if start(sess.clone(), visitor_id, spec.clone()).await {
+            return;
+        }
+    }
+    warn!(
+        visitor = %spec.name,
+        addr = %format!("{}:{}", spec.bind_addr, spec.bind_port),
+        "visitor bind failed after retries (port busy?); rule stays down until next config change"
+    );
+}
+
+/// 启动一个 visitor;返回 `false` 表示**绑定失败**(端口被占,值得重试)。
+pub async fn start(sess: Arc<ClientSession>, visitor_id: u64, spec: VisitorSpec) -> bool {
     let cancel = CancellationToken::new();
     sess.visitor_cancels
         .lock()
@@ -25,10 +49,11 @@ pub async fn start(sess: Arc<ClientSession>, visitor_id: u64, spec: VisitorSpec)
                 Ok(l) => l,
                 Err(e) => {
                     warn!(visitor = %spec.name, error = %e, "visitor bind failed");
-                    return;
+                    return false;
                 }
             };
             tokio::spawn(run_tcp(sess, visitor_id, spec, l, cancel));
+            true
         }
         VisitorKind::Sudp => {
             let addr = format!("{}:{}", spec.bind_addr, spec.bind_port);
@@ -36,10 +61,11 @@ pub async fn start(sess: Arc<ClientSession>, visitor_id: u64, spec: VisitorSpec)
                 Ok(s) => s,
                 Err(e) => {
                     warn!(visitor = %spec.name, error = %e, "visitor bind failed");
-                    return;
+                    return false;
                 }
             };
             tokio::spawn(run_udp(sess, visitor_id, Arc::new(s), cancel));
+            true
         }
     }
 }

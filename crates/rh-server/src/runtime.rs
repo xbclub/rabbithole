@@ -525,7 +525,7 @@ pub async fn notify_client_recovery(state: &Arc<AppState>, client_id: &str) {
             continue;
         }
         {
-            let l = state.limits.read().unwrap();
+            let l = state.limits.read().unwrap_or_else(|e| e.into_inner());
             crate::db::normalize_spec(&mut spec, l.default_pool_size, l.max_pool_size);
         }
         let _rt = spawn_runtime(state, client_id, &spec, revision).await;

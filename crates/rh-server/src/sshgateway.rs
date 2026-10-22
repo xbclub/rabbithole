@@ -107,8 +107,13 @@ impl SshGateway {
             let cfg2 = scfg.clone();
             tokio::spawn(async move {
                 let forwards: ForwardMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let peer_ip = sock
+                    .peer_addr()
+                    .map(|a| a.ip())
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
                 let session = SshSession {
                     state,
+                    peer_ip,
                     client_id: String::new(),
                     authorized_keys: keys,
                     forwards: forwards.clone(),
@@ -229,6 +234,8 @@ const MAX_FORWARDS_PER_SESSION: usize = 16;
 
 struct SshSession {
     state: Arc<AppState>,
+    /// 对端 IP(认证失败限速用)。
+    peer_ip: std::net::IpAddr,
     client_id: String,
     authorized_keys: Arc<Vec<PublicKey>>,
     /// 本连接注册的监听:port → 取消器(断开级联释放)。
@@ -251,6 +258,20 @@ impl Handler for SshSession {
             tracing::info!(client = user, "ssh gateway auth ok (password)");
             Ok(Auth::Accept)
         } else {
+            // ★失败计数限速:SSH 网关此前只有 1s 的 `auth_rejection_time`,
+            // 没有次数上限 —— 单个 IP 可以无限次尝试(每次都是一次 HMAC
+            // 比较 + 一次 DB 查询)。复用登录限速器(按 IP,30 次/分钟),
+            // 超限直接拒绝。
+            if self
+                .state
+                .login_limiter
+                .check_key(&format!("ssh|{}", self.peer_ip))
+                .is_err()
+            {
+                tracing::warn!(ip = %self.peer_ip, user, "ssh gateway auth rate limited");
+                // 限速期间退避更久,压住爆破速率
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
             Ok(Auth::reject())
         }
     }

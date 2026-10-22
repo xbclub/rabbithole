@@ -585,7 +585,7 @@ impl AppState {
 
     /// 认证窗口进入:超过每 IP 上限返回 false(0 = 不限)。
     pub fn enter_unauth(&self, ip: &IpAddr) -> bool {
-        let limit = self.limits.read().unwrap().unauth_conns_per_ip;
+        let limit = self.limits.read().unwrap_or_else(|e| e.into_inner()).unauth_conns_per_ip;
         if limit == 0 {
             return true;
         }

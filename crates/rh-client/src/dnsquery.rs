@@ -37,13 +37,24 @@ pub fn query(host: &str, ns: &str) -> Option<IpAddr> {
     }
     q.push(0);
     q.extend_from_slice(&[0, 1, 0, 1]);
+    // question 段的字节(从 offset 12 到末尾),用于校验应答回显
+    let question = q[12..].to_vec();
     sock.send(&q).ok()?;
     let mut buf = vec![0u8; 1500];
     // 校验应答事务 ID 与问题数(QD=1)后解析
     for _ in 0..3 {
         let n = sock.recv(&mut buf).ok()?;
+        // ★除 txid 与 QD=1 外,还要校验 **question 段回显**。
+        //
+        // 修前只比对 txid(16 位)与 QD:同源伪造者只要猜中 txid(~1/65536)
+        // 就能让本端接受一条**完全不同的域名**的应答。逐字节比对 question
+        // (域名+QTYPE+QCLASS)把可伪造面压到"必须知道我们查的是什么"。
         if n >= 12 && &buf[..2] == id.as_slice() && buf[4] == 0 && buf[5] == 1 {
-            return parse_a(&buf[..n]);
+            let qlen = question.len();
+            if n >= 12 + qlen && buf[12..12 + qlen] == question[..] {
+                return parse_a(&buf[..n]);
+            }
+            // 回显不符:不是我们这条查询的应答,继续等
         }
     }
     None

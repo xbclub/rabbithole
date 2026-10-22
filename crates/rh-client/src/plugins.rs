@@ -96,7 +96,14 @@ pub async fn dial_plugin(plugin: &PluginSpec, fwd: &StartForward) -> anyhow::Res
                 let Ok(tls_stream) = tls.accept(b).await else {
                     return;
                 };
-                let Ok(up) = tokio::net::TcpStream::connect(&local_addr).await else {
+                // 拨号必须有界:修前无超时,目标不可达时这个任务会长期占用
+                // 一对 duplex 半与 TLS 会话(客户端只看到"连上了但不通")。
+                let Ok(Ok(up)) = tokio::time::timeout(
+                    PLUGIN_DIAL_TIMEOUT,
+                    tokio::net::TcpStream::connect(&local_addr),
+                )
+                .await
+                else {
                     return;
                 };
                 let mut t = tls_stream;
@@ -297,6 +304,7 @@ async fn serve_static_file(
         let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
         let mut lines = head.split("\r\n");
         let req_line = lines.next().unwrap_or("");
+        let method = req_line.split(' ').next().unwrap_or("");
         let mut path = req_line.split(' ').nth(1).unwrap_or("/").to_string();
         // 剥离查询串与 fragment(缓存戳 URL 如 /app.js?v=1 不应 404)
         if let Some(p) = path.split_once(['?', '#']) {
@@ -306,6 +314,46 @@ async fn serve_static_file(
         for l in lines {
             if let Some((k, v)) = l.split_once(':') {
                 headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+            }
+        }
+        // ★只支持 GET/HEAD,且必须把请求体读掉。
+        //
+        // 修前不区分方法、也不看 `Content-Length`:客户端发 POST 时 body 会
+        // 留在 duplex 缓冲里,被当作**下一个请求**的起始解析 —— 表现为
+        // keep-alive 连接上后续请求全部错乱(或直接 400)。
+        // 静态文件服务没有 POST 语义,直接 405 + `Connection: close` 最安全,
+        // 并读掉 body 保证即使客户端不遵守 close 也不会污染后续解析。
+        let body_len: usize = headers
+            .iter()
+            .find(|(k, _)| k == "content-length")
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(0);
+        if method != "GET" && method != "HEAD" {
+            // 读掉请求体(有界:超过 1MiB 直接断开,避免被大 body 拖住)
+            let mut left = body_len;
+            let mut sink = [0u8; 8192];
+            while left > 0 {
+                let want = left.min(sink.len());
+                use tokio::io::AsyncReadExt as _;
+                match io.read(&mut sink[..want]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => left -= n,
+                }
+            }
+            let _ = write_simple(&mut io, 405, "Method Not Allowed", b"").await;
+            return;
+        }
+        // GET 也可能带 body(少见):同样读掉,避免污染后续请求
+        if body_len > 0 {
+            let mut left = body_len;
+            let mut sink = [0u8; 8192];
+            while left > 0 {
+                let want = left.min(sink.len());
+                use tokio::io::AsyncReadExt as _;
+                match io.read(&mut sink[..want]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => left -= n,
+                }
             }
         }
         // basic auth
@@ -557,14 +605,29 @@ fn acceptor_cache() -> &'static std::sync::Mutex<AcceptorCache> {
 /// 把同步阻塞扩散到别的任务上。
 fn tls_acceptor(crt: &str, key: &str) -> anyhow::Result<Arc<tokio_rustls::TlsAcceptor>> {
     let key_id = (crt.to_string(), key.to_string());
-    let mut cache = acceptor_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(hit) = cache.get(&key_id) {
-        return Ok(hit.clone());
+    // ★先在**锁外**查一次,再去锁外读盘。
+    //
+    // 修前把 `load_certs`/`load_key`(同步读盘)整段放在缓存锁内:
+    // 一次证书文件读取期间,所有需要 acceptor 的连接(每个 TLS 插件连接)
+    // 都阻塞在同一把 std Mutex 上 —— 在 async 任务里等于阻塞 OS 线程。
+    // 缓存命中路径很短,重读概率极低,这里接受"可能重复读一次"的代价。
+    {
+        let cache = acceptor_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(&key_id) {
+            return Ok(hit.clone());
+        }
     }
     let certs = load_certs(crt)?;
     let priv_key = load_key(key)?;
+    let mut cache = acceptor_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // 并发下可能已被别的任务插入:复用它的
+    if let Some(hit) = cache.get(&key_id) {
+        return Ok(hit.clone());
+    }
     let cfg = tokio_rustls::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, priv_key)?;

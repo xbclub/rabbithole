@@ -740,7 +740,7 @@ async fn list_services(
     let mut out = Vec::new();
     for (id, client_id, mut spec) in rows {
         {
-            let l = state.limits.read().unwrap();
+            let l = state.limits.read().unwrap_or_else(|e| e.into_inner());
             normalize_spec(&mut spec, l.default_pool_size, l.max_pool_size);
         }
         // ★列表回显前抹掉 secret_key。
@@ -836,7 +836,7 @@ async fn create_service_inner(
         return Err((2001, "名称须为 1-64 位字母/数字/下划线/连字符".into()));
     }
     {
-        let l = state.limits.read().unwrap();
+        let l = state.limits.read().unwrap_or_else(|e| e.into_inner());
         normalize_spec(spec, l.default_pool_size, l.max_pool_size);
     }
     // 密钥完全服务端管理:创建即生成随机凭据(入参提供的一律覆盖),
@@ -1017,7 +1017,7 @@ async fn update_service_inner(state: &Arc<AppState>, id: i64, mut spec: ProxySpe
         return err(2001, "名称须为 1-64 位字母/数字/下划线/连字符");
     }
     {
-        let l = state.limits.read().unwrap();
+        let l = state.limits.read().unwrap_or_else(|e| e.into_inner());
         normalize_spec(&mut spec, l.default_pool_size, l.max_pool_size);
     }
     // 实体读取在串行域内进行,避免与并发管理操作竞态
@@ -2039,7 +2039,7 @@ async fn get_server_config(State(state): State<Arc<AppState>>, headers: HeaderMa
             "log_level": hot.log_level,
             "ssh_gateway": serde_json::to_value(&hot.ssh_gateway).unwrap_or(serde_json::Value::Null),
             "metrics": serde_json::to_value(&hot.metrics).unwrap_or(serde_json::Value::Null),
-            "limits": serde_json::to_value(&*state.limits.read().unwrap())
+            "limits": serde_json::to_value(&*state.limits.read().unwrap_or_else(|e| e.into_inner()))
                 .unwrap_or(serde_json::Value::Null),
         },
         "authorized_keys": authorized_keys,
@@ -2458,7 +2458,7 @@ async fn put_server_config(
         disk.log.level = hot.log_level.clone();
         disk.ssh_gateway = hot.ssh_gateway.clone();
         disk.metrics = hot.metrics.clone();
-        disk.limits = state.limits.read().unwrap().clone();
+        disk.limits = state.limits.read().unwrap_or_else(|e| e.into_inner()).clone();
         disk.web.jwt_secret = state.cfg.web.jwt_secret.clone(); // 保留原值(未脱敏源)
         persist_err = match toml::to_string_pretty(&disk) {
             Ok(text) => {

@@ -322,7 +322,7 @@ async fn auth_and_run(
     let epoch = state.sessions.next_epoch();
     let cancel = CancellationToken::new();
     let (qtx, qrx) =
-        mpsc::channel::<ServerMessage>(state.limits.read().unwrap().control_send_queue);
+        mpsc::channel::<ServerMessage>(state.limits.read().unwrap_or_else(|e| e.into_inner()).control_send_queue);
     let sess = Session::new(latest.id.clone(), session_id.clone(), epoch, cancel, qtx);
     if let Some(old) = state.sessions.register(sess.clone()) {
         info!(client = %latest.name, old_epoch = old.epoch, "session replaced");
@@ -1077,7 +1077,7 @@ pub async fn route_data_stream(
         + 1;
     // 有效上限已钳制到 mux 顶-1024:应用层必然先于 yamux 拒绝,
     // 不会触发 yamux 的超限 SYN → 终止整条会话
-    if count as usize > state.limits.read().unwrap().data_conn_limit() {
+    if count as usize > state.limits.read().unwrap_or_else(|e| e.into_inner()).data_conn_limit() {
         sess.data_conn_count
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         return Err(anyhow::anyhow!("data connection limit"));

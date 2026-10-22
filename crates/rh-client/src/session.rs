@@ -1206,7 +1206,15 @@ async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) 
             if changed {
                 stop_visitor(sess, v.id).await;
                 cur.insert(v.id, v.clone());
-                crate::visitor_run::start(sess.clone(), v.id, v).await;
+                drop(cur); // 别持着 visitors 锁去做重绑定
+                // ★重绑前给旧监听器一点时间释放端口。
+                //
+                // `stop_visitor` 只是 `cancel()`,监听任务要跑到下一次
+                // accept 循环才 drop listener。紧接着 bind 同一端口会
+                // `EADDRINUSE`,而 `start` 里 bind 失败**只 warn 不重试**
+                // —— 规则从此永久失联,直到下次配置变更或客户端重启。
+                // 这里退避重试,把竞态窗口吃掉。
+                crate::visitor_run::start_with_retry(sess.clone(), v.id, v).await;
             }
         }
     }

@@ -13,7 +13,7 @@ mod visitor_run;
 use clap::Parser;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "rh-client", version)]
@@ -155,18 +155,43 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         let started = std::time::Instant::now();
+        let mut fatal = false;
         match session::connect_and_run(cfg.clone(), shutdown.clone()).await {
             Ok(()) => {
                 info!("session ended");
             }
             Err(e) => {
-                warn!(error = %e, "session error");
+                // ★凭据类错误(密钥错、客户端被禁用)重连再多次也没用。
+                //
+                // 修前一律按"网络抖动"处理:1,2,4,...,60s 无限重试,永久
+                // 冲击服务端(每次都走完整 TLS + 挑战应答,而服务端还要为
+                // 每次失败写一条 events)。
+                //
+                // 这里**不退出进程**:容器里退出会触发 restart 风暴,
+                // 运维反而更难看清原因。改为退避到上限 + 每个周期一条
+                // 醒目 error,提示"需人工修正凭据"。
+                let msg = e.to_string();
+                if msg.contains("session rejected") {
+                    fatal = true;
+                    error!(
+                        error = %msg,
+                        "凭据被服务端拒绝(密钥错误或客户端被禁用):客户端不会自行恢复,\
+                         请检查 client_id / secret 或控制台中的启用状态"
+                    );
+                } else {
+                    warn!(error = %e, "session error");
+                }
             }
         }
         // 会话存活超过 30s 视为健康周期:退避重置,避免长期运行后
         // 任意一次断线都要等满 60s 才重连
         if started.elapsed() >= std::time::Duration::from_secs(30) {
             backoff_secs = 1;
+        }
+        // 凭据类错误:直接顶到最大退避(不累积到 60s 之前每轮都重锤服务端),
+        // 但仍保留周期性重试 —— 运维修好凭据后无需重启客户端。
+        if fatal {
+            backoff_secs = 60;
         }
         if shutdown.is_cancelled() {
             return Ok(());

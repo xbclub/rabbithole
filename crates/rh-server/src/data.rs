@@ -243,7 +243,7 @@ pub async fn get_channel(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Optio
         return None;
     }
     // 先取出标量再进入 match:读锁守卫不得作为 match 临时量跨 await 持有
-    let wait_ms = state.limits.read().unwrap().pool_wait_timeout_ms;
+    let wait_ms = state.limits.read().unwrap_or_else(|e| e.into_inner()).pool_wait_timeout_ms;
     match tokio::time::timeout(Duration::from_millis(wait_ms), rx).await {
         Ok(Ok(s)) => Some(s),
         _ => {
@@ -1307,7 +1307,7 @@ fn udp_session_admit(
     if sessions.contains_key(&addr) {
         return true;
     }
-    let limit = state.limits.read().unwrap().max_udp_sessions_per_proxy;
+    let limit = state.limits.read().unwrap_or_else(|e| e.into_inner()).max_udp_sessions_per_proxy;
     if limit != 0 && sessions.len() >= limit {
         // B7:超限必须可见 —— 静默丢弃会让"UDP 不通"无从排查。
         state.metrics.udp_sessions_rejected.inc();
@@ -1352,7 +1352,7 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
         };
         let (mut ch_r, mut ch_w) = tokio::io::split(stream);
         let mut frame_buf = bytes::BytesMut::with_capacity(2048);
-        let mut pkt_buf = vec![0u8; state.limits.read().unwrap().udp_packet_size.max(1500)];
+        let mut pkt_buf = vec![0u8; state.limits.read().unwrap_or_else(|e| e.into_inner()).udp_packet_size.max(1500)];
         let mut last_ping_sent = Instant::now();
         let mut last_alive = Instant::now();
         let dead = loop {
