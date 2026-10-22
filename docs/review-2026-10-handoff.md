@@ -2,11 +2,11 @@
 
 > 本文是压缩上下文前的交接记录。按"已完成 / 未完成 / 待决策"三段组织。
 
-## 一、已完成(9 个提交,均在 main,未推送)
+## 一、已完成(8 个提交,均在 main,未推送)
 
 ```
-<待填> fix(client): 按 frp 语义重写 http_proxy / socks5 插件
-<待填> fix(test): splice 无锁拆分探针改用 task-local 作用域(修 flaky)
+c01a3e2 fix(client): 按 frp 语义重写 http_proxy / socks5 插件
+        (含 splice 探针改 task-local 作用域的 flaky 修复)
 4f34114 docs: 记录待办(插件代理语义)与本轮审查交接
 5e6de9a fix(client): P9/P10 仲裁 —— 我的"误报"判定错了,两项均成立并已修
 d8b7d07 fix: 把最后 9 项核实完 —— 修 7 项,B9/B11 判定为设计使然而非缺陷
@@ -59,7 +59,7 @@ fe47dd0 fix(server): 修 A1/A2 自锁、A3 记账缺口、A4 UDP 单边限流、
 
 ### 是否推送
 
-9 个提交未推送(`git log --oneline origin/main..HEAD`)。
+8 个提交未推送(`git log --oneline origin/main..HEAD`)。
 
 推送前建议:
 
