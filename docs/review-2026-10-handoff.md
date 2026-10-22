@@ -22,6 +22,7 @@ fe47dd0 fix(server): 修 A1/A2 自锁、A3 记账缺口、A4 UDP 单边限流、
 ### 状态
 
 - 测试:**558 通过 / 0 失败 / 2 忽略**(交接时 543;新增 15 条代理插件测试)
+  —— 计数含 2 条 `#[ignore]` 之外的通过项,`--ignored` 单列 2 条
 - clippy:`--workspace --all-targets -D warnings` 零错误
 - `tests/e2e-plugins.sh`:**16/16 PASS**
 - 真实代理客户端验收(curl 经隧道访问外网):见 §五
