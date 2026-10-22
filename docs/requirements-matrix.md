@@ -69,10 +69,10 @@
 | D7 | Prometheus 指标 | enablePrometheus | rh-server metrics.rs | tests/e2e.sh「Prometheus 指标暴露」 | acceptance.md §E2E-1 | done |
 | D8 | 服务重启恢复 | (本项目核心) | rh-server recovery.rs | tests/e2e.sh「服务端重启恢复规则/重启后 TCP、UDP 恢复转发」 | acceptance.md §E2E-1 | done |
 | **E. 前端** |
-| E1 | vben 基座(web-antd,锁定 commit d27a5b8) | — | web/(独立 pnpm workspace) | 生产构建 + 服务端托管渲染通过(resolve.dedupe 修复 vue-router 双实例);**dist 经 rust-embed 内嵌进二进制(单文件分发,static_dir 可覆盖)**;typecheck 0 错误;浏览器验收以生产构建执行 | acceptance.md §2、§7(浏览器)、§14 | done |
-| E2 | 登录/登出/过期处理/改密 | — | web-antd login + requestClient(401 跳登录)+ 设置页改密表单(校验+成功强制重登) | 浏览器验收(登录/登出/改密→强制重登→新密码登录回跳) | acceptance.md §浏览器 | done |
-| E3 | 仪表盘/客户端/规则/visitor/事件页面 | — | web-antd views/rabbithole(总览/客户端/转发规则/访问器) | 浏览器验收全链路 | acceptance.md §浏览器 | done |
-| E4 | 一次性密钥展示/危险操作确认/校验/加载/空态/失败提示 | — | web-antd(凭据仅此一次展示/确认弹窗/表单校验) | 浏览器验收(创建/轮换凭据展示) | acceptance.md §浏览器 | done |
+| E1 | 前端基座(vben web-antd,锁定 commit d27a5b8) | — | `console/`(Vite 7 + React 19 + TS strict + Tailwind v4 + shadcn/ui;10-10 起替换 vben,10-12 起替换 antd) | 生产构建 + 服务端托管通过;**dist 经 rust-embed 内嵌进二进制(单文件分发,static_dir 可覆盖)**;`pnpm typecheck` 0 错误;浏览器验收以生产构建执行 | acceptance.md §16、§14、`docs/screenshots/console-shadcn/` | done |
+| E2 | 登录/登出/过期处理/改密 | — | `console/src/api/request.ts`(401 跳登录、拦截器统一附 Bearer)+ 设置页改密表单(校验+成功强制重登) | 浏览器验收(登录/登出/改密→强制重登→新密码登录回跳) | acceptance.md §12、review-log R33 | done |
+| E3 | 仪表盘/客户端/规则/visitor/事件页面 | — | `console/src/pages/`(总览/客户端/tcp/udp/域名/密钥/访问器/证书/设置) | 浏览器验收全链路 | `docs/screenshots/console-shadcn/` | done |
+| E4 | 一次性密钥展示/危险操作确认/校验/加载/空态/失败提示 | — | `console/`(凭据仅此一次展示/确认弹窗/表单校验/空态三件套) | 浏览器验收(创建/轮换凭据展示) | `docs/screenshots/console-shadcn/` | done |
 | **实验项(非稳定验收门槛)** |
 | X1 | VirtualNet(vnet) | pkg/virtual, Alpha | 不实现,不宣称 | — | — | experimental |
 | X2 | featureGates 实验开关 | client | 不实现 | — | — | experimental |

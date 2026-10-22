@@ -1,5 +1,10 @@
 # rabbithole vs frp 性能对比方案
 
+> **时效说明(2026-10-22 补注)**:本文是 2026-10-12 定下的**对比方法学**,
+> 其中的公平性原则(只换被测软件、对等配置、同一直连基线)至今有效,
+> `benchmark/peer-frp.sh` 即按此实现。文中"被测版本 v0.3.0"是当时的取值,
+> 现役对 frp 的结论见 `docs/deep-review-performance-report.md`(2026-10-21)。
+
 ## 1. 目标
 
 在与 rabbithole 基准完全相同的条件下测量 frp v0.71.0(rabbithole README 声明对标的

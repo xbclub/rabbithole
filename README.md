@@ -1,6 +1,7 @@
 # rabbithole
 
-自托管的端口转发与远程服务接入平台:Rust 服务端 + 客户端 + Web 管理控制台(Umi Max + antd v6)。
+自托管的端口转发与远程服务接入平台:Rust 服务端 + 客户端 + Web 管理控制台
+(React 19 + Vite + Tailwind v4 + shadcn/ui)。
 功能基线对齐 frp v0.71.0 的稳定能力(对照矩阵见 `docs/requirements-matrix.md`),
 协议为全新自有设计(RHTP),不兼容 frp。
 
@@ -70,14 +71,14 @@ cargo build --release
 # A. 生产模式(推荐,单二进制):构建前端产物后重新编译服务端,
 #    dist 会被 rust-embed 自动嵌进 rh-server(build.rs 自动检测),无需任何配置
 cd console && pnpm install
-pnpm build                            # 产物 console/dist/(Umi Max + antd v6)
+pnpm build                            # 产物 console/dist/(Vite + React 19 + shadcn/ui)
 cd .. && cargo build --release        # 二进制内嵌控制台
 ./target/release/rh-server --config deploy/server.example.toml
 # 也可改用 [web] static_dir 指向磁盘目录(优先级高于内嵌,便于只更新前端不重编);
 # SPA 回退已内置:深层路由 200,未知 /api/* 返回 JSON 404
 # 未构建前端时直接 cargo build 也可编译(二进制不含控制台,API 正常,补 UI 需重建)
 
-# B. 开发模式:Umi dev server(/api 代理,端口与后端见 console/config/proxy.ts)
+# B. 开发模式:Vite dev server(/api 代理到 127.0.0.1:8080,见 console/vite.config.ts)
 cd console && pnpm dev
 ```
 
@@ -200,7 +201,7 @@ crates/rh-transport  tcp/tls/ws/quic/kcp、yamux 复用、压缩、代理拨号
 crates/rh-core       限速、PROXY protocol、STUN、网络工具
 crates/rh-server     控制面/数据面/管理 API/vhost/SSH 网关/SQLite
 crates/rh-client     会话与重连、转发、插件、健康检查、visitor、打洞
-console/            管理控制台(React 19 + antd v6,Umi Max + ProComponents)
+console/            管理控制台(React 19 + Vite + Tailwind v4 + shadcn/ui)
 tests/               E2E 与负载测试脚本
 docs/                设计文档、需求矩阵、验收记录、评审日志
 deploy/              部署示例配置与 systemd 单元
@@ -215,7 +216,8 @@ Apache-2.0(与基线 frp 一致)。
 - **[frp](https://github.com/fatedier/frp)**(Apache-2.0)—— 功能基线与转发语义的对标项目,
   多处模块设计(插件、visitor、打洞、vhost)参考了其成熟实现
 - **[ant-design-admin-v6](https://github.com/arvinaij/ant-design-admin-v6)**(MIT,
-  LICENSE 见 `console/`)—— 管理控制台前端基座(Umi Max + React 19 + antd v6 + ProComponents)
+  LICENSE 见 `console/`)—— 第二代控制台的前端基座(Umi Max + React 19 + antd v6 + ProComponents),
+  已于 2026-10-12 由 Vite + Tailwind v4 + shadcn/ui 重写取代,`console/LICENSE` 沿用其 MIT 许可
 - **[vue-vben-admin](https://github.com/vbenjs/vue-vben-admin)**(MIT)—— 早期控制台基座,
   已于 2026-10 移除,其交互惯例影响了首版控制台设计
 

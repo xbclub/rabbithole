@@ -1,5 +1,12 @@
 # rabbithole 能力补齐设计(对标 nps,排除多用户)— v0.2
 
+> **时效说明(2026-10-22 补注)**:本文是 2026-10-10 的能力补齐设计,**能力口径仍有效**,
+> 但前端实现细节已两次演进:先由 vben 换为 Umi Max + antd v6(本文决策 5),
+> 2026-10-12 又整体重写为 **Vite + React 19 + Tailwind v4 + shadcn/ui**。
+> 凡本文提到"antd v6 / Umi Max / ProComponents / web-antd 路径 / `/rabbithole/*` 路由"
+> 的具体实现锚点,**以 `console/` 现役代码与 `docs/review-log.md` R20 之后的条目为准**;
+> 后端契约(F1–F8 的数据模型与 API 语义)不受影响。
+
 > 范围:补齐与 nps 网页端对标中识别出的能力差距,**不含多用户/注册/角色体系**(明确非目标,见 §15)。
 > 基线:docs/design.md v1.4 及其附录的实现状态。本文档不改变 RHCP 协议帧格式、认证握手与规则状态机;
 > 唯一的协议载荷变更是 `HttpProxyConfig` 增一个可选字段(§5)。
@@ -369,6 +376,11 @@ CREATE TABLE certs (
 ---
 
 ## 10. F9 前端基座重写(React + Ant Design v6)
+
+> **已实现并被后续重写取代**:F9 的成果(独立 `console/` 工程、后端零变更、
+> 契约平移)已全部落地;其中的 antd 技术选型于 2026-10-12 由
+> Vite + Tailwind v4 + shadcn/ui 取代。本节保留为决策与迁移路径记录,
+> 技术栈细节以 `console/README.md` 为准。
 
 ### 10.1 决策与范围
 

@@ -1,5 +1,21 @@
 # rabbithole 评审日志(review-log)
 
+> **覆盖范围**:R1(2026-10-08)~ R33(2026-10-12),共 33 轮。
+>
+> **2026-10-13 之后的评审不在本文**,分散在下列专题文档中,查找时请一并检索:
+>
+> | 时段 | 内容 | 文档 |
+> |---|---|---|
+> | 10-13 ~ 10-15 | 性能修复与门槛判定(G1/G2/G6) | `performance-repair-*.md`、`performance-g1-tcp-*.md` |
+> | 10-15 ~ 10-18 | 多载体/单载体瓶颈实测 | `single-carrier-bottleneck-measurement.md`、`multicarrier-autosizing-handoff.md` |
+> | 10-20 | 七路静态深审(A/B/C 三批) | `deep-review-ffd49d3-remediation-plan.md` |
+> | 10-21 | 深审后对 frp 吞吐复测 | `deep-review-performance-report.md` |
+> | 10-22 | 静态审查(1 P0 + 14 P1 + P2/P3)与插件代理语义重写 | `review-2026-10-handoff.md`、`fixed-plugin-proxy-semantics.md` |
+>
+> 本文中 R20–R33 涉及的前端实现(Umi Max + antd)已于 2026-10-12 被
+> Vite + Tailwind v4 + shadcn/ui 重写取代;**行为契约(登录路径、术语、
+> 密钥零输入、错误提示可见性等)仍然有效**,组件与文件路径不再对应。
+
 ## R1 功能对照审查(frp 0.71.0 基线)
 
 - 以 /tmp/ref/frp(d20a232)为基线逐文件对照,产出 docs/requirements-matrix.md

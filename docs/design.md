@@ -2,7 +2,7 @@
 
 > 目标：Rust 实现的端口转发 / 内网穿透服务。服务端提供 Web 控制台，集中管理多个客户端与端口映射规则（对标 nps 的管理模式），数据面能力对标 frp。
 > 本文档覆盖 P0 范围；P1/P2 扩展方向在文末路线图中列出。
-> 决策记录：**全新自有协议，不兼容 frp/frpc**；前端基于 vue-vben-admin（锁定 main 分支 commit `d27a5b8a`，见 §8.1）。
+> 决策记录：**全新自有协议，不兼容 frp/frpc**；前端为独立 `console/` 工程（Vite + React 19 + Tailwind v4 + shadcn/ui，见 §8）。
 >
 > **v1.4 修订**（相对 v1.3，来源为四次评审）：
 > 1. 会话注册锁内**同时复验最新 secret**（重算 HMAC 比对），修复"挑战校验通过后才轮换密钥"的交错窗口；
@@ -34,7 +34,7 @@
 |---|---|
 | `rh-server` | 单进程服务端。三合一：控制面（客户端接入/认证/规则下发）、数据面（映射端口监听与转发）、管理面（REST API + Web 静态资源托管） |
 | `rh-client` | 客户端。运行在 NAT 后的目标机器，主动连接服务端，按服务端下发的规则把本地服务暴露出去 |
-| `console` | Web 控制台前端（React 19 + antd v6,Umi Max + ProComponents;2026-10-10 CUT 起替换 vben 版），编译产物由 rh-server 托管 |
+| `console` | Web 控制台前端（Vite + React 19 + TypeScript + Tailwind v4 + shadcn/ui；2026-10-12 起替换 antd 版），编译产物由 rh-server 托管 |
 
 ### 1.2 端口规划
 
@@ -76,7 +76,7 @@ rabbithole/
 │   │                     # 接口边界按 §10 定义（连接/流分离, datagram 可选能力）
 │   ├── rh-server/        # bin: 控制面 + 数据面 + axum API + sqlx
 │   └── rh-client/        # bin: 会话状态机 + 被动拨号器 + 本地转发
-├── console/              # React + antd v6 控制台(Umi Max;见 §8)
+├── console/              # Vite + React 19 + shadcn/ui 控制台(见 §8)
 ├── migrations/           # sqlx 迁移
 └── docs/
 ```
@@ -603,10 +603,13 @@ P1 增加 `/api/stats/stream`（SSE）。
 
 ## 8. 前端设计
 
-> **现状（2026-10-10 CUT）**:前端已整体切换为顶层 `console/` 工程(React 19 + antd v6,
-> Umi Max + ProComponents,基于 ant-design-admin-v6 模板裁剪);`web/`(vben)已删除。
-> §8.1 的 vben 基座条款**废止**(历史存档);§8.2 对接契约语义不变,由 console/ 承接
-> (axios envelope 解包、HTTP 401、logout 显式 Bearer、改密强制重登均已在 console/ 实现)。
+> **现状（2026-10-12 第二次重写）**:前端为顶层 `console/` 独立工程，技术栈
+> **Vite 7 + React 19 + TypeScript(strict) + Tailwind v4 + shadcn/ui**，数据层
+> axios + TanStack Query + zustand，表格 TanStack Table，表单 react-hook-form + zod。
+> `web/`(vben)已于 2026-10-10 删除；2026-10-10 至 10-12 期间的 Umi Max + antd v6
+> 版本也已整体替换。§8.1 的 vben 基座条款**废止**(历史存档)；§8.2 对接契约语义不变，
+> 由 console/ 承接(axios envelope 解包、HTTP 401、改密强制重登均已在 console/ 实现；
+> logout 由 axios 拦截器统一附 Bearer，不再需要模板期的一行改动)。
 
 ### 8.1 基座锁定与裁剪边界（已废止,历史存档）
 
@@ -789,20 +792,23 @@ trait DatagramCapable { fn max_datagram_size(&self) -> usize;
   禁用方跳步、在途请求失效与级联关闭、UDP 目标变更原位发布)。macOS 平台
   通配 bind 可与具体地址监听共存,试绑补环回探针对齐 Linux 语义。
   全量核验与修复记录见 docs/review-log.md R8。
-- **控制台生产部署(2026-10-09 补记)**:`pnpm build` 产物经 `[web].static_dir`
+- **控制台生产部署(2026-10-09 补记,历史存档)**:`pnpm build` 产物经 `[web].static_dir`
   由 rh-server 单进程托管(SPA 回退 200、未知 /api/* 返回 JSON 404)。曾因
   pnpm 图 vue-router 双实例导致登录后空白,已以 `resolve.dedupe` 修复并按
-  生产构建复跑浏览器验收(acceptance §7)。登出入口在页头(log-out 图标,
-  vben 默认 logoutButtonPosition=header)。
+  生产构建复跑浏览器验收。以上均为 vben 时代记录;现役控制台为 React 工程,
+  无 vue-router 依赖。
 - **单二进制内嵌控制台(2026-10-10 补记)**:`build.rs` 检测
-  `web/apps/web-antd/dist` 存在时置 `embed_ui` cfg,`rust-embed` 将 dist
+  `console/dist` 存在时置 `embed_ui` cfg,`rust-embed` 将 dist
   编译进 rh-server(约 +3.2MB);未配置 `static_dir` 时由内嵌资产托管,
   语义与磁盘分支一致(SPA 回退/`/api` JSON 404),`static_dir` 显式配置
   优先于内嵌。无 dist 的纯 Rust 检出仍可构建(二进制不含 UI,API 不受影响)。
-  验证:tests/e2e-embed.sh(9/9)。
-- **前端基座重写(2026-10-10 决策)**:管理面前端由 vue-vben-admin 裁剪版切换为
-  React 19 + Ant Design v6 独立工程(顶层 `console/`,Vite 产物托管方式不变:
-  `[web].static_dir` / rust-embed,登录链路与 envelope 契约逐项保留)。
-  §8.1 基座锁定与裁剪边界条款**废止**,§8.2 对接契约语义由新工程承接;
-  迁移期新旧并存,切换(CUT)后删除 `web/`。详见 docs/design-parity.md §10(F9)
-  与 R0–R3/CUT 里程碑。
+  验证:tests/e2e-embed.sh(9/9)。旧路径 `web/apps/web-antd/dist` 已随
+  2026-10-10 CUT 移除。
+- **前端基座重写(2026-10-10 决策,2026-10-12 再次替换)**:管理面前端先由
+  vue-vben-admin 裁剪版切换为 React 19 + Ant Design v6 独立工程(顶层 `console/`,
+  Vite 产物托管方式不变:`[web].static_dir` / rust-embed,登录链路与 envelope
+  契约逐项保留);2026-10-12 又整体重写为 **Vite + React 19 + Tailwind v4 +
+  shadcn/ui**,彻底移除 Umi Max / antd / ProComponents。
+  §8.1 基座锁定与裁剪边界条款**废止**,§8.2 对接契约语义由新工程承接。
+  详见 docs/design-parity.md §10(F9)、docs/console-ui-redesign.md 与
+  docs/review-log.md R20–R33。

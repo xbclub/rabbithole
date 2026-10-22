@@ -1,6 +1,12 @@
 # 设置页设计评估与整改意见(settings-page-review)
 
-- 对象:`console/src/pages/settings/index.tsx` 及依赖组件(`components/ui.tsx`、`global.less`)
+> **⚠ 已被取代(2026-10-22 补注)**。本文针对的是 **antd 版** `console/`:
+> 其引用的 `components/ui.tsx` 与 `global.less` 在 2026-10-12 的
+> Vite + Tailwind v4 + shadcn/ui 重写中已删除,文中行号全部失效。
+> 所提的 P0(保存配置静默清空端口策略)等缺陷**已随重写消除**。
+> 保留本文是因为它记录的**表单取值陷阱与无障碍检查方法**仍可复用。
+
+- 对象(历史):`console/src/pages/settings/index.tsx` 及依赖组件(`components/ui.tsx`、`global.less`)
 - 方法:按 Vercel Web Interface Guidelines 逐条代码审查 + 真实渲染走查
   (本地构建 rh-server + `pnpm dev` + 浏览器,桌面 1280px / 窄屏 390px),
   关键问题均在真实页面复现实证。

@@ -1,5 +1,15 @@
 # 性能修复状态(2026-10-14,c84f631 收口轮 full-accept 后)
 
+> **⚠ 已被后续测量取代(2026-10-22 补注)**。本文的 G1/G2/G6 判定基于
+> 2026-10-14 的构建,其"未达标"结论**不代表现役版本**。此后:
+>
+> - 2026-10-15 ~ 10-18:多载体/单载体瓶颈定位(`single-carrier-bottleneck-measurement.md`);
+> - 2026-10-20:`ffd49d3` 七路深审修复与六轮固定开销优化(`9bd748b`);
+> - 2026-10-21:**TCP/TLS 全部 12 档吞吐超过 frp**(`deep-review-performance-report.md`)。
+>
+> 现役性能口径以 `docs/deep-review-performance-report.md` 与
+> `docs/vhost-benchmark-rh-vs-frp.md` 为准。本文保留为当时证据链与判定过程记录。
+
 **结论:固定性能目标仍未完成。**基线 `c84f63174cd2ebafd994c4fafacd5beba4a0240b`(分支 `fix/performance-closure-c84f631`,HEAD 即该检查点,本轮**无新提交**;旧版"无 git 提交、HEAD 仍 `c3ca4bd`"的说法已随检查点落库而过期)。本轮在既有授权内完成:风险项 A–E 全部修复并红→绿、验收装置落地、三机 full-accept(candidate-r0)真实执行——四套 E2E 全绿、Linux 全 workspace 测试/构建 exit=0、六协议全矩阵逐条测量;但 **G1/G2/G6 及 G5 的 kcp 单缺口未达标**(§3),candidatePassed=false,不以单项改善替代结论。上一版 79 行已原样存档 [performance-repair-history-4.md](performance-repair-history-4.md)(SHA256 `d81a6729…`,cp 后 shasum 核验);更早为 history-3/history-2/history.md,后缀唯一、均不再重写。本轮明细见 [performance-closure-c84-report.md](performance-closure-c84-report.md)。
 
 ## 0. 授权边界(更正旧版 §7)

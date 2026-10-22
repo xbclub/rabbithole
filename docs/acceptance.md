@@ -2,6 +2,19 @@
 
 日期:2026-10-08 初测,2026-10-09 前端生产构建修复后复测(全部命令在本仓库工作区实际执行;环境 macOS 27.0 arm64,Rust stable,Node 26.10/pnpm 11.16)
 
+> **时效说明(2026-10-22 补注)**。本文按时间累积,不同章节对应不同时点的前端形态,
+> 阅读时请先认准年代:
+>
+> | 章节 | 时点 | 对应前端 |
+> |---|---|---|
+> | §1–§13 | 2026-10-08 ~ 10-10 | `web/`(vue-vben-admin 裁剪版,**已删除**) |
+> | §14–§15 | 2026-10-10 | 同上(内嵌托管刚落地时) |
+> | 现役控制台 | 2026-10-12 起 | `console/`(Vite + React 19 + Tailwind v4 + shadcn/ui) |
+>
+> §2 的"前端质量门"记录的是 **vben 版**的实测结果,其命令(`pnpm --filter web-antd …`)
+> 与测试计数(575 用例)在 `web/` 删除后**已不可复现**。现役控制台的质量门见
+> 文末 §16 与 `console/README.md`。Rust 侧门(§1)与各 E2E 套件的结论不受前端替换影响。
+
 ## 1. Rust 质量门
 
 | 门 | 命令 | 结果 |
@@ -12,6 +25,10 @@
 | 发布构建 | `cargo build --release` | 通过(仅 rust-objcopy 剥离调试信息的本机工具链告警,产物完整可用) |
 
 ## 2. 前端质量门(web/pnpm workspace,Node 26.10/pnpm 11.16)
+
+> **历史存档**:本节记录 `web/`(vue-vben-admin)在 2026-10-09 的实测结果。
+> 该目录已于 2026-10-10 CUT 删除,下列命令与计数**无法在当前仓库复现**。
+> 现役控制台的质量门见 §16。
 
 | 门 | 命令 | 结果 |
 |----|------|------|
@@ -246,7 +263,11 @@ ann.vben/Pro;④ 顶栏退出按钮 → 确认弹窗「是否退出登录?」→
 
 ## 14. 内嵌 Web 控制台(单二进制,`tests/e2e-embed.sh`,9/9 PASS,2026-10-10)
 
-构建期 `build.rs` 检测 `web/apps/web-antd/dist` 存在 → `rust-embed` 嵌入
+> **路径已变更**:当时的检测路径是 `web/apps/web-antd/dist`,现已改为
+> `console/dist`(`crates/rh-server/build.rs`)。内嵌机制、SPA 回退与
+> `/api/*` JSON 404 语义不变,`static_dir` 仍优先于内嵌。
+
+构建期 `build.rs` 检测 `console/dist` 存在 → `rust-embed` 嵌入
 rh-server(release 二进制 14.3MB→17.5MB,+3.2MB);无 dist 的纯 Rust 检出
 `cargo check --release` 通过(CI 后端 job 不依赖前端产物)。用例:
 
@@ -273,3 +294,21 @@ rh-server(release 二进制 14.3MB→17.5MB,+3.2MB);无 dist 的纯 Rust 检出
 上限未实现(以对端锁定 + 句柄归零快速回收缓解);TCPMux 标准模式端到端 e2e
 仍仅到 CONNECT 200(yamux 客户端语义,流路径由 mux.rs 单测覆盖);web 前端
 问题因"前端将重写"决策不处理。
+
+## 16. 现役控制台质量门(`console/`,2026-10-22 实测)
+
+2026-10-12 起控制台为 `console/` 独立工程(Vite 7 + React 19 + TS strict +
+Tailwind v4 + shadcn/ui)。以下为本次实际执行结果(本机 Node 26.11 / pnpm 11.16,
+`console/` 下执行):
+
+| 门 | 命令 | 结果 |
+|----|------|------|
+| 类型检查 | `pnpm typecheck`(`tsc --noEmit`) | **通过,0 错误** |
+| 单元测试 | `pnpm test`(`vitest run`) | **50/50 通过**(`features/services/__tests__/spec.test.ts`,覆盖 spec↔表单值组装/反解与 kind 字段矩阵) |
+| Lint | `pnpm lint`(`eslint .`) | **0 error / 5 warning**;5 条均为 `react-refresh/only-export-components` 与 `react-hooks/incompatible-library` 的 HMR 粒度提示,非正确性问题 |
+| 生产构建 | `pnpm build` | 通过;`index.html` 仅一条 CSS preload,图表(`traffic-chart` 366 KB / 108 KB gz)与表单(`form` 129 KB / 40 KB gz)按需懒加载 |
+| 格式检查 | `pnpm format:check` | **未通过**:`index.html` 与 `src/pages/settings/index.tsx` 有格式偏差(纯空白/换行,`pnpm format` 可修) |
+
+**注**:本节的 50 条用例是 2026-10-12 重写时随 `features/services` 抽出的纯逻辑测试,
+与 §2 中 vben 版的 575 条(vue 组件测试)不是同一口径,不可直接对比。
+浏览器走查证据见 `docs/screenshots/console-shadcn/`(40 张,生产构建 + 真实后端)。
