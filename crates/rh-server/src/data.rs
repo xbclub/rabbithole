@@ -1208,22 +1208,81 @@ pub async fn group_pick_public(
     group_pick(state, rt).await
 }
 
-/// 组内健康成员选取(组键由 spec 决定)。
+/// 组内**粘性**选路(公开):同一 `affinity` 恒定落同一成员。
+///
+/// 供带缓存语义的路径使用 —— 缓存挂在成员各自的 `rt.http_cache` 上,
+/// 轮询选路会让跨请求命中率掉到 `1/N`。
+pub async fn group_pick_sticky_public(
+    state: &Arc<AppState>,
+    rt: &Arc<ProxyRuntime>,
+    affinity: &str,
+) -> Option<Arc<ProxyRuntime>> {
+    group_pick_sticky(state, rt, affinity).await
+}
+
+/// 组内健康成员选取(组键由 spec 决定),**轮询**。
+///
+/// 这是 TCP 数据面的默认选路:同一组的连接依次落到不同成员,组内负载均摊。
+/// 带缓存语义的路径(vhost HTTP)不要用它 —— 见 [`group_pick_sticky`]。
 async fn group_pick(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Option<Arc<ProxyRuntime>> {
     let key = {
         let spec = rt.spec.read().await;
         crate::state::ProxyManager::group_key(&spec)?
     };
-    let (members, start) = {
-        let g = state.proxies.groups.get(&key)?;
-        let members = g.members.read().await.clone();
-        let start = g.rr.fetch_add(1, Ordering::Relaxed) as usize;
-        (members, start)
-    };
+    let g = state.proxies.groups.get(&key)?;
+    let members = g.members.read().await.clone();
     if members.len() <= 1 {
         return Some(rt.clone());
     }
-    // 轮询健康且在线的成员
+    let start = g.rr.fetch_add(1, Ordering::Relaxed) as usize;
+    pick_healthy(state, &members, start)
+}
+
+/// 组内健康成员选取,**按 `affinity` 哈希**,同一 affinity 恒定落到同一成员。
+///
+/// # 为什么需要它(vhost 缓存的粘性)
+///
+/// 缓存挂在**成员各自**的 `rt.http_cache` 上(proxy 级)。轮询选路下,
+/// 同一个 `cache_key` 的第 1 个请求落成员 A(写入 A 的缓存)、第 2 个落
+/// 成员 B(查 B 的缓存,必然 MISS)→ 稳态命中率约 `1/N`。
+///
+/// 「读写用同一个 rt」只保证**单请求内**一致(修 B2 时解决的跨域串号),
+/// 不保证**跨请求**一致。按 `cache_key` 哈希选成员后,同一资源的读写恒定
+/// 落同一成员,命中率回到单成员水平;不同资源仍按哈希分散到各成员,
+/// 负载仍然均摊。
+///
+/// 只用于**有缓存配置**的 vhost HTTP 路径;TCP 数据面继续用轮询(那里没有
+/// 需要粘性的状态,轮询的均摊更均匀)。
+async fn group_pick_sticky(
+    state: &Arc<AppState>,
+    rt: &Arc<ProxyRuntime>,
+    affinity: &str,
+) -> Option<Arc<ProxyRuntime>> {
+    let key = {
+        let spec = rt.spec.read().await;
+        crate::state::ProxyManager::group_key(&spec)?
+    };
+    let g = state.proxies.groups.get(&key)?;
+    let members = g.members.read().await.clone();
+    if members.len() <= 1 {
+        return Some(rt.clone());
+    }
+    // FNV-1a:与 std 的 DefaultHasher 不同,它的输出跨进程/跨版本稳定。
+    // 这里不需要密码学强度,只需要「同一串恒定得到同一个数」。
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in affinity.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    pick_healthy(state, &members, (h as usize) % members.len())
+}
+
+/// 从 `start` 起环形找一个健康且在线的成员。
+fn pick_healthy(
+    state: &Arc<AppState>,
+    members: &[u64],
+    start: usize,
+) -> Option<Arc<ProxyRuntime>> {
     for idx in (start..).take(members.len()) {
         let id = members[idx % members.len()];
         if let Some(m) = state.proxies.get(id) {
@@ -2655,6 +2714,84 @@ mod udp_pump_survives_reconnect_tests {
 
     fn make_rt() -> Arc<ProxyRuntime> {
         Arc::new(ProxyRuntime::new(1001, "cid".to_string(), udp_spec()))
+    }
+
+    /// 粘性选路:同一 `cache_key` 恒定落到同一成员,不同键分散到各成员。
+    ///
+    /// 这是 B3「分组缓存命中率只到 1/N」的回归锁。轮询选路下,同一资源的
+    /// 第 1 个请求写成员 A、第 2 个查成员 B —— 跨请求必然 MISS。这里直接
+    /// 断言选路结果对同一 affinity 稳定、对不同 affinity 覆盖到多个成员。
+    #[tokio::test]
+    async fn sticky_pick_is_stable_per_affinity_and_spreads_keys() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(ServerConfig::default(), db));
+        // 三个同组、同 kind/bind 的成员(vhost http 也走这条组键)
+        let mut rts = Vec::new();
+        for id in 1..=3u64 {
+            let mut spec = udp_spec();
+            spec.id = id;
+            spec.kind = rh_protocol::ProxyKind::Http;
+            spec.bind_port = 9000;
+            spec.group = Some("g1".into());
+            let rt = Arc::new(ProxyRuntime::new(id, format!("cid{id}"), spec));
+            state.proxies.runtimes.insert(id, rt.clone());
+            rts.push(rt);
+        }
+        let spec0 = rts[0].spec.read().await.clone();
+        let key = crate::state::ProxyManager::group_key(&spec0).unwrap();
+        let g = state.proxies.group_entry(&key);
+        {
+            let mut m = g.members.write().await;
+            m.extend(1..=3u64);
+        }
+        // 会话在线(选路要求 session 存在)
+        for id in 1..=3u64 {
+            let (tx, _rx) = tokio::sync::mpsc::channel(4);
+            state.sessions.register(crate::session::Session::new(
+                format!("cid{id}"),
+                format!("sid-{id}"),
+                id,
+                tokio_util::sync::CancellationToken::new(),
+                tx,
+            ));
+        }
+
+        // 同一 affinity 重复取,必须恒为同一个成员
+        let a1 = group_pick_sticky(&state, &rts[0], "a.com\0/index.html")
+            .await
+            .expect("组内应能选出成员");
+        for _ in 0..20 {
+            let a = group_pick_sticky(&state, &rts[0], "a.com\0/index.html")
+                .await
+                .unwrap();
+            assert_eq!(
+                a.id, a1.id,
+                "同一 cache_key 必须恒定落同一成员,否则缓存跨请求必 MISS"
+            );
+        }
+
+        // 不同 affinity 应覆盖到多个成员(否则粘性退化成单点)
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..60 {
+            let k = format!("a.com\0/asset{i}.js");
+            let m = group_pick_sticky(&state, &rts[0], &k).await.unwrap();
+            seen.insert(m.id);
+        }
+        assert!(
+            seen.len() > 1,
+            "不同 cache_key 必须分散到多个成员(实际只有 {seen:?}),否则负载不均"
+        );
+
+        // 轮询选路仍然存在且不粘性(TCP 数据面继续用它)
+        let mut rr_seen = std::collections::HashSet::new();
+        for _ in 0..6 {
+            let m = group_pick(&state, &rts[0]).await.unwrap();
+            rr_seen.insert(m.id);
+        }
+        assert!(
+            rr_seen.len() > 1,
+            "轮询选路必须继续把连接均摊到多个成员(实际 {rr_seen:?})"
+        );
     }
 
     /// 契约 1:close 之后 sender 仍在(旧实现会变成 None)。

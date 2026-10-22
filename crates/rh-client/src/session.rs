@@ -16,6 +16,96 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+/// 会话级致命错误:重连再多次也不会有不同结果的失败。
+///
+/// # 为什么必须是类型而不是字符串
+///
+/// 修前 `main.rs` 用 `msg.contains("session rejected")` 判断要不要顶到最大
+/// 退避,而那个串**只在 `dispatch_frame` 里产生**,并且:
+///
+/// * 握手阶段的真实措辞是 `server rejected: <code>: <msg>`
+///   (`connect_and_run`)与 `hello rejected:` —— 都不含该串;
+/// * `dispatch_frame` 产生的那个又被 `run_loop` 吞掉(`run_loop` 返回 `()`,
+///   `connect_and_run` 恒 `Ok(())`),外层根本收不到。
+///
+/// 于是凭据错误仍按 1,2,4,...,60s 无限重试,「需人工修正凭据」的提示永不
+/// 打印。字符串匹配本来就脆弱:改一句文案就静默失效,且没有任何编译期
+/// 约束。这里改成**带 code 的错误类型**,由产生方直接标注,消费方只认
+/// 变体 —— 文案怎么改都不会再影响判定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FatalKind {
+    /// 服务端明确拒绝本次认证/报到(凭据错误、客户端被禁用等)。
+    /// 携带服务端下发的错误码(`AUTH_FAILED` / `CLIENT_DISABLED` / …)。
+    Rejected(String),
+    /// 协议版本不兼容:重连也是同一个结果,必须升级其中一端。
+    VersionMismatch,
+}
+
+impl FatalKind {
+    /// 给运维看的处置建议(与错误码一一对应,不含任何猜测)。
+    pub fn advice(&self) -> &'static str {
+        match self {
+            FatalKind::Rejected(code) if code == "CLIENT_DISABLED" => {
+                "客户端已被控制台禁用:请启用该客户端,或换用其他 client_id"
+            }
+            FatalKind::Rejected(code) if code == "AUTH_FAILED" => {
+                "认证被拒绝:请检查 client_id / secret 是否与服务端一致"
+            }
+            FatalKind::Rejected(_) => "服务端拒绝了本次会话:请检查客户端凭据与控制台状态",
+            FatalKind::VersionMismatch => "协议版本不兼容:请升级客户端或服务端到同一版本",
+        }
+    }
+}
+
+impl std::fmt::Display for FatalKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FatalKind::Rejected(code) => write!(f, "rejected({code})"),
+            FatalKind::VersionMismatch => f.write_str("version mismatch"),
+        }
+    }
+}
+
+/// 会话错误:要么致命(重连无用),要么是普通断线(重连有意义)。
+#[derive(Debug)]
+pub enum SessionError {
+    /// 致命:调用方应顶到最大退避并给出醒目提示,而不是当作网络抖动。
+    Fatal(FatalKind),
+    /// 普通错误(网络、超时、IO):按退避重连即可。
+    Transient(anyhow::Error),
+}
+
+impl SessionError {
+    pub fn fatal_kind(&self) -> Option<&FatalKind> {
+        match self {
+            SessionError::Fatal(k) => Some(k),
+            SessionError::Transient(_) => None,
+        }
+    }
+
+    /// 构造致命错误(服务端拒绝)。
+    fn rejected(code: impl Into<String>) -> Self {
+        SessionError::Fatal(FatalKind::Rejected(code.into()))
+    }
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionError::Fatal(k) => write!(f, "{k}"),
+            SessionError::Transient(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+impl From<anyhow::Error> for SessionError {
+    fn from(e: anyhow::Error) -> Self {
+        SessionError::Transient(e)
+    }
+}
+
 /// 一次已建立会话的全部运行态。
 pub struct ClientSession {
     pub cfg: Arc<ClientConfig>,
@@ -542,6 +632,50 @@ fn verify_all_carrier_certs(expected: &[u8], seen_all: &[Vec<u8>]) -> anyhow::Re
 pub async fn connect_and_run(
     cfg: Arc<ClientConfig>,
     shutdown: CancellationToken,
+) -> Result<(), SessionError> {
+    // 内层保持 `anyhow::Result`:函数体里有几十处 `?`(IO / serde / 传输),
+    // 逐处换成 SessionError 只会把 `From` 实现写成一大片样板,而真正的
+    // 语义差别只有一条 —— **是不是服务端明确拒绝**。所以这里只做一次
+    // 分类:内层遇到拒绝时用 [`reject`] 打上类型标记,外层 `downcast` 回来。
+    match connect_and_run_inner(cfg, shutdown).await {
+        Ok(()) => Ok(()),
+        Err(e) => match e.downcast::<SessionError>() {
+            Ok(sess_err) => Err(sess_err),
+            Err(other) => Err(SessionError::Transient(other)),
+        },
+    }
+}
+
+/// 把「服务端拒绝」包成带类型的错误(内层用它 bail,外层 downcast 还原)。
+fn reject(code: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(SessionError::rejected(code))
+}
+
+/// 从 ERROR 帧载荷里取错误码。
+///
+/// 服务端统一用 `ServerMessage::Error` 信封(`send_error` 写的是
+/// `serde_json::to_vec(&ServerMessage::Error(..))`),所以先按信封解;
+/// 解不出再退一步按裸 `ErrorMessage` 解(兼容只写裸结构的老服务端),
+/// 都失败才落到 `UNKNOWN`。**绝不因为解析失败就丢掉错误码** —— 上层靠它
+/// 区分「凭据错」与「客户端被禁用」。
+fn parse_error_code(payload: &[u8]) -> String {
+    if let Ok(ServerMessage::Error(e)) = serde_json::from_slice::<ServerMessage>(payload) {
+        return e.code;
+    }
+    if let Ok(e) = serde_json::from_slice::<rh_protocol::message::ErrorMessage>(payload) {
+        return e.code;
+    }
+    "UNKNOWN".to_string()
+}
+
+/// 把「版本不兼容」包成带类型的错误。
+fn reject_version() -> anyhow::Error {
+    anyhow::Error::new(SessionError::Fatal(FatalKind::VersionMismatch))
+}
+
+async fn connect_and_run_inner(
+    cfg: Arc<ClientConfig>,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut tcfg = cfg.transport_cfg()?;
     // 证书比对用:记录本次连接实际看到的对端证书(仅加密协议有意义)。
@@ -608,17 +742,7 @@ pub async fn connect_and_run(
     .map_err(|_| anyhow::anyhow!("hello timeout"))??;
     match ty {
         FrameType::ERROR => {
-            let e: ServerMessage = serde_json::from_slice(&payload).unwrap_or(
-                ServerMessage::Error(rh_protocol::message::ErrorMessage {
-                    code: "UNKNOWN".into(),
-                    message: String::from_utf8_lossy(&payload).into_owned(),
-                }),
-            );
-            let (code, msg) = match e {
-                ServerMessage::Error(e) => (e.code, e.message),
-                _ => ("UNKNOWN".to_string(), "unexpected".to_string()),
-            };
-            anyhow::bail!("server rejected: {code}: {msg}");
+            return Err(reject(parse_error_code(&payload)));
         }
         FrameType::AUTH_CHALLENGE => {
             let ch: rh_protocol::message::AuthChallenge = serde_json::from_slice(&payload)?;
@@ -648,16 +772,27 @@ pub async fn connect_and_run(
     .await
     .map_err(|_| anyhow::anyhow!("ack timeout"))??;
     if ty == FrameType::ERROR {
-        let e: rh_protocol::message::ErrorMessage = serde_json::from_slice(&payload)
-            .map_err(|_| anyhow::anyhow!("server error (unparsable)"))?;
-        anyhow::bail!("server rejected: {}: {}", e.code, e.message);
+        // ★服务端发的是 **`ServerMessage::Error` 信封**(`{"Error":{...}}`),
+        // 不是裸 `ErrorMessage`。修前这里按裸结构反序列化,必然失败,于是
+        // 每一例拒绝都退化成 `server error (unparsable)` —— 错误码丢失,
+        // 上层也就无法区分「凭据错」和「客户端被禁用」。
+        //
+        // 与上面 HELLO 首帧的错误分支保持同一解析方式(先信封、再兜底)。
+        let code = parse_error_code(&payload);
+        return Err(reject(code));
     }
     if ty != FrameType::HELLO_ACK {
         anyhow::bail!("expected HELLO_ACK, got {ty:?}");
     }
     let ack: rh_protocol::message::HelloAck = serde_json::from_slice(&payload)?;
     if !ack.ok {
-        anyhow::bail!("hello rejected: {:?}", ack.error_code);
+        // 报到被拒:error_code 与 ERROR 帧同源,按致命处理
+        let code = ack
+            .error_code
+            .clone()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        return Err(reject(code));
     }
     let session_id = ack.session_id.clone().unwrap_or_default();
     // 证书下发校验:服务端用 secret 派生的密钥把它的 TLS 证书加密发来,
@@ -870,10 +1005,10 @@ pub async fn connect_and_run(
     });
     let _ = shutdown.clone();
     let sweeper = sess.spawn_waiting_sweeper();
-    run_loop(sess.clone(), control, send_rx, shutdown, buf).await;
+    let outcome = run_loop(sess.clone(), control, send_rx, shutdown, buf).await;
     sess.cancel.cancel();
     sweeper.abort();
-    Ok(())
+    outcome.map_err(anyhow::Error::new)
 }
 
 fn hostname_or_unknown() -> String {
@@ -915,7 +1050,11 @@ async fn run_loop(
     // 合并到同一批)恰恰是最容易触发的场景。数据通道侧早已用 PrependedIo
     // 处理同款问题,控制面这里是唯一漏点。
     mut buf: bytes::BytesMut,
-) {
+) -> Result<(), SessionError> {
+    // 致命错误(服务端拒绝)必须一路传到 `main` 的重连循环:那里才知道
+    // 该不该顶到最大退避并打印「需人工修正凭据」。修前这里返回 `()`,
+    // 调用处直接丢弃,致命信号就此消失。
+    let mut fatal: Option<SessionError> = None;
     let mut hb = tokio::time::interval(Duration::from_secs(sess.heartbeat_s as u64));
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let _ = hb.tick().await;
@@ -930,10 +1069,16 @@ async fn run_loop(
                     Ok((ty, payload)) => {
                         last_rx = std::time::Instant::now();
                         if let Err(e) = dispatch_frame(&sess, &mut control, &mut buf, ty, &payload, &shutdown).await {
-                            if e.to_string().starts_with("session rejected") {
-                                sess.cancel.cancel();
-                            }
                             warn!(error = %e, "control dispatch error");
+                            // 致命错误(如服务端在会话中途下发 AUTH_FAILED /
+                            // CLIENT_DISABLED)必须带出去;其它错误只是断线,
+                            // 由外层按普通退避重连。
+                            if let Some(f) = e.downcast_ref::<SessionError>() {
+                                if let Some(k) = f.fatal_kind() {
+                                    fatal = Some(SessionError::Fatal(k.clone()));
+                                    sess.cancel.cancel();
+                                }
+                            }
                             break;
                         }
                     }
@@ -1013,6 +1158,10 @@ async fn run_loop(
     for id in ids {
         stop_proxy(&sess, id).await;
     }
+    match fatal {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// 供 main 循环调用的读分发(见 run_session)。
@@ -1072,7 +1221,10 @@ pub async fn dispatch_frame(
             ServerMessage::Error(e) => {
                 warn!(code = %e.code, msg = %e.message, "server error frame");
                 if e.code == "AUTH_FAILED" || e.code == "CLIENT_DISABLED" {
-                    return Err(anyhow::anyhow!("session rejected: {}", e.code));
+                    return Err(reject(e.code));
+                }
+                if e.code == "VERSION_MISMATCH" {
+                    return Err(reject_version());
                 }
             }
             _ => warn!("unexpected envelope frame {ty:?}"),
@@ -1982,6 +2134,118 @@ mod multi_carrier_cert_tests {
     fn single_carrier_ok() {
         let cert = vec![9u8; 16];
         assert!(verify_all_carrier_certs(&cert, std::slice::from_ref(&cert)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod fatal_error_tests {
+    //! 回归:`main` 的重连退避必须能**认出**服务端拒绝。
+    //!
+    //! 修前这条判定是 `msg.contains("session rejected")`,而那个串只在
+    //! `dispatch_frame` 里产生、又被 `run_loop` 的 `()` 吞掉;握手阶段的
+    //! 措辞是 `server rejected:` / `hello rejected:`。于是「凭据错误 → 顶到
+    //! 最大退避 + 醒目 error」整段是死代码,凭据错误照旧无限重试。
+    //!
+    //! 这里的断言全部落在**类型**上:文案随便改,这些用例都不该动。
+
+    use super::*;
+
+    #[test]
+    fn handshake_rejection_is_fatal_and_carries_code() {
+        // 握手阶段三处拒绝点都经 `reject(code)`,必须能还原成 Fatal
+        for code in ["AUTH_FAILED", "CLIENT_DISABLED", "UNKNOWN"] {
+            let err = reject(code);
+            let sess = err
+                .downcast::<SessionError>()
+                .expect("reject() 必须产出可 downcast 的 SessionError");
+            assert_eq!(
+                sess.fatal_kind(),
+                Some(&FatalKind::Rejected(code.to_string())),
+                "code={code} 必须被判为致命并原样保留"
+            );
+        }
+    }
+
+    /// ERROR 帧的载荷是 `ServerMessage::Error` **信封**,不是裸结构。
+    ///
+    /// 修前按裸 `ErrorMessage` 反序列化,必然失败 → 每例拒绝都变成
+    /// `server error (unparsable)`,错误码丢失。这里直接锁住三种形态。
+    #[test]
+    fn error_code_parsed_from_envelope_not_only_bare_struct() {
+        // 服务端真实形态(信封)
+        let envelope = serde_json::to_vec(&ServerMessage::Error(
+            rh_protocol::message::ErrorMessage {
+                code: "CLIENT_DISABLED".into(),
+                message: "client disabled".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(parse_error_code(&envelope), "CLIENT_DISABLED");
+
+        // 兼容老服务端的裸结构
+        let bare = br#"{"code":"AUTH_FAILED","message":"bad credentials"}"#;
+        assert_eq!(parse_error_code(bare), "AUTH_FAILED");
+
+        // 完全解析不出:落 UNKNOWN,但不得 panic
+        assert_eq!(parse_error_code(b"not json"), "UNKNOWN");
+    }
+
+    #[test]
+    fn version_mismatch_is_fatal() {
+        let err = reject_version();
+        let sess = err.downcast::<SessionError>().unwrap();
+        assert_eq!(sess.fatal_kind(), Some(&FatalKind::VersionMismatch));
+    }
+
+    /// 普通错误不得被判为致命 —— 否则一次网络抖动就会把客户端钉在 60s 退避。
+    #[test]
+    fn transient_errors_are_not_fatal() {
+        for msg in [
+            "connection reset by peer",
+            "hello timeout",
+            "control link watchdog: no server frames",
+            // 修前的判定串:现在**故意**不再有任何特殊含义
+            "session rejected: AUTH_FAILED",
+        ] {
+            let e = SessionError::Transient(anyhow::anyhow!(msg));
+            assert!(
+                e.fatal_kind().is_none(),
+                "普通断线 {msg:?} 不得被判为致命"
+            );
+        }
+    }
+
+    /// 运维提示必须与错误码对应,不能给「检查 secret」这类误导性建议。
+    #[test]
+    fn advice_matches_error_code() {
+        assert!(FatalKind::Rejected("AUTH_FAILED".into())
+            .advice()
+            .contains("secret"));
+        assert!(FatalKind::Rejected("CLIENT_DISABLED".into())
+            .advice()
+            .contains("禁用"));
+        assert!(FatalKind::VersionMismatch.advice().contains("升级"));
+    }
+
+    /// `connect_and_run` 的公开签名必须保留致命信息:用一个必然失败的
+    /// 握手路径(连不上的地址)验证「普通错误仍归为 Transient」。
+    #[tokio::test]
+    async fn unreachable_server_is_transient() {
+        let cfg = Arc::new(crate::config::ClientConfig {
+            server_addr: "127.0.0.1:1".into(),
+            protocol: "tcp".into(),
+            client_id: "c".into(),
+            secret: "s".repeat(32),
+            ..Default::default()
+        });
+        let r = connect_and_run(cfg, CancellationToken::new()).await;
+        match r {
+            Err(e) => assert!(
+                e.fatal_kind().is_none(),
+                "连不上服务端是普通错误,不得判为致命:{e}"
+            ),
+            Ok(()) => panic!("127.0.0.1:1 不该连上"),
+        }
     }
 }
 

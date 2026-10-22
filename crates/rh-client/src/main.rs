@@ -161,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
                 info!("session ended");
             }
             Err(e) => {
-                // ★凭据类错误(密钥错、客户端被禁用)重连再多次也没用。
+                // ★致命错误(服务端拒绝 / 版本不兼容)重连再多次也没用。
                 //
                 // 修前一律按"网络抖动"处理:1,2,4,...,60s 无限重试,永久
                 // 冲击服务端(每次都走完整 TLS + 挑战应答,而服务端还要为
@@ -169,17 +169,27 @@ async fn main() -> anyhow::Result<()> {
                 //
                 // 这里**不退出进程**:容器里退出会触发 restart 风暴,
                 // 运维反而更难看清原因。改为退避到上限 + 每个周期一条
-                // 醒目 error,提示"需人工修正凭据"。
-                let msg = e.to_string();
-                if msg.contains("session rejected") {
-                    fatal = true;
-                    error!(
-                        error = %msg,
-                        "凭据被服务端拒绝(密钥错误或客户端被禁用):客户端不会自行恢复,\
-                         请检查 client_id / secret 或控制台中的启用状态"
-                    );
-                } else {
-                    warn!(error = %e, "session error");
+                // 醒目 error,提示"需人工修正"。
+                //
+                // ★判定必须走**类型**,不能匹配文案。
+                //
+                // 修前这里是 `msg.contains("session rejected")`,而那个串
+                // 只在 `dispatch_frame` 里产生、且被 `run_loop` 的 `()` 吞掉;
+                // 握手阶段的真实措辞是 `server rejected:` / `hello rejected:`,
+                // 都不含它。于是凭据错误照旧无限重试,提示永不打印 ——
+                // 一段从未生效的死代码。
+                match e.fatal_kind() {
+                    Some(kind) => {
+                        fatal = true;
+                        error!(
+                            error = %e,
+                            kind = %kind,
+                            "会话被服务端拒绝({}):客户端不会自行恢复,{}",
+                            kind,
+                            kind.advice()
+                        );
+                    }
+                    None => warn!(error = %e, "session error"),
                 }
             }
         }

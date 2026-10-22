@@ -402,11 +402,26 @@ async fn handle_http_request(
     // 修前顺序反了:HIT 查 `route.proxy_id` 那条(组内固定一条),
     // 而 MISS 把结果写进 `group_pick` 选出来的那条。组内成员不同时,
     // 缓存**永远不会命中**(写 A 读 B),而且白占内存。
+    //
+    // ★但这只解决了**单请求内**的一致;跨请求仍会漏。
+    //
+    // 缓存挂在**成员各自**的 `rt.http_cache` 上,而 `group_pick` 是轮询:
+    // 同一个 `cache_key` 的第 1 个请求落 A(写 A)、第 2 个落 B(查 B,
+    // MISS)→ 稳态命中率约 `1/N`。所以带缓存的路径改用**粘性**选路:
+    // 按 `cache_key` 哈希选成员,同一资源的读写恒定落同一成员。
+    // 没有缓存配置的请求不需要粘性,继续轮询以均摊得更均匀。
     // 无锁快路径保留:非分组规则(group 为空)不走 group_pick。
+    let sticky = cache_cfg.is_some() && cacheable;
     let rt = if rt.has_group.load(std::sync::atomic::Ordering::Relaxed) {
-        crate::data::group_pick_public(&state, &rt)
-            .await
-            .unwrap_or(rt)
+        if sticky {
+            crate::data::group_pick_sticky_public(&state, &rt, &cache_key)
+                .await
+                .unwrap_or(rt)
+        } else {
+            crate::data::group_pick_public(&state, &rt)
+                .await
+                .unwrap_or(rt)
+        }
     } else {
         rt
     };
