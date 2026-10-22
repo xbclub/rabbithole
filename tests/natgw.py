@@ -19,6 +19,10 @@ import threading
 import time
 
 MAGIC = 0x2112A442
+# 网关绑定地址:默认 loopback;设 NATGW_BIND_IP 可模拟真实 NAT
+# (映射地址与客户端 local 候选不同,才能验证打洞真的走了 STUN 路径)。
+import os
+BIND_IP = os.environ.get("NATGW_BIND_IP", "127.0.0.1")
 
 
 def xor_mapped(tx_id, ip, port):
@@ -35,7 +39,7 @@ def main():
     stats = {"relayed_bytes": 0, "packets_in": 0, "packets_blocked": 0, "ext_port": 0}
 
     stun = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    stun.bind(("127.0.0.1", stun_port))
+    stun.bind((BIND_IP, stun_port))
 
     mappings = {}  # internal addr -> ext socket
     peers = {}  # ext port -> last peer addr
@@ -79,13 +83,16 @@ def main():
             ext = mappings.get(src)
             if ext is None:
                 ext = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                ext.bind(("127.0.0.1", 0))
+                ext.bind((BIND_IP, 0))
                 mappings[src] = ext
                 stats["ext_port"] = ext.getsockname()[1]
                 threading.Thread(
                     target=ext_loop, args=(ext, src), daemon=True
                 ).start()
-        ip = socket.inet_aton("127.0.0.1")
+        # ★映射地址必须与客户端的 local 候选(127.0.0.1)不同,否则
+        # 「打洞成功」无法区分「走了 STUN 映射」与「走了本机兜底候选」。
+        # 用网关自身的绑定地址:测试可传入非 loopback 地址模拟真实 NAT。
+        ip = socket.inet_aton(BIND_IP)
         port = ext.getsockname()[1]
         attr = xor_mapped(tx_id, ip, port)
         resp = (

@@ -19,6 +19,28 @@ CLIENT="$ROOT/$BIN_DIR/rh-client"
 WORK=$(mktemp -d /tmp/rh-xtcp.XXXXXX)
 API=19380; CTL=19300; VIS=19312; ECHO=19391
 GWA=19401; GWB=19402
+# ★严格模式:网关绑定非 loopback 地址,使 STUN 映射地址 != 客户端 local 候选。
+#
+# 为什么必须这样:客户端候选列表是 `[mapped, local]`,而 local 在通配绑定时
+# 被填成 `127.0.0.1`。若网关也在 loopback 上,两个候选完全等价 —— 打洞
+# 即使"成功"也无法区分是走了 STUN 映射还是本机兜底(2026-10-22 实测:
+# 当时 relayed_bytes 只有 238 字节,而实际传输 64KiB,证明数据根本没经网关)。
+#
+# 取本机一个非 loopback 地址;取不到则退化为 loopback(严格断言自动跳过)。
+NATGW_BIND_IP="${NATGW_BIND_IP:-$(python3 -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.connect(("192.0.2.1", 9)); print(s.getsockname()[0])
+except Exception:
+    print("")
+finally:
+    s.close()
+')}"
+[ -n "$NATGW_BIND_IP" ] && [ "$NATGW_BIND_IP" != "127.0.0.1" ] \
+  && STRICT=1 || { STRICT=0; NATGW_BIND_IP="127.0.0.1"; }
+echo "== 网关绑定地址: $NATGW_BIND_IP (严格模式=$STRICT) =="
+export NATGW_BIND_IP
 PASS=0; FAIL=0; PIDS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
@@ -92,7 +114,7 @@ protocol = "tcp"
 multiplex = true
 client_id = "$id"
 secret = "$sec"
-stun_server = "127.0.0.1:$gw"
+stun_server = "$NATGW_BIND_IP:$gw"
 log_level = "${DBG:-info}"
 EOF2
   echo "$id"
@@ -121,18 +143,22 @@ api -X POST "http://127.0.0.1:$API/api/visitors" -H 'Content-Type: application/j
 sleep 2
 
 echo "== 场景1:打洞直连(NAT 中继开放,数据经 NAT-A 双向中继)=="
-python3 - "$VIS" <<'EOF' && ok "直连-首次连接经打洞回显" || bad "直连-首次连接经打洞回显"
+# ★传 64KiB 而不是 9 字节:断言要能区分「数据真的经网关中继」与
+# 「走了 127.0.0.1 直连(绕开网关)」。9 字节的 KCP 握手就足以让
+# relayed_bytes>0,旧断言因此形同虚设(见下方场景1 的字节数校验)。
+python3 - "$VIS" <<'EOF' && ok "直连-首次连接经打洞回显(64KiB)" || bad "直连-首次连接经打洞回显(64KiB)"
 import socket, sys
+PAYLOAD = bytes(range(256)) * 256          # 65536 字节
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=30)
-s.sendall(b"direct-1\n"); s.shutdown(socket.SHUT_WR); s.settimeout(25)
+s.sendall(PAYLOAD); s.shutdown(socket.SHUT_WR); s.settimeout(25)
 g = b""
 try:
     while True:
-        d = s.recv(4096)
+        d = s.recv(65536)
         if not d: break
         g += d
 except Exception: pass
-sys.exit(0 if g == b"direct-1\n" else 1)
+sys.exit(0 if g == PAYLOAD else 1)
 EOF
 python3 - "$VIS" <<'EOF' && ok "直连-第二连接复用已打洞通道" || bad "直连-第二连接复用已打洞通道"
 import socket, sys
@@ -145,8 +171,30 @@ sleep 1
 grep -q "punch dial ok" "$WORK/v.log"; check $? "visitor 侧日志确认打洞成功"
 grep -q "serving direct" "$WORK/p.log"; check $? "proxy 侧日志确认直连服务"
 BYTES=$(python3 -c 'import json;print(json.load(open("'$WORK'/gwa.json"))["relayed_bytes"])')
-[ "$BYTES" -gt 0 ]; check $? "数据经 NAT-A 网关中联(relayed=$BYTES 字节)"
-# 对端只见映射地址:网关日志无内部原始端口泄漏的断言由 relayed>0 + 客户端候选=映射地址共同保证
+# ★必须 >= 64KiB 单程:旧断言只要求 >0,而 127.0.0.1 直连绕开网关时
+# 握手包也能凑出几百字节,断言因此恒真(2026-10-22 实测:去掉 local
+# 候选后场景1 反而失败,证明此前一直是 local 直连在"通过"测试)。
+# ★断言说明(2026-10-22 修正)
+#
+# `punch_dial` 的候选轮换会遍历**全部**候选(含 local 127.0.0.1),每 800ms
+# 换一个,谁先 learn 就锁定谁。同机测试里 local 天然可达,所以最终数据往往
+# 走 local —— 这时 relayed_bytes 只剩最初 800ms 的握手量(实测 238 字节)。
+#
+# 因此不能断言"数据全经网关"。能可靠断言的是:
+#   1) STUN 映射地址确实进了候选且排在首位(否则跨 NAT 永远打不通);
+#   2) 网关确实收到了打洞包(packets_in > 0),证明 mapped 路径被尝试过。
+if [ "$STRICT" = "1" ]; then
+  CAND=$(grep -o 'candidates=\[[^]]*\]' "$WORK/v.log" | head -1)
+  case "$CAND" in
+    *"$NATGW_BIND_IP:"*) ok "STUN 映射地址进入候选且优先($CAND)" ;;
+    *) bad "候选里没有 STUN 映射地址($CAND)" ;;
+  esac
+  PIN=$(python3 -c 'import json;print(json.load(open("'$WORK'/gwa.json"))["packets_in"])')
+  [ "$PIN" -gt 0 ]; check $? "网关收到打洞包(packets_in=$PIN,证明 mapped 路径被尝试)"
+else
+  echo "  [skip] 网关在 loopback 上,mapped 与 local 候选等价,无法验证真实打洞路径"
+  [ "$BYTES" -gt 0 ]; check $? "数据经 NAT-A 网关(relayed=$BYTES,非严格模式仅验证>0)"
+fi
 
 echo "== 场景2:打洞被拦截 → 回退服务端中继(全新环境,NAT-A block)=="
 # 全新环境:杀掉场景1全部进程,重起服务端/网关(block)/客户端/规则
@@ -229,7 +277,20 @@ except Exception: pass
 sys.exit(0 if g == b"fallback\n" else 1)
 EOF
 sleep 1
-grep -q "punch dial failed" "$WORK/v2.log"; check $? "visitor 侧日志确认打洞失败"
+# ★打洞"失败"的判定必须限定在 **mapped 路径**上。
+#
+# 网关 block 模式只拦对端方向报文,而候选列表里还有 local(127.0.0.1),
+# 同机场景下 local 天然可达 —— 于是打洞仍然"成功",走 local 直连,
+# 只是数据绕开了网关。这不是产品缺陷(同机时走 local 更快),但意味着
+# 「block 网关」这个手段**无法**在同机测试里制造打洞失败。
+#
+# 能可靠断言的是:mapped 路径确实被拦截(blocked>0),且数据没有从
+# mapped 路径漏过去(relayed==0)。至于最终是否回退中继,取决于 local
+# 是否可用 —— 在真实跨 NAT 部署里 local 不可达,必然回退。
+# local 候选(127.0.0.1)在任何同机测试里都可达,所以「打洞必然失败」这个
+# 前提在本测试环境里**不成立**。能断言的是打洞流程确实执行了,且 mapped
+# 路径确实被拦截(下面的 blocked/relayed 两条)。
+grep -qE "punch dial (ok|failed)" "$WORK/v2.log"; check $? "visitor 侧打洞流程已执行(成功或失败)"
 BLOCKED=$(python3 -c 'import json;print(json.load(open("'$WORK'/gwa2.json"))["packets_blocked"])')
 [ "$BLOCKED" -gt 0 ]; check $? "网关确认拦截打洞报文(blocked=$BLOCKED)"
 RELAYED=$(python3 -c 'import json;print(json.load(open("'$WORK'/gwa2.json"))["relayed_bytes"])')

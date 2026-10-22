@@ -121,9 +121,14 @@ pub async fn on_connect(sess: Arc<ClientSession>, m: NatHoleConnect, shutdown: C
         "dial" => {
             let cands: Vec<SocketAddr> =
                 m.candidates.iter().filter_map(|c| c.parse().ok()).collect();
+            // 候选来源必须可观测:测试要能区分「真的经 STUN 映射地址打通」与
+            // 「走了本机 127.0.0.1 兜底候选(绕开 NAT)」。后者在真实部署里
+            // 无意义(对端不可达),但同机测试会让它"通过",掩盖真实路径。
+            // 排障时也需要知道实际拨了哪个地址。
+            let cands_str: Vec<String> = cands.iter().map(|c| c.to_string()).collect();
             match rh_transport::kcp::punch_dial(sock, &cands, punch_secs).await {
                 Ok(mux) => {
-                    info!(tx = %m.transaction_id, "punch dial ok");
+                    info!(tx = %m.transaction_id, candidates = ?cands_str, "punch dial ok");
                     replay_waiting(&sess, &m, mux).await;
                 }
                 Err(e) => {
