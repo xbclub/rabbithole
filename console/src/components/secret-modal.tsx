@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import {
   Select,
   SelectContent,
@@ -20,6 +21,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { focusFirstControl } from '@/lib/dialog-focus';
 import { feedbackSuccess, feedbackWarning } from '@/lib/feedback';
@@ -106,6 +108,11 @@ export function SecretModal({
   // 默认 tls:与服务端一键部署脚本/生产建议一致;纯内网 tcp 部署自行切换
   const [serverAddr, setServerAddr] = useState(() => `${window.location.hostname}:7100`);
   const [protocol, setProtocol] = useState('tls');
+  // 服务端自签证书(一键部署的默认形态)必须跳过校验才能握手成功。
+  // 默认勾选:deploy/install-server.sh 生成的 server.toml 用 `bind_protocol = "tls"`
+  // 且证书自动生成于配置目录,不自签反而连不上 —— 默认值要指向"能用"。
+  // 生产对外应换成可信证书并取消勾选(或用 trusted_ca_file / tls_pin_sha256)。
+  const [tlsInsecure, setTlsInsecure] = useState(true);
   const [tab, setTab] = useState<SnippetTab>('script');
   const [tomlOpen, setTomlOpen] = useState(false);
 
@@ -113,8 +120,8 @@ export function SecretModal({
   // 一键脚本:下载 + 校验 + systemd 服务(凭据经 /etc/rabbithole/client.env 接入)
   const scriptCmd = useMemo(
     () =>
-      `curl -fsSL ${SCRIPT_URL} | sudo bash -s -- \\\n  --server ${serverAddr} --protocol ${protocol} \\\n  --id ${id} --secret ${secret}`,
-    [serverAddr, protocol, id, secret],
+      `curl -fsSL ${SCRIPT_URL} | sudo bash -s -- \\\n  --server ${serverAddr} --protocol ${protocol} \\\n  --id ${id} --secret ${secret}${tlsInsecure ? ' \\\n  --insecure' : ''}`,
+    [serverAddr, protocol, id, secret, tlsInsecure],
   );
   // Docker:纯环境变量接入
   const dockerCmd = useMemo(
@@ -125,9 +132,10 @@ export function SecretModal({
         `  -e RH_PROTOCOL=${protocol} \\`,
         `  -e RH_CLIENT_ID=${id} \\`,
         `  -e RH_SECRET=${secret} \\`,
+        ...(tlsInsecure ? ['  -e RH_TLS_INSECURE=true \\'] : []),
         '  ghcr.io/xbclub/rabbithole-client:latest',
       ].join('\n'),
-    [serverAddr, protocol, id, secret],
+    [serverAddr, protocol, id, secret, tlsInsecure],
   );
   const toml = useMemo(
     () =>
@@ -137,10 +145,13 @@ export function SecretModal({
         'multiplex = true',
         `client_id = "${id}"`,
         `secret = "${secret}"`,
+        // 与上方开关联动:自签服务端必须为 true,否则 TLS 握手失败
+        `tls_insecure_skip_verify = ${tlsInsecure}`,
         'log_level = "info"',
-        // 高级项(可选):trusted_ca_file / tls_pin_sha256 / proxy_url / stun_server / dns_server
+        // 高级项(可选):trusted_ca_file / server_name / tls_pin_sha256 /
+        // mux_pool_size / proxy_url / stun_server / dns_server
       ].join('\n'),
-    [serverAddr, protocol, id, secret],
+    [serverAddr, protocol, id, secret, tlsInsecure],
   );
 
   return (
@@ -200,6 +211,23 @@ export function SecretModal({
             默认地址按当前访问主机 + 控制端口 7100 推测,以实际控制端口为准;协议与服务端
             bind_protocol 一致。
           </p>
+        </div>
+
+        <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
+          <div className="min-w-0 space-y-1">
+            <Label htmlFor="tls-insecure" className="text-xs font-medium">
+              跳过 TLS 证书校验(自签服务端)
+            </Label>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              服务端一键部署默认自签证书,需开启才能握手成功;改用可信证书后请关闭。
+            </p>
+          </div>
+          <Switch
+            id="tls-insecure"
+            checked={tlsInsecure}
+            onCheckedChange={setTlsInsecure}
+            aria-label="跳过 TLS 证书校验"
+          />
         </div>
 
         <Tabs value={tab} onValueChange={(value) => setTab(value as SnippetTab)} className="gap-3">
