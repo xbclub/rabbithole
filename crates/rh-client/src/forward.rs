@@ -298,11 +298,27 @@ fn mk_client_limiter(
 
 /// 拨号本地目标(插件优先)。
 ///
-/// ★拨号目标以**本地配置 `spec` 为权威**,不使用线路下发的
-/// `fwd.target_host/port`。下发值只用于插件(插件语义由服务端规则定义,
-/// 且插件本身不做任意地址拨号)。而普通中继若照下发值拨号,一个被攻破的
-/// server 就能让 client 去拨内网任意地址(SSRF)。`nathole_cli` 的直连
-/// 路径早已这么做(用 spec 覆盖 fwd),这里补齐,两条路径口径一致。
+/// # 为什么用 `spec` 而不是 `fwd`(一致性,不是安全修复)
+///
+/// 常规中继的目标取自**本地 `spec`**(与 `health.rs` 的探活目标同源),
+/// 而非线路下发的 `fwd.target_host/port`。两点必须分清:
+///
+/// **这不是 SSRF 修复。** `ProxySpec` 完全由服务端 `ServiceSync` 下发
+/// (`session.rs` 的 `apply_sync` 构建;客户端 `ClientConfig` 里**没有**
+/// 本地规则字段)。也就是说 `spec.target_host` 与 `fwd.target_host`
+/// **同为服务端可控** —— 在"服务端被攻破"这一威胁模型下,改与不改都拦不住
+/// 它让客户端去拨内网地址。真正的信任边界是**服务端本身可信**(客户端用
+/// secret / TLS pin / CA 认证服务端身份),本函数不做、也做不了任何加固。
+///
+/// **它的价值是单一事实源与一致性。** `health.rs` 的探活早已用 `spec`,
+/// 而拨号此前用 `fwd`,同一份规则在同一进程里有两个取值来源。两者一旦漂移
+/// (服务端下发与本地下发不同步、或将来引入本地覆盖),就会出现"探活打到 A、
+/// 转发打到 B"这类极难归因的故障。`nathole_cli` 的直连路径早已用 `spec`
+/// 覆盖 `fwd`,这里补齐后两条路径口径一致。
+///
+/// 插件分支仍传 `fwd`:代理/改写类插件的地址语义由服务端规则定义
+/// (`http_proxy`/`socks5` 用 `fwd.target_host` 表达**本地代理地址**,
+/// 改写类插件用服务端下发的 `local_addr`),与常规中继的 `spec` 无关。
 pub async fn dial_target(
     _sess: &Arc<ClientSession>,
     spec: &ProxySpec,
