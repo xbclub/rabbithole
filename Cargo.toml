@@ -80,3 +80,38 @@ mimalloc = { version = "0.1", default-features = false }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# 诊断档位:`cargo build --profile diag`。
+#
+# 与 `release` **完全同速**(继承全部优化选项),仅额外打开 `debug_assertions`,
+# 让 `#[cfg(debug_assertions)]` 门控的断言/诊断参与编译。用于需要"真实吞吐 +
+# 开发期检查"同时在场的场景(性能体检、复现只在优化构建下出现的时序问题)。
+# `dev` 档位不能用:它不优化,测出来的数字与发版产物无可比性。
+#
+# 产物实测:比 release 大 2.3KB(14,969,984 -> 14,972,336),`debug_assert!`
+# 文案进入二进制,而 release 中不存在。
+#
+# 注意:`debug-assertions = true` 也会激活 `debug_assert!` 宏
+# (mux.rs / compress.rs 各一处)。那是预期行为,不是副作用。
+# 若只想要诊断、不要溢出检查,可显式关掉:`CARGO_PROFILE_DIAG_OVERFLOW_CHECKS=false`
+# (两者在 Cargo 中相互独立,已实测可解耦)。
+#
+# --- 为什么**不**把现有诊断改成 `#[cfg]` 门控(实测结论,勿重复尝试)---
+#
+# 曾评估"把 RH_PUMP_STATS / RH_SPLICE_STATS 等诊断从运行时 env 开关改为
+# 编译期 cfg,使发版产物物理不含诊断"。结论是**不做**,三条实测依据:
+#
+#   1) 没有性能可省。这些诊断本就写成 `if diag { ...累加/计时... }`,
+#      `diag` 默认 false => release 下分支体根本不执行。实测强制全开
+#      (`RH_PUMP_STATS=1`)与关闭的吞吐差 **-0.01%**,是噪声。
+#   2) 收益极小。全量 cfg 化后二进制只小 **176 字节**。
+#   3) 会破坏 CI。cfg 化会让 release 下 `read_ns`/`write_ns` 等变成未使用
+#      变量(`-D warnings` 直接失败);若改用自定义 cfg(如 `--cfg rh_diag`),
+#      还要给**每个** crate 建 build.rs 声明 `rustc-check-cfg`,否则
+#      `unexpected_cfgs` 同样在 `-D warnings` 下编译失败。
+#
+# 更重要的是**能力倒退**:env 开关允许线上出问题时临时开诊断、无需重编;
+# cfg 掉了就必须重新出包。保留运行时开关是对的。
+[profile.diag]
+inherits = "release"
+debug-assertions = true
