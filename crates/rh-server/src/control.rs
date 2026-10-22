@@ -372,16 +372,12 @@ async fn auth_and_run(
     // 停读控制流即可触发,之后心跳超时与 cancel 全部失联,任务与 fd 永久泄漏。
     // 队列满说明客户端已经不读了,SYNC 晚一点到没有意义,丢弃即可(客户端
     // 重连或下次配置变更会重新下发)。
-    if sess
-        .queue_tx
-        .try_send(ServerMessage::ServiceSync(
-            rh_protocol::message::ServiceSync {
-                revision: rev,
-                entities,
-            },
-        ))
-        .is_err()
-    {
+    if !sess.try_send_msg(ServerMessage::ServiceSync(
+        rh_protocol::message::ServiceSync {
+            revision: rev,
+            entities,
+        },
+    )) {
         debug!(
             client_id = %sess.client_id,
             "service sync dropped: control queue full (client not reading)"

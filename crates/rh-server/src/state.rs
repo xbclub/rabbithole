@@ -11,6 +11,12 @@ use rh_protocol::{
     ProxySpec,
 };
 use rh_transport::BoxedIo;
+
+/// 控制面内联路径的发送上限。
+///
+/// 与 control.rs 的 `CONTROL_REPLY_TIMEOUT` 同量级:正常下发是微秒级,
+/// 卡满 2s 说明对端已不读控制流,继续等只会拖死控制读循环(自锁)。
+const CONTROL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
@@ -445,8 +451,13 @@ impl AppState {
     }
 
     /// Prometheus 独立监听是否在运行。
+    ///
+    /// ★除了"持有任务句柄"还要判 `is_finished()`:修前只看 `is_some()`,
+    /// 任务异常退出(panic / socket 错误)后句柄仍在,状态会**永远报 true**
+    /// —— 控制台显示 metrics 在跑,实际端点已死。
     pub async fn metrics_listening(&self) -> bool {
-        self.metrics_task.lock().await.is_some()
+        let g = self.metrics_task.lock().await;
+        g.as_ref().is_some_and(|h| !h.is_finished())
     }
 
     /// 2007/3005 端口占用归属分类:按协议族(tcp/udp)+端口+IP 重叠
@@ -1431,9 +1442,11 @@ impl AppState {
         if ok {
             Some(rid)
         } else {
-            // 签发失败:摘掉条目但**不要**触发 on_expire 钩子 ——
-            // 调用方(tcp_refill)在拿到 None 后会自行归还 inflight。
-            // 两边都减会双减,把计数打到 0 以下。
+            // 签发失败:摘掉条目但**不触发** on_expire 钩子。
+            //
+            // 原因:调用方(tcp_refill)在拿到 None 后**会自己归还** inflight
+            // (见 data.rs 的 None 分支)。这里再调钩子就是双减,会把计数打到
+            // 0 以下。两处注释必须成对维护 —— 改一边就要改另一边。
             sess.take_pending_request_quiet(rid).await;
             None
         }
@@ -1487,17 +1500,32 @@ impl AppState {
                 },
             )
             .await;
+        // ★有界发送,不能用 `send().await`。
+        //
+        // 本函数经 `handle_client_message` → `on_user_connect` → `relay_tcp`
+        // 在**控制读循环里内联**执行(control.rs),而那个循环同时是
+        // `queue_tx` 的唯一消费者。队列(256)满时 `send().await` 会 park 在
+        // "等自己消费"上 —— 与 A1 注释描述的自锁完全同形,心跳与 cancel
+        // 全部失联,任务与 fd 永久泄漏。
+        // 触发条件很现实:持凭据的 visitor 客户端本地建 256+ 用户连接、
+        // 同时停读控制流,再发一条 UserConnect 即可。
         let ok_v = visitor_sess
-            .send(ServerMessage::CreateDataChannel(CreateDataChannel {
-                request_id: v_rid,
-                entity: visitor_entity,
-            }))
+            .send_bounded(
+                ServerMessage::CreateDataChannel(CreateDataChannel {
+                    request_id: v_rid,
+                    entity: visitor_entity,
+                }),
+                CONTROL_SEND_TIMEOUT,
+            )
             .await;
         let ok_p = proxy_sess
-            .send(ServerMessage::CreateDataChannel(CreateDataChannel {
-                request_id: p_rid,
-                entity: proxy_entity,
-            }))
+            .send_bounded(
+                ServerMessage::CreateDataChannel(CreateDataChannel {
+                    request_id: p_rid,
+                    entity: proxy_entity,
+                }),
+                CONTROL_SEND_TIMEOUT,
+            )
             .await;
         if ok_v && ok_p {
             return Some((v_rid, p_rid, vr, pr));
@@ -1648,5 +1676,41 @@ mod quota_tests {
 
         u.set_quota(ClientQuota::default()); // flow_limit = 0
         assert!(!u.flow_cut.load(std::sync::atomic::Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod metrics_listening_tests {
+    use super::*;
+
+    /// 任务已结束但句柄仍在时,`metrics_listening()` 必须报 false。
+    ///
+    /// 修前只看 `is_some()`:任务异常退出(panic / socket 错误)后句柄仍在,
+    /// 状态永远报 true —— 控制台显示 metrics 在跑,实际端点已死。
+    #[tokio::test]
+    async fn reports_false_after_task_finished() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        *state.metrics_task.lock().await = Some(tokio::spawn(async {}));
+        // 让任务跑完
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !state.metrics_listening().await,
+            "任务已结束,不得再报 listening"
+        );
+    }
+
+    /// 任务仍在运行时必须报 true(不能因加了 is_finished 就误判)。
+    #[tokio::test]
+    async fn reports_true_while_task_running() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        *state.metrics_task.lock().await = Some(tokio::spawn(async move {
+            let _ = rx.await;
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(state.metrics_listening().await, "运行中应报 true");
+        let _ = tx.send(());
     }
 }

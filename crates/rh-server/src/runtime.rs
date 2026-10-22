@@ -12,6 +12,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+/// 控制面发送上限(与 state.rs 同名常量同义):超时按"对端不读"处理。
+const CONTROL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// 会话建立:重置确认、状态推进、预热。
 pub async fn on_session_up(state: &Arc<AppState>, sess: &Arc<Session>) {
     let proxies = match state.db.list_proxies(Some(&sess.client_id)).await {
@@ -108,14 +111,10 @@ pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &App
         let client = state.db.get_client(&sess.client_id).await.ok().flatten();
         let rev = client.map(|c| c.config_revision.max(0) as u64).unwrap_or(0);
         sess.mark_unconfirmed(rev).await;
-        if sess
-            .queue_tx
-            .try_send(ServerMessage::ServiceSync(ServiceSync {
-                revision: rev,
-                entities,
-            }))
-            .is_err()
-        {
+        if !sess.try_send_msg(ServerMessage::ServiceSync(ServiceSync {
+            revision: rev,
+            entities,
+        })) {
             debug!(
                 client_id = %sess.client_id,
                 "service sync (full resend) dropped: control queue full"
@@ -339,11 +338,16 @@ pub async fn spawn_runtime(
     if let Some(sess) = session {
         rt.latest_revision.store(revision, Ordering::Relaxed);
         sess.mark_unconfirmed(revision).await;
+        // 有界发送:客户端零窗口黑洞时,`send().await` 会把 admin API 请求
+        // 挂到 TCP 超时(15~20 分钟)。统一用 2s 上限,超时按"对方不读"处理。
         let _ = sess
-            .send(ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
-                revision,
-                entity: SyncEntity::Proxy(Box::new(spec.clone())),
-            })))
+            .send_bounded(
+                ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
+                    revision,
+                    entity: SyncEntity::Proxy(Box::new(spec.clone())),
+                })),
+                CONTROL_SEND_TIMEOUT,
+            )
             .await;
     }
     rt
@@ -451,10 +455,13 @@ async fn bind_error_retry(state: Arc<AppState>, rt: Arc<ProxyRuntime>) {
                 let rev = latest.max(1);
                 sess.mark_unconfirmed(rev).await;
                 let _ = sess
-                    .send(ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
-                        revision: rev,
-                        entity: SyncEntity::Proxy(Box::new(spec.clone())),
-                    })))
+                    .send_bounded(
+                        ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
+                            revision: rev,
+                            entity: SyncEntity::Proxy(Box::new(spec.clone())),
+                        })),
+                        CONTROL_SEND_TIMEOUT,
+                    )
                     .await;
             }
         } else {
@@ -529,10 +536,13 @@ pub async fn notify_client_recovery(state: &Arc<AppState>, client_id: &str) {
         let entities = state.build_sync_entities(client_id).await;
         sess.mark_unconfirmed(revision).await;
         let _ = sess
-            .send(ServerMessage::ServiceSync(ServiceSync {
-                revision,
-                entities,
-            }))
+            .send_bounded(
+                ServerMessage::ServiceSync(ServiceSync {
+                    revision,
+                    entities,
+                }),
+                CONTROL_SEND_TIMEOUT,
+            )
             .await;
     }
 }
@@ -563,11 +573,16 @@ pub async fn publish_spec_in_place(
     rt.http_upstream.clear();
     if let Some(sess) = state.sessions.get(&rt.client_id) {
         sess.mark_unconfirmed(revision).await;
+        // 有界发送:客户端零窗口黑洞时,`send().await` 会把 admin API 请求
+        // 挂到 TCP 超时(15~20 分钟)。统一用 2s 上限,超时按"对方不读"处理。
         let _ = sess
-            .send(ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
-                revision,
-                entity: SyncEntity::Proxy(Box::new(spec.clone())),
-            })))
+            .send_bounded(
+                ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
+                    revision,
+                    entity: SyncEntity::Proxy(Box::new(spec.clone())),
+                })),
+                CONTROL_SEND_TIMEOUT,
+            )
             .await;
         let (st, _) = rt.snapshot_state().await;
         if st == ProxyState::Running {

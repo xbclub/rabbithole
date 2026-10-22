@@ -11,6 +11,13 @@ use tokio::sync::Mutex;
 use tracing::info;
 use uuid::Uuid;
 
+/// 控制面内联路径的发送上限(与 state.rs 同名常量同义)。
+///
+/// nathole 的 prepare/connect 由 `handle_client_message` 在**控制读循环里
+/// 内联** await(control.rs),队列满时 `send().await` 会 park 在等自己消费,
+/// 心跳与 cancel 全部失联 —— 与 A1/A2 同族的自锁。
+const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Clone)]
 struct NatSession {
     visitor_client: String,
@@ -99,8 +106,10 @@ pub async fn start(
         timeout_seconds: timeout,
         nonce: nonce.clone(),
     });
-    let ok1 = visitor_sess.send(prep.clone()).await;
-    let ok2 = proxy_sess.send(prep).await;
+    let ok1 = visitor_sess
+        .send_bounded(prep.clone(), CONTROL_SEND_TIMEOUT)
+        .await;
+    let ok2 = proxy_sess.send_bounded(prep, CONTROL_SEND_TIMEOUT).await;
     if !ok1 || !ok2 {
         state.nathole.txs.lock().await.remove(&txid);
         return true;
@@ -165,8 +174,8 @@ async fn decide(state: &Arc<AppState>, txid: &str) {
                 nonce: nonce.clone(),
                 auth: auth.clone(),
             });
-            let _ = v_sess.send(connect_v).await;
-            let _ = p_sess.send(connect_p).await;
+            let _ = v_sess.send_bounded(connect_v, CONTROL_SEND_TIMEOUT).await;
+            let _ = p_sess.send_bounded(connect_p, CONTROL_SEND_TIMEOUT).await;
             info!(tx = txid, "nathole connect instructions sent");
         }
         _ => {
@@ -182,7 +191,7 @@ async fn decide(state: &Arc<AppState>, txid: &str) {
                 nonce: String::new(),
                 auth: String::new(),
             });
-            let _ = v_sess.send(fb).await;
+            let _ = v_sess.send_bounded(fb, CONTROL_SEND_TIMEOUT).await;
         }
     }
 }

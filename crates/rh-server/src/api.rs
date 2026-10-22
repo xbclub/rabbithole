@@ -207,7 +207,15 @@ async fn change_password(
         Ok(Some(r)) => r,
         _ => return err(1001, "用户不存在"),
     };
-    if !verify_password(&req.old_password, &row.1) {
+    // C6 同款:argon2 是 CPU/内存密集操作(m=19456,t=2),必须在 blocking 池
+    // 里跑。修前在 worker 线程同步执行 —— 持 token 并发调本接口即可把
+    // executor 线程逐个卡住(login 早已修,这里此前漏了)。
+    let old_pw = req.old_password.clone();
+    let old_hash = row.1.clone();
+    let old_ok = tokio::task::spawn_blocking(move || verify_password(&old_pw, &old_hash))
+        .await
+        .unwrap_or(false);
+    if !old_ok {
         state
             .events
             .emit(
@@ -218,9 +226,11 @@ async fn change_password(
             .await;
         return err(1001, "旧密码错误");
     }
-    let hash = match hash_password(&req.new_password) {
-        Ok(h) => h,
-        Err(e) => return err(500, &format!("内部错误(hash):{e}")),
+    let new_pw = req.new_password.clone();
+    let hash = match tokio::task::spawn_blocking(move || hash_password(&new_pw)).await {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => return err(500, &format!("内部错误(hash):{e}")),
+        Err(_) => return err(500, "内部错误(hash worker)"),
     };
     match state.db.update_user_password(&user, &hash).await {
         Ok(true) => {}

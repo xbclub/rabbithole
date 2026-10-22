@@ -612,7 +612,33 @@ fn ext_cached(path: &str, extensions: &[String]) -> bool {
 
 fn not_found_response(state: &Arc<AppState>) -> hyper::Response<BoxBody> {
     if let Some(path) = &state.cfg.vhost.custom_404_page {
-        if let Ok(body) = std::fs::read(path) {
+        // ★自定义 404 页只读一次盘,之后走进程内缓存。
+        //
+        // 修前每次 404 都 `std::fs::read` —— 这是**同步 IO 跑在 async 上下文**,
+        // 404 洪峰(扫描器、爬虫)会把 executor 线程逐个堵在 read 上。
+        // 配置在进程生命周期内不变,缓存是安全的;改动需重启(与本配置项
+        // 其他字段一致)。
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<
+            std::path::PathBuf,
+            Vec<u8>,
+        >>> = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        // 命中:克隆一份(响应体需要所有权)
+        let cached = { cache.lock().ok().and_then(|m| m.get(path).cloned()) };
+        let body = match cached {
+            Some(b) => Some(b),
+            None => match std::fs::read(path) {
+                Ok(b) => {
+                    if let Ok(mut m) = cache.lock() {
+                        m.insert(path.clone(), b.clone());
+                    }
+                    Some(b)
+                }
+                // 读失败不缓存:文件可能是部署后补上的
+                Err(_) => None,
+            },
+        };
+        if let Some(body) = body {
             return hyper::Response::builder()
                 .status(404)
                 .body(

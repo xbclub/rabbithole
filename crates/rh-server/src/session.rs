@@ -231,6 +231,29 @@ impl Session {
     pub async fn send(&self, msg: ServerMessage) -> bool {
         self.queue_tx.send(msg).await.is_ok()
     }
+
+    /// 有界发送,**专供控制读循环的内联路径**。
+    ///
+    /// 控制读循环同时是 `queue_tx` 的**唯一消费者**:循环里任何一处
+    /// `send().await` 在队列(256)满时都会 park 在"等自己消费"上,心跳、
+    /// cancel 随之全部失联,任务与 fd 永久泄漏(A1 自锁形态)。
+    ///
+    /// 已在四处踩过:首次 ServiceSync、`on_apply_result` 的全量重发、
+    /// `issue_relay_pair` 的双端 CREATE、nathole 的 prepare/connect。
+    /// 这里收敛成一个入口,新代码只该用这个(或 [`Self::try_send_msg`])。
+    ///
+    /// 超时返回 false,调用方按"对端已不读"处理(通常放弃本次下发并收尾)。
+    pub async fn send_bounded(&self, msg: ServerMessage, timeout: std::time::Duration) -> bool {
+        matches!(
+            tokio::time::timeout(timeout, self.queue_tx.send(msg)).await,
+            Ok(Ok(()))
+        )
+    }
+
+    /// 非阻塞发送:队列满立即返回 false,绝不 park 读循环。
+    pub fn try_send_msg(&self, msg: ServerMessage) -> bool {
+        self.queue_tx.try_send(msg).is_ok()
+    }
 }
 
 /// 每客户端会话注册表。
@@ -643,5 +666,75 @@ mod pending_expire_tests {
         sess.add_pending_request(4, req(10_000, None)).await;
         assert_eq!(hits.load(AO::SeqCst), 0, "未过期不得回收");
         assert!(sess.take_pending_request(3).await.is_some(), "未过期应可取");
+    }
+}
+
+#[cfg(test)]
+mod bounded_send_tests {
+    use super::*;
+
+    fn sess_with_queue(cap: usize) -> (Arc<Session>, tokio::sync::mpsc::Receiver<ServerMessage>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(cap);
+        let s = Session::new(
+            "c".into(),
+            "sid".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        );
+        (s, rx)
+    }
+
+    fn ping() -> ServerMessage {
+        ServerMessage::Pong(rh_protocol::message::Pong { ts_ms: 0, probe: false })
+    }
+
+    /// `send_bounded` 在队列满时必须**超时返回 false**,不得永久 park。
+    ///
+    /// 这是 A1/A2/A9 那批自锁修复的共同前提:控制读循环是 `queue_tx` 的
+    /// 唯一消费者,循环里任何 `send().await` 在队列满时都会等自己,心跳与
+    /// cancel 全部失联。`send_bounded` 用超时把它变成一次可失败的发送。
+    #[tokio::test]
+    async fn send_bounded_times_out_when_queue_full() {
+        let (s, _rx) = sess_with_queue(1);
+        // 填满队列(不消费)
+        assert!(s.try_send_msg(ping()), "第一条应入队");
+        assert!(!s.try_send_msg(ping()), "队列满应立即返回 false");
+
+        let t0 = std::time::Instant::now();
+        let ok = s
+            .send_bounded(ping(), std::time::Duration::from_millis(120))
+            .await;
+        let el = t0.elapsed();
+        assert!(!ok, "队列满时 send_bounded 必须返回 false");
+        assert!(
+            el >= std::time::Duration::from_millis(110),
+            "应在超时后才返回(实际 {el:?})"
+        );
+        assert!(
+            el < std::time::Duration::from_secs(2),
+            "不得超时过久(实际 {el:?})"
+        );
+    }
+
+    /// 队列有空间时 `send_bounded` 必须成功(不能因加了超时就误判失败)。
+    #[tokio::test]
+    async fn send_bounded_succeeds_when_space_available() {
+        let (s, mut rx) = sess_with_queue(4);
+        // 起个消费者把消息取走,保证 send 不会因无人收而卡住
+        let consumer = tokio::spawn(async move {
+            let mut n = 0;
+            while rx.recv().await.is_some() {
+                n += 1;
+                if n == 1 {
+                    return;
+                }
+            }
+        });
+        let ok = s
+            .send_bounded(ping(), std::time::Duration::from_secs(1))
+            .await;
+        assert!(ok, "队列有空间时不得失败");
+        let _ = consumer.await;
     }
 }

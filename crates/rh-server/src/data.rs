@@ -124,9 +124,19 @@ pub async fn tcp_refill(state: &Arc<AppState>, sess: &Arc<Session>, rt: &Arc<Pro
         {
             Some(_rid) => {}
             None => {
-                // 签发失败:钩子随条目在 take_pending_request 里被调用,
-                // 但那条路径不保证走到 —— 这里显式再减一次会双减,
-                // 故用 saturating_sub 兜住(见上面的 fetch_update)。
+                // ★签发失败必须显式归还计数。
+                //
+                // `issue_create_channel_with` 失败路径用的是
+                // `take_pending_request_quiet`(故意**不**触发钩子),因为
+                // 它假定调用方自己回收。所以这里不减就**谁都不减**:
+                // 修前只 `break`,一次签发失败让池永久少一个名额。
+                // 两边注释曾互相指认对方会减,实际都不减,靠"send 失败
+                // ⟹ 会话将死 ⟹ claim_pool 清零"侥幸自愈 —— 不该依赖。
+                let _ = pool.inflight.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
                 break;
             }
         }
@@ -1334,6 +1344,20 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                 r = sock.recv_from(&mut pkt_buf) => {
                     match r {
                         Ok((n, peer)) => {
+                            // ★配额击穿后上行也必须停。
+                            //
+                            // 下行(通道 → 用户)早已检查 flow_cut,但上行
+                            // (用户 → 通道)此前照常计费转发 —— 配额击穿后
+                            // UDP 只有单边被切:客户端仍能持续把数据打进隧道,
+                            // 表现是"限流生效了但只限一半"。
+                            if state
+                                .client_usage(&rt.client_id)
+                                .flow_cut
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                last_alive = Instant::now();
+                                continue;
+                            }
                             // 会话准入:超上限的新源地址直接丢包(既有会话不受影响)
                             if !udp_session_admit(&state, &mut sessions, peer) {
                                 continue;
