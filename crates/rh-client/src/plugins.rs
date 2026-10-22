@@ -747,9 +747,6 @@ fn rewrite_http_head(head: &[u8], host_rewrite: &str, op: &HeaderOp) -> Vec<u8> 
     out
 }
 
-#[allow(dead_code)]
-fn unused_base64_table() {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

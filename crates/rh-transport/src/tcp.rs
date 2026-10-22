@@ -222,7 +222,6 @@ async fn peek_prefix(mut io: crate::BoxedIo) -> io::Result<([u8; 4], crate::Boxe
     Ok((b, io))
 }
 
-#[allow(unused)]
 fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     use socket2::{SockRef, TcpKeepalive};
     let s = SockRef::from(stream);
