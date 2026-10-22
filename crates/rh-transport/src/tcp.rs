@@ -806,6 +806,19 @@ mod sndbuf_tests {
     /// 直接调 socket2 设值(不经 env,避免进程级 OnceLock 与并行测试冲突),
     /// 验证"选定的 API 在该平台可用且语义如预期"——这是 `apply_carrier_sndbuf`
     /// 的实现依据。
+    ///
+    /// # 目标值不能硬编码 4 MiB(CI 曾因此变红)
+    ///
+    /// Linux 的 `setsockopt(SO_SNDBUF)` 受 `net.core.wmem_max` 约束:
+    /// 超出部分被**静默截断**,不报错。开发机常见 `wmem_max=16MiB`(所以
+    /// 4 MiB 能生效),而 GitHub Actions 容器用内核默认值 **212992**
+    /// (约 208 KiB)—— 于是 4 MiB 被压到约 416 KiB,断言 `got >= target`
+    /// 失败,报 `target=4194304 got=425984`。
+    ///
+    /// 现在先读系统上限,取「上限与 4 MiB 的较小者」作为目标。这样:
+    /// * 上限充裕的机器仍然验证到 4 MiB 这一档;
+    /// * 受限环境退化为验证「设一个系统允许的值确实生效」,这仍是本用例
+    ///   要证明的东西(API 可用 + 语义如预期),而不是在测内核策略。
     #[tokio::test]
     async fn sndbuf_explicit_set_takes_effect() {
         use socket2::SockRef;
@@ -816,12 +829,22 @@ mod sndbuf_tests {
         let client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let _ = accept.await.unwrap().unwrap();
 
-        let target = 4 * 1024 * 1024;
+        // 系统允许的上限:读不到(非 Linux / 无权限)就按 4 MiB 试
+        let sys_max = std::fs::read_to_string("/proc/sys/net/core/wmem_max")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok());
+        let target = sys_max.map_or(4 * 1024 * 1024, |m| m.min(4 * 1024 * 1024));
+        // 上限太小时(理论上不会,但别让断言恒真)直接跳过
+        if target < 64 * 1024 {
+            eprintln!("wmem_max={target} 过小,跳过 SO_SNDBUF 生效性验证");
+            return;
+        }
+
         SockRef::from(&client).set_send_buffer_size(target).unwrap();
         let got = SockRef::from(&client).send_buffer_size().unwrap();
         assert!(
             got >= target,
-            "Linux 会翻倍,读回应 >= 目标:target={target} got={got}"
+            "Linux 会翻倍,读回应 >= 目标:target={target} got={got} (wmem_max={sys_max:?})"
         );
     }
 }
