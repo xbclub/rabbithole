@@ -1,19 +1,32 @@
-//! 客户端插件(10 种):本地目标拨号的替代实现。
+//! 客户端插件(9 种):本地目标拨号的替代实现。
 //!
 //! 结构:插件返回一对 duplex 的通道侧;协议处理任务持有另一侧并连接
 //! 上游,完成握手/终结/改写后纯搬运。HTTP 改写类插件对请求头做
 //! Host 重写 + HeaderOp + `Connection: close`(每连接单请求,语义正确)。
+//!
+//! 两类插件的方向相反,不能混为一谈:
+//!
+//! * **改写/终结类**(`https2http`/`http2https`/…/`tls2raw`/`static_file`/
+//!   `unix_domain_socket`):目的地由**配置**给出(`local_addr`/`unix_path`),
+//!   插件把通道流量送到那个固定目标。
+//! * **代理服务端类**(`http_proxy`/`socks5`):插件在客户端进程内**扮演代理
+//!   服务端**,目的地由**用户在代理请求里写**(`CONNECT host:port` / SOCKS5
+//!   的 `DST.ADDR`),插件解析后自己拨号。配置里的 `target_host/target_port`
+//!   对这两种插件没有意义。详见 [`serve_http_proxy`] / [`serve_socks5`]。
 
-use base64::Engine as _;
-use rh_protocol::message::StartForward;
 use rh_protocol::HeaderOp;
 use rh_protocol::PluginSpec;
 use rh_transport::BoxedIo;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// 按插件规格建立本地连接。
-pub async fn dial_plugin(plugin: &PluginSpec, fwd: &StartForward) -> anyhow::Result<BoxedIo> {
+/// 按插件规格建立本地连接(返回的是「通道侧」端点)。
+///
+/// 目标一律来自 `plugin` 自身字段:改写/终结类取 `local_addr`/`unix_path`,
+/// 代理服务端类取**用户请求里的目的地**。线路上的 `StartForward.target_*`
+/// 对任何插件都不参与决策 —— 从前 `http_proxy`/`socks5` 拿它当目标,
+/// 才有了「连代理 → CONNECT 代理自己」的自指 bug。
+pub async fn dial_plugin(plugin: &PluginSpec) -> anyhow::Result<BoxedIo> {
     match plugin {
         PluginSpec::UnixDomainSocket { unix_path } => {
             #[cfg(unix)]
@@ -30,8 +43,10 @@ pub async fn dial_plugin(plugin: &PluginSpec, fwd: &StartForward) -> anyhow::Res
         PluginSpec::HttpProxy {
             http_user,
             http_password,
-        } => dial_http_proxy(fwd, http_user, http_password).await,
-        PluginSpec::Socks5 { user, password } => dial_socks5(fwd, user, password).await,
+        } => serve_proxy(ProxyProtocol::Http, http_user, http_password),
+        PluginSpec::Socks5 { user, password } => {
+            serve_proxy(ProxyProtocol::Socks5, user, password)
+        }
         PluginSpec::StaticFile {
             local_path,
             strip_prefix,
@@ -193,87 +208,552 @@ where
     }
 }
 
-// ---------------- http_proxy / socks5(经本地代理出站) ----------------
+// ---------------- http_proxy / socks5(在客户端进程内扮演代理服务端) ----------------
+//
+// # 为什么是「服务端」而不是「拨号器」
+//
+// 这两个插件与 frp 同名插件的语义是**同一件事**:把隧道送进来的用户连接
+// 当成一条「用户 → 代理」的连接来服务。用户想访问的站点写在他的代理请求里
+// (`CONNECT host:port` 或 SOCKS5 的 `DST.ADDR`),插件解析出来**自己**去拨。
+//
+// 修前的实现把配置里的 `target_host:target_port` 同时当成「代理地址」与
+// 「CONNECT 目的地」:先连上代理,再让代理连它自己。真实目的地从未出现在
+// 代码里,所以对任何真实代理(squid / tinyproxy)都用不了 —— 只有配一个
+// 允许自连的假代理才会「跑通」,而那只是回环,不转发任何用户流量。
+//
+// # 连接模型
+//
+// 每条隧道连接 = 一条代理客户端连接。用户在隧道另一端每访问一个目标,
+// 就新开一条到本代理的连接(HTTP 代理对 https 必然如此;SOCKS5 亦然)。
+// 因此「一个通道对应一条代理会话」,插件内不做多路复用,也不需要监听端口。
 
-async fn dial_http_proxy(fwd: &StartForward, user: &str, pass: &str) -> anyhow::Result<BoxedIo> {
-    // 目标字段承载本地代理地址
-    let addr = resolve_addr(&fwd.target_host, fwd.target_port).await?;
-    let mut s = connect_with_timeout(addr).await?;
-    let mut req = format!(
-        "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n",
-        host = fwd.target_host,
-        port = fwd.target_port
-    );
-    if !user.is_empty() {
-        let cred = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
-        req.push_str(&format!("Proxy-Authorization: Basic {cred}\r\n"));
-    }
-    req.push_str("\r\n");
-    s.write_all(req.as_bytes()).await?;
-    // 上限 8KiB(与旧实现的 `buf.len() > 8192` 判定一致)
-    let buf = read_http_head(&mut s, 8192)
-        .await
-        .map_err(|e| anyhow::anyhow!("http proxy response: {e}"))?;
-    let head = String::from_utf8_lossy(&buf);
-    let first = head.lines().next().unwrap_or("");
-    if !first.contains(" 2") {
-        anyhow::bail!("http proxy CONNECT failed: {first}");
-    }
-    Ok(Box::new(s))
+/// 代理服务端的两种协议(共用鉴权/拨号/转发骨架,只有握手不同)。
+#[derive(Clone, Copy)]
+enum ProxyProtocol {
+    Http,
+    Socks5,
 }
 
-async fn dial_socks5(fwd: &StartForward, user: &str, pass: &str) -> anyhow::Result<BoxedIo> {
-    let addr = resolve_addr(&fwd.target_host, fwd.target_port).await?;
-    let mut s = connect_with_timeout(addr).await?;
-    if user.is_empty() {
-        s.write_all(&[0x05, 0x01, 0x00]).await?;
+/// 代理会话内「用户迟迟不说话」的兜底上限。
+///
+/// 隧道是长连接:没有上限时一个半开连接可以永久占住一对任务。
+/// 60s 与 frp 的 `ReadHeaderTimeout` 同值,便于对照排障。
+const PROXY_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 建一个代理会话,返回通道侧端点。
+///
+/// 会话任务持有 duplex 的另一半:解析用户请求 → 鉴权 → 拨目的地 →
+/// 写成功应答 → 双向搬运。任一步失败都写协议对应的应答再断开,
+/// 让用户看到 407/502/REP 而不是莫名其妙的 EOF。
+fn serve_proxy(proto: ProxyProtocol, user: &str, pass: &str) -> anyhow::Result<BoxedIo> {
+    let (chan, session) = tokio::io::duplex(64 * 1024);
+    let auth = basic_auth(user, pass);
+    tokio::spawn(async move {
+        match proto {
+            ProxyProtocol::Http => serve_http_proxy(session, auth).await,
+            ProxyProtocol::Socks5 => serve_socks5(session, auth).await,
+        }
+    });
+    Ok(Box::new(chan))
+}
+
+/// 代理凭据校验(恒定时间),返回是否放行。
+///
+/// 免鉴权的判据是「用户名为空」,与 [`basic_auth`] 及 `static_file` 的
+/// Basic Auth 同口径 —— 同一个控制台里两种「空密码」不该有两种语义。
+/// 与 frp 的差异仅在「只填密码不填用户名」这一种配置:frp 仍要求认证
+/// (用户名为空串),我们视为不鉴权。控制台表单里密码是用户名的从属项,
+/// 单独填密码没有可表达的意图。
+fn check_proxy_auth(auth: &Option<(String, String)>, got: Option<&str>) -> bool {
+    let Some((user, pass)) = auth else {
+        return true;
+    };
+    let Some(got) = got else {
+        return false;
+    };
+    let want = format!("{user}:{pass}");
+    rh_transport::constant_time_eq(got.as_bytes(), want.as_bytes())
+}
+
+/// 拨代理请求里的目的地。
+///
+/// 与 [`connect_upstream`] 同口径:解析走异步路径(C8),连接有超时。
+/// 解析失败、连接被拒、超时都归一成 `Err`,由调用方回 502 / REP。
+async fn dial_proxy_destination(host: &str, port: u16) -> anyhow::Result<BoxedIo> {
+    let addr = resolve_addr(host, port).await?;
+    let tcp = connect_with_timeout(addr).await?;
+    tcp.set_nodelay(true).ok();
+    Ok(Box::new(tcp))
+}
+
+/// 双向搬运一条代理会话(半关闭传递)。
+///
+/// 用 [`crate::forward::splice`] 而不是 `copy_bidirectional`:后者在一侧
+/// EOF 时立刻关掉另一侧的两个方向,丢掉「用户半关闭写、还在等响应」的
+/// 合法用法;`splice` 是项目里统一的半关闭语义,且能走无锁拆半 /
+/// 内核 splice 快路径。
+async fn splice_session(chan: tokio::io::DuplexStream, remote: BoxedIo) {
+    crate::forward::splice(Box::new(chan), remote, None).await;
+}
+
+/// 把「已多读的用户字节」先送给目的地,再开始双向搬运。
+///
+/// `read_http_head` 一次读 4KiB,很可能把 `CONNECT` 之后紧跟的 TLS
+/// ClientHello 一起读进来;丢掉就会表现为「隧道建立了但 https 握手
+/// 永远超时」。
+async fn finish_session(chan: tokio::io::DuplexStream, remote: BoxedIo, leftover: Vec<u8>) {
+    if leftover.is_empty() {
+        splice_session(chan, remote).await;
+        return;
+    }
+    let mut remote = remote;
+    if remote.write_all(&leftover).await.is_ok() {
+        splice_session(chan, remote).await;
+    }
+}
+
+// ---- 地址拆分(两个协议共用) ----
+
+/// 拆分 `host:port` / `[v6]:port`,并归一化 host。
+///
+/// 归一化只做两件对拨号有实际影响的事:
+/// * 去掉 IPv6 的方括号(`[::1]:80` → `::1`)—— [`resolve_addr`] 走
+///   `IpAddr::parse`,带括号会解析失败;
+/// * 去掉末尾的根点(`example.com.` → `example.com`)—— 两者等价,
+///   但日志与 DNS 缓存键应统一,否则同一目标会有两个缓存条目。
+///
+/// 只有一个冒号才是 `host:port`;未加括号的 v6 字面量(`a:b:c`)无法
+/// 区分端口,**直接拒绝而不是猜**。空 host 与 0 端口一律 `None`。
+fn split_authority(authority: &str, default_port: u16) -> Option<(String, u16)> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None if after.is_empty() => default_port,
+            None => return None,
+        };
+        (host, port)
     } else {
-        s.write_all(&[0x05, 0x01, 0x02]).await?;
+        match authority.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') => (h, p.parse().ok()?),
+            Some(_) => return None,
+            None => (authority, default_port),
+        }
+    };
+    let host = host.trim_end_matches('.');
+    if host.is_empty() || port == 0 {
+        return None;
     }
-    let mut resp = [0u8; 2];
-    s.read_exact(&mut resp).await?;
-    anyhow::ensure!(resp[0] == 0x05, "bad socks version");
-    if resp[1] == 0x02 {
-        let u = user.as_bytes();
-        let p = pass.as_bytes();
-        let mut auth = vec![0x01, u.len() as u8];
-        auth.extend_from_slice(u);
-        auth.push(p.len() as u8);
-        auth.extend_from_slice(p);
-        s.write_all(&auth).await?;
-        let mut ar = [0u8; 2];
-        s.read_exact(&mut ar).await?;
-        anyhow::ensure!(ar[1] == 0x00, "socks auth failed");
-    } else if resp[1] != 0x00 {
-        anyhow::bail!("socks5 no acceptable auth method");
+    Some((host.to_string(), port))
+}
+
+// ---- HTTP 正向代理 ----
+
+/// HTTP 代理会话的错误:要么回一个状态码,要么什么都不写。
+enum HttpProxyError {
+    Status(u16, &'static str),
+    /// 用户没把请求发完就断了:此时再写应答没有意义。
+    Silent,
+}
+
+/// 一条已解析的代理请求。
+struct HttpProxyRequest {
+    /// 原始请求头整块(含 `\r\n\r\n`)。CONNECT 不需要它,普通请求要转发。
+    head: Vec<u8>,
+    /// `CONNECT` 的目标 authority,或 absolute-form 请求里的 authority。
+    authority: String,
+    /// 是否需要把请求行从 absolute-form 改写成 origin-form。
+    rewrite_request_line: bool,
+    /// `Proxy-Authorization` 的 base64 载荷(已解码成 `user:pass`)。
+    credential: Option<String>,
+    /// 读头时一并读进来的用户字节(TLS ClientHello / 请求体)。
+    leftover: Vec<u8>,
+}
+
+/// 读一条代理客户端请求(请求行 + 头)并解析。
+async fn read_proxy_request(
+    io: &mut tokio::io::DuplexStream,
+) -> Result<HttpProxyRequest, HttpProxyError> {
+    let buf = tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, read_http_head(io, 64 * 1024))
+        .await
+        .map_err(|_| HttpProxyError::Status(408, "Request Timeout"))?
+        .map_err(|e| match e.kind() {
+            // 超长头按 431 回,与 static_file 一致
+            std::io::ErrorKind::InvalidData => {
+                HttpProxyError::Status(431, "Request Header Fields Too Large")
+            }
+            _ => HttpProxyError::Silent,
+        })?;
+    let head_len = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(buf.len());
+    let head = buf[..head_len].to_vec();
+    let leftover = buf[head_len..].to_vec();
+    let text = String::from_utf8_lossy(&head).into_owned();
+
+    let mut lines = text.split("\r\n");
+    let req_line = lines.next().unwrap_or("");
+    let mut parts = req_line.split(' ');
+    let (method, target) = match (parts.next(), parts.next()) {
+        (Some(m), Some(t)) if !m.is_empty() && !t.is_empty() => (m, t),
+        _ => return Err(HttpProxyError::Status(400, "Bad Request")),
+    };
+
+    let mut credential = None;
+    for line in lines {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        if k.trim().eq_ignore_ascii_case("proxy-authorization") {
+            let v = v.trim();
+            if let Some(b64) = v
+                .strip_prefix("Basic ")
+                .or_else(|| v.strip_prefix("basic "))
+            {
+                credential = base64_decode(b64);
+            }
+        }
     }
-    let mut req = vec![0x05, 0x01, 0x00, 0x03, fwd.target_host.len() as u8];
-    req.extend_from_slice(fwd.target_host.as_bytes());
-    req.extend_from_slice(&fwd.target_port.to_be_bytes());
-    s.write_all(&req).await?;
-    let mut head = [0u8; 4];
-    s.read_exact(&mut head).await?;
-    anyhow::ensure!(head[1] == 0x00, "socks connect failed: {}", head[1]);
-    match head[3] {
+
+    // CONNECT:authority-form,目标就是目的地
+    // 其它方法:absolute-form(`GET http://host/path`),取 URL 的 authority
+    let (authority, rewrite_request_line) = if method.eq_ignore_ascii_case("CONNECT") {
+        (target.to_string(), false)
+    } else {
+        match absolute_form_authority(target) {
+            Some(a) => (a, true),
+            // 非 absolute-form 的普通请求(`GET /`)是「把本代理当源服务器」
+            // 的用法。frp 把它交给内置 RoundTrip,但那要求代理自己知道上游;
+            // 本插件没有这个配置,如实回 400 比假装成功好。
+            None => return Err(HttpProxyError::Status(400, "Bad Request")),
+        }
+    };
+
+    Ok(HttpProxyRequest {
+        head,
+        authority,
+        rewrite_request_line,
+        credential,
+        leftover,
+    })
+}
+
+/// 从 absolute-form 请求行目标里取 authority。
+///
+/// `http://example.com:8080/p?q` → `example.com:8080`;
+/// `http://user:pw@example.com/` → `example.com`(userinfo 不参与拨号)。
+/// 非 http/https scheme 或没有 authority 一律 `None`。
+fn absolute_form_authority(target: &str) -> Option<String> {
+    let (scheme, rest) = target.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    (!authority.is_empty()).then(|| authority.to_string())
+}
+
+/// absolute-form 目标 → origin-form(`/path?query`),供普通 HTTP 转发使用。
+///
+/// fragment 不发给服务器(RFC 7230 §5.3.2);没有路径时补 `/`。
+fn origin_form(target: &str) -> String {
+    let Some((_, rest)) = target.split_once("://") else {
+        return "/".into();
+    };
+    let after_auth = match rest.find(['/', '?', '#']) {
+        Some(i) => &rest[i..],
+        None => return "/".into(),
+    };
+    // 去掉 fragment
+    let after_auth = after_auth.split('#').next().unwrap_or(after_auth);
+    if after_auth.starts_with('?') {
+        format!("/{after_auth}")
+    } else if after_auth.is_empty() {
+        "/".into()
+    } else {
+        after_auth.to_string()
+    }
+}
+
+/// 普通(非 CONNECT)代理请求的头改写:请求行转 origin-form、去掉代理专有头、
+/// 强制 `Connection: close`。
+///
+/// 为什么强制 close:插件是「一通道一会话」,不做 keep-alive 的状态机;
+/// 不关闭则服务器可能在同一条连接上继续等下一个请求,而用户侧的第二个
+/// 请求已经在同一通道里被当作隧道字节处理 —— 语义会错位。close 让双方
+/// 都在这一问一答后收工,与项目里其他插件「每连接单请求」的口径一致。
+fn rewrite_proxy_request_head(head: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.split("\r\n");
+    let req_line = lines.next().unwrap_or("");
+    let mut parts = req_line.split(' ');
+    let (method, target, version) = (
+        parts.next().unwrap_or("GET"),
+        parts.next().unwrap_or("/"),
+        parts.next().unwrap_or("HTTP/1.1"),
+    );
+    let mut out = Vec::with_capacity(head.len() + 32);
+    out.extend_from_slice(format!("{method} {} {version}\r\n", origin_form(target)).as_bytes());
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((k, _)) = line.split_once(':') else {
+            continue;
+        };
+        let lk = k.trim().to_ascii_lowercase();
+        // 代理专有头不得透传给源服务器(RFC 7230 §6.1)
+        if lk == "proxy-authorization" || lk == "proxy-connection" || lk == "connection" {
+            continue;
+        }
+        out.extend_from_slice(line.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out
+}
+
+/// 写一个最小 HTTP 应答并关闭连接。
+async fn write_proxy_status(
+    io: &mut tokio::io::DuplexStream,
+    code: u16,
+    reason: &str,
+    extra: &str,
+) -> std::io::Result<()> {
+    let resp =
+        format!("HTTP/1.1 {code} {reason}\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n");
+    io.write_all(resp.as_bytes()).await?;
+    io.shutdown().await
+}
+
+/// 服务一条 HTTP 代理连接。
+///
+/// 一条通道只服务一次请求:CONNECT 成功后连接变成裸隧道,HTTP 语义到此
+/// 结束(与 frp 的 `handleConnectReq` 一致);普通请求转发完一问一答后
+/// 也随 `Connection: close` 收工。
+async fn serve_http_proxy(mut io: tokio::io::DuplexStream, auth: Option<(String, String)>) {
+    let req = match read_proxy_request(&mut io).await {
+        Ok(v) => v,
+        Err(HttpProxyError::Status(code, reason)) => {
+            let extra = if code == 407 {
+                "Proxy-Authenticate: Basic realm=\"rabbithole\"\r\n"
+            } else {
+                ""
+            };
+            let _ = write_proxy_status(&mut io, code, reason, extra).await;
+            return;
+        }
+        Err(HttpProxyError::Silent) => return,
+    };
+    if !check_proxy_auth(&auth, req.credential.as_deref()) {
+        // 407 必须带 Proxy-Authenticate,否则客户端无法重试认证
+        let _ = write_proxy_status(
+            &mut io,
+            407,
+            "Proxy Authentication Required",
+            "Proxy-Authenticate: Basic realm=\"rabbithole\"\r\n",
+        )
+        .await;
+        return;
+    }
+    // 缺端口时按语义补默认值:CONNECT 的唯一用途是 TLS → 443;
+    // absolute-form 的 scheme 已在解析时限定为 http/https,这里用 80
+    // (https 的 absolute-form 极少见,补 80 会被对端拒绝,好过猜错端口)。
+    let default_port = if req.rewrite_request_line { 80 } else { 443 };
+    let Some((host, port)) = split_authority(&req.authority, default_port) else {
+        let _ = write_proxy_status(&mut io, 400, "Bad Request", "").await;
+        return;
+    };
+    let mut remote = match dial_proxy_destination(&host, port).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(host = %host, port, error = %e, "http_proxy: 目的地拨号失败");
+            let _ = write_proxy_status(&mut io, 502, "Bad Gateway", "").await;
+            return;
+        }
+    };
+    if req.rewrite_request_line {
+        // 普通请求:把改写后的头写过去,之后纯搬运(请求体与响应)
+        let head = rewrite_proxy_request_head(&req.head);
+        if remote.write_all(&head).await.is_err() {
+            let _ = write_proxy_status(&mut io, 502, "Bad Gateway", "").await;
+            return;
+        }
+    } else if io
+        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return;
+    }
+    finish_session(io, remote, req.leftover).await;
+}
+
+// ---- SOCKS5 ----
+
+/// 服务一条 SOCKS5 连接(RFC 1928 / RFC 1929 用户名密码认证)。
+///
+/// 只实现 CONNECT:BIND / UDP ASSOCIATE 需要监听回连地址或维护 UDP 关联表,
+/// 与「隧道里的一条 TCP 流」模型不兼容,按 RFC 回 `0x07 Command not supported`。
+async fn serve_socks5(mut io: tokio::io::DuplexStream, auth: Option<(String, String)>) {
+    match socks5_handshake(&mut io, &auth).await {
+        Ok((host, port)) => {
+            let mut remote = match dial_proxy_destination(&host, port).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(host = %host, port, error = %e, "socks5: 目的地拨号失败");
+                    let _ = socks5_reply(&mut io, SOCKS_REP_HOST_UNREACHABLE).await;
+                    let _ = io.shutdown().await;
+                    return;
+                }
+            };
+            if socks5_reply(&mut io, SOCKS_REP_SUCCESS).await.is_err() {
+                return;
+            }
+            // 握手阶段全部用 read_exact 精确读取,不会多读用户字节
+            let _ = &mut remote;
+            splice_session(io, remote).await;
+        }
+        Err(code) => {
+            // 0xFF = 握手早期就该断开(版本不对 / 方法不可接受 / 认证失败),
+            // 此时还没进入「按命令回 REP」的阶段
+            if code != SOCKS_REP_ABORT {
+                let _ = socks5_reply(&mut io, code).await;
+            }
+            let _ = io.shutdown().await;
+        }
+    }
+}
+
+const SOCKS_REP_SUCCESS: u8 = 0x00;
+const SOCKS_REP_HOST_UNREACHABLE: u8 = 0x04;
+/// 内部哨兵:不是合法的 REP 码,表示「此时不应回任何应答」。
+const SOCKS_REP_ABORT: u8 = 0xFF;
+
+/// 写 SOCKS5 应答。`rep == 0` 表示成功。
+///
+/// BND.ADDR/BND.PORT 固定回 `0.0.0.0:0`:隧道出口没有「对外可回连的绑定
+/// 地址」可言,填假地址反而会误导客户端去做反向连接。RFC 1928 允许客户端
+/// 忽略这两个字段(除 BIND 外)。
+async fn socks5_reply(io: &mut tokio::io::DuplexStream, rep: u8) -> std::io::Result<()> {
+    io.write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
+}
+
+/// 走完 SOCKS5 握手,返回(目的地 host, 端口)。
+///
+/// `Err(rep)` 里的 `rep` 是应回给客户端的 REP 码;`SOCKS_REP_ABORT` 表示
+/// 握手早期就该断开(还没到能回 REP 的阶段)。
+async fn socks5_handshake(
+    io: &mut tokio::io::DuplexStream,
+    auth: &Option<(String, String)>,
+) -> Result<(String, u16), u8> {
+    // ---- 方法协商 ----
+    let mut head = [0u8; 2];
+    read_exact_timeout(io, &mut head).await.map_err(|_| SOCKS_REP_ABORT)?;
+    if head[0] != 0x05 {
+        return Err(SOCKS_REP_ABORT); // 不是 SOCKS5,无从应答
+    }
+    let mut methods = vec![0u8; head[1] as usize];
+    read_exact_timeout(io, &mut methods)
+        .await
+        .map_err(|_| SOCKS_REP_ABORT)?;
+    // 需要认证时只接受 0x02(用户名/密码),否则只接受 0x00(免认证)
+    let want = if auth.is_some() { 0x02 } else { 0x00 };
+    if !methods.contains(&want) {
+        let _ = io.write_all(&[0x05, 0xFF]).await;
+        return Err(SOCKS_REP_ABORT);
+    }
+    io.write_all(&[0x05, want]).await.map_err(|_| SOCKS_REP_ABORT)?;
+
+    // ---- 用户名/密码认证(RFC 1929) ----
+    if want == 0x02 {
+        let mut ver = [0u8; 1];
+        read_exact_timeout(io, &mut ver).await.map_err(|_| SOCKS_REP_ABORT)?;
+        if ver[0] != 0x01 {
+            let _ = io.write_all(&[0x01, 0x01]).await;
+            return Err(SOCKS_REP_ABORT);
+        }
+        let user = read_len_prefixed(io).await.map_err(|_| SOCKS_REP_ABORT)?;
+        let pass = read_len_prefixed(io).await.map_err(|_| SOCKS_REP_ABORT)?;
+        let got = format!(
+            "{}:{}",
+            String::from_utf8_lossy(&user),
+            String::from_utf8_lossy(&pass)
+        );
+        // 认证失败:回 0x01 后断开(REP 阶段还没开始)
+        if !check_proxy_auth(auth, Some(&got)) {
+            let _ = io.write_all(&[0x01, 0x01]).await;
+            return Err(SOCKS_REP_ABORT);
+        }
+        io.write_all(&[0x01, 0x00]).await.map_err(|_| SOCKS_REP_ABORT)?;
+    }
+
+    // ---- 请求 ----
+    let mut req = [0u8; 4];
+    read_exact_timeout(io, &mut req).await.map_err(|_| SOCKS_REP_ABORT)?;
+    if req[0] != 0x05 {
+        return Err(SOCKS_REP_ABORT);
+    }
+    if req[1] != 0x01 {
+        // 非 CONNECT:REP=0x07 Command not supported
+        return Err(0x07);
+    }
+    let host = match req[3] {
         0x01 => {
             let mut a = [0u8; 4];
-            s.read_exact(&mut a).await?;
+            read_exact_timeout(io, &mut a).await.map_err(|_| SOCKS_REP_ABORT)?;
+            std::net::Ipv4Addr::from(a).to_string()
         }
         0x03 => {
-            let mut l = [0u8; 1];
-            s.read_exact(&mut l).await?;
-            let mut d = vec![0u8; l[0] as usize];
-            s.read_exact(&mut d).await?;
+            let d = read_len_prefixed(io).await.map_err(|_| SOCKS_REP_ABORT)?;
+            // 域名不做 UTF-8 强校验:非法字节交给 DNS 解析失败处理,
+            // 免得因为一个非 ASCII 域名就回 0xFF 让客户端以为服务端坏了
+            String::from_utf8_lossy(&d).into_owned()
         }
         0x04 => {
             let mut a = [0u8; 16];
-            s.read_exact(&mut a).await?;
+            read_exact_timeout(io, &mut a).await.map_err(|_| SOCKS_REP_ABORT)?;
+            std::net::Ipv6Addr::from(a).to_string()
         }
-        other => anyhow::bail!("bad socks atyp {other}"),
-    }
+        // 未知地址类型:REP=0x08 Address type not supported
+        _ => return Err(0x08),
+    };
     let mut port = [0u8; 2];
-    s.read_exact(&mut port).await?;
-    Ok(Box::new(s))
+    read_exact_timeout(io, &mut port).await.map_err(|_| SOCKS_REP_ABORT)?;
+    let port = u16::from_be_bytes(port);
+    if host.is_empty() || port == 0 {
+        return Err(0x01); // general failure
+    }
+    Ok((host, port))
+}
+
+/// 读一个 SOCKS5 长度前缀字段(1 字节长度 + 内容)。
+async fn read_len_prefixed(io: &mut tokio::io::DuplexStream) -> std::io::Result<Vec<u8>> {
+    let mut len = [0u8; 1];
+    read_exact_timeout(io, &mut len).await?;
+    let mut buf = vec![0u8; len[0] as usize];
+    read_exact_timeout(io, &mut buf).await?;
+    Ok(buf)
+}
+
+/// 带超时的 `read_exact`:握手阶段用户迟迟不发数据时必须能放弃。
+async fn read_exact_timeout(
+    io: &mut tokio::io::DuplexStream,
+    buf: &mut [u8],
+) -> std::io::Result<()> {
+    match tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, io.read_exact(buf)).await {
+        Ok(r) => r.map(|_| ()),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "proxy handshake timeout",
+        )),
+    }
 }
 
 // ---------------- static_file(最小 HTTP/1.1 文件服务) ----------------
@@ -810,6 +1290,437 @@ fn rewrite_http_head(head: &[u8], host_rewrite: &str, op: &HeaderOp) -> Vec<u8> 
     }
     out.extend_from_slice(b"Connection: close\r\n\r\n");
     out
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    //! `http_proxy` / `socks5` 代理服务端的单元测试。
+    //!
+    //! 这一组测试的存在理由是**防止回到自指语义**:修前的实现把
+    //! `target_host:target_port` 当目的地,任何"拨号能通"的测试都会绿。
+    //! 所以这里的断言一律落在「目的地来自用户请求」上 ——
+    //! 用一个只在**用户请求指定的端口**上监听的 echo 服务,任何
+    //! "拨配置里的地址"的实现都会失败。
+
+    use super::*;
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 在 127.0.0.1 上起一个回显服务,返回其端口。
+    ///
+    /// 绑定 0 让内核分配端口:测试里**没有**「配置的目标地址」可言,
+    /// 端口只出现在用户请求里,这正是要断言的语义。
+    async fn spawn_echo() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if s.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// 从插件拿到通道侧端点(与 `dial_plugin` 走同一路径)。
+    async fn open(plugin: &PluginSpec) -> BoxedIo {
+        dial_plugin(plugin).await.expect("插件应能建立会话")
+    }
+
+    async fn read_some(io: &mut BoxedIo, n: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; n];
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), io.read(&mut buf))
+            .await
+            .expect("读超时")
+            .expect("读失败");
+        buf.truncate(got);
+        buf
+    }
+
+    fn http_proxy_spec(user: &str, pass: &str) -> PluginSpec {
+        PluginSpec::HttpProxy {
+            http_user: user.into(),
+            http_password: pass.into(),
+        }
+    }
+
+    fn socks_spec(user: &str, pass: &str) -> PluginSpec {
+        PluginSpec::Socks5 {
+            user: user.into(),
+            password: pass.into(),
+        }
+    }
+
+    /// HTTP CONNECT:目的地取自请求行,载荷原样穿过隧道。
+    #[tokio::test]
+    async fn http_proxy_connect_dials_request_target() {
+        let echo = spawn_echo().await;
+        let mut io = open(&http_proxy_spec("", "")).await;
+        io.write_all(format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nHost: ignored\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let resp = read_some(&mut io, 128).await;
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "CONNECT 应回 200,实际:{text}"
+        );
+        // 应答头之后才有载荷,这里再发一轮
+        io.write_all(b"ping-through-tunnel").await.unwrap();
+        let back = read_some(&mut io, 64).await;
+        assert_eq!(back, b"ping-through-tunnel");
+    }
+
+    /// CONNECT 里紧跟的载荷(与请求头同一次写入)必须送达目的地。
+    ///
+    /// 这是「多读的字节被丢掉」这个 bug 的回归:读头一次读 4KiB,
+    /// 很可能把 TLS ClientHello 一起读进来。
+    #[tokio::test]
+    async fn http_proxy_connect_forwards_pipelined_bytes() {
+        let echo = spawn_echo().await;
+        let mut io = open(&http_proxy_spec("", "")).await;
+        let mut req =
+            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nHost: x\r\n\r\n").into_bytes();
+        req.extend_from_slice(b"EARLY-BYTES");
+        io.write_all(&req).await.unwrap();
+        // 第一个 read 可能拿到 200 应答,也可能拿到应答+回显
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !seen.windows(11).any(|w| w == b"EARLY-BYTES") {
+            if tokio::time::Instant::now() > deadline {
+                panic!("未收到回显,已读:{:?}", String::from_utf8_lossy(&seen));
+            }
+            seen.extend_from_slice(&read_some(&mut io, 256).await);
+        }
+    }
+
+    /// 错误凭据 → 407 + `Proxy-Authenticate`,且**不拨号**。
+    #[tokio::test]
+    async fn http_proxy_rejects_bad_credentials() {
+        let echo = spawn_echo().await;
+        let mut io = open(&http_proxy_spec("pu", "pp")).await;
+        let cred = base64_encode("pu:WRONG");
+        io.write_all(
+            format!(
+                "CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nProxy-Authorization: Basic {cred}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let resp = read_some(&mut io, 256).await;
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 407"), "应为 407,实际:{text}");
+        assert!(
+            text.to_ascii_lowercase().contains("proxy-authenticate:"),
+            "407 必须带 Proxy-Authenticate:{text}"
+        );
+    }
+
+    /// 正确凭据放行。
+    #[tokio::test]
+    async fn http_proxy_accepts_good_credentials() {
+        let echo = spawn_echo().await;
+        let mut io = open(&http_proxy_spec("pu", "pp")).await;
+        let cred = base64_encode("pu:pp");
+        io.write_all(
+            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nProxy-Authorization: Basic {cred}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8_lossy(&read_some(&mut io, 128).await).into_owned();
+        assert!(text.starts_with("HTTP/1.1 200"), "应放行:{text}");
+    }
+
+    /// 目的地不可达 → 502(而不是把用户连接静默挂死)。
+    #[tokio::test]
+    async fn http_proxy_reports_unreachable_target() {
+        // 取一个几乎必然没人监听的端口
+        let port = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let mut io = open(&http_proxy_spec("", "")).await;
+        io.write_all(format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&read_some(&mut io, 256).await).into_owned();
+        assert!(text.starts_with("HTTP/1.1 502"), "应为 502,实际:{text}");
+    }
+
+    /// 普通请求(absolute-form):请求行改写成 origin-form,代理专有头被剥掉。
+    #[tokio::test]
+    async fn http_proxy_plain_request_is_rewritten() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let _ = s
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await;
+            let _ = s.shutdown().await;
+        });
+        let mut io = open(&http_proxy_spec("", "")).await;
+        io.write_all(
+            format!(
+                "GET http://127.0.0.1:{port}/path?q=1 HTTP/1.1\r\n\
+                 Host: 127.0.0.1:{port}\r\n\
+                 Proxy-Authorization: Basic {}\r\n\
+                 Proxy-Connection: keep-alive\r\n\r\n",
+                base64_encode("a:b")
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("上游未收到请求")
+            .unwrap();
+        assert!(
+            got.starts_with("GET /path?q=1 HTTP/1.1\r\n"),
+            "请求行应为 origin-form:{got}"
+        );
+        assert!(
+            !got.to_ascii_lowercase().contains("proxy-authorization"),
+            "Proxy-Authorization 不得透传:{got}"
+        );
+        assert!(
+            !got.to_ascii_lowercase().contains("proxy-connection"),
+            "Proxy-Connection 不得透传:{got}"
+        );
+        assert!(
+            got.to_ascii_lowercase().contains("connection: close"),
+            "必须强制 Connection: close:{got}"
+        );
+        // 响应要回到用户侧
+        let resp = String::from_utf8_lossy(&read_some(&mut io, 256).await).into_owned();
+        assert!(resp.contains("200 OK"), "响应未回传:{resp}");
+    }
+
+    /// SOCKS5:协商 → 认证 → CONNECT → 隧道,目的地取自 `DST.ADDR`。
+    #[tokio::test]
+    async fn socks5_connect_dials_request_target() {
+        let echo = spawn_echo().await;
+        let mut io = open(&socks_spec("su", "sp")).await;
+        // 协商:只提供 0x02
+        io.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut m = [0u8; 2];
+        io.read_exact(&mut m).await.unwrap();
+        assert_eq!(m, [0x05, 0x02], "应选择用户名密码认证");
+        // 认证
+        let mut auth = vec![0x01, 2];
+        auth.extend_from_slice(b"su");
+        auth.push(2);
+        auth.extend_from_slice(b"sp");
+        io.write_all(&auth).await.unwrap();
+        let mut ar = [0u8; 2];
+        io.read_exact(&mut ar).await.unwrap();
+        assert_eq!(ar, [0x01, 0x00], "认证应成功");
+        // CONNECT 到 echo(域名形式用 127.0.0.1 的 v4 地址即可)
+        let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+        req.extend_from_slice(&echo.to_be_bytes());
+        io.write_all(&req).await.unwrap();
+        let mut rep = [0u8; 10];
+        io.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x00, "REP 应为成功:{rep:?}");
+        io.write_all(b"socks-payload").await.unwrap();
+        assert_eq!(read_some(&mut io, 64).await, b"socks-payload");
+    }
+
+    /// SOCKS5 域名目标(ATYP=0x03):插件**自己**解析域名后拨号。
+    ///
+    /// 解析函数被替换成「固定回 127.0.0.1:<port>」,所以断言成立即证明
+    /// 目的地确实来自 `DST.ADDR` 里的域名。不注入的话,`localhost` 在
+    /// 部分系统上先解析成 `::1`,而测试的 echo 只监听 v4 —— 那会得到
+    /// 一个与语义无关的失败。
+    #[tokio::test]
+    async fn socks5_domain_target_is_resolved_locally() {
+        let _serial = DNS_OVERRIDE_LOCK.lock().await;
+        let _override = DnsOverride::new();
+        let echo = spawn_echo().await;
+        let mut io = open(&socks_spec("", "")).await;
+        io.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut m = [0u8; 2];
+        io.read_exact(&mut m).await.unwrap();
+        assert_eq!(m, [0x05, 0x00], "免认证应选 0x00");
+        let dom = b"echo.invalid";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, dom.len() as u8];
+        req.extend_from_slice(dom);
+        req.extend_from_slice(&echo.to_be_bytes());
+        io.write_all(&req).await.unwrap();
+        let mut rep = [0u8; 10];
+        io.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x00, "REP 应为成功:{rep:?}");
+        io.write_all(b"domain-ok").await.unwrap();
+        assert_eq!(read_some(&mut io, 32).await, b"domain-ok");
+    }
+
+    /// 解析函数是**进程级**全局状态,注入期间必须串行,否则并行测试
+    /// 会看到彼此伪造的解析结果。
+    static DNS_OVERRIDE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn fake_dns(
+        _host: &str,
+        port: u16,
+        _ns: Option<&str>,
+    ) -> futures::future::BoxFuture<'static, Option<std::net::SocketAddr>> {
+        Box::pin(async move {
+            Some(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                port,
+            )))
+        })
+    }
+
+    /// 注入解析函数,drop 时恢复(panic 也不会污染后续用例)。
+    struct DnsOverride;
+
+    impl DnsOverride {
+        fn new() -> Self {
+            crate::dnsquery::cache_clear();
+            crate::dnsquery::resolve_set_query(Some(fake_dns));
+            Self
+        }
+    }
+
+    impl Drop for DnsOverride {
+        fn drop(&mut self) {
+            crate::dnsquery::resolve_set_query(None);
+            crate::dnsquery::cache_clear();
+        }
+    }
+
+    /// SOCKS5 认证失败:回 `0x01 0x01` 并断开。
+    #[tokio::test]
+    async fn socks5_rejects_bad_credentials() {
+        let mut io = open(&socks_spec("su", "sp")).await;
+        io.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut m = [0u8; 2];
+        io.read_exact(&mut m).await.unwrap();
+        let mut auth = vec![0x01, 2];
+        auth.extend_from_slice(b"su");
+        auth.push(2);
+        auth.extend_from_slice(b"BAD");
+        io.write_all(&auth).await.unwrap();
+        let mut ar = [0u8; 2];
+        io.read_exact(&mut ar).await.unwrap();
+        assert_eq!(ar, [0x01, 0x01], "认证应失败");
+    }
+
+    /// 非 CONNECT 命令 → REP=0x07(而不是假装成功)。
+    #[tokio::test]
+    async fn socks5_rejects_non_connect_command() {
+        let mut io = open(&socks_spec("", "")).await;
+        io.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut m = [0u8; 2];
+        io.read_exact(&mut m).await.unwrap();
+        // BIND(0x02)到 127.0.0.1:1
+        io.write_all(&[0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0, 1])
+            .await
+            .unwrap();
+        let mut rep = [0u8; 10];
+        io.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x07, "应回 Command not supported:{rep:?}");
+    }
+
+    // ---- 地址拆分 ----
+
+    #[test]
+    fn split_authority_handles_common_forms() {
+        assert_eq!(
+            split_authority("example.com:8080", 443),
+            Some(("example.com".into(), 8080))
+        );
+        assert_eq!(
+            split_authority("example.com", 443),
+            Some(("example.com".into(), 443))
+        );
+        assert_eq!(
+            split_authority("127.0.0.1:80", 443),
+            Some(("127.0.0.1".into(), 80))
+        );
+        // IPv6 方括号必须剥掉,否则 IpAddr::parse 失败
+        assert_eq!(split_authority("[::1]:8080", 443), Some(("::1".into(), 8080)));
+        assert_eq!(split_authority("[::1]", 443), Some(("::1".into(), 443)));
+        // 末尾根点归一化
+        assert_eq!(
+            split_authority("example.com.:80", 443),
+            Some(("example.com".into(), 80))
+        );
+    }
+
+    #[test]
+    fn split_authority_rejects_malformed() {
+        // 空 / 空 host / 0 端口 / 未加括号的 v6 / 端口非数字
+        assert_eq!(split_authority("", 443), None);
+        assert_eq!(split_authority(":443", 443), None);
+        assert_eq!(split_authority("example.com:0", 443), None);
+        assert_eq!(split_authority("::1:8080", 443), None);
+        assert_eq!(split_authority("example.com:http", 443), None);
+        assert_eq!(split_authority("[::1]:x", 443), None);
+    }
+
+    #[test]
+    fn absolute_form_authority_extracts_host() {
+        assert_eq!(
+            absolute_form_authority("http://example.com:8080/p?q"),
+            Some("example.com:8080".into())
+        );
+        assert_eq!(
+            absolute_form_authority("http://user:pw@example.com/"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            absolute_form_authority("https://example.com"),
+            Some("example.com".into())
+        );
+        // 非 http(s) 或没有 authority
+        assert_eq!(absolute_form_authority("ftp://example.com/"), None);
+        assert_eq!(absolute_form_authority("/path"), None);
+    }
+
+    #[test]
+    fn origin_form_keeps_path_and_drops_fragment() {
+        assert_eq!(origin_form("http://h/a/b?x=1#frag"), "/a/b?x=1");
+        assert_eq!(origin_form("http://h"), "/");
+        assert_eq!(origin_form("http://h?q=1"), "/?q=1");
+    }
+
+    /// 免鉴权判据:用户名为空即不鉴权(与 static_file 同口径)。
+    #[test]
+    fn auth_gate_matches_empty_username_rule() {
+        let none = basic_auth("", "");
+        assert!(check_proxy_auth(&none, None), "空用户名应免鉴权");
+        assert!(check_proxy_auth(&none, Some("anything:at-all")));
+
+        let some = basic_auth("u", "p");
+        assert!(check_proxy_auth(&some, Some("u:p")));
+        assert!(!check_proxy_auth(&some, Some("u:wrong")));
+        assert!(!check_proxy_auth(&some, None), "缺凭据必须拒绝");
+    }
+
+    // ---- 测试辅助 ----
+
+    fn base64_encode(s: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+    }
 }
 
 #[cfg(test)]

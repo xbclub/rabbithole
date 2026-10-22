@@ -141,11 +141,15 @@ target/debug 陈旧二进制导致假失败,已改默认 target/release)。
 | https2http | TLS 终结(插件证书)→ 明文上游 + 头改写 | curl -k 可达,上游断言 Host 重写+注入头 |
 | https2https | TLS 终结 → TLS 上游(双 TLS 链路) | 上游断言重写后请求 |
 | tls2raw | TLS 入 → 裸 TCP 上游(不解读 HTTP) | python TLS 客户端发送,裸 echo 回显 |
-| http_proxy | CONNECT + Basic 凭据 + 隧道 | 代理侧断言 CONNECT 目标与 `AUTH=pu:pp`,隧道回显;错误凭据 407 → 连接干净关闭 |
-| socks5 | 方法协商 + 用户密码 + 域名目标 + 隧道 | 服务侧断言 methods/auth=su:sp/target,隧道回显 |
+| http_proxy | 插件**即代理服务端**:解析用户 `CONNECT host:port` 里的目的地并拨号 | 规则的 target 故意填不可达地址(127.0.0.1:1),仍能 CONNECT 到用户指定的 echo 并回显;错误凭据 → 407 + `Proxy-Authenticate`;目的地不可达 → 502 |
+| socks5 | 插件**即 SOCKS5 服务端**:方法协商 + RFC1929 认证 + 用户指定的 `DST.ADDR` | 同上(target 不可达),CONNECT 到用户指定 echo 并回显;错误凭据 → `0x01 0x01`;非 CONNECT 命令 → REP `0x07` |
 
-辅助服务全部为本地 python(请求头记录型上游、HTTP 正向代理、SOCKS5 服务、echo),
-显式 close 释放连接。
+http_proxy/socks5 的断言刻意建立在「配置里的 target 是死地址」之上:
+修前的实现把 target 同时当代理地址与 CONNECT 目的地,自指;只要实现
+重新去读 target,这两条用例就会立刻变红。
+
+辅助服务全部为本地 python(请求头记录型上游、echo),显式 close 释放连接。
+两个代理插件的 e2e 不需要「本地代理辅助服务」——被测插件自己就是代理服务端。
 
 ## 10. E2E-6(vhost 进阶,`tests/e2e-vhost.sh`,10/10 PASS ×3)
 

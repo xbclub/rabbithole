@@ -79,6 +79,10 @@ assertion `left == right` failed: 一次到齐应只推 1 次 read
 
 `tests/e2e-plugins.sh`:**PASS=15 FAIL=0**(http_proxy / socks5 / https2http / https2https / http2https / http2http / tls2raw 全覆盖)。
 
+> 2026-10-22 更新:http_proxy / socks5 已按 frp 语义重写为「进程内代理服务端」
+> (目的地取自用户请求,不再是配置里的 target),脚本同步改为 16 条断言。
+> 上面这行数字是当时的记录,保留作历史;当前结果见 `docs/review-2026-10-handoff.md`。
+
 全量:`cargo test --workspace` 全绿(rh-client 43 → 57 lib 测试);`cargo clippy --workspace --all-targets -- -D warnings` 通过。
 
 ## 3. 吞吐(如实:没有提升)

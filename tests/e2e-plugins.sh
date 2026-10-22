@@ -5,8 +5,10 @@
 #   - 改写类(http2http/http2https/https2http/https2https):上游记录收到的请求头,
 #     断言 Host 重写 / HeaderOp(set 后 del)/ 响应回传
 #   - tls2raw:TLS 入 → 裸 echo 上游回显
-#   - http_proxy/socks5:本地代理辅助服务断言握手(CONNECT/Basic 认证;SOCKS5
-#     方法协商/用户密码/域名目标)后建立隧道,载荷经隧道回显
+#   - http_proxy/socks5:插件在客户端进程内扮演**代理服务端**。断言用户的
+#     CONNECT / SOCKS5 请求里写的目的地被真正拨通并回显(配置的 target 故意
+#     填不可达地址,任何"拨配置目标"的实现都会失败),并覆盖 407 / RFC1929
+#     认证失败 / 502 / 非 CONNECT 命令 四个负向分支
 # 用法: tests/e2e-plugins.sh [二进制目录(默认 target/release)]
 set -u
 BIN_DIR="${1:-$(dirname "$0")/../target/release}"
@@ -14,7 +16,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SERVER="$ROOT/$BIN_DIR/rh-server"
 CLIENT="$ROOT/$BIN_DIR/rh-client"
 WORK=$(mktemp -d /tmp/rh-plugins.XXXXXX)
-API=30580; CTL=30500; ECHO=30501; HDR=30502; HDR_TLS=30503; HPROXY=30504; SOCKS=30505
+API=30580; CTL=30500; ECHO=30501; HDR=30502; HDR_TLS=30503
 PASS=0; FAIL=0; PIDS=()
 cleanup(){
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
@@ -100,117 +102,6 @@ def serve(c):
         c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
     except OSError: pass
     finally: c.close()
-while True:
-    c, _ = s.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
-EOF
-PIDS+=($!)
-
-# 本地 HTTP 正向代理:校验 Basic 凭据后隧道到固定 echo(记录 CONNECT 行与凭据)
-python3 - "$HPROXY" "$WORK/hproxy.log" "$ECHO" <<'EOF' &
-import socket, threading, base64, sys
-PORT, LOG, ECHO = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
-s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", PORT)); s.listen(64)
-def pump(a, b):
-    try:
-        while True:
-            d = a.recv(65536)
-            if not d: break
-            b.sendall(d)
-    except OSError: pass
-    finally:
-        try: a.close()
-        except OSError: pass
-def serve(c):
-    try:
-        buf = b""
-        while b"\r\n\r\n" not in buf:
-            d = c.recv(65536)
-            if not d: c.close(); return
-            buf += d
-        head = buf.split(b"\r\n\r\n", 1)[0].decode("latin1")
-        with open(LOG, "a") as f: f.write("---CONNECT---\n" + head + "\n")
-        auth = ""
-        for l in head.split("\r\n"):
-            if l.lower().startswith("proxy-authorization:"):
-                auth = l.split(":", 1)[1].strip()
-        userpass = ""
-        if auth.startswith("Basic "):
-            try: userpass = base64.b64decode(auth[6:]).decode()
-            except Exception: pass
-        with open(LOG, "a") as f: f.write("AUTH=" + userpass + "\n")
-        if userpass != "pu:pp":
-            c.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            c.close(); return
-        c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        up = socket.create_connection(("127.0.0.1", ECHO))
-        if buf.split(b"\r\n\r\n", 1)[1]:
-            up.sendall(buf.split(b"\r\n\r\n", 1)[1])
-        threading.Thread(target=pump, args=(c, up), daemon=True).start()
-        pump(up, c)
-    except OSError: pass
-    finally:
-        try: c.close()
-        except OSError: pass
-while True:
-    c, _ = s.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
-EOF
-PIDS+=($!)
-
-# 本地 SOCKS5 服务:方法协商/用户密码校验/域名目标断言,成功后隧道到固定 echo
-python3 - "$SOCKS" "$WORK/socks.log" "$ECHO" "$SOCKS" <<'EOF' &
-import socket, threading, sys
-PORT, LOG, ECHO = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
-SocksSelfPort = int(sys.argv[4])
-s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", PORT)); s.listen(64)
-def pump(a, b):
-    try:
-        while True:
-            d = a.recv(65536)
-            if not d: break
-            b.sendall(d)
-    except OSError: pass
-    finally:
-        try: a.close()
-        except OSError: pass
-def serve(c):
-    log = []
-    try:
-        greet = c.recv(2)
-        nmethods = greet[1]
-        methods = c.recv(nmethods)
-        log.append("methods=" + ",".join(str(m) for m in methods))
-        if 0x02 in methods:
-            c.sendall(b"\x05\x02")
-            ver = c.recv(1); ulen = c.recv(1)[0]; user = c.recv(ulen)
-            plen = c.recv(1)[0]; pwd = c.recv(plen)
-            creds = user.decode() + ":" + pwd.decode()
-            log.append("auth=" + creds)
-            if creds != "su:sp":
-                c.sendall(b"\x01\x01"); c.close(); return
-            c.sendall(b"\x01\x00")
-        else:
-            c.sendall(b"\x05\x00")
-        head = c.recv(4)
-        atyp = head[3]
-        if atyp == 0x03:
-            dl = c.recv(1)[0]; dom = c.recv(dl)
-        elif atyp == 0x01:
-            dom = c.recv(4)
-        else:
-            dom = c.recv(16)
-        port = int.from_bytes(c.recv(2), "big")
-        log.append("target=" + (dom.decode() if isinstance(dom, bytes) and atyp == 0x03 else str(dom)) + ":" + str(port))
-        with open(LOG, "a") as f: f.write("---SOCKS---\n" + "\n".join(log) + "\n")
-        c.sendall(b"\x05\x00\x00\x01" + b"\x7f\x00\x00\x01" + port.to_bytes(2, "big"))
-        up = socket.create_connection(("127.0.0.1", ECHO))
-        threading.Thread(target=pump, args=(c, up), daemon=True).start()
-        pump(up, c)
-    except OSError: pass
-    finally:
-        try: c.close()
-        except OSError: pass
 while True:
     c, _ = s.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
 EOF
@@ -330,54 +221,146 @@ EOF2
 )
 [ "$out" = "tls2raw-ping" ]; check $? "tls2raw:TLS 解密后裸转发回显($out)"
 
-# ---------- 6) http_proxy:CONNECT + Basic 认证 + 隧道 ----------
-mk_svc "{\"client_id\":\"$CID\",\"name\":\"hpx\",\"kind\":\"tcp\",\"bind_port\":30516,\"target_host\":\"127.0.0.1\",\"target_port\":$HPROXY,\"enabled\":true,\"plugin\":{\"kind\":\"http_proxy\",\"http_user\":\"pu\",\"http_password\":\"pp\"}}"
+# ---------- 6) http_proxy:插件自己扮演代理服务端,目的地来自用户请求 ----------
+#
+# 语义要点(见 docs/pending-plugin-proxy-semantics.md 的结论):
+# 插件不是「拨号器」,而是「客户端进程内的代理服务端」。用户经隧道发来的
+# CONNECT 里写的才是目的地,插件解析后自己去拨。
+#
+# 因此规则**不再需要 target 指向代理**:target_host/target_port 对这两个
+# 插件无意义,这里故意填一个不可达地址,任何「拨配置目标」的实现都会失败。
+HPX_DEAD_TARGET='"target_host":"127.0.0.1","target_port":1'
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"hpx\",\"kind\":\"tcp\",\"bind_port\":30516,$HPX_DEAD_TARGET,\"enabled\":true,\"plugin\":{\"kind\":\"http_proxy\",\"http_user\":\"pu\",\"http_password\":\"pp\"}}"
 wait_rule hpx
-tun=$(python3 - <<'EOF'
-import socket
+hpx_out=$(python3 - "$ECHO" <<'EOF'
+import socket, sys, base64
+echo = int(sys.argv[1])
 try:
     s = socket.create_connection(("127.0.0.1", 30516), timeout=10)
-    s.sendall(b"tun-payload\n"); s.settimeout(8)
-    d = s.recv(64)
-    print(d.decode())
+    cred = base64.b64encode(b"pu:pp").decode()
+    # 目的地是 echo(由用户请求指定),不是配置里的 target
+    s.sendall(("CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: ignored\r\n"
+               "Proxy-Authorization: Basic %s\r\n\r\n" % (echo, cred)).encode())
+    s.settimeout(8)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        d = s.recv(4096)
+        if not d: break
+        buf += d
+    status = buf.split(b"\r\n", 1)[0].decode()
+    if " 200" not in status:
+        print("STATUS:" + status); sys.exit(0)
+    s.sendall(b"hpx-payload\n")
+    print(s.recv(64).decode())
 except Exception as e:
     print("ERR", e)
 EOF
 )
-[ "$tun" = "tun-payload" ]; check $? "http_proxy:经代理隧道回显($tun)"
-grep -q "CONNECT 127.0.0.1:$HPROXY" "$WORK/hproxy.log" && grep -q "AUTH=pu:pp" "$WORK/hproxy.log"; check $? "http_proxy:CONNECT 目标与 Basic 凭据正确"
-# 负向:错误凭据 → 代理 407 → 用户连接被关闭
-mk_svc "{\"client_id\":\"$CID\",\"name\":\"hpxbad\",\"kind\":\"tcp\",\"bind_port\":30517,\"target_host\":\"127.0.0.1\",\"target_port\":$HPROXY,\"enabled\":true,\"plugin\":{\"kind\":\"http_proxy\",\"http_user\":\"pu\",\"http_password\":\"WRONG\"}}"
+[ "$hpx_out" = "hpx-payload" ]; check $? "http_proxy:CONNECT 到用户请求的目的地并回显($hpx_out)"
+
+# 负向:错误凭据 → 407 + Proxy-Authenticate(而不是静默断开)
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"hpxbad\",\"kind\":\"tcp\",\"bind_port\":30517,$HPX_DEAD_TARGET,\"enabled\":true,\"plugin\":{\"kind\":\"http_proxy\",\"http_user\":\"pu\",\"http_password\":\"pp\"}}"
 wait_rule hpxbad
-neg=$(python3 - <<'EOF'
-import socket
+hpx_neg=$(python3 - "$ECHO" <<'EOF'
+import socket, sys, base64
+echo = int(sys.argv[1])
 try:
     s = socket.create_connection(("127.0.0.1", 30517), timeout=10)
-    s.sendall(b"x\n"); s.settimeout(8)
-    d = s.recv(64)
-    print("EOF" if not d else d.decode())
+    cred = base64.b64encode(b"pu:WRONG").decode()
+    s.sendall(("CONNECT 127.0.0.1:%d HTTP/1.1\r\nProxy-Authorization: Basic %s\r\n\r\n"
+               % (echo, cred)).encode())
+    s.settimeout(8)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        d = s.recv(4096)
+        if not d: break
+        buf += d
+    head = buf.decode("latin1")
+    ok = " 407 " in head.split("\r\n", 1)[0] and "proxy-authenticate:" in head.lower()
+    print("407-OK" if ok else "BAD:" + head.replace("\r\n", "|"))
 except Exception as e:
-    print("CLOSED")
+    print("ERR", e)
 EOF
 )
-[ "$neg" = "EOF" ] || [ "$neg" = "CLOSED" ]; check $? "http_proxy:错误凭据被拒(连接干净关闭)"
+[ "$hpx_neg" = "407-OK" ]; check $? "http_proxy:错误凭据回 407 且带 Proxy-Authenticate($hpx_neg)"
 
-# ---------- 7) socks5:方法协商 + 用户密码 + 域名目标 + 隧道 ----------
-mk_svc "{\"client_id\":\"$CID\",\"name\":\"s5\",\"kind\":\"tcp\",\"bind_port\":30518,\"target_host\":\"127.0.0.1\",\"target_port\":$SOCKS,\"enabled\":true,\"plugin\":{\"kind\":\"socks5\",\"user\":\"su\",\"password\":\"sp\"}}"
+# 负向:目的地不可达 → 502(不能把用户连接挂死)
+hpx_502=$(python3 - <<'EOF'
+import socket, base64
+try:
+    s = socket.create_connection(("127.0.0.1", 30516), timeout=10)
+    cred = base64.b64encode(b"pu:pp").decode()
+    # 端口 1 几乎必然无人监听;凭据必须正确,否则先被 407 挡下
+    s.sendall(("CONNECT 127.0.0.1:1 HTTP/1.1\r\nProxy-Authorization: Basic %s\r\n\r\n" % cred).encode())
+    s.settimeout(8)
+    d = s.recv(256)
+    print("502" if b" 502 " in d.split(b"\r\n", 1)[0] else "BAD:" + d.decode("latin1", "replace"))
+except Exception as e:
+    print("ERR", e)
+EOF
+)
+[ "$hpx_502" = "502" ]; check $? "http_proxy:目的地不可达回 502($hpx_502)"
+
+# ---------- 7) socks5:方法协商 + 用户密码 + 用户指定的目的地 + 隧道 ----------
+mk_svc "{\"client_id\":\"$CID\",\"name\":\"s5\",\"kind\":\"tcp\",\"bind_port\":30518,$HPX_DEAD_TARGET,\"enabled\":true,\"plugin\":{\"kind\":\"socks5\",\"user\":\"su\",\"password\":\"sp\"}}"
 wait_rule s5
-tun=$(python3 - <<'EOF'
+s5_out=$(python3 - "$ECHO" <<'EOF'
+import socket, sys
+echo = int(sys.argv[1])
+try:
+    s = socket.create_connection(("127.0.0.1", 30518), timeout=10)
+    s.settimeout(8)
+    s.sendall(b"\x05\x01\x02")            # 只提供用户名密码
+    assert s.recv(2) == b"\x05\x02", "应选 0x02"
+    s.sendall(b"\x01\x02su\x02sp")        # RFC1929
+    assert s.recv(2) == b"\x01\x00", "认证应成功"
+    # CONNECT 到 echo(用户指定),不是配置里的 target
+    s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") + echo.to_bytes(2, "big"))
+    rep = s.recv(10)
+    if rep[1] != 0:
+        print("REP:%d" % rep[1]); sys.exit(0)
+    s.sendall(b"socks-payload\n")
+    print(s.recv(64).decode())
+except Exception as e:
+    print("ERR", e)
+EOF
+)
+[ "$s5_out" = "socks-payload" ]; check $? "socks5:CONNECT 到用户请求的目的地并回显($s5_out)"
+
+# 负向:错误凭据 → RFC1929 的 0x01 0x01,且不再接受请求
+s5_neg=$(python3 - <<'EOF'
 import socket
 try:
     s = socket.create_connection(("127.0.0.1", 30518), timeout=10)
-    s.sendall(b"socks-payload\n"); s.settimeout(8)
-    d = s.recv(64)
-    print(d.decode())
+    s.settimeout(8)
+    s.sendall(b"\x05\x01\x02")
+    s.recv(2)
+    s.sendall(b"\x01\x02su\x03BAD")
+    print("AUTHFAIL" if s.recv(2) == b"\x01\x01" else "BAD")
 except Exception as e:
     print("ERR", e)
 EOF
 )
-[ "$tun" = "socks-payload" ]; check $? "socks5:经 SOCKS5 隧道回显($tun)"
-grep -q "methods=0,2\|methods=2,0\|methods=2" "$WORK/socks.log" && grep -q "auth=su:sp" "$WORK/socks.log" && grep -q "target=127.0.0.1:$SOCKS" "$WORK/socks.log"; check $? "socks5:协商/认证/域名目标正确"
+[ "$s5_neg" = "AUTHFAIL" ]; check $? "socks5:错误凭据回 0x01 0x01($s5_neg)"
+
+# 负向:非 CONNECT 命令(BIND)→ REP=0x07
+s5_cmd=$(python3 - "$ECHO" <<'EOF'
+import socket, sys
+echo = int(sys.argv[1])
+try:
+    s = socket.create_connection(("127.0.0.1", 30518), timeout=10)
+    s.settimeout(8)
+    s.sendall(b"\x05\x01\x02")
+    s.recv(2)
+    s.sendall(b"\x01\x02su\x02sp")
+    s.recv(2)
+    s.sendall(b"\x05\x02\x00\x01" + socket.inet_aton("127.0.0.1") + echo.to_bytes(2, "big"))
+    print("REP=%d" % s.recv(10)[1])
+except Exception as e:
+    print("ERR", e)
+EOF
+)
+[ "$s5_cmd" = "REP=7" ]; check $? "socks5:非 CONNECT 命令回 REP=0x07($s5_cmd)"
 
 echo
 echo "== 结果: PASS=$PASS FAIL=$FAIL =="

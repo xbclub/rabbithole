@@ -47,8 +47,8 @@
 | C14 | 端口自动分配(remotePort=0) | server ports | rh-server state.rs allocate_port(OS 探测) | tests/e2e.sh「ssh -R 注册(分配端口)」 | acceptance.md §E2E-1 | done |
 | C15 | IPv4/IPv6(bind addr 字面量) | 全局 | rh-core net.rs | rh-core 单测(bind_ip_parse/conflict_detection) | acceptance.md §测试-1 | done |
 | C16 | 插件:unix_domain_socket | pkg/plugin/client | rh-client plugins.rs | tests/e2e.sh「插件 unix_domain_socket 回显」 | acceptance.md §E2E-1 | done |
-| C17 | 插件:http_proxy | 同上 | rh-client plugins.rs(CONNECT+BasicAuth) | tests/e2e-plugins.sh:本地代理辅助服务断言 CONNECT 目标与 Basic 凭据、隧道回显、错误凭据 407 拒绝 | acceptance.md §E2E-5 | done |
-| C18 | 插件:socks5 | 同上 | rh-client plugins.rs(用户名密码+域名 CONNECT) | tests/e2e-plugins.sh:SOCKS5 辅助服务断言方法协商/用户密码/域名目标,隧道回显 | acceptance.md §E2E-5 | done |
+| C17 | 插件:http_proxy | 同上 | rh-client plugins.rs(**进程内 HTTP 代理服务端**:解析用户 CONNECT 的目的地后拨号,Basic 鉴权) | tests/e2e-plugins.sh:规则的 target 填不可达地址仍能 CONNECT 到用户指定目的地并回显;407 / 502 负向 | acceptance.md §E2E-5 | done |
+| C18 | 插件:socks5 | 同上 | rh-client plugins.rs(**进程内 SOCKS5 服务端**:方法协商 + RFC1929 + 用户 DST.ADDR) | tests/e2e-plugins.sh:target 不可达仍能 CONNECT 到用户指定目的地并回显;认证失败 / 非 CONNECT 负向 | acceptance.md §E2E-5 | done |
 | C19 | 插件:static_file | 同上 | rh-client plugins.rs | tests/e2e.sh「插件 static_file 服务文件」 | acceptance.md §E2E-1 | done |
 | C20 | 插件:https2http | 同上 | rh-client plugins.rs(TLS 终结→明文上游+头改写) | tests/e2e-plugins.sh:curl -k 经规则 TLS 到达插件,上游断言 Host 重写+注入头,响应回传 | acceptance.md §E2E-5 | done |
 | C21 | 插件:https2https | 同上 | rh-client plugins.rs(TLS 终结→TLS 上游) | tests/e2e-plugins.sh:双 TLS 链路(curl -k → 插件终结 → TLS 上游),上游断言重写后请求 | acceptance.md §E2E-5 | done |

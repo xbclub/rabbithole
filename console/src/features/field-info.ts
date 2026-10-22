@@ -36,7 +36,8 @@ export const FIELD_INFO = {
   'service.advanced': '传输压缩、限速、负载均衡分组、健康检查与 HTTP 增强等低频配置',
 
   // ── 规则弹窗(插件) ──
-  'service.plugin_kind': '在客户端本地处理流量(静态文件/SOCKS5/https2http 等),替代直连目标服务',
+  'service.plugin_kind':
+    '在客户端本地处理流量(静态文件/SOCKS5/https2http 等),替代直连目标服务;http_proxy 与 socks5 是「在客户端进程内运行的代理服务端」,目的地由用户请求里的 CONNECT/目标地址决定,与目标地址无关',
   'service.plugin_params': '按所选插件类型展开对应参数',
 
   // ── 规则弹窗(传输与限速) ──

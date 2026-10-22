@@ -342,16 +342,17 @@ fn mk_client_limiter(
 /// 转发打到 B"这类极难归因的故障。`nathole_cli` 的直连路径早已用 `spec`
 /// 覆盖 `fwd`,这里补齐后两条路径口径一致。
 ///
-/// 插件分支仍传 `fwd`:代理/改写类插件的地址语义由服务端规则定义
-/// (`http_proxy`/`socks5` 用 `fwd.target_host` 表达**本地代理地址**,
-/// 改写类插件用服务端下发的 `local_addr`),与常规中继的 `spec` 无关。
+/// 插件分支**不读** `fwd`:所有插件的目标都来自 `spec.plugin` 自身
+/// (`local_addr`/`unix_path`),`http_proxy`/`socks5` 的目的地更是来自
+/// 用户在代理请求里写的地址。从前这里把 `fwd.target_host` 当成「本地代理
+/// 地址」传给插件,才导致那两个插件自指(连代理 → CONNECT 代理自己)。
 pub async fn dial_target(
     _sess: &Arc<ClientSession>,
     spec: &ProxySpec,
-    fwd: &StartForward,
+    _fwd: &StartForward,
 ) -> anyhow::Result<BoxedIo> {
     if let Some(plugin) = &spec.plugin {
-        return crate::plugins::dial_plugin(plugin, fwd).await;
+        return crate::plugins::dial_plugin(plugin).await;
     }
     let addr = resolve(&spec.target_host, spec.target_port).await?;
     let stream = tokio::time::timeout(
@@ -405,11 +406,26 @@ const ERROR_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(1)
 
 /// 无锁拆分命中计数(仅测试用):断言 splice 在裸 TCP 上确实走了
 /// `split_boxed_io` 而非共享一把 Mutex 的 `tokio::io::split`。
-///
-/// 是**进程级全局**计数,故两条探针测试用 [`SPLIT_PROBE_LOCK`] 串行,
-/// 否则并行执行时彼此的 splice 会污染对方的差值(实测必 flaky)。
 #[cfg(test)]
 static LOCKLESS_SPLITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+tokio::task_local! {
+    /// 探针作用域标记。**只有被它包裹的那次 splice 才计数。**
+    ///
+    /// 为什么不是全局开关:`splice` 在别的测试里也会跑(代理插件的端到端
+    /// 用例就 splice 真实 TCP),全局开关会把它们的命中一起算进来 ——
+    /// 实测就是这样 flaky 的(`left: 6, right: 0`)。task-local 天然按
+    /// 「这次 future」隔离,并发用例互不可见。
+    static SPLIT_PROBE_SCOPE: ();
+}
+
+/// 采集点:不在作用域内时 `try_with` 返回 `Err`,一次分支即可,代价可忽略。
+#[cfg(test)]
+fn note_lockless_split() {
+    let _ = SPLIT_PROBE_SCOPE.try_with(|_| {
+        LOCKLESS_SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
 
 /// 探针测试串行锁(见 [`LOCKLESS_SPLITS`])。用 tokio Mutex:守卫要跨
 /// `await` 持有(std MutexGuard 跨 await 会被 clippy 判为错误)。
@@ -446,7 +462,7 @@ pub async fn splice(a: BoxedIo, b: BoxedIo, bucket: Option<Arc<rh_core::ratelimi
     ) = match rh_transport::split_boxed_io(a) {
         Ok((r, w)) => {
             #[cfg(test)]
-            LOCKLESS_SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_lockless_split();
             (Box::new(r), Box::new(w))
         }
         Err(io) => {
@@ -460,7 +476,7 @@ pub async fn splice(a: BoxedIo, b: BoxedIo, bucket: Option<Arc<rh_core::ratelimi
     ) = match rh_transport::split_boxed_io(b) {
         Ok((r, w)) => {
             #[cfg(test)]
-            LOCKLESS_SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_lockless_split();
             (Box::new(r), Box::new(w))
         }
         Err(io) => {
@@ -1022,6 +1038,7 @@ mod tests {
         // 探针是进程级全局:与 splice_falls_back_for_non_tcp 串行,避免并行
         // 测试互相污染计数差值。
         let _serial = SPLIT_PROBE_LOCK.lock().await;
+        let before = LOCKLESS_SPLITS.load(Ordering::Relaxed);
         const N: usize = 1024 * 1024;
 
         // 外侧两端(测试自己持有),中间两条交给 splice 对接。
@@ -1031,8 +1048,7 @@ mod tests {
         let (out_b, b) = tcp_pair().await; // out_b ↔ b
         let (mut out_b_r, mut out_b_w) = out_b.into_split();
 
-        let before = LOCKLESS_SPLITS.load(Ordering::Relaxed);
-        let relay = tokio::spawn(splice(Box::new(a), Box::new(b), None));
+        let relay = tokio::spawn(SPLIT_PROBE_SCOPE.scope((), splice(Box::new(a), Box::new(b), None)));
         // 无锁分支必须在 splice 起步后立刻命中两次(a、b 各一)
         for _ in 0..200 {
             if LOCKLESS_SPLITS.load(Ordering::Relaxed) >= before + 2 {
@@ -1108,7 +1124,10 @@ mod tests {
         let (mut b_peer, b_local) = tokio::io::duplex(64 * 1024);
 
         let before = LOCKLESS_SPLITS.load(Ordering::Relaxed);
-        let relay = tokio::spawn(splice(Box::new(a_local), Box::new(b_local), None));
+        let relay = tokio::spawn(SPLIT_PROBE_SCOPE.scope(
+            (),
+            splice(Box::new(a_local), Box::new(b_local), None),
+        ));
         // duplex 不是 TcpStream:不得命中无锁分支
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(
