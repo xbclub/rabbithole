@@ -307,7 +307,7 @@ Tailwind v4 + shadcn/ui)。以下为本次实际执行结果(本机 Node 26.11 /
 | 单元测试 | `pnpm test`(`vitest run`) | **50/50 通过**(`features/services/__tests__/spec.test.ts`,覆盖 spec↔表单值组装/反解与 kind 字段矩阵) |
 | Lint | `pnpm lint`(`eslint .`) | **0 error / 5 warning**;5 条均为 `react-refresh/only-export-components` 与 `react-hooks/incompatible-library` 的 HMR 粒度提示,非正确性问题 |
 | 生产构建 | `pnpm build` | 通过;`index.html` 仅一条 CSS preload,图表(`traffic-chart` 366 KB / 108 KB gz)与表单(`form` 129 KB / 40 KB gz)按需懒加载 |
-| 格式检查 | `pnpm format:check` | **未通过**:`index.html` 与 `src/pages/settings/index.tsx` 有格式偏差(纯空白/换行,`pnpm format` 可修) |
+| 格式检查 | `pnpm format:check` | **通过**(2026-10-22 补:`index.html` 与 `src/pages/settings/index.tsx` 的空白/换行偏差已用 `prettier --write` 修掉,复跑 `All matched files use Prettier code style!`) |
 
 **注**:本节的 50 条用例是 2026-10-12 重写时随 `features/services` 抽出的纯逻辑测试,
 与 §2 中 vben 版的 575 条(vue 组件测试)不是同一口径,不可直接对比。

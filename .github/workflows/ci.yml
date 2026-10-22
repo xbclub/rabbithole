@@ -12,9 +12,8 @@
 # * `windows-check`(Windows x86_64):**只做编译检查,不跑测试**。
 #   见该 job 内的说明(v0.4.0 的 msvc 目标曾同时红)。
 #
-# **刻意不含 `cargo fmt --check`**:仓库当前有 93 处 fmt 差异(24 个文件),
-# 是既有状态。加进去会让门禁一上线就红,而"红的门禁"很快就会被无视 ——
-# 那比没有门禁更糟。要加,先把 fmt 单独整理成一次纯格式化提交。
+# 含 `cargo fmt --check`:仓库已在 `f25f0ff` 做过一次纯格式化提交
+# (登记在 `.git-blame-ignore-revs`),现在格式化是干净的,门禁可以上线。
 name: ci
 
 on:
@@ -39,7 +38,7 @@ jobs:
       - name: 安装 Rust 工具链
         run: |
           rustup show active-toolchain || rustup toolchain install
-          rustup component add clippy
+          rustup component add clippy rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -53,6 +52,9 @@ jobs:
         run: |
           command -v ss || { sudo apt-get update && sudo apt-get install -y iproute2; }
           ss -V
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings

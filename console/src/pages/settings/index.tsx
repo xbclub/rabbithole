@@ -95,9 +95,7 @@ function alpnListValid(raw: string): boolean {
     .map((x) => x.trim())
     .filter(Boolean);
   if (items.length > 8) return false;
-  return items.every(
-    (it) => it.length >= 1 && it.length <= 255 && /^[\x21-\x7e]+$/.test(it),
-  );
+  return items.every((it) => it.length >= 1 && it.length <= 255 && /^[\x21-\x7e]+$/.test(it));
 }
 
 /** 服务器配置(热生效子集):SSH 网关 / 端口策略 / 日志级别 / 公钥白名单。 */
@@ -510,9 +508,9 @@ function ServerConfigCard() {
                 <h3 className="text-sm font-semibold">TLS</h3>
                 <p className="text-xs leading-relaxed text-muted-foreground">
                   ALPN 位于 TLS 握手的 ClientHello 中且<strong>不经加密</strong>,
-                  任何抓包工具都能直接读到。用项目专属名称会被识别为 rabbithole,
-                  故默认值用最常见的 <code className="font-mono">h2</code>。
-                  改动<strong>必须与客户端一致</strong>,否则 TLS 握手直接失败。
+                  任何抓包工具都能直接读到。用项目专属名称会被识别为 rabbithole, 故默认值用最常见的{' '}
+                  <code className="font-mono">h2</code>。 改动<strong>必须与客户端一致</strong>,否则
+                  TLS 握手直接失败。
                 </p>
               </div>
               <FormField
