@@ -6,8 +6,8 @@
 >
 > | 时段 | 内容 | 文档 |
 > |---|---|---|
-> | 10-13 ~ 10-15 | 性能修复与门槛判定(G1/G2/G6) | `performance-repair-*.md`、`performance-g1-tcp-*.md` |
-> | 10-15 ~ 10-18 | 多载体/单载体瓶颈实测 | `single-carrier-bottleneck-measurement.md`、`multicarrier-autosizing-handoff.md` |
+> | 10-13 ~ 10-15 | 性能修复与门槛判定(G1/G2/G6) | `performance-2026-10-history.md` |
+> | 10-15 ~ 10-18 | 多载体/单载体瓶颈实测 | `single-carrier-bottleneck-summary.md`、`multicarrier-autosizing-handoff.md` |
 > | 10-20 | 七路静态深审(A/B/C 三批) | `deep-review-ffd49d3-remediation-plan.md` |
 > | 10-21 | 深审后对 frp 吞吐复测 | `deep-review-performance-report.md` |
 > | 10-22 | 静态审查(1 P0 + 14 P1 + P2/P3)与插件代理语义重写 | `review-2026-10-handoff.md`、`fixed-plugin-proxy-semantics.md` |

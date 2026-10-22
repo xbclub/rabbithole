@@ -58,36 +58,26 @@
 | [visitor-mux-relay.md](visitor-mux-relay.md) | visitor 数据面零拷贝 mux 中继 | 已落地 |
 | [pump-down-loop-gap-shadowing.md](pump-down-loop-gap-shadowing.md) | `pump_down` 变量遮蔽缺陷 | 已修 |
 | [mux-stream-limit-investigation.md](mux-stream-limit-investigation.md) | mux 并发流上限**不该**加到客户端 | 结论:不改 |
-| [single-carrier-bottleneck-measurement.md](single-carrier-bottleneck-measurement.md) | 单载体多流瓶颈实测(含 13k 行原始数据) | 参考 |
+| [single-carrier-bottleneck-summary.md](single-carrier-bottleneck-summary.md) | 单载体/多载体瓶颈实测结论:K 的最优值取决于 BDP,低延迟下 K=1 更快 | 参考 |
 
 ## 5. 历史:性能攻坚(2026-10-13 ~ 10-15,已被取代)
 
-> **这 14 篇是同一场攻坚的分阶段产物,结论均为"G1/G2/G6 未达标"。**
-> 那是**当时构建**的判定;现役版本在 2026-10-21 已达成全部 12 档超过 frp。
-> 保留它们是作为证据链与归因过程,**不要引用其性能结论**。
+| 文档 | 内容 |
+|---|---|
+| [performance-2026-10-history.md](performance-2026-10-history.md) | **合并稿**:当时目标与判定、被证伪的 9 个方向、后来怎么解决的、方法论教训 |
 
-按时间顺序:
-
-1. [performance-repair-acceptance.md](performance-repair-acceptance.md) — 验收方案(规划稿 r5)
-2. [performance-repair-history.md](performance-repair-history.md) — 1059 行全过程(含历史附录)
-3. [performance-repair-history-2.md](performance-repair-history-2.md) — 44 行简报
-4. [performance-repair-history-3.md](performance-repair-history-3.md) — 主代理复核撤回"全部通过"
-5. [performance-repair-history-4.md](performance-repair-history-4.md) — kcp-boundary 七轮收官
-6. [performance-repair-status.md](performance-repair-status.md) — c84f631 收口轮 full-accept
-7. [performance-closure-c84-plan.md](performance-closure-c84-plan.md) — c84 一页执行设计
-8. [performance-closure-c84-report.md](performance-closure-c84-report.md) — c84 收口轮报告
-9. [performance-closure-r1-plan.md](performance-closure-r1-plan.md) — r1 计划
-10. [performance-g1-tcp-plan.md](performance-g1-tcp-plan.md) — G1 3000 Mbps 专项方案
-11. [performance-g1-tcp-r2-plan.md](performance-g1-tcp-r2-plan.md) — G1 第二轮方案
-12. [performance-g1-tcp-report.md](performance-g1-tcp-report.md) — G1 FAIL(1952/2036 Mbps)
-13. [performance-g1-tcp-2800-plan.md](performance-g1-tcp-2800-plan.md) — G1-2800 方案
-14. [performance-g1-tcp-2800-progress.md](performance-g1-tcp-2800-progress.md) — G1-2800 进度
-15. [performance-g1-tcp-2800-report.md](performance-g1-tcp-2800-report.md) — G1-2800 FAIL
-
-> 另有 [post-task-evaluation.md](post-task-evaluation.md)(后续任务评估 + 三机回归,
-> 结论:F 级 9 项无一项构成真实优化)与
-> [pending-unified-review.md](pending-unified-review.md)(六轮改动的统一收尾清单,
-> 其"未提交工作树"状态已随 `9bd748b` 落库而失效)。
+> 该时期原有 **15 篇分阶段文档**,已于 2026-10-22 合并为上面这一篇后删除
+> (它们结论一致均为"G1/G2/G6 未达标",且 11 篇引用不入库的 `benchmark/runs/`,
+> 新克隆必断链)。原文可从 git 取回:
+>
+> ```bash
+> git log --diff-filter=D --name-only -- 'docs/performance-*'
+> git show <commit>:docs/performance-g1-tcp-report.md
+> ```
+>
+> 同批删除的还有 `docs/single-carrier-bottleneck-measurement.md`
+> (13,119 行 / 472 KB 的 85 轮实验日志),结论已抽入
+> [single-carrier-bottleneck-summary.md](single-carrier-bottleneck-summary.md)。
 
 ## 6. 子目录
 
@@ -100,14 +90,35 @@
 
 | 文档 | 说明 |
 |---|---|
-| [../CONSOLE-REWRITE-PROMPT.md](../CONSOLE-REWRITE-PROMPT.md) | 已废止的一次性任务书(2026-10-12 标注)。多项要求被推翻,仅作历史追溯 |
 | [../PROGRESS.md](../PROGRESS.md) | 已停止更新的会话备忘(截至会话 11)。根因与踩坑教训仍有效,状态描述已过期 |
+
+> `CONSOLE-REWRITE-PROMPT.md` 已于 2026-10-22 **删除**(而非归档):它是写给
+> agent 的一次性任务书,要求的 antd v6 技术栈与 `secret_key` 表单 /
+> `allow_users` / `/auth/login` 三处规格均已被推翻,留在根目录会被误当作
+> 现行指令。需要时 `git show <commit>:CONSOLE-REWRITE-PROMPT.md` 可取回。
+
+---
+
+## 关于证据指针
+
+本目录多篇文档引用 `benchmark/runs/` 下的原始证据。**该目录不入版本控制**
+(见 `.gitignore`:体积大、含内网地址),因此**克隆仓库后这些路径不存在**,
+文档里的「详见 `benchmark/runs/xxx/verdict.json`」会是死链。
+
+复核证据时的做法:
+
+1. **结论性数字已内联在文档正文**,可直接引用,不必追溯原始文件;
+2. 需要原始 JSONL / verdict 时,向维护者索取,或按根目录 `AGENTS.md`
+   「性能基准(三机 peer 基准)」一节在三机上复跑重建;
+3. 新增文档引用这类路径时,**必须同时写出关键数字**,不能只给指针。
 
 ---
 
 ## 维护约定
 
 - 新文档落盘时,**在本文对应分区加一行**,并标注状态。
-- 结论被推翻时,**不要删除旧文档**,在开头加"⚠ 已被 X 取代"横幅,并更新本索引。
-- `benchmark/runs/` 与 `*.jsonl` 不入库(见 `.gitignore`),文档引用这些路径时
-  应说明"原始证据在磁盘上,不入库"。
+- 结论被推翻时,优先**合并进综述并删除分阶段文档**(避免读者从中间一节读起
+  得到已被自身后续推翻的结论);确实需要保留原貌时,在开头加
+  "⚠ 已被 X 取代"横幅。
+- 分阶段的过程日志(如逐轮实验记录)**不要长期堆积在 `docs/` 根目录**,
+  它的价值在结论,不在过程。

@@ -2,7 +2,7 @@
 
 可复现的性能基准套件。任何人都能在他自己的机器上复跑,得到可对比的数字。
 
-> **goal-repair 修复版(2026-10-13,r2)**:本套件按 `docs/performance-repair-acceptance.md`
+> **goal-repair 修复版(2026-10-13,r2)**:本套件按当时的验收方案
 > §5 P3 完成了一轮测量方法修复(A8/A9/A10/A11/A12 + F-Drive-Nofile + CPU 采样),
 > **门槛阈值未变**。r2 按主代理独立复核堵死核验器 6 个误通过(UDP 包长、
 > 六协议并发、源清单绑定、保持证据、raw 形态、nofile 实值),并加严:
@@ -198,8 +198,9 @@ python3 py/summarize.py runs/goal-repair --gates             # 同一判定的�
 python3 py/verify_goal.py --self-test                        # 核验器自检(37 个对抗用例)
 ```
 
-门槛 G1–G7 与 `docs/performance-repair-acceptance.md` §1 一致
-(阈值硬编码在 `py/verify_goal.py` 的 `THRESH`,不随测量方法改变);
+门槛 G1–G7 沿用当时的 goal-repair 验收方案(原文已于 2026-10-22 删除,
+可用 `git log --diff-filter=D -- docs/performance-repair-acceptance.md` 取回);
+阈值硬编码在 `py/verify_goal.py` 的 `THRESH`,不随测量方法改变;
 `verify_goal` 只认原始证据,记录里的 `pass`/`verdict` 等手填字段一律忽略;
 数据不足 = FAIL(不是 skip)。核验的是完整证据链,不是字段存在性:
 

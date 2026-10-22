@@ -110,7 +110,7 @@ else
 fi
 
 # 并发最高档 → 本轮 fd 需求(每连接 1 fd + 余量 512;4096 档即 ≥4608,
-# 统一推荐 65535。见 docs/performance-repair-acceptance.md §1.2/§5 P3.0)
+# 统一推荐 65535。依据见 docs/performance-2026-10-history.md §4)
 conc_fd_need() {
   local max=0 n
   for n in $PEER_CONC_LEVELS; do [ "$n" -gt "$max" ] && max="$n"; done
