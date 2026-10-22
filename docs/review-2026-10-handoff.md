@@ -1,10 +1,18 @@
 # 交接:2026-10-22 静态审查与修复进度
 
 > 本文是压缩上下文前的交接记录。按"已完成 / 未完成 / 待决策"三段组织。
+>
+> **状态更新(2026-10-22 补注)**:文中"8 个提交未推送"已不准确 ——
+> 当前 `origin/main..HEAD` 为 **11 个提交**(交接后又落了
+> `a119766`/`e1e3c1e` 两个文档提交与 `c01a3e2` 插件重写)。
+> 推送与发版决策**仍未执行**,见 §三。
 
-## 一、已完成(8 个提交,均在 main,未推送)
+## 一、已完成(11 个提交,均在 main,未推送)
 
 ```
+3fdfc19 fix(client,server): 凭据错误退避是死代码 + 分组缓存只到 1/N 命中
+e1e3c1e docs: 交接文档补测试计数口径
+a119766 docs: 交接文档填入提交哈希
 c01a3e2 fix(client): 按 frp 语义重写 http_proxy / socks5 插件
         (含 splice 探针改 task-local 作用域的 flaky 修复)
 4f34114 docs: 记录待办(插件代理语义)与本轮审查交接
@@ -23,6 +31,10 @@ fe47dd0 fix(server): 修 A1/A2 自锁、A3 记账缺口、A4 UDP 单边限流、
 
 - 测试:**558 通过 / 0 失败 / 2 忽略**(交接时 543;新增 15 条代理插件测试)
   —— 计数含 2 条 `#[ignore]` 之外的通过项,`--ignored` 单列 2 条
+  - **2026-10-22 复跑更正**:**564 通过 / 0 失败 / 2 忽略**(交接时 558)。
+    注意:复跑时工作区存在**多个文件的未提交改动**且仍在变动,该计数
+    含其影响,不能等同于"已提交状态"的计数;要拿到稳定数字,需在干净
+    检出上重跑 `cargo test --workspace`。
 - clippy:`--workspace --all-targets -D warnings` 零错误
 - `tests/e2e-plugins.sh`:**16/16 PASS**
 - 真实代理客户端验收(curl 经隧道访问外网):见 §五
@@ -60,7 +72,8 @@ fe47dd0 fix(server): 修 A1/A2 自锁、A3 记账缺口、A4 UDP 单边限流、
 
 ### 是否推送
 
-8 个提交未推送(`git log --oneline origin/main..HEAD`)。
+11 个提交未推送(`git log --oneline origin/main..HEAD`,2026-10-22 核实;
+交接时记为 8 个,此后又落了 3 个)。
 
 推送前建议:
 
@@ -99,6 +112,68 @@ cargo clippy --workspace --all-targets -- -D warnings
 6. **全局计数探针在并行测试里必然 flaky**:`LOCKLESS_SPLITS` 只靠一把串行锁
    隔离,挡不住"别的测试也 splice 真实 TCP"(代理插件的端到端用例就是)。
    改成 `tokio::task_local` 作用域,按 future 隔离才是对的。
+
+## 四点五、2026-10-22 二轮核实:四条"剩余问题"
+
+外部提出四条,逐条核实结果如下(修与不修都给了理由)。
+
+| 编号 | 结论 | 处置 |
+| --- | --- | --- |
+| B1 凭据错误退避是死代码 | **属实,且比报告更严重** | 已修(见下) |
+| B3 分组缓存只到 1/N 命中 | **属实** | 已修(粘性选路) |
+| Linux-only 背压测试从未执行 | **属实** | 已补 CI |
+| KEY_TYPES 的 `rsa-`/`dsa-` 冗余 | **不成立** | 不改 |
+
+### B1:报告漏了两层,实际有三处断裂
+
+1. `run_loop` 返回 `()`,`connect_and_run` 恒 `Ok(())` —— `dispatch_frame`
+   产生的串被 `break` 吞掉;
+2. 握手阶段措辞是 `server rejected:` / `hello rejected:`,不含该串;
+3. **报告没提到的第三处**:服务端 ERROR 帧发的是 `ServerMessage::Error`
+   **信封**(`{"Error":{...}}`),客户端在 HELLO_ACK 阶段按**裸
+   `ErrorMessage`** 反序列化 → 必然失败 → 每例拒绝都变成
+   `server error (unparsable)`,错误码整个丢失。所以即使 1、2 都修好,
+   判定仍然拿不到 `AUTH_FAILED` / `CLIENT_DISABLED`。
+
+修法:新增 `SessionError { Fatal(FatalKind), Transient }` 与
+`FatalKind::{Rejected(code), VersionMismatch}`,拒绝点用 `reject(code)`
+打类型标记,`main` 只认类型不认文案;新增 `parse_error_code()`
+(先信封、再裸结构、都失败才 `UNKNOWN`,**绝不因解析失败丢掉错误码**)。
+
+实测(错误 secret / 客户端被禁用,release 二进制):
+退避从 1,2,4,8,16,32 逐级爬 → 直接顶到 60s,并按错误码给出不同提示
+(`AUTH_FAILED` → 检查 secret;`CLIENT_DISABLED` → 检查控制台启用状态)。
+
+### B3:粘性选路
+
+新增 `group_pick_sticky`(FNV-1a,跨进程稳定)。vhost HTTP 在**有缓存配置**
+时按 `cache_key` 哈希选成员 —— 同一资源读写恒定落同一成员,不同资源仍分散。
+TCP 数据面继续轮询(那里没有需要粘性的状态)。
+
+### Linux-only 测试:补 CI
+
+新增 `.github/workflows/ci.yml`(push main / PR 跑 clippy + cargo test,
+并显式确认 `ss` 可用)。**刻意不含 `cargo fmt --check`**:仓库当前有 93 处
+fmt 差异(24 文件),是既有状态;加进去门禁一上线就红,红的门禁很快会被
+无视,那比没有更糟。要加,先把 fmt 单独整理成一次纯格式化提交。
+
+### KEY_TYPES:`rsa-`/`dsa-` 不是冗余
+
+`rsa-` 覆盖的是 `rsa-sha2-256` / `rsa-sha2-512` 这类**不含 `ssh-` 前缀**的
+算法名;`dsa-` 同理。二者与 `ssh-` 是并集关系而非子集,删掉会让这类行被
+当作"没有 options"整行交给 `from_openssh`,解析失败后整行丢弃。
+
+### 顺带修掉的自己引入的 flaky
+
+代理插件的域名用例原先注入**全局**解析函数,会与 `dnsquery` 自己的注入
+用例互相污染(单独跑绿、成组跑红)。改为只断言协议契约 + 纯函数级验证。
+
+### 一个**未修**的独立问题(如实记录)
+
+`rh-transport` 的 `probe_result_matches_thresholds` 偶发失败(5 轮全量里
+出现 1 次;单独重复 8 次全过)。它依赖注入的拨号延迟做 RTT 分档断言,
+时序敏感。本次未触及该 crate,不混入本次提交,但**它确实是个真 flaky**,
+下一轮应单独处理(把"注入延迟"换成可控时钟,而不是真的 sleep)。
 
 ## 五、真实代理客户端验收(2026-10-22,本地)
 
