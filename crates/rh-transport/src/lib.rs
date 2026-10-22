@@ -33,30 +33,15 @@ pub use compress::compress_stream;
 /// 底层 IO 对象:实现 AsyncRead + AsyncWrite + Send + Unpin 即可。
 /// `as_any` 供数据面做具体类型反射(splice 资格判定:提取裸 TCP);
 /// `into_any_box` 供按具体类型取回所有权(mux 流零拷贝路径降级判定)。
+///
+/// 注:本 trait 曾有一个 `into_halves` 默认方法(返回 `None`),但**没有任何
+/// 实现或调用** —— 真正的无锁拆半由自由函数 [`split_boxed_io`] 完成(它用
+/// `as_any`/`into_any_box` 做类型探测)。该方法已删除,避免留下"看起来是
+/// 扩展点、实际无人使用"的死 API。
 pub trait Io: AsyncRead + AsyncWrite + Send + Unpin {
     fn as_any(&self) -> &dyn std::any::Any;
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
     fn into_any_box(self: Box<Self>) -> Box<dyn std::any::Any>;
-
-    /// 无锁拆成独立的读半/写半(round-69)。
-    ///
-    /// # 为什么需要
-    ///
-    /// `tokio::io::split` 用**一把 `std::sync::Mutex`** 包住整个 stream
-    /// (`tokio/src/io/split.rs:59` 的 `with_lock` 直接 `lock().unwrap()`)。
-    /// 在 async 任务里用同步锁的后果:一端在 poll 期间持锁,另一端要
-    /// `lock()` 就会**阻塞整个 OS 线程**(不是让出,是 futex 等待)。
-    ///
-    /// 实测(上行 P=16,服务端 12s):`strace -c` 显示
-    /// **`futex` 占 75.0% 的 syscall 时间(39.85s/53.13s),3690 次调用,
-    /// 平均每次 10.8ms** ——这就是那把锁。
-    ///
-    /// 同一时刻只有一个读者和一个写者,poll 本身不会长期持锁;但当
-    /// `poll_read` 内部走到内核态(recvfrom 0.36ms、copy 12.7%)时,
-    /// 写者会被阻塞同一时长,反之亦然。高并发下这些阻塞叠加。
-    ///
-    /// 默认返回 `None`(调用方回落到 `tokio::io::split`)。
-    fn into_halves(self: Box<Self>) -> Option<(BoxedIo, BoxedIo)>;
 }
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Io for T {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -68,9 +53,6 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Io for T {
     fn into_any_box(self: Box<T>) -> Box<dyn std::any::Any> {
         self
     }
-    fn into_halves(self: Box<Self>) -> Option<(BoxedIo, BoxedIo)> {
-        None
-    }
 }
 
 pub type BoxedIo = Box<dyn Io>;
@@ -80,6 +62,19 @@ pub type BoxedIo = Box<dyn Io>;
 /// 仅裸 `TcpStream` 支持(`into_split` 产出两个独立 fd,各有一条 tokio
 /// IO 注册,读写之间无共享锁)。任何包装类型返回 `None`,调用方回落到
 /// [`tokio::io::split`]。
+///
+/// # 为什么必须存在(tokio::io::split 的代价)
+///
+/// `tokio::io::split` 用**一把 `std::sync::Mutex`** 包住整个 stream
+/// (`tokio/src/io/split.rs:59` 的 `with_lock` 直接 `lock().unwrap()`)。
+/// 在 async 任务里用同步锁的后果:一端在 poll 期间持锁,另一端要
+/// `lock()` 就会**阻塞整个 OS 线程**(不是让出,是 futex 等待)。
+///
+/// 实测(上行 P=16,服务端 12s):`strace -c` 显示
+/// **`futex` 占 75.0% 的 syscall 时间(39.85s/53.13s),3690 次调用,
+/// 平均每次 10.8ms** —— 这就是那把锁。同一时刻只有一个读者和一个写者,
+/// poll 本身不会长期持锁;但 `poll_read` 走到内核态(recvfrom 0.36ms、
+/// copy 12.7%)时写者被阻塞同一时长,反之亦然,高并发下叠加。
 ///
 /// 之所以用**自由函数 + downcast**而不是 trait 方法:泛型
 /// `impl<T: AsyncRead+AsyncWrite> Io for T` 已经覆盖所有类型,再加一个

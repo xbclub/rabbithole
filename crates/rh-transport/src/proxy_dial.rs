@@ -212,7 +212,10 @@ async fn socks5_connect(
             )))
         }
     }
-    // CONNECT 请求(域名形式发送主机名,IPv4/IPv6 用地址形式)
+    // CONNECT 请求:target 是已解析的 SocketAddr,因此只能走地址形式
+    // (ATYP=0x01 IPv4 / 0x04 IPv6)。SOCKS5 的域名形式(ATYP=0x03)在这里
+    // **不可达** —— 若将来要保留域名给代理解析(远端 DNS),需把 target 换成
+    // 枚举类型,不能沿用 SocketAddr。
     let mut req = vec![0x05, 0x01, 0x00];
     match target.ip() {
         std::net::IpAddr::V4(v4) => {

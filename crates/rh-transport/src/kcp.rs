@@ -1213,11 +1213,14 @@ impl SessionGate {
     /// 准入:全局上限 + 每 IP 速率。返回 true 才允许注册新会话。
     fn admit(&self, ip: std::net::IpAddr) -> bool {
         use std::sync::atomic::Ordering;
-        let cur = self.live.load(Ordering::Relaxed);
-        if cur >= self.cfg.max_sessions {
+        // 上限判定与计数递增必须在**同一个临界区**内:修前 `load` 判上限、
+        // 末尾 `fetch_add` 两步分离,并行 admit 可同时通过判定、令 live 突破
+        // max_sessions(超出量 = 并发度)。per_ip 锁本就在本函数内持有,
+        // 把判定移进锁内即闭合,无需 CAS 循环。
+        let mut g = self.per_ip.lock().unwrap();
+        if self.live.load(Ordering::Relaxed) >= self.cfg.max_sessions {
             return false;
         }
-        let mut g = self.per_ip.lock().unwrap();
         let now = std::time::Instant::now();
         let cap = self.cfg.new_sessions_per_ip_per_sec.max(1.0);
         let e = g.entry(ip).or_insert((cap, now));

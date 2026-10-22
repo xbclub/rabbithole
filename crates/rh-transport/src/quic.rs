@@ -57,9 +57,25 @@ fn transport_config(keepalive: bool, max_streams: usize) -> quinn::TransportConf
 }
 
 /// 服务端 QUIC 监听器:接受与握手解耦(慢握手不阻塞后续接入)。
+///
+/// `Drop` 通过 watch 信号让 accept 循环退出(与 `TcpListenerShim::drop`
+/// 同款),使 UDP socket 得以释放、端口可重绑。**不用 `Endpoint::close()`**:
+/// 那会给每个已建立连接发送 Close 事件,把还在正常转发连接一起打死 ——
+/// 而 drop listener 的语义只是"不再接新连接"。
 pub struct QuicListener {
     pub(crate) local: std::net::SocketAddr,
     ready: tokio::sync::mpsc::Receiver<Incoming>,
+    /// 通知 accept 循环退出(只停接受,不动已有连接)。
+    shutdown: tokio::sync::watch::Sender<()>,
+}
+
+impl Drop for QuicListener {
+    fn drop(&mut self) {
+        // 电平台触发:accept 循环的 select 立即醒来并返回,UDP socket 随
+        // 循环任务持有的 endpoint 引用释放而关闭(已建立连接各自持有
+        // endpoint 引用,不受影响,继续服务到自然结束)。
+        let _ = self.shutdown.send(());
+    }
 }
 
 /// 服务端流上限在端点构建时固化(quinn 不支持热换端点配置),改动需重启;
@@ -83,11 +99,17 @@ pub fn listen(
         .local_addr()
         .map_err(|e| other_err(format!("quic local addr: {e}")))?;
     let (tx, ready) = tokio::sync::mpsc::channel::<Incoming>(512);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
     tokio::spawn(async move {
         loop {
-            let incoming = match endpoint.accept().await {
-                Some(i) => i,
-                None => return, // endpoint 关闭
+            // biased:先看退出信号,listener drop 后立即停止接受新连接
+            let incoming = tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => return,
+                res = endpoint.accept() => match res {
+                    Some(i) => i,
+                    None => return, // endpoint 已关闭
+                },
             };
             let tx2 = tx.clone();
             tokio::spawn(async move {
@@ -111,8 +133,12 @@ pub fn listen(
             });
         }
     });
-    // 持有 endpoint 供运行期关闭语义:pump 任务已独占
-    Ok(QuicListener { local, ready })
+    // listener 只持退出信号:drop 时不碰 endpoint/已建立连接。
+    Ok(QuicListener {
+        local,
+        ready,
+        shutdown: shutdown_tx,
+    })
 }
 
 pub async fn accept(listener: &mut QuicListener) -> io::Result<Incoming> {
@@ -130,7 +156,14 @@ pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>
             .map_err(|e| other_err(format!("quic client config: {e}")))?,
     ));
     qcfg.transport_config(Arc::new(transport_config(true, MUX_STREAMS_UNLIMITED)));
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+    // 本地绑定地址必须与**服务端地址同族**:写死 0.0.0.0 时连 IPv6 服务端
+    // 会因 address family 不匹配直接失败(与 kcp.rs 的同款分支对齐)。
+    let bind_local: std::net::SocketAddr = if cfg.server_addr.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let mut endpoint = quinn::Endpoint::client(bind_local)
         .map_err(|e| other_err(format!("quic client bind: {e}")))?;
     endpoint.set_default_client_config(qcfg);
     let name = cfg
@@ -138,16 +171,22 @@ pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>
         .server_name
         .clone()
         .unwrap_or_else(|| cfg.server_addr.ip().to_string());
-    let connecting = tokio::time::timeout(cfg.connect_timeout, async {
-        endpoint.connect(cfg.server_addr, &name)
+    // 一次超时覆盖"建连接对象 + 握手"两段:修前两段各包一次 connect_timeout,
+    // 最坏情况要等 2× 超时才失败(上层按 connect_timeout 做重连退避,双倍延迟
+    // 会让退避节奏整体错位)。endpoint.connect 本身只构造状态机不阻塞,真正
+    // 耗时的握手在 awaiting `connecting` 时发生,故合并为单个 deadline 即可。
+    // 两段错误类型不同(ConnectError / ConnectionError),在闭包内就地转成
+    // io::Error,让外层只需处理超时。
+    let conn = tokio::time::timeout(cfg.connect_timeout, async {
+        let connecting = endpoint
+            .connect(cfg.server_addr, &name)
+            .map_err(|e| other_err(format!("quic connect: {e}")))?;
+        connecting
+            .await
+            .map_err(|e| other_err(format!("quic handshake: {e}")))
     })
     .await
-    .map_err(|_| other_err("quic connect timeout"))?
-    .map_err(|e| other_err(format!("quic connect: {e}")))?;
-    let conn = tokio::time::timeout(cfg.connect_timeout, connecting)
-        .await
-        .map_err(|_| other_err("quic handshake timeout"))?
-        .map_err(|e| other_err(format!("quic handshake: {e}")))?;
+    .map_err(|_| other_err("quic connect/handshake timeout"))??;
     // 记录对端叶子证书:上层(rh-client)用它比对服务端用 secret 加密下发的
     // 证书,不一致即说明中间有人在转发。与 tcp/tls 路径(sink 在握手后立刻
     // 写入)对齐——不写 sink 时上层 `peer_cert.get()` 恒为 None,而
@@ -337,6 +376,66 @@ mod tests {
         s.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"quic-ok!");
         srv.await.unwrap();
+    }
+
+    /// listener drop 后 accept 循环必须退出(资源收敛)。
+    ///
+    /// 修前 `QuicListener` 只持有 ready Receiver,`accept()` 只在 endpoint
+    /// 关闭后才返回 None —— drop listener 后 accept 循环**永续**,任务与
+    /// 及其持有的 endpoint 引用长期泄漏。TCP(`TcpListenerShim::drop` 发
+    /// watch + abort 泵)与 KCP(触发 closing)都做了收敛,QUIC 缺席。
+    ///
+    /// # 实测修正:影响面比最初判断的小
+    ///
+    /// 曾以为"UDP socket 永久占用、端口无法重绑"。实测否定:listener 并不
+    /// 持有 endpoint,endpoint 只被 accept 循环任务持有;而**端口重绑**在这种
+    /// 状态下仍会成功(UDP 行为如此),新连接也照常被接受。所以真实泄漏只有
+    /// "一个空转的 accept 循环任务 + 它持有的 endpoint 引用"。
+    ///
+    /// 因此本条测试的定位是**回归护栏**(锁住 drop 必须发信号这一实现),
+    /// 而不是能区分 bug 的断言 —— 负向验证(把 `shutdown.send(())` 删掉)
+    /// 实测**不会变红**,已如实记录,避免后人误以为它有区分力。
+    ///
+    /// 反向契约:drop **不得**杀死已建立连接 —— 第一版实现用
+    /// `Endpoint::close()` 收敛,实测把在途连接一起打死
+    /// (`ConnectionLost(ApplicationClosed{reason:"listener dropped"})`,
+    /// 由 `quic_connect_and_stream` 抓出),故改为 watch 信号。
+    #[tokio::test]
+    async fn quic_listener_drop_stops_accepting() {
+        let (cert, key) = crate::tls::auto_cert(&Default::default()).unwrap();
+        let server_cfg = ServerTransportConfig {
+            protocol: Protocol::Quic,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            multiplex: true,
+            tls: crate::TlsServerOptions {
+                cert_pem: Some(cert),
+                key_pem: Some(key),
+                ..Default::default()
+            },
+            alpn: vec![crate::DEFAULT_ALPN.into()],
+        };
+        let streams = std::sync::atomic::AtomicUsize::new(0);
+        let listener = super::listen(&server_cfg, &streams).unwrap();
+        let addr = listener.local;
+        drop(listener);
+
+        // drop 后新连接不得成功建立(accept 循环已退出,endpoint 随循环任务
+        // 持有的最后一份引用释放而关闭,UDP 不再响应)。
+        let client = ClientTransportConfig {
+            protocol: Protocol::Quic,
+            server_addr: addr,
+            connect_timeout: std::time::Duration::from_millis(800),
+            tls: crate::TlsClientOptions {
+                insecure_skip_verify: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let res = tokio::time::timeout(std::time::Duration::from_secs(3), super::connect(&client)).await;
+        // 超时或失败都算"没有被接受";只有 Ok 说明 accept 循环还活着
+        if let Ok(Ok(_)) = res {
+            panic!("listener drop 后不应还能建立连接(accept 循环未退出)");
+        }
     }
 
     /// `secret_verified` 模式下上层靠 `peer_cert_sink` 拿到对端证书做比对。

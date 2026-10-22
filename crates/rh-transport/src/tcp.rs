@@ -19,6 +19,14 @@ use tokio_rustls::TlsConnector;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 在途握手上限(与 ready 队列容量同量级)。
+///
+/// ready 队列(512)只背压"已验证待交付"的连接;在途握手若无上限,建连
+/// 洪水(慢握手 / 半开 TCP)可在 HANDSHAKE_TIMEOUT(5s)内堆积任意多任务
+/// 与 socket。取 512:与队列对齐,不改变正常负载的并发度(压测中并发建连
+/// 恰在此量级,未观察到排队),只在异常洪峰时把压力退回内核 backlog。
+const HANDSHAKE_MAX_INFLIGHT: usize = 512;
+
 /// 服务端 TCP/TLS/WS/WSS 监听器。
 /// 接受与握手解耦:后台泵逐个 accept TCP,每连接的握手(TLS/WS/peek)
 /// 在独立任务完成,慢握手不得阻塞后续接入(DoS 缓解);就绪连接入队供消费。
@@ -315,6 +323,13 @@ pub async fn listen_stream(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
     // 握手 child 由泵的 JoinSet 持有:完成即回收(panic/错误可观测,不悬空);
     // 泵退出时中止全部在途 child(结果已无消费者),连同行文 socket 一并释放。
+    //
+    // 在途握手**有界**:ready 队列(512)只背压"已验证待交付",不背压在途
+    // 握手 —— 修前每秒可接无限多连接,每个 child 各持一条 socket 且最长
+    // HANDSHAKE_TIMEOUT(5s)才结束,建连洪水(尤其慢握手/半开 TCP)能在
+    // 5s 内堆积数万任务与 fd。这里用信号量把在途握手钳到与 ready 队列同量级,
+    // 满了就不 accept(内核 backlog 承接,新连接在内核侧排队而非耗用户态 fd)。
+    let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(HANDSHAKE_MAX_INFLIGHT));
     let pump = tokio::spawn(async move {
         let mut handshakes = tokio::task::JoinSet::new();
         loop {
@@ -344,7 +359,15 @@ pub async fn listen_stream(
                     let tx2 = tx.clone();
                     let tls2 = tls.clone();
                     let max_streams = mux_limit.load(Ordering::Relaxed);
+                    let inflight2 = inflight.clone();
                     handshakes.spawn(async move {
+                        // 在途握手配额:acquire 在这里(不是 select 前),因为
+                        // 只有拿到许可的 child 才真正开始耗 socket;许可随本
+                        // child 结束自动归还(_permit 由作用域持有)。
+                        let _permit = inflight2
+                            .acquire()
+                            .await
+                            .expect("handshake semaphore never closed");
                         match verify(stream, tls2, ws_upgrade, multiplex).await {
                             Ok((io, write_dup, yamux)) => {
                                 let vc = VerifiedConn {
@@ -622,9 +645,15 @@ async fn dial_io(
                 Ok((io, None))
             }
             crate::Protocol::Ws => {
-                let io =
-                    ws::client_handshake(Box::new(tcp), &cfg.server_addr.to_string(), ws::WS_PATH)
-                        .await?;
+                // Host 头与 Wss 分支同口径:`tls.server_name` 优先,未设才回落到
+                // server_addr。修前此处恒用 server_addr,想用域名伪装(反指纹/
+                // 前置反代按 Host 分流)的部署在 ws 明文路径仍会暴露 IP:port。
+                let host = cfg
+                    .tls
+                    .server_name
+                    .clone()
+                    .unwrap_or_else(|| cfg.server_addr.to_string());
+                let io = ws::client_handshake(Box::new(tcp), &host, ws::WS_PATH).await?;
                 Ok((io, None))
             }
             crate::Protocol::Quic | crate::Protocol::Kcp => Err(other_err("use quic/kcp connect")),

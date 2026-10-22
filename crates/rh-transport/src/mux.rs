@@ -328,12 +328,27 @@ impl UpReader {
         &mut self,
         r: &mut R,
     ) -> io::Result<TryChunk> {
+        // ★初始相必须用**本地**缓冲,与 `read_chunk` 的阻塞路径同口径(C4):
+        // 修前这里无条件 `pool_get(cap)`,初始相也会走池 —— 而 vendor
+        // `Pool::get(12KiB)` 会弹出池内 CLASS 级大缓冲或新分配
+        // `min.max(CLASS)` 且用完即弃(12KiB < MIN_RECYCLE,冻结后 put 被拒收)。
+        // 行为无害,但滴流连接每次读都白白扰动池,与 C4「空闲中继驻留
+        // 12KiB 本地缓冲、不钉池」的意图相悖。
         let cap = if self.upgraded {
             up_chunk_cap()
         } else {
             INIT_BUF_CAP
         };
-        let mut bm = pool_get(cap);
+        let mut bm = if self.upgraded {
+            #[cfg(test)]
+            {
+                self.pool_borrows += 1;
+            }
+            pool_get(cap)
+        } else {
+            // 本地缓冲:不经池,冻结后写穿直接释放
+            bytes::BytesMut::with_capacity(cap)
+        };
         let n = std::future::poll_fn(|cx| {
             let spare = bm.spare_capacity_mut();
             let limit = spare.len().min(cap);
@@ -813,7 +828,13 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
         // 组装本轮批:首块(pending 或新读)+ 所有已就绪块,直到上限。
         let mut batch: Vec<Bytes> = Vec::with_capacity(UP_BATCH_SEGS);
         let mut batch_bytes = 0usize;
+        // 读侧终止原因必须分开记:`batch_eof` 只表示 **clean EOF**,
+        // 读错误另置 `read_err`。两者混用会让错误被当成干净结束 ——
+        // 上层据此返回 clean=true,于是不置 `up_errored`、不走 1s 有界
+        // 收尾,对向泵仍以为还有半关闭要等,一路拖到 30s halfclose 兜底,
+        // 且错误语义丢失。
         let mut batch_eof = false;
+        let mut read_err = false;
 
         for c in pending.drain(..) {
             batch_bytes += c.len();
@@ -829,7 +850,13 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
                     batch_eof = true;
                     break;
                 }
-                Ok(TryChunk::Empty) | Err(_) => break,
+                // 收集阶段的错误原本不置 batch_eof,靠下一轮阻塞读重新发现;
+                // 现在显式记下,免得多跑一轮(语义与修前一致)。
+                Err(_) => {
+                    read_err = true;
+                    break;
+                }
+                Ok(TryChunk::Empty) => break,
             }
         }
         if batch.is_empty() {
@@ -891,7 +918,8 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
         // 直接从这里取,不再等 RTT。
         let mut prefetched: Vec<Bytes> = Vec::new();
         let mut prefetched_bytes = 0usize;
-        let ok = if prefetch_enabled() && batch_bytes < UP_BATCH_BYTES && !batch_eof {
+        // 预取窗口里 read_err 已置位时不再发起新读(错误已确定,继续读无意义)。
+        let ok = if prefetch_enabled() && batch_bytes < UP_BATCH_BYTES && !batch_eof && !read_err {
             let write_fut = write_all;
             futures::pin_mut!(write_fut);
             loop {
@@ -911,8 +939,9 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
                             batch_eof = true;
                             break write_fut.await;
                         }
+                        // ★读错误 ≠ clean EOF:置 read_err,由下方统一收敛
                         Err(_) => {
-                            batch_eof = true;
+                            read_err = true;
                             break write_fut.await;
                         }
                     },
@@ -933,6 +962,14 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
             }
         }
         if !ok {
+            if diag {
+                dump_up(read_ns, write_ns, slow_reads, slow_writes);
+            }
+            return false;
+        }
+        // ★读错误优先于 clean EOF:错误必须报 false,让上层置 up_errored
+        // 并走有界收尾,不能当作半关闭一路等下去。
+        if read_err {
             if diag {
                 dump_up(read_ns, write_ns, slow_reads, slow_writes);
             }
@@ -1171,7 +1208,11 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         // 写一旦失败立即返回(**收敛红线**:不能 join,写错后读可能永挂)。
         let mut batch: Vec<Bytes> = Vec::new();
         let mut batch_bytes = 0usize;
+        // 同 pump_up:clean EOF 与读错误必须分开记,否则错误被当成干净结束
+        // (上层返回 clean=true → 不置 dn_errored → 不走 1s 有界收尾 →
+        // 拖到 30s halfclose 兜底,错误语义丢失)。
         let mut batch_eof = false;
+        let mut read_err = false;
 
         // 组装本轮批:先把预取队列整体并入(round-76),再抢收已就绪块,
         // 直到上限。预取队列可能有多块——这正是与 round-31~75 的差别。
@@ -1192,11 +1233,12 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                     batch.push(c);
                 }
                 Ok(Some(_)) => {}
-                Ok(None) => break,
+                // 读错误 ≠ clean EOF:置 read_err,由返回值判定统一收敛
                 Err(_) => {
-                    batch_eof = true;
+                    read_err = true;
                     break;
                 }
+                Ok(None) => break,
             }
         }
         if batch.is_empty() {
@@ -1249,38 +1291,40 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         // 平均 writev 被压到 384KiB(K=1 是 589KiB)。现在与 `pump_up`
         // (round-68)同构:循环发起新读,直到 pending 触顶
         // `DOWN_BATCH_BYTES` 或写完成。
-        let __ok = if prefetch_enabled() && batch_bytes < DOWN_BATCH_BYTES && !batch_eof {
-            let write_fut = flush(a_w, &mut batch, &mut batch_bytes, limiter);
-            futures::pin_mut!(write_fut);
-            loop {
-                // 预取已够下一轮用:不再发起新读,专心等写完成。
-                // C5:增量计数,不再每轮 O(n) 重算
-                if pending_bytes >= DOWN_BATCH_BYTES || pending.len() >= SMALL_CHUNK_SEGS {
-                    break write_fut.await;
+        let __ok =
+            if prefetch_enabled() && batch_bytes < DOWN_BATCH_BYTES && !batch_eof && !read_err {
+                let write_fut = flush(a_w, &mut batch, &mut batch_bytes, limiter);
+                futures::pin_mut!(write_fut);
+                loop {
+                    // 预取已够下一轮用:不再发起新读,专心等写完成。
+                    // C5:增量计数,不再每轮 O(n) 重算
+                    if pending_bytes >= DOWN_BATCH_BYTES || pending.len() >= SMALL_CHUNK_SEGS {
+                        break write_fut.await;
+                    }
+                    let read_fut = b_read.read_chunk();
+                    futures::pin_mut!(read_fut);
+                    match futures::future::select(read_fut, write_fut.as_mut()).await {
+                        futures::future::Either::Left((nr, _)) => match nr {
+                            Ok(Some(c)) if !c.is_empty() => {
+                                pending_bytes += c.len();
+                                pending.push_back(c)
+                            }
+                            Ok(_) => {
+                                batch_eof = true;
+                                break write_fut.await;
+                            }
+                            // ★读错误 ≠ clean EOF(同 pump_up)
+                            Err(_) => {
+                                read_err = true;
+                                break write_fut.await;
+                            }
+                        },
+                        futures::future::Either::Right((ok, _)) => break ok,
+                    }
                 }
-                let read_fut = b_read.read_chunk();
-                futures::pin_mut!(read_fut);
-                match futures::future::select(read_fut, write_fut.as_mut()).await {
-                    futures::future::Either::Left((nr, _)) => match nr {
-                        Ok(Some(c)) if !c.is_empty() => {
-                            pending_bytes += c.len();
-                            pending.push_back(c)
-                        }
-                        Ok(_) => {
-                            batch_eof = true;
-                            break write_fut.await;
-                        }
-                        Err(_) => {
-                            batch_eof = true;
-                            break write_fut.await;
-                        }
-                    },
-                    futures::future::Either::Right((ok, _)) => break ok,
-                }
-            }
-        } else {
-            flush(a_w, &mut batch, &mut batch_bytes, limiter).await
-        };
+            } else {
+                flush(a_w, &mut batch, &mut batch_bytes, limiter).await
+            };
         if let Some(t) = __w0 {
             let el = t.elapsed();
             wr_ns += el.as_nanos() as u64;
@@ -1290,6 +1334,11 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             }
         }
         if !__ok {
+            break 'outer false;
+        }
+        // ★读错误优先于 clean EOF(同 pump_up):错误必须报 false,
+        // 让上层置 dn_errored 并走 1s 有界收尾,而非等 30s halfclose 兜底。
+        if read_err {
             break 'outer false;
         }
         if batch_eof && pending.is_empty() {
@@ -3394,6 +3443,100 @@ mod tests {
         assert!(last.is_some());
     }
 
+    /// 读错误必须报 `false`(不得当成 clean EOF)—— 双向泵的收敛前提。
+    ///
+    /// 修前:`pump_up` 的**预取窗口**把 `Err(_)` 与 `Ok(None)` 都记为
+    /// `batch_eof = true`,而返回值只看 `batch_eof`,于是读错误被当成干净
+    /// 结束(clean=true)。后果链:
+    ///   clean=true → 上层不置 `up_errored`
+    ///   → 对向泵不被立即终止(以为还在等半关闭)
+    ///   → 错误侧走 `close_with_late_cancel` 无界等待(而非 1s CANCEL_CLOSE_GRACE)
+    ///   → 最终靠 `join_relay_pumps` 的 30s halfclose 兜底才回收。
+    /// 即:错误语义丢失 + 收尾拖到最长 30 秒。
+    ///
+    /// # 构造要点(踩过两次,记下来避免误判)
+    ///
+    /// 进入预取窗口的条件是 `batch_bytes < UP_BATCH_BYTES` **且**收集循环
+    /// 已退出。收集循环只在三种情况退出:攒满上限、读到 EOF/Err、读到
+    /// `TryChunk::Empty`(即 poll_read 返回 Pending)。前两种都会在**收集
+    /// 阶段**就消费掉错误 —— 而收集阶段本来就会正确返回 false,测不出修复。
+    /// 所以读端必须是:**先给一小段数据 → 立刻 Pending → 之后才 Err**。
+    /// 这样批很小、收集循环因 Pending 退出,写这批时进入预取,预取里拿到的
+    /// 第一个结果就是 Err。
+    #[tokio::test]
+    async fn pump_reports_read_error_as_not_clean() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        /// 第 1 次交付 `chunk` 字节;第 2 次返回 Pending(让收集循环退出);
+        /// 第 3 次起返回 ConnectionReset(只能落在预取窗口里)。
+        struct TrickleThenReset {
+            calls: usize,
+            chunk: usize,
+        }
+        impl tokio::io::AsyncRead for TrickleThenReset {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        let n = buf.remaining().min(self.chunk);
+                        buf.put_slice(&vec![0x5Au8; n]);
+                        Poll::Ready(Ok(()))
+                    }
+                    2 => {
+                        // 立即唤醒:让下一轮预取能重新 poll 到 Err,避免挂住
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    _ => Poll::Ready(Err(std::io::Error::from(
+                        std::io::ErrorKind::ConnectionReset,
+                    ))),
+                }
+            }
+        }
+
+        let (a, b) = tokio::io::duplex(8 * 1024 * 1024);
+        let client = wrap_stream_as_client(Box::new(a) as crate::BoxedIo, true, 100);
+        let server = wrap_stream_as_server(Box::new(b) as crate::BoxedIo, true, 100);
+        let out = client.open_stream().await.expect("open");
+        let mut inp = server.accept().await.expect("accept");
+
+        // 对端持续读走:写不阻塞,预取窗口才会展开
+        let drain = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                match inp.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let mut reader = TrickleThenReset {
+            calls: 0,
+            chunk: 4 * 1024,
+        };
+        let mut io: crate::BoxedIo = out;
+        let (_r, mut w) = steal_mux_halves(&mut io).expect("mux halves");
+        // 超时保护:若实现把 Err 当 clean 并继续等下一批,不应挂死本测试
+        let clean = tokio::time::timeout(std::time::Duration::from_secs(5), pump_up(&mut reader, &mut w, &None))
+            .await
+            .expect("pump_up 不得因读错误而挂起");
+
+        assert!(
+            !clean,
+            "读错误必须返回 false(修前被误判为 clean EOF,导致收尾拖到 30s)"
+        );
+        drop(w);
+        drain.abort();
+        let _ = drain.await;
+    }
+
     /// **端到端**:真实跑一次 `pump_down`,断言 `LOOP_GAP_N` 真的增长。
     ///
     /// 这条是唯一能抓到「调用点遮蔽」的测试:纯函数 `loop_gap_step` 本身
@@ -4916,6 +5059,29 @@ mod tests {
             .expect("pool phase read");
         assert!(!c2.is_empty());
         assert_eq!(reader.pool_borrows, 1, "升级后读路径进入池相");
+    }
+
+    /// C4 补充:非阻塞路径(`try_read_chunk`)的初始相同样不得借池。
+    ///
+    /// 这条是上一条的盲区 —— `idle_chunk_relay_releases_buffer` 只走阻塞
+    /// `read_chunk`,而生产中批量收集走的是 `try_read_chunk`。修前它无条件
+    /// `pool_get(cap)`,违反 C4 却没有任何测试发现。
+    #[tokio::test]
+    async fn try_read_chunk_initial_phase_uses_local_buffer() {
+        let mut reader = UpReader::default();
+        // 对端有数据但不足 INIT_BUF_CAP:停在初始相
+        let data = [3u8; 64];
+        let mut mem = &data[..];
+        let c = reader
+            .try_read_chunk(&mut mem)
+            .await
+            .unwrap();
+        assert!(matches!(c, TryChunk::Data(_)), "应有数据");
+        assert!(!reader.upgraded, "64 字节不足以升级");
+        assert_eq!(
+            reader.pool_borrows, 0,
+            "非阻塞路径的初始相也不得借池(C4)"
+        );
     }
 
     // Y1 chunk 中继:真实 echo 目标 + 偷取 halves → mux_relay;
