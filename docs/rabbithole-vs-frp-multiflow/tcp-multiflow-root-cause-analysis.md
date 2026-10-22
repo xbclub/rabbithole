@@ -299,7 +299,10 @@ frps 侧每用户连接从 `workConnCh` 有界 channel **直取**一条流（`be
 > **实施结果**：见 §0a。×16↓ +15.0%、×16↑ +31.2%、×4↑ +22.3%；×16 双向已超 frp。原「不承诺数字」的表述已被实测替换。以下为原始方案文本。
 
 - **做什么**：客户端 `crates/rh-client/src/session.rs` 由 `rh_transport::connect(&tcfg)` 改为 `rh_transport::connect_pool(&tcfg, carriers)`（`carriers<=1` 时行为零漂移，可用 env 先灰度）；服务端把 accept 到的同会话多条连接经 `Multiplexer::yamux_pool_server` / `yamux_pool_client` 合流，替换单流 accept 语义。
-  - **K 取值的修正（round-45）**：原文此处写「推荐 `YAMUX_POOL_DEFAULT_CARRIERS=4`」，该常量**从未被生产代码读取**且已删除。K 的真实默认值由 `rh_transport::default_carriers()` 决定：**tcp/ws = 1、tls/wss = 2、quic/kcp = 1**；显式配置走 `rh-client` 的 `mux_pool_size`（env `RH_MUX_POOL_SIZE`），再经硬件上限与服务端 `max_carriers` 收敛（只减不增）。
+  - **K 取值的修正（round-45）**：原文此处写「推荐 `YAMUX_POOL_DEFAULT_CARRIERS=4`」，该常量**从未被生产代码读取**且已删除。K 的真实默认值由 `rh_transport::default_carriers()` 决定；显式配置走 `rh-client` 的 `mux_pool_size`（env `RH_MUX_POOL_SIZE`），再经硬件上限与服务端 `max_carriers` 收敛（只减不增）。
+    > **2026-10-22 补注**：`default_carriers()` 此后已改为**所有 TCP 系协议返回 2**（QUIC/KCP=1，原为 tcp/ws=1、tls/wss=2），并新增 RTT 自适应
+    > （`carriers_for_rtt()`：<5ms→1、5~15ms→2、>=15ms→4，自动路径取 `max(RTT 建议, 协议基线)`）。
+    > 现役口径见 `README.md`「多载体池自动定容」。
   - 本轮实测的 rh4 是**显式把 K 设成 4 的实验臂**（`RH_MUX_POOL_SIZE=4`），不是默认行为；不要把表中的「K=4」读成开箱即得的默认值。
 - **为什么排第一**：这是唯一「代码可证」的根因（R1/R4），且能力已实现并有测试背书（本次 `cargo test -p rh-transport --lib mux::` 17/17）。
 - **预期收益**：download×4 / ×16 的单出口写拥塞直接候选；理论上单 carrier 写出口从 1 条扩到 4 条（4 个 RSS 队列 + 4 组 TCP 发送缓冲）。具体百分比**无实测支撑，不承诺数字**——单出口 ≠ 必然 25% 差。

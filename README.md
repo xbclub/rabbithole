@@ -123,21 +123,40 @@ docker run -d --name rh-client --restart unless-stopped \
 裸机同理:`RH_SERVER=host:7100 RH_CLIENT_ID=... RH_SECRET=... rh-client` 直接接入
 (优先级:CLI `--server/--id/--secret` > 环境变量 > 配置文件)。
 
-### 多载体池自动定容(round-10)
+### 多载体池自动定容
 
-启用 `multiplex = true` 的 tcp/tls/ws/wss 客户端会按三段式决定拨几条物理载体
-(K),控制流占第 0 条,其余用于数据面轮转分派:
+启用 `multiplex = true` 的 tcp/tls/ws/wss 客户端会决定拨几条物理载体(K),
+控制流占第 0 条,其余用于数据面轮转分派。**K 不是固定值,而是按链路 RTT
+自适应**——这是 2026-10-18 实测后的结论(85 轮实验,见
+`docs/single-carrier-bottleneck-summary.md`)。
 
-1. **协议基线**:tls/wss = 2(单连接串行加解密易成瓶颈);tcp/ws = 1;
-   QUIC/KCP 自带多路复用,恒 1。
-2. **硬件上限**:`min(CPU 核数/2, 网卡 RX 队列数)`,钳制 [1,8];非 Linux
-   或读不到队列数时仅由 CPU 决定("读不到"不等于"单队列")。
-3. **服务端上限**:报到应答回写 `max_carriers`(默认 8,钳制 [1,8]);
-   客户端取 `min(基线/期望, 硬件, 服务端)`。
+期望值的来源优先级(见 `initial_k_for_async`):
 
-显式配置优先级:配置文件 `mux_pool_size = N` > 环境变量 `RH_MUX_POOL_SIZE`
-> 自动。`mux_pool_size = 1` 表示强制单载体(严格等价旧路径);K=1 时每条
-载体的 yamux 分片 Worker 仍为 4,不会被缩减。K>1 时每载体分片 Worker 按
+1. **显式配置**:配置文件 `mux_pool_size = N` > 环境变量 `RH_MUX_POOL_SIZE`
+   > 自动。显式配置时**不探测 RTT**。
+2. **RTT 自适应**(自动路径):`carriers_for_rtt()`
+   - `RTT < 5ms` → 1;`5~15ms` → 2;`>= 15ms` → **4**
+   - 依据:0.4ms 时 K=1 比 K=4 快 8%;20ms 时 K=4 快 16%;
+     300ms 时 **K=8 比 K=4 慢 33%**,故上限取 4 而非 8。
+   - 注意:该结果还要与下一项取 `max`,**所以低 RTT 下最终也不是 1**。
+3. **协议基线兜底**:`default_carriers()` 对所有 TCP 系协议返回 **2**
+   (QUIC/KCP 恒 1)。自动路径取 `max(rtt_k, 协议基线)`——协议基线抬高**下限**,
+   RTT 仍可在高 BDP 下继续上调。依据:单载体在 2.1–2.2 G 封顶且与流数无关,
+   瓶颈是单条 TCP 拥塞窗 + yamux 单 `FlushTask` 串行,K=2 可测提升 6–10%,
+   K=4 与 K=2 持平(只增成本)。
+4. **硬件上限**:`max(CPU 核数 - 1, 1)`,能读到网卡 RX 队列数时再取
+   `min(该值, 队列数)`;结果钳制 [1,8]。非 Linux 或读不到队列数时仅由 CPU
+   决定("读不到"不等于"单队列")。
+5. **服务端上限**:报到应答回写 `max_carriers`(默认 8,钳制 [1,8])。
+
+最终 `K = min(期望值, 硬件上限).clamp(1, 8)`,服务端上限在报到后收敛。
+
+> **探测失败不阻断连接**:探针只打一条 TCP(走与真实拨号相同的路径,含
+> `proxy_url`),超时 2s;失败时退回协议基线。QUIC/KCP 与非 multiplex 场景
+> **在探测之前**就 gate 成 1,不会白打这条 TCP。
+
+`mux_pool_size = 1` 表示强制单载体(严格等价旧路径);K=1 时每条载体的
+yamux 分片 Worker 仍为 4,不会被缩减。K>1 时每载体分片 Worker 按
 `max(1, 4/K)` 缩减,避免线程总量随 K 线性膨胀。
 
 报表中的 shard 数是**拨号时固化**的:收敛保留控制载体 + (`final_k` - 1) 个

@@ -41,7 +41,7 @@
 | [settings-page-review.md](settings-page-review.md) | 设置页评审。**引用的是已删除的 antd 实现**(`components/ui.tsx`、`global.less`),问题已随重写解决 | 历史 |
 | [0rtt-remediation.md](0rtt-remediation.md) | TLS 1.3 / QUIC 0-RTT 整改。代码已按此实现(`max_early_data_size=0` / `enable_early_data=false`),由 `tls.rs` 三条回归测试锁定 | 现役 |
 | [carriers-decision-analysis.md](carriers-decision-analysis.md) | `default_carriers=2` 与 RTT 自适应的冲突判断 | 参考 |
-| [multicarrier-autosizing-handoff.md](multicarrier-autosizing-handoff.md) | 多载体池自适应定容的前因后果与方案。README 已记录最终实现 | 参考 |
+| [multicarrier-autosizing-handoff.md](multicarrier-autosizing-handoff.md) | 多载体池自适应定容的前因后果与方案。**定容规则已两次演进**(协议基线改为恒 2、硬件上限 `cpus-1`、新增 RTT 自适应),现役口径见 README | 参考 |
 
 ## 4. 专题:性能优化(单点结论)
 
