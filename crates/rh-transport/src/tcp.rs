@@ -1153,12 +1153,9 @@ mod handshake_backpressure_tests {
         );
 
         drop(held);
-        let inc = tokio::time::timeout(
-            std::time::Duration::from_millis(3000),
-            listener.accept(),
-        )
-        .await
-        .expect("归还许可后应恢复 accept");
+        let inc = tokio::time::timeout(std::time::Duration::from_millis(3000), listener.accept())
+            .await
+            .expect("归还许可后应恢复 accept");
         assert!(inc.is_ok());
         drop(cli);
     }
@@ -1184,12 +1181,9 @@ mod handshake_backpressure_tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         drop(held);
-        let inc = tokio::time::timeout(
-            std::time::Duration::from_millis(3000),
-            listener.accept(),
-        )
-        .await
-        .expect("归还许可后应立即恢复 accept(不得因预条件不唤醒而停摆)");
+        let inc = tokio::time::timeout(std::time::Duration::from_millis(3000), listener.accept())
+            .await
+            .expect("归还许可后应立即恢复 accept(不得因预条件不唤醒而停摆)");
         assert!(inc.is_ok());
         drop(cli);
     }

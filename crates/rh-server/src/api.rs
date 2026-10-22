@@ -2458,7 +2458,11 @@ async fn put_server_config(
         disk.log.level = hot.log_level.clone();
         disk.ssh_gateway = hot.ssh_gateway.clone();
         disk.metrics = hot.metrics.clone();
-        disk.limits = state.limits.read().unwrap_or_else(|e| e.into_inner()).clone();
+        disk.limits = state
+            .limits
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         disk.web.jwt_secret = state.cfg.web.jwt_secret.clone(); // 保留原值(未脱敏源)
         persist_err = match toml::to_string_pretty(&disk) {
             Ok(text) => {
@@ -2671,10 +2675,7 @@ mod login_rate_key_tests {
         assert_eq!(a_user, b_user);
 
         // 键里不得出现冒号(IPv4 带端口的形式);IPv6 本身含冒号,单独测
-        assert!(
-            !a_ip.contains(':'),
-            "IPv4 限速键不得含端口: {a_ip}"
-        );
+        assert!(!a_ip.contains(':'), "IPv4 限速键不得含端口: {a_ip}");
         assert_eq!(a_ip, "ip|203.0.113.7");
         assert_eq!(a_user, "203.0.113.7|admin");
     }

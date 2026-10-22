@@ -544,7 +544,9 @@ mod tests {
     /// 非整块边界(小于 64KiB、跨块、空写)也要一致。
     #[tokio::test]
     async fn roundtrip_odd_sizes() {
-        for size in [0usize, 1, 5, 127, 128, 4096, 65_535, 65_536, 65_537, 200_003] {
+        for size in [
+            0usize, 1, 5, 127, 128, 4096, 65_535, 65_536, 65_537, 200_003,
+        ] {
             let data = pseudo_random(size, 0x9E37_79B9_7F4A_7C15 ^ size as u64);
             let got = roundtrip_via_public_api(data.clone()).await;
             assert_eq!(got, data, "size {size} mismatch");
@@ -591,7 +593,10 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_with_byte_by_byte_source() {
         for chunks in [1usize, 2, 3, 17] {
-            let data = pseudo_random(MAX_UNCOMPRESSED_CHUNK * chunks - 7, 0x5EED_0000 + chunks as u64);
+            let data = pseudo_random(
+                MAX_UNCOMPRESSED_CHUNK * chunks - 7,
+                0x5EED_0000 + chunks as u64,
+            );
             let mut sink = VecSink::default();
             let mut src = SliceSrc::new(data.clone(), MAX_UNCOMPRESSED_CHUNK);
             compress_pump(&mut src, &mut sink).await;

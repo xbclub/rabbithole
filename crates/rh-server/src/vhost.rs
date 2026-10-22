@@ -649,10 +649,9 @@ fn not_found_response(state: &Arc<AppState>) -> hyper::Response<BoxBody> {
         // 404 洪峰(扫描器、爬虫)会把 executor 线程逐个堵在 read 上。
         // 配置在进程生命周期内不变,缓存是安全的;改动需重启(与本配置项
         // 其他字段一致)。
-        static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<
-            std::path::PathBuf,
-            Vec<u8>,
-        >>> = std::sync::OnceLock::new();
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
+        > = std::sync::OnceLock::new();
         let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
         // 命中:克隆一份(响应体需要所有权)
         let cached = { cache.lock().ok().and_then(|m| m.get(path).cloned()) };
@@ -1554,12 +1553,12 @@ mod tests {
         // 跑的是与生产完全相同的那份借用/归还逻辑。
         let pool: UpstreamPool<http_body_util::Empty<Bytes>> = UpstreamPool::default();
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (mut sender, conn) =
-            hyper::client::conn::http1::handshake::<_, http_body_util::Empty<Bytes>>(
-                hyper_util::rt::TokioIo::new(stream),
-            )
-            .await
-            .unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<
+            _,
+            http_body_util::Empty<Bytes>,
+        >(hyper_util::rt::TokioIo::new(stream))
+        .await
+        .unwrap();
         tokio::spawn(async move {
             let _ = conn.await;
         });
@@ -1610,8 +1609,8 @@ mod tests {
             hyper::client::conn::http1::handshake::<_, http_body_util::Empty<Bytes>>(
                 hyper_util::rt::TokioIo::new(stream),
             )
-                .await
-                .unwrap();
+            .await
+            .unwrap();
         tokio::spawn(async move {
             let _ = conn.await;
         });

@@ -291,10 +291,7 @@ pub(crate) mod relay_path_probe {
 
     /// (chunk 次数, copy 次数)
     pub fn snapshot() -> (usize, usize) {
-        (
-            CHUNK.load(Ordering::SeqCst),
-            COPY.load(Ordering::SeqCst),
-        )
+        (CHUNK.load(Ordering::SeqCst), COPY.load(Ordering::SeqCst))
     }
 
     /// 进入串行窗口:整个用例期间持有,结束随 guard drop 释放。
@@ -1048,7 +1045,8 @@ mod tests {
         let (out_b, b) = tcp_pair().await; // out_b ↔ b
         let (mut out_b_r, mut out_b_w) = out_b.into_split();
 
-        let relay = tokio::spawn(SPLIT_PROBE_SCOPE.scope((), splice(Box::new(a), Box::new(b), None)));
+        let relay =
+            tokio::spawn(SPLIT_PROBE_SCOPE.scope((), splice(Box::new(a), Box::new(b), None)));
         // 无锁分支必须在 splice 起步后立刻命中两次(a、b 各一)
         for _ in 0..200 {
             if LOCKLESS_SPLITS.load(Ordering::Relaxed) >= before + 2 {
@@ -1124,10 +1122,9 @@ mod tests {
         let (mut b_peer, b_local) = tokio::io::duplex(64 * 1024);
 
         let before = LOCKLESS_SPLITS.load(Ordering::Relaxed);
-        let relay = tokio::spawn(SPLIT_PROBE_SCOPE.scope(
-            (),
-            splice(Box::new(a_local), Box::new(b_local), None),
-        ));
+        let relay = tokio::spawn(
+            SPLIT_PROBE_SCOPE.scope((), splice(Box::new(a_local), Box::new(b_local), None)),
+        );
         // duplex 不是 TcpStream:不得命中无锁分支
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(

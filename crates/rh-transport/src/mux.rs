@@ -1062,10 +1062,7 @@ const DOWN_BATCH_BYTES: usize = 1024 * 1024;
 /// 诊断关闭时返回 `None`,且**不调用** `Instant::now()`
 /// (红线:关闭时零开销)。
 #[inline]
-fn loop_gap_step(
-    prev: Option<std::time::Instant>,
-    enabled: bool,
-) -> Option<std::time::Instant> {
+fn loop_gap_step(prev: Option<std::time::Instant>, enabled: bool) -> Option<std::time::Instant> {
     if let Some(prev) = prev {
         pump_diag::LOOP_GAP_NS.fetch_add(
             prev.elapsed().as_nanos() as u64,
@@ -3524,9 +3521,12 @@ mod tests {
         let mut io: crate::BoxedIo = out;
         let (_r, mut w) = steal_mux_halves(&mut io).expect("mux halves");
         // 超时保护:若实现把 Err 当 clean 并继续等下一批,不应挂死本测试
-        let clean = tokio::time::timeout(std::time::Duration::from_secs(5), pump_up(&mut reader, &mut w, &None))
-            .await
-            .expect("pump_up 不得因读错误而挂起");
+        let clean = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pump_up(&mut reader, &mut w, &None),
+        )
+        .await
+        .expect("pump_up 不得因读错误而挂起");
 
         assert!(
             !clean,
@@ -3581,10 +3581,7 @@ mod tests {
         assert_eq!(sink.len(), 8 * 4096, "数据必须完整搬运");
 
         let (ns, n) = gap_snapshot();
-        assert!(
-            n > 0,
-            "LOOP_GAP_N 必须 > 0(修前是遮蔽导致恒 0);实际 n={n}"
-        );
+        assert!(n > 0, "LOOP_GAP_N 必须 > 0(修前是遮蔽导致恒 0);实际 n={n}");
         assert!(ns > 0, "累计间隔应为正值,实际 {ns}");
     }
 
@@ -5072,16 +5069,10 @@ mod tests {
         // 对端有数据但不足 INIT_BUF_CAP:停在初始相
         let data = [3u8; 64];
         let mut mem = &data[..];
-        let c = reader
-            .try_read_chunk(&mut mem)
-            .await
-            .unwrap();
+        let c = reader.try_read_chunk(&mut mem).await.unwrap();
         assert!(matches!(c, TryChunk::Data(_)), "应有数据");
         assert!(!reader.upgraded, "64 字节不足以升级");
-        assert_eq!(
-            reader.pool_borrows, 0,
-            "非阻塞路径的初始相也不得借池(C4)"
-        );
+        assert_eq!(reader.pool_borrows, 0, "非阻塞路径的初始相也不得借池(C4)");
     }
 
     // Y1 chunk 中继:真实 echo 目标 + 偷取 halves → mux_relay;

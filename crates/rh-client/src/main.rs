@@ -63,7 +63,6 @@ fn rand_u64() -> u64 {
     h.finish()
 }
 
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();

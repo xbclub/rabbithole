@@ -347,10 +347,7 @@ impl ServerConfig {
             }
         }
         if out.is_empty() {
-            tracing::warn!(
-                raw,
-                "auto_range: 没有任何有效区间,回落到默认 10000-25000"
-            );
+            tracing::warn!(raw, "auto_range: 没有任何有效区间,回落到默认 10000-25000");
             return vec![PortsRange {
                 start: 10000,
                 end: 25000,

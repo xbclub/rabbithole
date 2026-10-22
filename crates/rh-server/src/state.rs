@@ -206,8 +206,8 @@ impl ClientUsage {
         // 2GB 这种"加量"操作后,已置位的 flow_cut 会**永久**保持,所有连接
         // 继续被杀(客户端侧 check flow_cut 直接 continue),只能重启进程
         // 或先改 0 再改回来。改成按实际用量判定:加量到超过已用量即恢复。
-        let limit_unreached =
-            q.flow_limit == 0 || self.bytes.load(std::sync::atomic::Ordering::Relaxed) < q.flow_limit as u64;
+        let limit_unreached = q.flow_limit == 0
+            || self.bytes.load(std::sync::atomic::Ordering::Relaxed) < q.flow_limit as u64;
         if limit_unreached {
             self.flow_cut
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -585,7 +585,11 @@ impl AppState {
 
     /// 认证窗口进入:超过每 IP 上限返回 false(0 = 不限)。
     pub fn enter_unauth(&self, ip: &IpAddr) -> bool {
-        let limit = self.limits.read().unwrap_or_else(|e| e.into_inner()).unauth_conns_per_ip;
+        let limit = self
+            .limits
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .unauth_conns_per_ip;
         if limit == 0 {
             return true;
         }
@@ -1245,11 +1249,8 @@ impl ProxyManager {
         // ★先快照再遍历:dashmap 的 `iter()` 会持有**分片写锁**,而下面
         // `rt.spec.read().await` 是 await 点 —— 守卫跨 await 会长期占住该分片,
         // 其它 runtime 的增删/查找全被挡住。快照后立即释放。
-        let runtimes: Vec<Arc<ProxyRuntime>> = self
-            .runtimes
-            .iter()
-            .map(|e| e.value().clone())
-            .collect();
+        let runtimes: Vec<Arc<ProxyRuntime>> =
+            self.runtimes.iter().map(|e| e.value().clone()).collect();
         for rt in runtimes.iter() {
             let spec_guard = rt.spec.read().await;
             let spec = &*spec_guard;
@@ -1408,7 +1409,8 @@ impl AppState {
         entity: ChannelEntity,
         purpose: crate::session::RequestPurpose,
     ) -> Option<u64> {
-        self.issue_create_channel_with(sess, entity, purpose, None).await
+        self.issue_create_channel_with(sess, entity, purpose, None)
+            .await
     }
 
     /// 同 [`Self::issue_create_channel`],但可指定**过期回收钩子**。

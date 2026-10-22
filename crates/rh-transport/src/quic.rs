@@ -439,7 +439,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let res = tokio::time::timeout(std::time::Duration::from_secs(3), super::connect(&client)).await;
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(3), super::connect(&client)).await;
         // 超时或失败都算"没有被接受";只有 Ok 说明 accept 循环还活着
         if let Ok(Ok(_)) = res {
             panic!("listener drop 后不应还能建立连接(accept 循环未退出)");

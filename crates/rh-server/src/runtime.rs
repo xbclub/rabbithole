@@ -537,10 +537,7 @@ pub async fn notify_client_recovery(state: &Arc<AppState>, client_id: &str) {
         sess.mark_unconfirmed(revision).await;
         let _ = sess
             .send_bounded(
-                ServerMessage::ServiceSync(ServiceSync {
-                    revision,
-                    entities,
-                }),
+                ServerMessage::ServiceSync(ServiceSync { revision, entities }),
                 CONTROL_SEND_TIMEOUT,
             )
             .await;

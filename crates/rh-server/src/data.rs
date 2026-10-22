@@ -107,11 +107,12 @@ pub async fn tcp_refill(state: &Arc<AppState>, sess: &Arc<Session>, rt: &Arc<Pro
         // 修前没有任何回收路径,每一次过期都让池永久少一个名额。
         let pool_for_expire = pool.clone();
         let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
-            let _ = pool_for_expire.inflight.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| Some(v.saturating_sub(1)),
-            );
+            let _ =
+                pool_for_expire
+                    .inflight
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    });
         });
         match state
             .issue_create_channel_with(
@@ -132,11 +133,11 @@ pub async fn tcp_refill(state: &Arc<AppState>, sess: &Arc<Session>, rt: &Arc<Pro
                 // 修前只 `break`,一次签发失败让池永久少一个名额。
                 // 两边注释曾互相指认对方会减,实际都不减,靠"send 失败
                 // ⟹ 会话将死 ⟹ claim_pool 清零"侥幸自愈 —— 不该依赖。
-                let _ = pool.inflight.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |v| Some(v.saturating_sub(1)),
-                );
+                let _ = pool
+                    .inflight
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    });
                 break;
             }
         }
@@ -243,7 +244,11 @@ pub async fn get_channel(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Optio
         return None;
     }
     // 先取出标量再进入 match:读锁守卫不得作为 match 临时量跨 await 持有
-    let wait_ms = state.limits.read().unwrap_or_else(|e| e.into_inner()).pool_wait_timeout_ms;
+    let wait_ms = state
+        .limits
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .pool_wait_timeout_ms;
     match tokio::time::timeout(Duration::from_millis(wait_ms), rx).await {
         Ok(Ok(s)) => Some(s),
         _ => {
@@ -1278,11 +1283,7 @@ async fn group_pick_sticky(
 }
 
 /// 从 `start` 起环形找一个健康且在线的成员。
-fn pick_healthy(
-    state: &Arc<AppState>,
-    members: &[u64],
-    start: usize,
-) -> Option<Arc<ProxyRuntime>> {
+fn pick_healthy(state: &Arc<AppState>, members: &[u64], start: usize) -> Option<Arc<ProxyRuntime>> {
     for idx in (start..).take(members.len()) {
         let id = members[idx % members.len()];
         if let Some(m) = state.proxies.get(id) {
@@ -1366,7 +1367,11 @@ fn udp_session_admit(
     if sessions.contains_key(&addr) {
         return true;
     }
-    let limit = state.limits.read().unwrap_or_else(|e| e.into_inner()).max_udp_sessions_per_proxy;
+    let limit = state
+        .limits
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .max_udp_sessions_per_proxy;
     if limit != 0 && sessions.len() >= limit {
         // B7:超限必须可见 —— 静默丢弃会让"UDP 不通"无从排查。
         state.metrics.udp_sessions_rejected.inc();
@@ -1411,7 +1416,15 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
         };
         let (mut ch_r, mut ch_w) = tokio::io::split(stream);
         let mut frame_buf = bytes::BytesMut::with_capacity(2048);
-        let mut pkt_buf = vec![0u8; state.limits.read().unwrap_or_else(|e| e.into_inner()).udp_packet_size.max(1500)];
+        let mut pkt_buf = vec![
+            0u8;
+            state
+                .limits
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .udp_packet_size
+                .max(1500)
+        ];
         let mut last_ping_sent = Instant::now();
         let mut last_alive = Instant::now();
         let dead = loop {

@@ -223,11 +223,7 @@ fn store(key: CacheKey, addr: Option<SocketAddr>) {
     let mut g = cache().lock().unwrap_or_else(|e| e.into_inner());
     if g.len() >= MAX_ENTRIES && !g.contains_key(&key) {
         // 淘汰最旧:条目上限 4096,线性扫一遍可接受(仅在满时触发)。
-        if let Some(oldest) = g
-            .iter()
-            .min_by_key(|(_, e)| e.at)
-            .map(|(k, _)| k.clone())
-        {
+        if let Some(oldest) = g.iter().min_by_key(|(_, e)| e.at).map(|(k, _)| k.clone()) {
             g.remove(&oldest);
         }
     }
@@ -241,7 +237,8 @@ fn store(key: CacheKey, addr: Option<SocketAddr>) {
 }
 
 /// 真实解析(未命中缓存时才会执行)。测试通过 [`resolve_set_query`] 替换。
-type QueryFn = fn(&str, u16, Option<&str>) -> futures::future::BoxFuture<'static, Option<SocketAddr>>;
+type QueryFn =
+    fn(&str, u16, Option<&str>) -> futures::future::BoxFuture<'static, Option<SocketAddr>>;
 
 static QUERY: Mutex<Option<QueryFn>> = Mutex::new(None);
 
@@ -418,7 +415,10 @@ mod cache_tests {
         let other_port = cache_key("h", 81, None);
         assert!(look_up(&other_port, now).is_none(), "不同 port 不得命中");
         let other_ns = cache_key("h", 80, Some("1.2.3.4:53"));
-        assert!(look_up(&other_ns, now).is_none(), "不同 dns_server 不得命中");
+        assert!(
+            look_up(&other_ns, now).is_none(),
+            "不同 dns_server 不得命中"
+        );
         let other_host = cache_key("H", 80, None);
         // host 统一小写:大小写不同视为同一键
         assert!(look_up(&other_host, now).is_some(), "host 应大小写归一");
@@ -444,11 +444,7 @@ mod cache_tests {
         }
 
         assert!(resolve_cached(HOST, 80, None).await.is_some());
-        assert_eq!(
-            QUERIES.load(Ordering::SeqCst),
-            2,
-            "TTL 过期后必须重新解析"
-        );
+        assert_eq!(QUERIES.load(Ordering::SeqCst), 2, "TTL 过期后必须重新解析");
         teardown();
     }
 
@@ -478,11 +474,7 @@ mod cache_tests {
             }
         }
         assert!(resolve_cached(HOST, 80, None).await.is_none());
-        assert_eq!(
-            QUERIES.load(Ordering::SeqCst),
-            2,
-            "负 TTL 过期后必须重试"
-        );
+        assert_eq!(QUERIES.load(Ordering::SeqCst), 2, "负 TTL 过期后必须重试");
         teardown();
     }
 
@@ -493,9 +485,9 @@ mod cache_tests {
         let _g = setup(50, true).await;
         let mut handles = Vec::new();
         for _ in 0..10 {
-            handles.push(tokio::spawn(async move {
-                resolve_cached(HOST, 80, None).await
-            }));
+            handles.push(tokio::spawn(
+                async move { resolve_cached(HOST, 80, None).await },
+            ));
         }
         let mut got = Vec::new();
         for h in handles {
@@ -503,7 +495,8 @@ mod cache_tests {
         }
         assert_eq!(got.len(), 10);
         assert!(
-            got.iter().all(|a| *a == Some(SocketAddr::from(([10, 0, 0, 7], 80)))),
+            got.iter()
+                .all(|a| *a == Some(SocketAddr::from(([10, 0, 0, 7], 80)))),
             "所有并发请求都必须拿到同一地址"
         );
         assert_eq!(
@@ -552,15 +545,9 @@ mod cache_tests {
         }
         // 再插一条新的,应触发淘汰最旧
         let newest = cache_key("zz-newest", 80, None);
-        store(
-            newest.clone(),
-            Some(SocketAddr::from(([10, 0, 0, 2], 80))),
-        );
+        store(newest.clone(), Some(SocketAddr::from(([10, 0, 0, 2], 80))));
         let now = std::time::Instant::now();
-        assert!(
-            look_up(&newest, now).is_some(),
-            "最新写入的条目不得被淘汰"
-        );
+        assert!(look_up(&newest, now).is_some(), "最新写入的条目不得被淘汰");
         assert!(
             look_up(&cache_key("k0", 80, None), now).is_none(),
             "最旧的条目应被淘汰"
@@ -574,11 +561,7 @@ mod cache_tests {
         let _g = setup(0, true).await;
         let addr = crate::forward::resolve("203.0.113.9", 8080).await.unwrap();
         assert_eq!(addr, SocketAddr::from(([203, 0, 113, 9], 8080)));
-        assert_eq!(
-            QUERIES.load(Ordering::SeqCst),
-            0,
-            "IP 直连不得触发任何解析"
-        );
+        assert_eq!(QUERIES.load(Ordering::SeqCst), 0, "IP 直连不得触发任何解析");
         // 也不得写缓存(缓存键是域名,IP 根本不该进来)
         assert!(
             cache().lock().unwrap().is_empty(),

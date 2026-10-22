@@ -197,11 +197,16 @@ fn encode_control_frame(m: &ClientMessage) -> Option<bytes::Bytes> {
 
 impl ClientSession {
     /// 登记一个等待配对的本地连接(带登记时刻,供 TTL 淘汰)。
-    pub async fn insert_waiting(&self, user_conn_id: u64, conn: tokio::net::TcpStream, visitor_id: u64) {
-        self.waiting.lock().await.insert(
-            user_conn_id,
-            (conn, visitor_id, std::time::Instant::now()),
-        );
+    pub async fn insert_waiting(
+        &self,
+        user_conn_id: u64,
+        conn: tokio::net::TcpStream,
+        visitor_id: u64,
+    ) {
+        self.waiting
+            .lock()
+            .await
+            .insert(user_conn_id, (conn, visitor_id, std::time::Instant::now()));
     }
 
     /// 取出一个等待中的连接(配对成功时调用)。
@@ -1359,13 +1364,13 @@ async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) 
                 stop_visitor(sess, v.id).await;
                 cur.insert(v.id, v.clone());
                 drop(cur); // 别持着 visitors 锁去做重绑定
-                // ★重绑前给旧监听器一点时间释放端口。
-                //
-                // `stop_visitor` 只是 `cancel()`,监听任务要跑到下一次
-                // accept 循环才 drop listener。紧接着 bind 同一端口会
-                // `EADDRINUSE`,而 `start` 里 bind 失败**只 warn 不重试**
-                // —— 规则从此永久失联,直到下次配置变更或客户端重启。
-                // 这里退避重试,把竞态窗口吃掉。
+                           // ★重绑前给旧监听器一点时间释放端口。
+                           //
+                           // `stop_visitor` 只是 `cancel()`,监听任务要跑到下一次
+                           // accept 循环才 drop listener。紧接着 bind 同一端口会
+                           // `EADDRINUSE`,而 `start` 里 bind 失败**只 warn 不重试**
+                           // —— 规则从此永久失联,直到下次配置变更或客户端重启。
+                           // 这里退避重试,把竞态窗口吃掉。
                 crate::visitor_run::start_with_retry(sess.clone(), v.id, v).await;
             }
         }
@@ -2173,13 +2178,12 @@ mod fatal_error_tests {
     #[test]
     fn error_code_parsed_from_envelope_not_only_bare_struct() {
         // 服务端真实形态(信封)
-        let envelope = serde_json::to_vec(&ServerMessage::Error(
-            rh_protocol::message::ErrorMessage {
+        let envelope =
+            serde_json::to_vec(&ServerMessage::Error(rh_protocol::message::ErrorMessage {
                 code: "CLIENT_DISABLED".into(),
                 message: "client disabled".into(),
-            },
-        ))
-        .unwrap();
+            }))
+            .unwrap();
         assert_eq!(parse_error_code(&envelope), "CLIENT_DISABLED");
 
         // 兼容老服务端的裸结构
@@ -2208,10 +2212,7 @@ mod fatal_error_tests {
             "session rejected: AUTH_FAILED",
         ] {
             let e = SessionError::Transient(anyhow::anyhow!(msg));
-            assert!(
-                e.fatal_kind().is_none(),
-                "普通断线 {msg:?} 不得被判为致命"
-            );
+            assert!(e.fatal_kind().is_none(), "普通断线 {msg:?} 不得被判为致命");
         }
     }
 
@@ -2268,7 +2269,10 @@ mod control_frame_tests {
     #[tokio::test]
     async fn control_frame_bytes_identical_to_legacy_path() {
         let msgs = vec![
-            ClientMessage::Ping(Ping { ts_ms: 1_700_000_000_123, probe: false }),
+            ClientMessage::Ping(Ping {
+                ts_ms: 1_700_000_000_123,
+                probe: false,
+            }),
             ClientMessage::UserConnect(UserConnect {
                 visitor_id: 42,
                 user_conn_id: 7,
@@ -2334,11 +2338,14 @@ mod control_frame_tests {
                 }),
                 FrameType::HELLO,
             ),
-            (ClientMessage::Ping(Ping { ts_ms: 0, probe: false }), FrameType::PING),
             (
-                ClientMessage::SyncRequest {},
-                FrameType::SYNC_REQUEST,
+                ClientMessage::Ping(Ping {
+                    ts_ms: 0,
+                    probe: false,
+                }),
+                FrameType::PING,
             ),
+            (ClientMessage::SyncRequest {}, FrameType::SYNC_REQUEST),
             (
                 ClientMessage::DataChannelHello(DataChannelHello {
                     session_id: "s".into(),
@@ -2398,10 +2405,7 @@ mod control_frame_tests {
         });
         let payload_len = serde_json::to_vec(&m).unwrap().len();
         assert_eq!(payload_len, rh_protocol::frame::MAX_FRAME_LEN);
-        assert!(
-            encode_control_frame(&m).is_some(),
-            "恰为上限的载荷必须放行"
-        );
+        assert!(encode_control_frame(&m).is_some(), "恰为上限的载荷必须放行");
     }
 
     /// 计数探针:每消息只编码一次(`encode_frame_bytes` 恰好被调用 1 次)。
@@ -2434,7 +2438,10 @@ mod control_frame_tests {
             conn_counter: AtomicU64::new(0),
         });
 
-        let m = ClientMessage::Ping(Ping { ts_ms: 99, probe: false });
+        let m = ClientMessage::Ping(Ping {
+            ts_ms: 99,
+            probe: false,
+        });
         assert!(sess.send_msg(m.clone()).await);
         let got = rx.recv().await.expect("队列里必须有一帧");
 
@@ -2473,7 +2480,10 @@ mod control_frame_tests {
             tx.send(bytes::Bytes::from_static(b"257")),
         )
         .await;
-        assert!(extra.is_err(), "队满时 send 必须 await(背压语义),不得静默丢弃");
+        assert!(
+            extra.is_err(),
+            "队满时 send 必须 await(背压语义),不得静默丢弃"
+        );
 
         // 消费一条后应恢复可写
         let _ = rx.recv().await;
@@ -2585,7 +2595,11 @@ mod waiting_ttl_tests {
             let c = tcp_conn().await;
             sess.insert_waiting(id, c, 1).await;
         }
-        assert_eq!(sess.waiting.lock().await.len() as u64, N, "1000 条必须全部登记");
+        assert_eq!(
+            sess.waiting.lock().await.len() as u64,
+            N,
+            "1000 条必须全部登记"
+        );
 
         // 1s 内全部交付
         let t0 = std::time::Instant::now();
@@ -2599,10 +2613,7 @@ mod waiting_ttl_tests {
             "1000 条交付耗时 {elapsed:?},超过 1s"
         );
 
-        assert!(
-            sess.waiting.lock().await.is_empty(),
-            "全部交付后表必须为空"
-        );
+        assert!(sess.waiting.lock().await.is_empty(), "全部交付后表必须为空");
 
         // 没有残留的每连接任务:交付后再 sweep 一轮,不应有可淘汰项
         assert_eq!(sess.sweep_waiting().await, 0, "交付后不得有残留条目");

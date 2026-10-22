@@ -382,7 +382,11 @@ async fn main() -> anyhow::Result<()> {
         bound.push((listener, leaf));
     }
     for (listener, leaf) in bound {
-        tokio::spawn(control::serve_transport_bound(state.clone(), listener, leaf));
+        tokio::spawn(control::serve_transport_bound(
+            state.clone(),
+            listener,
+            leaf,
+        ));
     }
     // vhost 监听
     if cfg.vhost.http_port > 0 {

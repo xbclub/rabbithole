@@ -132,7 +132,11 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mib: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(64);
     let reps: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(7);
-    let kind = args.get(2).map(String::as_str).unwrap_or("noise").to_string();
+    let kind = args
+        .get(2)
+        .map(String::as_str)
+        .unwrap_or("noise")
+        .to_string();
     let total = mib * 1024 * 1024;
 
     println!(

@@ -566,10 +566,13 @@ pub fn carriers_for_rtt(rtt: std::time::Duration) -> usize {
 pub type DialFn = fn(
     SocketAddr,
     Option<String>,
-) -> futures::future::BoxFuture<'static, std::io::Result<tokio::net::TcpStream>>;
+)
+    -> futures::future::BoxFuture<'static, std::io::Result<tokio::net::TcpStream>>;
 
 fn dial_fn() -> DialFn {
-    DIAL.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(default_dial)
+    DIAL.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or(default_dial)
 }
 
 static DIAL: std::sync::Mutex<Option<DialFn>> = std::sync::Mutex::new(None);
@@ -682,7 +685,10 @@ fn rtt_cache() -> &'static std::sync::Mutex<RttCache> {
 /// 的集成测试需要它来隔离用例。不是 `#[cfg(test)]` —— 那样只有
 /// rh-transport 自身的测试能看到,下游看不见(实测编译失败)。
 pub fn probe_cache_clear() {
-    rtt_cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    rtt_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// 本进程内**真实发生过**的探测次数(缓存命中不计)。
@@ -1371,11 +1377,7 @@ mod carrier_baseline_tests {
             Some("http://127.0.0.1:3128".into()),
         )
         .await;
-        assert_eq!(
-            dials(),
-            2,
-            "不同 proxy_url 必须各自探测一次"
-        );
+        assert_eq!(dials(), 2, "不同 proxy_url 必须各自探测一次");
         probe_teardown();
     }
 
@@ -1403,11 +1405,7 @@ mod carrier_baseline_tests {
         // 失败结果也要缓存:避免断线时每次重连都白等超时
         let k2 = auto_carriers(addr(), std::time::Duration::from_secs(2), None).await;
         assert_eq!(k2, 1);
-        assert_eq!(
-            dials(),
-            1,
-            "失败结果也必须缓存"
-        );
+        assert_eq!(dials(), 1, "失败结果也必须缓存");
         probe_teardown();
     }
 

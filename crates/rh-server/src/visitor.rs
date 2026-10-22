@@ -58,9 +58,7 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
                 vspec,
                 pspec,
             });
-            state
-                .visitor_cache
-                .insert(cache_key.clone(), entry.clone());
+            state.visitor_cache.insert(cache_key.clone(), entry.clone());
             entry
         }
     };
@@ -110,15 +108,7 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
         conn = u.user_conn_id,
         "visitor relay established"
     );
-    relay_tcp(
-        state,
-        sess,
-        &vspec,
-        &pspec,
-        &target_sess,
-        u.user_conn_id,
-    )
-    .await;
+    relay_tcp(state, sess, &vspec, &pspec, &target_sess, u.user_conn_id).await;
 }
 
 /// 密钥校验。访问授权由访问器记录本身保证(仅管理员可建,记录绑定客户端与

@@ -69,10 +69,7 @@ impl std::fmt::Debug for ClientConfig {
             .field("tls_pin_sha256", &self.tls_pin_sha256)
             .field("alpn", &self.alpn)
             // proxy_url 常带 user:pass,同样遮蔽
-            .field(
-                "proxy_url",
-                &self.proxy_url.as_ref().map(|_| "<redacted>"),
-            )
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| "<redacted>"))
             .field("stun_server", &self.stun_server)
             .field("dns_server", &self.dns_server)
             .field("log_level", &self.log_level)
@@ -655,10 +652,7 @@ mod debug_redaction_tests {
             ..Default::default()
         };
         let s = format!("{cfg:?}");
-        assert!(
-            !s.contains("SUPER-SECRET-VALUE"),
-            "secret 必须被遮蔽: {s}"
-        );
+        assert!(!s.contains("SUPER-SECRET-VALUE"), "secret 必须被遮蔽: {s}");
         assert!(!s.contains("hunter2"), "代理口令必须被遮蔽: {s}");
         // 非敏感字段照常可读(诊断不受影响)
         assert!(s.contains("cid-1"), "client_id 应可见: {s}");

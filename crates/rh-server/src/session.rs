@@ -604,9 +604,15 @@ mod pending_expire_tests {
         let sess = make_sess();
         let hits = Arc::new(AtomicUsize::new(0));
         let h = hits.clone();
-        sess.add_pending_request(1, req(10, Some(Box::new(move || {
-            h.fetch_add(1, AO::SeqCst);
-        }))))
+        sess.add_pending_request(
+            1,
+            req(
+                10,
+                Some(Box::new(move || {
+                    h.fetch_add(1, AO::SeqCst);
+                })),
+            ),
+        )
         .await;
         // 等过期,再登记一条新请求触发清理
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
@@ -620,9 +626,15 @@ mod pending_expire_tests {
         let sess = make_sess();
         let hits = Arc::new(AtomicUsize::new(0));
         let h = hits.clone();
-        sess.add_pending_request(1, req(10_000, Some(Box::new(move || {
-            h.fetch_add(1, AO::SeqCst);
-        }))))
+        sess.add_pending_request(
+            1,
+            req(
+                10_000,
+                Some(Box::new(move || {
+                    h.fetch_add(1, AO::SeqCst);
+                })),
+            ),
+        )
         .await;
         sess.invalidate_proxy_requests(1).await;
         assert_eq!(hits.load(AO::SeqCst), 1, "被失效的条目必须跑回收钩子");
@@ -634,12 +646,21 @@ mod pending_expire_tests {
         let sess = make_sess();
         let hits = Arc::new(AtomicUsize::new(0));
         let h = hits.clone();
-        sess.add_pending_request(7, req(10, Some(Box::new(move || {
-            h.fetch_add(1, AO::SeqCst);
-        }))))
+        sess.add_pending_request(
+            7,
+            req(
+                10,
+                Some(Box::new(move || {
+                    h.fetch_add(1, AO::SeqCst);
+                })),
+            ),
+        )
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        assert!(sess.take_pending_request(7).await.is_none(), "过期应返回 None");
+        assert!(
+            sess.take_pending_request(7).await.is_none(),
+            "过期应返回 None"
+        );
         assert_eq!(hits.load(AO::SeqCst), 1, "过期消费必须跑回收钩子");
     }
 
@@ -649,9 +670,15 @@ mod pending_expire_tests {
         let sess = make_sess();
         let hits = Arc::new(AtomicUsize::new(0));
         let h = hits.clone();
-        sess.add_pending_request(9, req(10_000, Some(Box::new(move || {
-            h.fetch_add(1, AO::SeqCst);
-        }))))
+        sess.add_pending_request(
+            9,
+            req(
+                10_000,
+                Some(Box::new(move || {
+                    h.fetch_add(1, AO::SeqCst);
+                })),
+            ),
+        )
         .await;
         sess.take_pending_request_quiet(9).await;
         assert_eq!(
@@ -667,9 +694,15 @@ mod pending_expire_tests {
         let sess = make_sess();
         let hits = Arc::new(AtomicUsize::new(0));
         let h = hits.clone();
-        sess.add_pending_request(3, req(10_000, Some(Box::new(move || {
-            h.fetch_add(1, AO::SeqCst);
-        }))))
+        sess.add_pending_request(
+            3,
+            req(
+                10_000,
+                Some(Box::new(move || {
+                    h.fetch_add(1, AO::SeqCst);
+                })),
+            ),
+        )
         .await;
         sess.add_pending_request(4, req(10_000, None)).await;
         assert_eq!(hits.load(AO::SeqCst), 0, "未过期不得回收");
@@ -694,7 +727,10 @@ mod bounded_send_tests {
     }
 
     fn ping() -> ServerMessage {
-        ServerMessage::Pong(rh_protocol::message::Pong { ts_ms: 0, probe: false })
+        ServerMessage::Pong(rh_protocol::message::Pong {
+            ts_ms: 0,
+            probe: false,
+        })
     }
 
     /// `send_bounded` 在队列满时必须**超时返回 false**,不得永久 park。

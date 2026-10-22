@@ -44,9 +44,7 @@ pub async fn dial_plugin(plugin: &PluginSpec) -> anyhow::Result<BoxedIo> {
             http_user,
             http_password,
         } => serve_proxy(ProxyProtocol::Http, http_user, http_password),
-        PluginSpec::Socks5 { user, password } => {
-            serve_proxy(ProxyProtocol::Socks5, user, password)
-        }
+        PluginSpec::Socks5 { user, password } => serve_proxy(ProxyProtocol::Socks5, user, password),
         PluginSpec::StaticFile {
             local_path,
             strip_prefix,
@@ -526,8 +524,9 @@ async fn write_proxy_status(
     reason: &str,
     extra: &str,
 ) -> std::io::Result<()> {
-    let resp =
-        format!("HTTP/1.1 {code} {reason}\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n");
+    let resp = format!(
+        "HTTP/1.1 {code} {reason}\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
     io.write_all(resp.as_bytes()).await?;
     io.shutdown().await
 }
@@ -642,7 +641,8 @@ const SOCKS_REP_ABORT: u8 = 0xFF;
 /// 地址」可言,填假地址反而会误导客户端去做反向连接。RFC 1928 允许客户端
 /// 忽略这两个字段(除 BIND 外)。
 async fn socks5_reply(io: &mut tokio::io::DuplexStream, rep: u8) -> std::io::Result<()> {
-    io.write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
+    io.write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
 }
 
 /// 走完 SOCKS5 握手,返回(目的地 host, 端口)。
@@ -655,7 +655,9 @@ async fn socks5_handshake(
 ) -> Result<(String, u16), u8> {
     // ---- 方法协商 ----
     let mut head = [0u8; 2];
-    read_exact_timeout(io, &mut head).await.map_err(|_| SOCKS_REP_ABORT)?;
+    read_exact_timeout(io, &mut head)
+        .await
+        .map_err(|_| SOCKS_REP_ABORT)?;
     if head[0] != 0x05 {
         return Err(SOCKS_REP_ABORT); // 不是 SOCKS5,无从应答
     }
@@ -669,12 +671,16 @@ async fn socks5_handshake(
         let _ = io.write_all(&[0x05, 0xFF]).await;
         return Err(SOCKS_REP_ABORT);
     }
-    io.write_all(&[0x05, want]).await.map_err(|_| SOCKS_REP_ABORT)?;
+    io.write_all(&[0x05, want])
+        .await
+        .map_err(|_| SOCKS_REP_ABORT)?;
 
     // ---- 用户名/密码认证(RFC 1929) ----
     if want == 0x02 {
         let mut ver = [0u8; 1];
-        read_exact_timeout(io, &mut ver).await.map_err(|_| SOCKS_REP_ABORT)?;
+        read_exact_timeout(io, &mut ver)
+            .await
+            .map_err(|_| SOCKS_REP_ABORT)?;
         if ver[0] != 0x01 {
             let _ = io.write_all(&[0x01, 0x01]).await;
             return Err(SOCKS_REP_ABORT);
@@ -691,12 +697,16 @@ async fn socks5_handshake(
             let _ = io.write_all(&[0x01, 0x01]).await;
             return Err(SOCKS_REP_ABORT);
         }
-        io.write_all(&[0x01, 0x00]).await.map_err(|_| SOCKS_REP_ABORT)?;
+        io.write_all(&[0x01, 0x00])
+            .await
+            .map_err(|_| SOCKS_REP_ABORT)?;
     }
 
     // ---- 请求 ----
     let mut req = [0u8; 4];
-    read_exact_timeout(io, &mut req).await.map_err(|_| SOCKS_REP_ABORT)?;
+    read_exact_timeout(io, &mut req)
+        .await
+        .map_err(|_| SOCKS_REP_ABORT)?;
     if req[0] != 0x05 {
         return Err(SOCKS_REP_ABORT);
     }
@@ -707,7 +717,9 @@ async fn socks5_handshake(
     let host = match req[3] {
         0x01 => {
             let mut a = [0u8; 4];
-            read_exact_timeout(io, &mut a).await.map_err(|_| SOCKS_REP_ABORT)?;
+            read_exact_timeout(io, &mut a)
+                .await
+                .map_err(|_| SOCKS_REP_ABORT)?;
             std::net::Ipv4Addr::from(a).to_string()
         }
         0x03 => {
@@ -718,14 +730,18 @@ async fn socks5_handshake(
         }
         0x04 => {
             let mut a = [0u8; 16];
-            read_exact_timeout(io, &mut a).await.map_err(|_| SOCKS_REP_ABORT)?;
+            read_exact_timeout(io, &mut a)
+                .await
+                .map_err(|_| SOCKS_REP_ABORT)?;
             std::net::Ipv6Addr::from(a).to_string()
         }
         // 未知地址类型:REP=0x08 Address type not supported
         _ => return Err(0x08),
     };
     let mut port = [0u8; 2];
-    read_exact_timeout(io, &mut port).await.map_err(|_| SOCKS_REP_ABORT)?;
+    read_exact_timeout(io, &mut port)
+        .await
+        .map_err(|_| SOCKS_REP_ABORT)?;
     let port = u16::from_be_bytes(port);
     if host.is_empty() || port == 0 {
         return Err(0x01); // general failure
@@ -1092,18 +1108,14 @@ fn tls_acceptor(crt: &str, key: &str) -> anyhow::Result<Arc<tokio_rustls::TlsAcc
     // 都阻塞在同一把 std Mutex 上 —— 在 async 任务里等于阻塞 OS 线程。
     // 缓存命中路径很短,重读概率极低,这里接受"可能重复读一次"的代价。
     {
-        let cache = acceptor_cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let cache = acceptor_cache().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = cache.get(&key_id) {
             return Ok(hit.clone());
         }
     }
     let certs = load_certs(crt)?;
     let priv_key = load_key(key)?;
-    let mut cache = acceptor_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut cache = acceptor_cache().lock().unwrap_or_else(|e| e.into_inner());
     // 并发下可能已被别的任务插入:复用它的
     if let Some(hit) = cache.get(&key_id) {
         return Ok(hit.clone());
@@ -1367,9 +1379,11 @@ mod proxy_tests {
     async fn http_proxy_connect_dials_request_target() {
         let echo = spawn_echo().await;
         let mut io = open(&http_proxy_spec("", "")).await;
-        io.write_all(format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nHost: ignored\r\n\r\n").as_bytes())
-            .await
-            .unwrap();
+        io.write_all(
+            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nHost: ignored\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
         let resp = read_some(&mut io, 128).await;
         let text = String::from_utf8_lossy(&resp);
         assert!(
@@ -1390,8 +1404,7 @@ mod proxy_tests {
     async fn http_proxy_connect_forwards_pipelined_bytes() {
         let echo = spawn_echo().await;
         let mut io = open(&http_proxy_spec("", "")).await;
-        let mut req =
-            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nHost: x\r\n\r\n").into_bytes();
+        let mut req = format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nHost: x\r\n\r\n").into_bytes();
         req.extend_from_slice(b"EARLY-BYTES");
         io.write_all(&req).await.unwrap();
         // 第一个 read 可能拿到 200 应答,也可能拿到应答+回显
@@ -1435,8 +1448,10 @@ mod proxy_tests {
         let mut io = open(&http_proxy_spec("pu", "pp")).await;
         let cred = base64_encode("pu:pp");
         io.write_all(
-            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nProxy-Authorization: Basic {cred}\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nProxy-Authorization: Basic {cred}\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();
@@ -1587,7 +1602,10 @@ mod proxy_tests {
     #[test]
     fn bracketed_v6_is_normalized_before_resolve() {
         let (host, port) = split_authority("[2001:db8::1]:8443", 443).unwrap();
-        assert_eq!(host, "2001:db8::1", "方括号必须剥掉,否则 IpAddr::parse 失败");
+        assert_eq!(
+            host, "2001:db8::1",
+            "方括号必须剥掉,否则 IpAddr::parse 失败"
+        );
         assert_eq!(port, 8443);
         assert!(host.parse::<std::net::IpAddr>().is_ok());
     }
@@ -1609,7 +1627,10 @@ mod proxy_tests {
             Some(("127.0.0.1".into(), 80))
         );
         // IPv6 方括号必须剥掉,否则 IpAddr::parse 失败
-        assert_eq!(split_authority("[::1]:8080", 443), Some(("::1".into(), 8080)));
+        assert_eq!(
+            split_authority("[::1]:8080", 443),
+            Some(("::1".into(), 8080))
+        );
         assert_eq!(split_authority("[::1]", 443), Some(("::1".into(), 443)));
         // 末尾根点归一化
         assert_eq!(
@@ -1872,12 +1893,18 @@ mod tests {
         let out = rewrite_http_head(head, "new.example", &op);
         let text = String::from_utf8(out).unwrap();
 
-        assert!(text.contains("Host: new.example\r\n"), "Host 必须被重写:{text}");
+        assert!(
+            text.contains("Host: new.example\r\n"),
+            "Host 必须被重写:{text}"
+        );
         assert!(!text.contains("Host: orig"), "原 Host 必须消失:{text}");
         assert!(!text.contains("X-Del:"), "del 必须生效:{text}");
         assert!(text.contains("X-Keep: k\r\n"), "无关头必须保留:{text}");
         assert!(!text.contains("keep-alive"), "Connection 必须被替换:{text}");
-        assert!(text.ends_with("Connection: close\r\n\r\n"), "必须强制 close:{text}");
+        assert!(
+            text.ends_with("Connection: close\r\n\r\n"),
+            "必须强制 close:{text}"
+        );
 
         // 顺序:set 的头出现在 del 判定之后(即位于头列表末尾)
         let set_pos = text.find("X-Set: s").unwrap();
@@ -1892,7 +1919,10 @@ mod tests {
         let op = rh_protocol::HeaderOp::default();
         let out = rewrite_http_head(head, "", &op);
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("Host: orig\r\n"), "空改写时原 Host 必须保留:{text}");
+        assert!(
+            text.contains("Host: orig\r\n"),
+            "空改写时原 Host 必须保留:{text}"
+        );
     }
 
     /// 无 Host 且给了 host_rewrite:必须补上。
@@ -1902,7 +1932,10 @@ mod tests {
         let op = rh_protocol::HeaderOp::default();
         let out = rewrite_http_head(head, "added.example", &op);
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("Host: added.example\r\n"), "缺失 Host 必须补:{text}");
+        assert!(
+            text.contains("Host: added.example\r\n"),
+            "缺失 Host 必须补:{text}"
+        );
     }
 
     /// 重复 Host:只保留第一个(旧行为)。
@@ -1968,7 +2001,6 @@ mod cache_tests {
         assert!(!Arc::ptr_eq(&a0, &a1), "不同证书路径必须各自独立缓存");
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 
     const TEST_CERT_PEM: &str = include_str!("testdata/cache-test.crt");
     const TEST_KEY_PEM: &str = include_str!("testdata/cache-test.key");

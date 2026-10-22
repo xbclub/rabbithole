@@ -169,14 +169,7 @@ fn load_authorized_keys(path: Option<&PathBuf>) -> Arc<Vec<PublicKey>> {
 /// (引号内),所以按**引号是否闭合**扫描而不是简单 split:找到第一个不在
 /// 引号内、且其后紧接已知密钥类型的空格位置。
 fn strip_authorized_keys_options(line: &str) -> &str {
-    const KEY_TYPES: [&str; 6] = [
-        "ssh-",
-        "ecdsa-",
-        "sk-",
-        "rsa-",
-        "dsa-",
-        "pkcs11:",
-    ];
+    const KEY_TYPES: [&str; 6] = ["ssh-", "ecdsa-", "sk-", "rsa-", "dsa-", "pkcs11:"];
     let bytes = line.as_bytes();
     let mut in_quote = false;
     let mut i = 0;
@@ -550,10 +543,7 @@ mod authorized_keys_tests {
     #[test]
     fn options_with_spaces_in_quotes() {
         let line = r#"command="echo hello world" ssh-ed25519 AAAA test"#;
-        assert_eq!(
-            strip_authorized_keys_options(line),
-            "ssh-ed25519 AAAA test"
-        );
+        assert_eq!(strip_authorized_keys_options(line), "ssh-ed25519 AAAA test");
     }
 
     /// 没有任何密钥类型时原样返回(让上层报错,不静默吞掉)。

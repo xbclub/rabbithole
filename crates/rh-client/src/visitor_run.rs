@@ -457,11 +457,20 @@ mod tests {
         // (mux_relay 与 splice 语义等价,把快路径关掉照样全绿),必须直接锁。
         let (chunk, copy) = crate::forward::relay_path_probe::since(base);
         if expect_chunk {
-            assert_eq!(chunk, 1, "必须走零拷贝 mux chunk 快路径(chunk={chunk}, copy={copy})");
+            assert_eq!(
+                chunk, 1,
+                "必须走零拷贝 mux chunk 快路径(chunk={chunk}, copy={copy})"
+            );
             assert_eq!(copy, 0, "不得回落 copy(chunk={chunk}, copy={copy})");
         } else {
-            assert_eq!(chunk, 0, "relay_mode=copy 不得走快路径(chunk={chunk}, copy={copy})");
-            assert_eq!(copy, 1, "relay_mode=copy 必须回落 copy(chunk={chunk}, copy={copy})");
+            assert_eq!(
+                chunk, 0,
+                "relay_mode=copy 不得走快路径(chunk={chunk}, copy={copy})"
+            );
+            assert_eq!(
+                copy, 1,
+                "relay_mode=copy 必须回落 copy(chunk={chunk}, copy={copy})"
+            );
         }
     }
 
