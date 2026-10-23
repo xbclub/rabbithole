@@ -326,19 +326,18 @@ async fn handle_http_request(
         .unwrap_or("")
         .to_lowercase();
     let path = req.uri().path().to_string();
-    // M2 静态缓存键:**含 query**。修前只用 path,`?id=1` 与 `?id=2` 命中
-    // 同一条缓存 —— 第二个用户会拿到第一个人的数据。扩展名判定仍用 path
-    // (query 不参与"是否可缓存"的判断)。
-    let cache_key = http_cache_key(&host, &path, req.uri().query());
 
-    // 路由:域名 + locations 前缀(最长匹配)
+    // 路由:域名 + locations 前缀(最长匹配)。
+    // B6:按 host 索引取候选(修前 O(全部域名) String== 扫描;索引与
+    // 路由表同批重建,顺序一致)。host 不在索引 = 无任何路由命中,
+    // 与全表扫描找不到同义。
     let routes = state.proxies.vhost_http.read().await.clone(); // C3: Arc 快照,O(1)
+    let idx = state.proxies.vhost_http_idx.read().await.clone();
+    let candidates: &[usize] = idx.get(&host).map(|v| v.as_slice()).unwrap_or(&[]);
     let mut best: Option<(&VhostRoute, usize)> = None;
     let mut domain_hit: Option<&VhostRoute> = None;
-    for r in routes.iter() {
-        if r.host != host {
-            continue;
-        }
+    for &ri in candidates {
+        let r = &routes[ri];
         if domain_hit.is_none() {
             domain_hit = Some(r);
         }
@@ -350,8 +349,13 @@ async fn handle_http_request(
         }
         for loc in &r.locations {
             let l = loc.trim_end_matches('/');
-            // 前缀匹配须以路径段为边界:/api 不得命中 /apifoo
-            if path == *loc || path.starts_with(&format!("{l}/")) {
+            // 前缀匹配须以路径段为边界:/api 不得命中 /apifoo。
+            // B6:零分配比较(修前每个 location 一次 format!);语义与
+            // `path.starts_with(&format!("{l}/"))` 逐字节等价。
+            let lb = l.as_bytes();
+            let pb = path.as_bytes();
+            let seg_prefix = pb.len() > lb.len() && pb.starts_with(lb) && pb[lb.len()] == b'/';
+            if path == *loc || seg_prefix {
                 let len = loc.len();
                 if best.map(|(_, bl)| len > bl).unwrap_or(true) {
                     best = Some((r, len));
@@ -393,6 +397,17 @@ async fn handle_http_request(
             .as_ref()
             .map(|c| ext_cached(&path, &c.extensions))
             .unwrap_or(false);
+    // M2 静态缓存键:**含 query**。修前只用 path,`?id=1` 与 `?id=2` 命中
+    // 同一条缓存 —— 第二个用户会拿到第一个人的数据。扩展名判定仍用 path
+    // (query 不参与"是否可缓存"的判断)。
+    // B6:键延迟到确认可缓存后才构造(修前每请求恒构造一次 String,
+    // 绝大多数规则没配缓存,纯白付)。非可缓存时为空串,下游全部走
+    // cacheable/cache_cfg 门控,不会误用。
+    let cache_key = if cacheable {
+        http_cache_key(&host, &path, req.uri().query())
+    } else {
+        String::new()
+    };
     // 上游通道(先组选路再取通道:通道属主须与 START_FORWARD 目标一致)
     let Some(rt) = state.proxies.get(route.proxy_id) else {
         return Ok(not_found_response(&state));
@@ -411,7 +426,8 @@ async fn handle_http_request(
     // 按 `cache_key` 哈希选成员,同一资源的读写恒定落同一成员。
     // 没有缓存配置的请求不需要粘性,继续轮询以均摊得更均匀。
     // 无锁快路径保留:非分组规则(group 为空)不走 group_pick。
-    let sticky = cache_cfg.is_some() && cacheable;
+    // cacheable 蕴含 cache_cfg.is_some()(见其定义),sticky == cacheable
+    let sticky = cacheable;
     let rt = if rt.has_group.load(std::sync::atomic::Ordering::Relaxed) {
         if sticky {
             crate::data::group_pick_sticky_public(&state, &rt, &cache_key)
@@ -542,10 +558,19 @@ async fn handle_http_request(
             let has_credentials = up_parts.headers.contains_key(hyper::header::SET_COOKIE);
             let over_size = collected.len() as u64 > cfg.max_item_size_kb * 1024;
             if forbidden_by_cc || has_credentials || over_size {
-                // 不可缓存:原样回给用户(不做 x-cache 标记)
-                let resp: hyper::Response<BoxBody> =
-                    hyper::Response::from_parts(up_parts, full_body_body(collected.clone()));
-                return Ok(resp);
+                // 不可缓存:原样回给用户(不做 x-cache 标记)。
+                // A4:响应体已完整读入内存(collected),上游连接是干净的,
+                // 必须挂 RecycleBody 让 Drop 统一判定归还 —— 修前直接
+                // return,sender 随作用域 drop,这条连接作废。所有
+                // "GET + 扩展名命中缓存白名单"的请求 100% 新建上游连接,
+                // 恰好是最该复用的一类(静态资源)。
+                let body = full_body_body(collected);
+                let body = if reusable {
+                    RecycleBody::new(body, Some(sender), rt.http_upstream.clone()).boxed()
+                } else {
+                    body
+                };
+                return Ok(hyper::Response::from_parts(up_parts, body));
             }
             let entry = crate::state::HttpCacheEntry {
                 expires: std::time::Instant::now()
@@ -568,7 +593,15 @@ async fn handle_http_request(
                     b = b.header(n.clone(), v.clone());
                 }
             }
-            let resp: hyper::Response<BoxBody> = b.body(full_body_body(collected))?;
+            // A4:MISS 分支 body 已读完,同样挂 RecycleBody 归还 sender
+            //(修前提前 return,连接每次用完即弃)。
+            let body = full_body_body(collected);
+            let body = if reusable {
+                RecycleBody::new(body, Some(sender), rt.http_upstream.clone()).boxed()
+            } else {
+                body
+            };
+            let resp: hyper::Response<BoxBody> = b.body(body)?;
             return Ok(resp);
         }
     }
@@ -862,8 +895,13 @@ async fn serve_https(
             return Ok(());
         }
     }
+    // B6:host 索引 O(1) 取代全表线性扫描
+    let idx = state.proxies.vhost_https_idx.read().await.clone();
     let routes = state.proxies.vhost_https.read().await.clone(); // C3: Arc 快照
-    let route = routes.iter().find(|r| r.host == sni);
+    let route = idx
+        .get(sni.as_str())
+        .and_then(|v| v.first())
+        .map(|&i| &routes[i]);
     let Some(route) = route else {
         return Ok(());
     };
@@ -1081,34 +1119,33 @@ async fn serve_tcpmux(
     }
     let hostport = parts[1].to_string();
     let host = hostport.split(':').next().unwrap_or("").to_lowercase();
+    // B6:一次读快照 + host 索引取路由(修前同一条 CONNECT 读两次
+    // vhost_tcpmux 快照并各扫一遍全表)。
+    let idx = state.proxies.vhost_tcpmux_idx.read().await.clone();
+    let routes = state.proxies.vhost_tcpmux.read().await.clone(); // C3: Arc 快照
+    let route = idx.get(&host).and_then(|v| v.first()).map(|&i| &routes[i]);
     // Basic 认证
-    let mut user_ok = true;
-    {
-        let routes = state.proxies.vhost_tcpmux.read().await.clone(); // C3: Arc 快照
-        if let Some(r) = routes.iter().find(|r| r.host == host) {
-            if !r.http_user.is_empty() {
-                let got = head.lines().find_map(|l| {
-                    let (k, v) = l.split_once(':')?;
-                    if k.trim().eq_ignore_ascii_case("proxy-authorization") {
-                        Some(v.trim().to_string())
-                    } else {
-                        None
-                    }
-                });
-                user_ok = check_basic_auth(got.as_deref(), &r.http_user, &r.http_password);
+    if let Some(r) = route {
+        if !r.http_user.is_empty() {
+            let got = head.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case("proxy-authorization") {
+                    Some(v.trim().to_string())
+                } else {
+                    None
+                }
+            });
+            if !check_basic_auth(got.as_deref(), &r.http_user, &r.http_password) {
+                sock.write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"rabbithole\"\r\n\r\n",
+                )
+                .await?;
+                return Ok(());
             }
         }
     }
-    if !user_ok {
-        sock.write_all(
-            b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"rabbithole\"\r\n\r\n",
-        )
-        .await?;
-        return Ok(());
-    }
     // 路由:按 host 匹配 tcpmux 规则
-    let routes = state.proxies.vhost_tcpmux.read().await.clone(); // C3: Arc 快照
-    let Some(route) = routes.iter().find(|r| r.host == host) else {
+    let Some(route) = route else {
         sock.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await?;
         return Ok(());
     };
@@ -1623,5 +1660,63 @@ mod tests {
         });
         let got = pool.borrow();
         assert!(got.is_none(), "已关闭的连接不得被借出");
+    }
+
+    /// A4(红→绿):缓存路径的响应体(collected 全量读回)在完整消费后,
+    /// 挂 RecycleBody 必须把 sender 归还池且可再次借出。
+    /// 修前缓存两分支提前 return,sender 随作用域 drop —— 静态资源类
+    /// 请求 100% 新建上游连接。
+    #[tokio::test]
+    async fn cache_path_body_recycles_sender() {
+        use http_body_util::BodyExt as _;
+        use hyper::body::Incoming;
+
+        // 极简 keep-alive 上游(握手对端存在即可,本测试不发请求)。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            // 持住已接受的连接不关(keep-alive),sender 才可能 ready。
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // 显式标注 B = Incoming(与生产同型;空请求体无法公开构造,
+        // 这里只验证 RecycleBody 的归还机制,不发真实请求)。
+        let (sender, conn): (hyper::client::conn::http1::SendRequest<Incoming>, _) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        // 缓存路径修后的构造形态:collected + RecycleBody。
+        // 给 conn 任务一次调度机会,让 giver 进入 wanting(ready)状态;
+        // 否则 Drop 的 is_ready 判定时序上还没就绪,会误判为不可复用。
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            if sender.is_ready() {
+                break;
+            }
+        }
+        let pool: UpstreamPool = UpstreamPool::default();
+        let body = full_body_body(Bytes::from_static(b"hello"));
+        let body = RecycleBody::new(body, Some(sender), pool.clone()).boxed();
+        let _ = body.collect().await; // 完整消费;drop 归还
+        assert_eq!(
+            pool.idle_len(),
+            1,
+            "缓存路径响应体读完后 sender 必须归还(A4)"
+        );
+
+        // 归还的连接可被再次借出且仍 ready(= 连接干净可复用)。
+        let u = pool.borrow().expect("recycled upstream must be borrowable");
+        assert!(
+            u.sender.is_ready() && !u.sender.is_closed(),
+            "recycled sender must be clean & reusable"
+        );
+        upstream.abort();
     }
 }

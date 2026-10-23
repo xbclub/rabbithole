@@ -10,10 +10,6 @@ pub struct BandwidthQuantity {
 }
 
 impl BandwidthQuantity {
-    pub fn from_bytes_per_sec(n: u64) -> Self {
-        Self { bytes_per_sec: n }
-    }
-
     pub fn bytes_per_sec(&self) -> u64 {
         self.bytes_per_sec
     }

@@ -377,7 +377,6 @@ async fn auth_and_run(
         .await;
     let entities = state.build_sync_entities(&latest.id).await;
     let rev = latest.config_revision.max(0) as u64;
-    sess.mark_unconfirmed(rev).await;
     // ★用 try_send,不用 send().await。
     //
     // 本函数在控制读循环里**内联** await(control.rs:849),而那个循环同时是
@@ -991,17 +990,10 @@ pub async fn handle_client_message(
     reply: &mpsc::Sender<ServerMessage>,
 ) {
     match msg {
-        ClientMessage::Ping(p) => {
-            // 同 A1:一律有界,绝不无界 park(见 run_session_loop 的 PING 分支)。
-            let _ = tokio::time::timeout(
-                CONTROL_REPLY_TIMEOUT,
-                reply.send(ServerMessage::Pong(rh_protocol::message::Pong {
-                    ts_ms: p.ts_ms,
-                    probe: p.probe,
-                })),
-            )
-            .await;
-        }
+        // C4:run_session_loop 在反序列化前就拦截 FrameType::PING 并
+        // try_send PONG,Ping 永远到不了这里(唯一调用点 :907)。旧分支
+        // 的 2s 有界 send 是读循环里的潜在停摆点,已删;此臂仅为穷尽性。
+        ClientMessage::Ping(_) => unreachable!("PING intercepted before dispatch (C4)"),
         ClientMessage::ApplyResult(r) => {
             crate::runtime::on_apply_result(&state, &sess, &r).await;
         }
@@ -1025,7 +1017,6 @@ pub async fn handle_client_message(
             let entities = state.build_sync_entities(&sess.client_id).await;
             let client = state.db.get_client(&sess.client_id).await.ok().flatten();
             let rev = client.map(|c| c.config_revision.max(0) as u64).unwrap_or(0);
-            sess.mark_unconfirmed(rev).await;
             let _ = tokio::time::timeout(
                 CONTROL_REPLY_TIMEOUT,
                 reply.send(ServerMessage::ServiceSync(

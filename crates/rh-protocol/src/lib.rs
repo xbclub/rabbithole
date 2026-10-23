@@ -10,8 +10,8 @@ pub mod proxy;
 pub mod visitor;
 
 pub use frame::{
-    decode_frame, encode_frame, encode_frame_bytes, read_frame, write_frame, FrameError, FrameType,
-    MAGIC, MAX_FRAME_LEN,
+    decode_frame, encode_frame, encode_frame_bytes, encode_frame_header, read_frame, write_frame,
+    FrameError, FrameType, MAGIC, MAX_FRAME_LEN,
 };
 pub use message::{forward_flags, ClientMessage, ServerMessage};
 pub use proxy::{

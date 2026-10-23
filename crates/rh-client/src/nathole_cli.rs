@@ -68,7 +68,16 @@ pub async fn on_prepare(sess: Arc<ClientSession>, m: NatHolePrepare) {
         candidates,
         nat_behavior: behavior,
     };
-    if sess.send_msg(ClientMessage::NatHoleReport(report)).await {
+    // 有界发送(2s):send_tx 的唯一消费者是 run_loop,队列满时无界
+    // send 会 park 在"等自己消费"上(A1 同形)。超时放弃本次上报,
+    // 服务端按事务超时回收。
+    let sent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sess.send_msg(ClientMessage::NatHoleReport(report)),
+    )
+    .await
+    .unwrap_or(false);
+    if sent {
         sess.nat_socks
             .lock()
             .await

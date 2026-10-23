@@ -71,6 +71,12 @@ pub async fn on_session_down(state: &Arc<AppState>, sess: &Arc<Session>) {
             continue;
         };
         rt.confirmed_revision.store(0, Ordering::Relaxed);
+        // C6c:IntGaugeVec 子项按 proxy_id 回收(修前只增不减,长跑 +
+        // 频繁建删规则时 /metrics 输出与内存无界增长)。
+        let _ = state
+            .metrics
+            .connections
+            .remove_label_values(&[&rt.metrics_label, "tcp"]);
         crate::data::close_proxy_channels(&rt).await;
         let (st, _) = rt.snapshot_state().await;
         let new_state = match st {
@@ -108,7 +114,6 @@ pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &App
         let entities = state.build_sync_entities(&sess.client_id).await;
         let client = state.db.get_client(&sess.client_id).await.ok().flatten();
         let rev = client.map(|c| c.config_revision.max(0) as u64).unwrap_or(0);
-        sess.mark_unconfirmed(rev).await;
         if !sess.try_send_msg(ServerMessage::ServiceSync(ServiceSync {
             revision: rev,
             entities,
@@ -120,18 +125,22 @@ pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &App
         }
         return;
     }
-    let still_waiting = sess.confirm_applied(r.revision, true).await;
-    let _ = still_waiting;
-    // 规则状态推进:confirmed ≥ latest → running
-    let proxies = state
-        .db
-        .list_proxies(Some(&sess.client_id))
-        .await
-        .unwrap_or_default();
-    for (_id, _cid, spec) in proxies {
-        let Some(rt) = state.proxies.get(spec.id) else {
-            continue;
-        };
+    sess.confirm_applied(r.revision, true).await;
+    // 规则状态推进:confirmed ≥ latest → running。
+    //
+    // B9:数据源改为内存 runtimes(按 client_id 过滤)。修前每个 ACK 都把
+    // 该客户端全部 N 条规则从 DB 读出并逐行反序列化 ProxySpec —— 客户端
+    // 对每条 ServiceUpdate 回一个 ApplyResult,批量改 N 条规则就是 O(N²)
+    // 的 DB 反序列化,且发生在控制读循环内联路径上。运行时集合与
+    // 「DB 行 ∩ 已建运行时」等价(旧代码对无运行时的行 continue 跳过)。
+    let rts: Vec<Arc<crate::state::ProxyRuntime>> = state
+        .proxies
+        .runtimes
+        .iter()
+        .filter(|e| e.value().client_id == sess.client_id)
+        .map(|e| e.value().clone())
+        .collect();
+    for rt in rts {
         rt.confirmed_revision.store(r.revision, Ordering::Relaxed);
         let latest = rt.latest_revision.load(Ordering::Relaxed);
         let (st, _) = rt.snapshot_state().await;
@@ -145,10 +154,13 @@ pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &App
         if new_state != st {
             rt.set_state(new_state, "applied").await;
             if new_state == ProxyState::Running {
+                let spec = rt.spec.read().await.clone();
                 warm_proxy(state, sess, &rt, &spec).await;
             }
         } else if st == ProxyState::Running {
-            // 已 running 的补充预热(如重连后)
+            // 已 running 的补充预热(如重连后);池满时 tcp_refill 为
+            // 无签发 no-op,重复调用的代价只是取一次池锁。
+            let spec = rt.spec.read().await.clone();
             warm_proxy(state, sess, &rt, &spec).await;
         }
     }
@@ -293,7 +305,6 @@ pub async fn spawn_runtime(
         ProxyKind::Udp => match crate::data::bind_udp_socket(state, spec, bind_ip).await {
             Ok(sock) => {
                 rt.bound.store(true, Ordering::Relaxed);
-                *rt.udp_socket.lock().await = Some(sock.clone());
                 let st2 = state.clone();
                 let rt2 = rt.clone();
                 tokio::spawn(crate::data::udp_serve_loop(st2, rt2, sock));
@@ -336,7 +347,6 @@ pub async fn spawn_runtime(
     // 入队增量(在线时;bind_error 也入队,恢复绑定后按 confirmed 直达 running)
     if let Some(sess) = session {
         rt.latest_revision.store(revision, Ordering::Relaxed);
-        sess.mark_unconfirmed(revision).await;
         // 有界发送:客户端零窗口黑洞时,`send().await` 会把 admin API 请求
         // 挂到 TCP 超时(15~20 分钟)。统一用 2s 上限,超时按"对方不读"处理。
         let _ = sess
@@ -397,7 +407,6 @@ async fn tcp_bind_and_serve(
     // 独享端口
     let l = crate::data::bind_tcp_listener(state, spec, bind_ip).await?;
     rt.bound.store(true, Ordering::Relaxed);
-    *rt.tcp_listener.lock().await = marker_listener();
     let rt2 = rt.clone();
     let st2 = state.clone();
     // A6 顺带:记录句柄,供下次重建前收敛(避免 EADDRINUSE 窗口)。
@@ -452,7 +461,6 @@ async fn bind_error_retry(state: Arc<AppState>, rt: Arc<ProxyRuntime>) {
                 // 未确认:入队增量等待确认后转 running
                 rt.set_state(ProxyState::Pending, "bind recovered").await;
                 let rev = latest.max(1);
-                sess.mark_unconfirmed(rev).await;
                 let _ = sess
                     .send_bounded(
                         ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
@@ -500,6 +508,12 @@ pub async fn teardown_runtime(state: &Arc<AppState>, proxy_id: u64) {
                 );
             }
         }
+        // C6c:IntGaugeVec 子项按 proxy_id 回收(修前只增不减,长跑 +
+        // 频繁建删规则时 /metrics 输出与内存无界增长)。
+        let _ = state
+            .metrics
+            .connections
+            .remove_label_values(&[&rt.metrics_label, "tcp"]);
         crate::data::close_proxy_channels(&rt).await;
         // 失效该规则在途 CREATE 请求:迟到回显不得进入新运行时(§4.5 代次隔离)
         if let Some(sess) = state.sessions.get(&rt.client_id) {
@@ -557,7 +571,6 @@ pub async fn notify_client_recovery(state: &Arc<AppState>, client_id: &str) {
     // visitors 重发(全量 SYNC 更简单且正确)
     if let Some(sess) = state.sessions.get(client_id) {
         let entities = state.build_sync_entities(client_id).await;
-        sess.mark_unconfirmed(revision).await;
         let _ = sess
             .send_bounded(
                 ServerMessage::ServiceSync(ServiceSync { revision, entities }),
@@ -565,11 +578,6 @@ pub async fn notify_client_recovery(state: &Arc<AppState>, client_id: &str) {
             )
             .await;
     }
-}
-
-/// 占位 listener(表示"已绑定"状态;真正监听由 serve loop 持有)。
-fn marker_listener() -> Option<tokio::net::TcpListener> {
-    None
 }
 
 /// 非端口字段变更的原位发布(§4.3):listener/池不动,仅更新运行态快照并入队。
@@ -592,7 +600,6 @@ pub async fn publish_spec_in_place(
     // 后续请求重建。代价是一次冷启动,正确性优先。
     rt.http_upstream.clear();
     if let Some(sess) = state.sessions.get(&rt.client_id) {
-        sess.mark_unconfirmed(revision).await;
         // 有界发送:客户端零窗口黑洞时,`send().await` 会把 admin API 请求
         // 挂到 TCP 超时(15~20 分钟)。统一用 2s 上限,超时按"对方不读"处理。
         let _ = sess

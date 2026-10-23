@@ -8,6 +8,6 @@ pub mod ratelimit;
 pub mod stun;
 
 pub use bandwidth::BandwidthQuantity;
-pub use proxyproto::{encode_v1, encode_v2, parse_header, ProxyProtoInfo};
+pub use proxyproto::{encode_v1, encode_v2, ProxyProtoInfo};
 pub use ratelimit::TokenBucket;
 pub use stun::stun_binding;

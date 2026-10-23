@@ -43,8 +43,22 @@ fn max_frame_len() -> usize {
 /// 丢弃返回值时 pump 任务随之结束并释放 inner。
 pub async fn compress_stream(inner: BoxedIo) -> BoxedIo {
     let (user_side, pump_side) = tokio::io::duplex(64 * 1024);
+    // DuplexStream 无 into_split,保持现状。
     let (pump_r, pump_w) = tokio::io::split(pump_side);
-    let (inner_r, inner_w) = tokio::io::split(inner);
+    // B4:底层是裸 TcpStream(multiplex=false 的 tcp 载体)时优先无锁
+    // 拆半(into_split 两个独立 fd);修前无条件 `tokio::io::split`,
+    // 压缩写泵与解压读泵共享一把 std::sync::Mutex,与 A2 同机理
+    //(round-69 实测 futex 占 75% syscall 时间)。包装类型照旧回落。
+    let (inner_r, inner_w): (
+        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    ) = match crate::split_boxed_io(inner) {
+        Ok((r, w)) => (Box::new(r), Box::new(w)),
+        Err(io) => {
+            let (r, w) = tokio::io::split(io);
+            (Box::new(r), Box::new(w))
+        }
+    };
     tokio::spawn(compress_pump(pump_r, inner_w));
     tokio::spawn(decompress_pump(inner_r, pump_w));
     Box::new(user_side)

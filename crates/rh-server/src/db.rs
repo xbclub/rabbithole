@@ -303,6 +303,10 @@ impl Db {
         port_auto: bool,
         source: &str,
     ) -> Result<i64> {
+        // C6b:INSERT 与 id 回填 UPDATE 放进同一事务(与 insert_proxy_bump
+        // 同款)。修前是两次独立往返且 `let _ =` 吞错 —— UPDATE 失败会
+        // 留下 spec.id=0 的行(读取方依赖 spec.id),且静默不可见。
+        let mut tx = self.pool.begin().await?;
         let mut spec = spec.clone();
         let spec_json = serde_json::to_string(&spec)?;
         let r = sqlx::query(
@@ -324,16 +328,18 @@ impl Db {
         .bind(source)
         .bind(&spec_json)
         .bind(now_ms())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         let id = r.last_insert_rowid();
         spec.id = id as u64;
-        // 回填 id 保证 spec JSON 与行一致(读取方依赖 spec.id)
-        let _ = sqlx::query("UPDATE proxies SET spec=?2 WHERE id=?1")
+        // 回填 id 保证 spec JSON 与行一致(读取方依赖 spec.id);
+        // 失败随事务回滚,不再静默。
+        sqlx::query("UPDATE proxies SET spec=?2 WHERE id=?1")
             .bind(id)
             .bind(serde_json::to_string(&spec)?)
-            .execute(&self.pool)
-            .await;
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -490,6 +496,40 @@ impl Db {
             }
             None => Ok(None),
         }
+    }
+
+    /// B8:端口冲突探测的轻量行(不做 spec JSON 反序列化)。
+    ///
+    /// `port_in_use_full` 修前走 `list_proxies(None)` 全表 + 每行把 spec
+    /// JSON 反序列化成 ProxySpec;N 条规则下每次建/改/启一条都是 O(N),
+    /// 批量 N 条 = O(N²)。本查询只取判定 `bind_conflicts` 所需的列,
+    /// 且可走 `idx_proxies_bind(kind, bind_port)` 部分索引。
+    /// 返回 (id, bind_ip, enabled, group_key)。
+    /// 返回 (id, kind, bind_ip, enabled, group)。组键在调用方按
+    /// `kind|bind_ip|bind_port|group` 派生(与 ProxyManager::group_key
+    /// 同式)—— DB 的 group_key 列存的是 spec 字段,不是派生键。
+    pub async fn list_proxies_on_port(
+        &self,
+        port: u16,
+    ) -> Result<Vec<(i64, String, String, bool, String)>> {
+        let rows = sqlx::query(
+            "SELECT id, kind, bind_ip, enabled, group_name FROM proxies \
+             WHERE bind_port=?1 AND bind_port>0 AND kind IN ('tcp','udp')",
+        )
+        .bind(port as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let id: i64 = r.get(0);
+                let kind: String = r.get(1);
+                let bind_ip: String = r.get(2);
+                let enabled = r.get::<i64, _>(3) != 0;
+                let group: String = r.get(4);
+                (id, kind, bind_ip, enabled, group)
+            })
+            .collect())
     }
 
     pub async fn list_proxies(

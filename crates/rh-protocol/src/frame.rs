@@ -80,6 +80,19 @@ pub fn encode_frame(out: &mut BytesMut, ty: FrameType, payload: &[u8]) {
     out.put_slice(payload);
 }
 
+/// 只编码帧头(payload 由调用方自行追加)。
+///
+/// B1:UDP 上行热路径按 `HEADER + 1 + addr + data` 预留一个缓冲一次成帧,
+/// 消除「udp_packet::encode 的中间 Vec + write_frame 的二次拷贝」。
+#[inline]
+pub fn encode_frame_header(out: &mut BytesMut, ty: FrameType, payload_len: usize) {
+    out.reserve(HEADER_LEN + payload_len);
+    out.put_slice(MAGIC);
+    out.put_u8(PROTOCOL_FRAME_VERSION);
+    out.put_u16(ty.0);
+    out.put_u32(payload_len as u32);
+}
+
 /// 编码一帧并返回(便于直接写出)。
 pub fn encode_frame_bytes(ty: FrameType, payload: &[u8]) -> Bytes {
     let mut buf = BytesMut::with_capacity(HEADER_LEN + payload.len());

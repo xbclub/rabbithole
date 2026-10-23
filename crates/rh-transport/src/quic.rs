@@ -6,7 +6,7 @@ use crate::{
 };
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -282,22 +282,24 @@ fn peer_leaf_cert(conn: &quinn::Connection) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(leaf.as_ref().to_vec()))
 }
 
-/// quinn 连接包装:开流/收流 + 关闭状态位。
+/// quinn 连接包装:开流/收流。
 pub struct QuicConnection {
     conn: quinn::Connection,
-    dead: Arc<AtomicBool>,
 }
 
 impl QuicConnection {
     pub fn new(conn: quinn::Connection) -> Self {
-        let dead = Arc::new(AtomicBool::new(false));
+        // 关闭看门:持有 Connection 克隆直到连接真正关闭。作用是
+        // **句柄 drop 后连接对象不立即释放** —— 已写出的在途数据得以
+        // 冲刷(quic_connect 回显测试曾因移除此任务竞态失败:服务端
+        // 回写后句柄 drop,endpoint 释放直接 ApplicationClose,客户端
+        // 读不到回声)。与 yamux POOL_DROP_GRACE 同理。
+        // C8:原 `dead` 状态位无读者(仅被删除的 is_dead 读),不再保留。
         let watcher_conn = conn.clone();
-        let watcher_dead = dead.clone();
         tokio::spawn(async move {
             let _ = watcher_conn.closed().await;
-            watcher_dead.store(true, Ordering::Relaxed);
         });
-        Self { conn, dead }
+        Self { conn }
     }
 
     pub async fn open_stream(&self) -> io::Result<BoxedIo> {
@@ -314,10 +316,6 @@ impl QuicConnection {
             Ok((send, recv)) => Ok(Box::new(BiStream { send, recv })),
             Err(e) => Err(other_err(format!("quic accept_bi: {e}"))),
         }
-    }
-
-    pub fn is_dead(&self) -> bool {
-        self.dead.load(Ordering::Relaxed)
     }
 }
 

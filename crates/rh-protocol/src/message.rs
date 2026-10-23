@@ -15,26 +15,7 @@ pub enum SyncEntity {
     Visitor(VisitorSpec),
 }
 
-impl SyncEntity {
-    pub fn entity_id(&self) -> u64 {
-        match self {
-            SyncEntity::Proxy(p) => p.id,
-            SyncEntity::Visitor(v) => v.id,
-        }
-    }
-    pub fn entity_name(&self) -> &str {
-        match self {
-            SyncEntity::Proxy(p) => &p.name,
-            SyncEntity::Visitor(v) => &v.name,
-        }
-    }
-    pub fn enabled(&self) -> bool {
-        match self {
-            SyncEntity::Proxy(p) => p.enabled,
-            SyncEntity::Visitor(v) => v.enabled,
-        }
-    }
-}
+impl SyncEntity {}
 
 /// 数据通道实体定位:代理或 visitor 侧。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

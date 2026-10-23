@@ -227,9 +227,13 @@ struct Shared {
     notify: Notify,
     shutdown: Notify,
     handles: AtomicUsize,
-    /// 本会话诊断计数(测试隔离读,避免进程级计数被并行测试污染)
+    /// 本会话诊断计数(测试隔离读,避免进程级计数被并行测试污染)。
+    /// B3:唯一读者是测试 → 收进 cfg(test),生产不再为它付每包
+    /// 5-6 次原子 RMW(并与 Shared 其它字段共享 cacheline)。
+    #[cfg(test)]
     stats: KcpCountersStatic,
-    /// 入站批缓冲容量高水位(D 守护:跨轮复用不增长)
+    /// 入站批缓冲容量高水位(D 守护:跨轮复用不增长;仅测试读)
+    #[cfg(test)]
     batch_cap_hwm: AtomicU64,
 }
 
@@ -878,8 +882,19 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
 
     loop {
         batch.clear();
+        // B3:自适应节拍。完全空闲(无在途段、无待写、无待交付)时
+        // kcp.update() 无事可做 —— 重传/探测由在途段驱动,无在途段
+        // 则没有 2ms 精度需求。停掉 ticker 分支,空闲会话只等
+        // inbound/notify/空闲死线(修前完全空闲也每 2ms 醒一次,
+        // max_sessions=4096 时最坏 205 万次唤醒/秒)。任一事件到达后
+        // 下一轮恢复 ticker;空闲死线到点由循环尾的 idle 检查收敛。
+        let idle = kcp.wait_snd() == 0 && {
+            let s = shared.guarded.lock().unwrap();
+            s.write_queue.is_empty() && s.read_buf.is_empty()
+        };
+        let idle_deadline = last_activity + idle_timeout;
         tokio::select! {
-            _ = ticker.tick() => {}
+            _ = ticker.tick(), if !idle => {}
             n = inbound.recv_many(&mut batch, BATCH_CAP) => {
                 // 通道已关闭且空:立即退出,不在 select 热转到 idle 超时。
                 if n == 0 {
@@ -888,24 +903,31 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
                 }
             }
             _ = shared.notify.notified() => {}
+            // 空闲轮的唯一定时唤醒:到点后走循环尾的 idle 超时判定。
+            // 非空闲轮不创建该 future(ticker 分支接管)。
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(idle_deadline)), if idle => {}
         }
+        #[cfg(test)]
         shared.stats.wakeups.fetch_add(1, Ordering::Relaxed);
         COUNTERS.wakeups.fetch_add(1, Ordering::Relaxed);
         let got_packet = !batch.is_empty();
         for cmd in batch.drain(..) {
             let SessionCmd::Packet(pkt) = cmd;
+            #[cfg(test)]
             shared
                 .stats
                 .packets_consumed
                 .fetch_add(1, Ordering::Relaxed);
             COUNTERS.packets_consumed.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
             shared.stats.input_calls.fetch_add(1, Ordering::Relaxed);
             COUNTERS.input_calls.fetch_add(1, Ordering::Relaxed);
             // input 错误(段格式/conv 不一致)由 demux 前置过滤,
             // 此处按可丢弃网络杂音处理,不终止会话。
             let _ = kcp.input(&pkt);
         }
-        // D 守护观测:批缓冲容量高水位(复用不增长)
+        // D 守护观测:批缓冲容量高水位(复用不增长;仅测试读)
+        #[cfg(test)]
         shared
             .batch_cap_hwm
             .fetch_max(batch.capacity() as u64, Ordering::Relaxed);
@@ -968,6 +990,7 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
             break;
         }
         // 驱动 kcp(重传/探测/输出)
+        #[cfg(test)]
         shared.stats.update_calls.fetch_add(1, Ordering::Relaxed);
         COUNTERS.update_calls.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = kcp.update(now_ms()) {
@@ -1015,6 +1038,7 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
         // 10ms,等 interval 会把每次写延迟放大到毫秒级。
         // idle 会话各条件皆假,不产生额外工作,无忙等/ACK 风暴。
         if user_wrote || got_packet || recv_moved || kcp.wait_snd() > 0 {
+            #[cfg(test)]
             shared.stats.flush_calls.fetch_add(1, Ordering::Relaxed);
             COUNTERS.flush_calls.fetch_add(1, Ordering::Relaxed);
             if let Err(e) = kcp.flush() {
@@ -1586,7 +1610,9 @@ fn new_io() -> (KcpIo, Arc<Shared>) {
         notify: Notify::new(),
         shutdown: Notify::new(),
         handles: AtomicUsize::new(1),
+        #[cfg(test)]
         stats: KcpCountersStatic::new(),
+        #[cfg(test)]
         batch_cap_hwm: AtomicU64::new(0),
     });
     (

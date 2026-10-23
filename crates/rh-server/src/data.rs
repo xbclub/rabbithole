@@ -376,14 +376,12 @@ pub async fn assign_forward(
                 .as_any()
                 .downcast_ref::<CountedUserIo<tokio::net::TcpStream>>()
                 .map(|w| w.inner_ref());
-            // 通道可能被 QuotaIo(限额守卫)包装:剥壳探测;更内层还有
-            // PrependedIo(残留字节)时不可零拷贝,保持回落。
-            let chan_tcp = rh_transport::splice::plain_tcp(&channel).or_else(|| {
-                channel
-                    .as_any()
-                    .downcast_ref::<crate::control::QuotaIo>()
-                    .and_then(|q| rh_transport::splice::plain_tcp(q.inner_ref()))
-            });
+            // QuotaIo 已在上方 :308 无条件剥壳,这里不会再出现(修前还有一个
+            // 恒 None 的 QuotaIo downcast 分支,与实际时序矛盾)。
+            // mux_steal_or_rewrap 回落时会把残留字节回包成 PrependedIo,
+            // 该包装不匹配裸 TCP 判定,自然回落 copy(尚有 prefix 的流不得
+            // 走 splice)。
+            let chan_tcp = rh_transport::splice::plain_tcp(&channel);
             if let (Some(utcp), Some(ctcp)) = (user_tcp, chan_tcp) {
                 state.metrics.count_relay_path("splice");
                 debug!(proxy = rt.id, "relay path: splice");
@@ -763,7 +761,16 @@ async fn mux_forward_chunked(
     let cancel: rh_transport::CancelFuture = futures::FutureExt::shared(futures::FutureExt::boxed(
         async move { rc.cancelled().await },
     ));
-    rh_transport::mux::mux_relay(user, b_r, b_w, limiter, Some(cancel)).await;
+    // A2:先剥 CountedUserIo 壳无锁拆半(into_split 两个独立 fd),
+    // 按方向重包计量;失败(非该包装)回落 mux_relay 自带的
+    // split_boxed_io / tokio::io::split 逻辑。修前服务端用户侧 100%
+    // 走 tokio::io::split 的同步锁拆半。
+    match split_counted_tcp_user(user) {
+        Ok((a_r, a_w)) => {
+            rh_transport::mux::mux_relay_split(a_r, a_w, b_r, b_w, limiter, Some(cancel)).await
+        }
+        Err(user) => rh_transport::mux::mux_relay(user, b_r, b_w, limiter, Some(cancel)).await,
+    }
 }
 
 /// 零拷贝指派中继(splice 快路径钩子装配)。
@@ -827,64 +834,23 @@ async fn splice_forward(
     rh_transport::splice::splice_relay(user, carrier, hooks).await
 }
 
-/// F1 计量:IO 透明包装,不改任何 IO 行为。
-/// user 模式:read→入站、write→出站(用户侧连接)。
-/// upstream 模式:read→出站、write→入站(上游通道,http vhost 反向归因)。
-/// 同时计入全局 Metrics 与所属规则(可选)。
-pub struct CountedUserIo<T> {
-    inner: T,
+/// F1 计量状态(全局 Metrics + 所属规则 + 客户端用量)。
+/// CountedUserIo 与拆半计量包装(CountedTcpReadHalf/WriteHalf)共享,
+/// 保证拆半前后计量逐字节等价。
+#[derive(Clone)]
+struct CountState {
     metrics: Arc<crate::state::Metrics>,
     proxy: Option<Arc<crate::state::ProxyRuntime>>,
     usage: Option<Arc<crate::state::ClientUsage>>,
-    reversed: bool,
 }
 
-impl<T> CountedUserIo<T> {
-    pub fn new(inner: T, metrics: Arc<crate::state::Metrics>) -> Self {
-        Self {
-            inner,
-            metrics,
-            proxy: None,
-            usage: None,
-            reversed: false,
-        }
-    }
-
-    /// 内部流引用(splice 快路径:提取裸 TCP 做零拷贝判定)。
-    #[cfg(target_os = "linux")]
-    pub fn inner_ref(&self) -> &T {
-        &self.inner
-    }
-
-    /// 用户侧连接(归属到规则;state 派生客户端用量)。
-    pub fn user(
-        inner: T,
-        state: &AppState,
-        proxy: Option<Arc<crate::state::ProxyRuntime>>,
-    ) -> Self {
+impl CountState {
+    fn new(state: &AppState, proxy: Option<Arc<crate::state::ProxyRuntime>>) -> Self {
         let usage = proxy.as_ref().map(|rt| state.client_usage(&rt.client_id));
         Self {
-            inner,
             metrics: state.metrics.clone(),
             proxy,
             usage,
-            reversed: false,
-        }
-    }
-
-    /// 上游通道(http vhost:连接层无法归因单规则,按请求通道计量)。
-    pub fn upstream(
-        inner: T,
-        state: &AppState,
-        proxy: Option<Arc<crate::state::ProxyRuntime>>,
-    ) -> Self {
-        let usage = proxy.as_ref().map(|rt| state.client_usage(&rt.client_id));
-        Self {
-            inner,
-            metrics: state.metrics.clone(),
-            proxy,
-            usage,
-            reversed: true,
         }
     }
 
@@ -921,6 +887,74 @@ impl<T> CountedUserIo<T> {
         if let Some(u) = &self.usage {
             u.add_bytes(n as u64);
         }
+    }
+}
+
+/// F1 计量:IO 透明包装,不改任何 IO 行为。
+/// user 模式:read→入站、write→出站(用户侧连接)。
+/// upstream 模式:read→出站、write→入站(上游通道,http vhost 反向归因)。
+/// 同时计入全局 Metrics 与所属规则(可选)。
+pub struct CountedUserIo<T> {
+    inner: T,
+    st: CountState,
+    reversed: bool,
+}
+
+impl<T> CountedUserIo<T> {
+    pub fn new(inner: T, metrics: Arc<crate::state::Metrics>) -> Self {
+        Self {
+            inner,
+            st: CountState {
+                metrics,
+                proxy: None,
+                usage: None,
+            },
+            reversed: false,
+        }
+    }
+
+    /// 内部流引用(splice 快路径:提取裸 TCP 做零拷贝判定)。
+    #[cfg(target_os = "linux")]
+    pub fn inner_ref(&self) -> &T {
+        &self.inner
+    }
+
+    /// 用户侧连接(归属到规则;state 派生客户端用量)。
+    pub fn user(
+        inner: T,
+        state: &AppState,
+        proxy: Option<Arc<crate::state::ProxyRuntime>>,
+    ) -> Self {
+        Self {
+            inner,
+            st: CountState::new(state, proxy),
+            reversed: false,
+        }
+    }
+
+    /// 上游通道(http vhost:连接层无法归因单规则,按请求通道计量)。
+    pub fn upstream(
+        inner: T,
+        state: &AppState,
+        proxy: Option<Arc<crate::state::ProxyRuntime>>,
+    ) -> Self {
+        Self {
+            inner,
+            st: CountState::new(state, proxy),
+            reversed: true,
+        }
+    }
+
+    fn flow_cut(&self) -> bool {
+        self.st.flow_cut()
+    }
+
+    fn count_in(&self, n: usize) {
+        self.st.count_in(n)
+    }
+
+    fn count_out(&self, n: usize) {
+        self.st.count_out(n)
     }
 }
 
@@ -1020,6 +1054,155 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountedUserIo<T
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
+}
+
+/// A2:拆半后的读侧计量(user 模式:read → 入站)。
+/// 与 CountedUserIo.poll_read 的行为逐字节等价(flow_cut 检查 + 计 in)。
+struct CountedTcpReadHalf {
+    inner: tokio::net::tcp::OwnedReadHalf,
+    st: CountState,
+}
+
+impl tokio::io::AsyncRead for CountedTcpReadHalf {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.st.flow_cut() {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "client flow limit exceeded",
+            )));
+        }
+        let before = buf.filled().len();
+        match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                let n = buf.filled().len() - before;
+                self.st.count_in(n);
+                std::task::Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+/// A2:拆半后的写侧计量(user 模式:write → 出站)。
+/// 与 CountedUserIo.poll_write/poll_write_vectored 行为等价
+/// (flow_cut 检查 + 计 out + 向量写透传)。
+struct CountedTcpWriteHalf {
+    inner: tokio::net::tcp::OwnedWriteHalf,
+    st: CountState,
+}
+
+impl tokio::io::AsyncWrite for CountedTcpWriteHalf {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.st.flow_cut() {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "client flow limit exceeded",
+            )));
+        }
+        match std::pin::Pin::new(&mut self.inner).poll_write(cx, buf) {
+            std::task::Poll::Ready(Ok(n)) => {
+                self.st.count_out(n);
+                std::task::Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.st.flow_cut() {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "client flow limit exceeded",
+            )));
+        }
+        match std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs) {
+            std::task::Poll::Ready(Ok(n)) => {
+                self.st.count_out(n);
+                std::task::Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        // OwnedWriteHalf 支持(TcpStream 走 writev);显式声明,
+        // 不让默认 false 退化 YamuxCarrier 的批量写。
+        true
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// A2:拆半后的读写半类型(a 侧中继输入)。
+type RelayHalves = (
+    Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+);
+
+/// A2:剥 `CountedUserIo<TcpStream>` 壳 → `into_split` 无锁拆半 →
+/// 按方向重包计量(user 模式:读半计 in、写半计 out)。
+///
+/// 服务端用户侧恒为该包装(serve_tcp_user),修前 `split_boxed_io` 的
+/// 精确类型探测必然 miss → `tokio::io::split` 的同步 Mutex 拆半,
+/// round-69 的无锁拆半在服务端主路径上从未生效(实测 futex 占 75%
+/// syscall 时间即此病灶)。非该类型 / upstream(reversed)模式原样返还。
+fn split_counted_tcp_user(io: rh_transport::BoxedIo) -> Result<RelayHalves, rh_transport::BoxedIo> {
+    {
+        let dynio: &dyn rh_transport::Io = &*io;
+        if !dynio.as_any().is::<CountedUserIo<tokio::net::TcpStream>>() {
+            return Err(io);
+        }
+    }
+    let any = io.into_any_box();
+    let boxed = any
+        .downcast::<CountedUserIo<tokio::net::TcpStream>>()
+        .expect("probed above: concrete type is CountedUserIo<TcpStream>");
+    let CountedUserIo {
+        inner: tcp,
+        st,
+        reversed,
+    } = *boxed;
+    if reversed {
+        // upstream 模式方向反转(http vhost 上游),本路径(user 侧转发)
+        // 不出现;防御性重建原样返还,回落 tokio::io::split 保持原语义。
+        return Err(Box::new(CountedUserIo {
+            inner: tcp,
+            st,
+            reversed,
+        }) as rh_transport::BoxedIo);
+    }
+    let (r, w) = tcp.into_split();
+    Ok((
+        Box::new(CountedTcpReadHalf {
+            inner: r,
+            st: st.clone(),
+        }),
+        Box::new(CountedTcpWriteHalf { inner: w, st }),
+    ))
 }
 
 /// TCP 监听服务循环(独享端口或组成员共享)。
@@ -1167,10 +1350,26 @@ async fn serve_tcp_user(
         debug!(proxy = rt.id, peer = %peer, "session failed: health fast-fail");
         return; // 健康摘除:快速失败
     }
-    // 组选路
-    let target_rt = match group_pick(&state, &rt).await {
-        Some(t) => t,
-        None => rt,
+    // 组选路:has_group 无锁快路径(与 vhost 三处调用点同构)。绝大多数
+    // 规则 group 为空,修前每 accept 一条连接都要 `spec.read().await`
+    // + 一次 format!,高并发下是无谓的锁争用。
+    let target_rt = if rt.has_group.load(Ordering::Relaxed) {
+        match group_pick(&state, &rt).await {
+            Some(t) => t,
+            None => rt,
+        }
+    } else {
+        rt
+    };
+    // F2 配额判定必须在取通道之前:修前先 `get_channel`(从池里 pop 一条
+    // 完成握手的热通道 + 签发一条 CREATE 补位),配额拒绝时那条通道随
+    // 作用域 drop 作废 —— 每次被拒连接 = 1 条预热通道 + 1 次额外 CREATE
+    // 往返 + 1 个 pending_request。配额判定不依赖通道,语义等价。
+    let Some(_conn_guard) = try_open_user_conn(&state, Some(&target_rt)) else {
+        // G5 1/N 归因:配额拒绝(max_conns/flow_limit)此前零留痕
+        state.metrics.count_session_failure("quota_rejected");
+        debug!(proxy = target_rt.id, peer = %peer, "session failed: client quota");
+        return; // F2 配额超限:直接断开
     };
     let Some(channel) = get_channel(&state, &target_rt).await else {
         // G5 1/N 归因:池等待超时/签发失败此前零留痕(4096 突发下
@@ -1179,16 +1378,13 @@ async fn serve_tcp_user(
         debug!(proxy = target_rt.id, peer = %peer, "session failed: no data channel");
         return; // 池空超时:快速失败
     };
-    let Some(_conn_guard) = try_open_user_conn(&state, Some(&target_rt)) else {
-        // G5 1/N 归因:配额拒绝(max_conns/flow_limit)此前零留痕
-        state.metrics.count_session_failure("quota_rejected");
-        debug!(proxy = target_rt.id, peer = %peer, "session failed: client quota");
-        return; // F2 配额超限:直接断开
-    };
+    // C6c:label 字符串缓存在 ProxyRuntime(修前每连接建/关各一次
+    // to_string 分配 + with_label_values 内部按 label 查表)。
+    let conn_labels = [target_rt.metrics_label.as_str(), "tcp"];
     state
         .metrics
         .connections
-        .with_label_values(&[&target_rt.id.to_string(), "tcp"])
+        .with_label_values(&conn_labels)
         .inc();
     assign_forward(
         &state,
@@ -1201,7 +1397,7 @@ async fn serve_tcp_user(
     state
         .metrics
         .connections
-        .with_label_values(&[&target_rt.id.to_string(), "tcp"])
+        .with_label_values(&conn_labels)
         .dec();
 }
 
@@ -1392,6 +1588,10 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
     let mut sessions: std::collections::HashMap<SocketAddr, Instant> =
         std::collections::HashMap::new();
     let mut gc = tokio::time::interval(Duration::from_secs(15));
+    // B1:客户端用量条目提到循环外一次获取(规则生命周期内 client_id
+    // 不变)。修前每包 2-3 次 `client_usage(&id)` —— `entry(id.to_string())`
+    // 命中时也先构造 String,再 clone 一次 Arc。
+    let usage = state.client_usage(&rt.client_id);
     loop {
         // 等待第一条/重建通道
         let stream = tokio::select! {
@@ -1416,6 +1616,9 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
         };
         let (mut ch_r, mut ch_w) = tokio::io::split(stream);
         let mut frame_buf = bytes::BytesMut::with_capacity(2048);
+        // B1:上行一次成帧缓冲 + 地址字符串复用缓冲。
+        let mut up_frame = bytes::BytesMut::new();
+        let mut addr_buf = String::with_capacity(24);
         let mut pkt_buf = vec![
             0u8;
             state
@@ -1438,8 +1641,7 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                             // (用户 → 通道)此前照常计费转发 —— 配额击穿后
                             // UDP 只有单边被切:客户端仍能持续把数据打进隧道,
                             // 表现是"限流生效了但只限一半"。
-                            if state
-                                .client_usage(&rt.client_id)
+                            if usage
                                 .flow_cut
                                 .load(std::sync::atomic::Ordering::Relaxed)
                             {
@@ -1452,9 +1654,21 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                             }
                             state.metrics.count_user_in(n);
                             rt.bytes_in.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-                            state.client_usage(&rt.client_id).add_bytes(n as u64);
-                            let payload = udp_packet::encode(&peer.to_string(), &pkt_buf[..n]);
-                            if rh_protocol::write_frame(&mut ch_w, FrameType::UDP_PACKET, &payload).await.is_err() {
+                            usage.add_bytes(n as u64);
+                            // B1:一次成帧(帧头 + [addr_len][addr][data] 直接写进
+                            // 复用缓冲),消除 encode 的中间 Vec 与 write_frame 的
+                            // 二次整包拷贝;地址字符串复用缓冲,不再每包分配。
+                            addr_buf.clear();
+                            use bytes::BufMut as _;
+                            use std::fmt::Write as _;
+                            let _ = write!(addr_buf, "{peer}");
+                            let payload_len = 1 + addr_buf.len() + n;
+                            up_frame.clear();
+                            rh_protocol::encode_frame_header(&mut up_frame, FrameType::UDP_PACKET, payload_len);
+                            up_frame.put_u8(addr_buf.len() as u8);
+                            up_frame.put_slice(addr_buf.as_bytes());
+                            up_frame.put_slice(&pkt_buf[..n]);
+                            if ch_w.write_all(&up_frame).await.is_err() {
                                 break true;
                             }
                             sessions.insert(peer, Instant::now());
@@ -1467,8 +1681,7 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                         Ok((FrameType::UDP_PACKET, p)) => {
                             if let Some((src, data)) = udp_packet::decode(&p) {
                                 if let Ok(addr) = src.parse::<SocketAddr>() {
-                                    if state
-                                        .client_usage(&rt.client_id)
+                                    if usage
                                         .flow_cut
                                         .load(std::sync::atomic::Ordering::Relaxed)
                                     {
@@ -1483,7 +1696,7 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                                     state.metrics.count_user_out(data.len());
                                     rt.bytes_out
                                         .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                                    state.client_usage(&rt.client_id).add_bytes(data.len() as u64);
+                                    usage.add_bytes(data.len() as u64);
                                     sessions.insert(addr, Instant::now());
                                 }
                                 last_alive = Instant::now();

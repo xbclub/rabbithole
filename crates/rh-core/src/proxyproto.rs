@@ -76,6 +76,10 @@ pub enum ParseError {
     TooLarge,
 }
 
+/// 仅测试使用:服务端不解析入站 PROXY 头,客户端只用 encode_v1/v2。
+/// 保留在 cfg(test) 内供 encode↔parse 往返测试,不编进生产二进制
+/// (parse_v1 内部含逐连接 Vec/format 开销,接入生产前需先改写)。
+#[cfg(test)]
 pub fn parse_header(buf: &[u8]) -> Result<Option<(ProxyProtoInfo, usize)>, ParseError> {
     if buf.is_empty() {
         return Ok(None);
@@ -96,6 +100,7 @@ pub fn parse_header(buf: &[u8]) -> Result<Option<(ProxyProtoInfo, usize)>, Parse
     Err(ParseError::NotProxyProtocol)
 }
 
+#[cfg(test)]
 fn parse_v1(buf: &[u8]) -> Result<Option<(ProxyProtoInfo, usize)>, ParseError> {
     let end = match buf.windows(2).position(|w| w == b"\r\n") {
         Some(p) => p + 2,
@@ -124,6 +129,7 @@ fn parse_v1(buf: &[u8]) -> Result<Option<(ProxyProtoInfo, usize)>, ParseError> {
     Ok(Some((ProxyProtoInfo { src, dst }, end)))
 }
 
+#[cfg(test)]
 fn parse_v2(buf: &[u8]) -> Result<Option<(ProxyProtoInfo, usize)>, ParseError> {
     if buf.len() < 16 {
         return Ok(None);

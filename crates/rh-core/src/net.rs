@@ -1,6 +1,6 @@
 //! 地址与端口工具:端口范围、绑定地址校验、IP 解析(IPv4/IPv6)。
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
 /// 端口范围段(含两端),支持单端口 "8080"、区间 "6000-6100"、"6000-6000"。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,34 +39,12 @@ pub struct PortAllowList {
 
 impl PortAllowList {
     /// 空 = 允许全部。
-    pub fn allow_all() -> Self {
-        Self::default()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
 
     pub fn allows(&self, port: u16) -> bool {
         self.is_empty() || self.ranges.iter().any(|r| r.contains(port))
-    }
-
-    /// 在白名单内寻找 [prefer, ...] 起的空闲端口(由调用方传入探测闭包)。
-    pub fn pick(&self, excluded: &dyn Fn(u16) -> bool, bind_ip: IpAddr) -> Option<u16> {
-        let probe = |port: u16| -> bool {
-            if excluded(port) {
-                return false;
-            }
-            std::net::TcpListener::bind(SocketAddr::new(bind_ip, port)).is_ok()
-        };
-        for r in &self.ranges {
-            for p in r.start..=r.end {
-                if probe(p) {
-                    return Some(p);
-                }
-            }
-        }
-        None
     }
 }
 

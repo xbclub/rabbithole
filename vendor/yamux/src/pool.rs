@@ -120,6 +120,11 @@ impl Pool {
                     Err(e) => e.into_inner(),
                 };
                 if let Some(b) = g.pop() {
+                    // 弹出即减预算(put 侧按 cap 累加,这里按实际 capacity 扣回)。
+                    // 修前 get 不减:每次 get→put 净增一块容量,约 128 块后
+                    // `cur + cap > LARGE_BUDGET` 恒成立,put 永远拒收,
+                    // 大类池在稳态下被自己的计数器关停(每块重新分配)。
+                    self.large_bytes.fetch_sub(b.capacity(), Ordering::Relaxed);
                     drop(g);
                     return b;
                 }
@@ -309,6 +314,31 @@ mod tests {
         assert!(
             max_seen >= MIN_RECYCLE,
             "standard entries must be recyclable"
+        );
+    }
+
+    /// C4(红→绿):大类稳态复用。修前 `get` 弹出大缓冲不减 `large_bytes`,
+    /// 每次 get→put 净增一块容量,约 128 块后预算恒满、put 永远拒收,
+    /// 之后每次 get 都是新分配。串行 get(256KiB)→put 交叉多轮,
+    /// 新分配数必须远小于操作数(与 pool_hit_rate_microbench 同型,
+    /// 但用大类容量 —— 修前该测试因计数器泄漏恒红)。
+    #[test]
+    fn pool_large_class_steady_reuse() {
+        let pool = Pool::new();
+        const LARGE: usize = 256 * 1024;
+        const M: usize = 1000;
+        let before = pool.allocations();
+        for _ in 0..M {
+            let mut b = pool.get(LARGE);
+            debug_assert!(b.capacity() >= LARGE);
+            b.extend_from_slice(&[1u8; 64]);
+            b.clear();
+            pool.put(b);
+        }
+        let delta = pool.allocations() - before;
+        assert!(
+            delta * 20 < M,
+            "large-class steady-state allocations {delta} for {M} ops — budget leak killed reuse (C4)"
         );
     }
 

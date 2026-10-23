@@ -464,9 +464,6 @@ impl ProxySpec {
         };
     }
 
-    pub fn udp_cfg(&self) -> Option<&UdpProxyConfig> {
-        self.udp.as_ref()
-    }
     pub fn http_cfg(&self) -> Option<&HttpProxyConfig> {
         self.http.as_ref()
     }

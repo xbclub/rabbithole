@@ -639,7 +639,9 @@ async fn dial_io(
             }
             crate::Protocol::Tls | crate::Protocol::Wss => {
                 // 同服务端:必须传入 cfg.alpn,否则配置项被静默忽略。
-                let (rust, verify) = crate::tls::client_config_with_alpn(&cfg.tls, &cfg.alpn)?;
+                // B5:走按配置键缓存的构造(含 rustls 会话恢复票据缓存),
+                // 修前每次拨号/重拨都重建 → PSK 恢复永远空转。
+                let (rust, verify) = crate::tls::client_config_cached(&cfg.tls, &cfg.alpn)?;
                 let connector = TlsConnector::from(rust);
                 let name = rustls_pki_types::ServerName::try_from(
                     cfg.tls

@@ -17,7 +17,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -104,27 +104,41 @@ pub struct HotConfig {
     pub ssh_gateway: crate::config::SshGatewayConfig,
     /// Prometheus 指标端点(独立监听;地址/端口均可热改,保存时热重启监听器)。
     pub metrics: crate::config::MetricsConfig,
+    /// B7:白名单解析结果缓存(随 allow_ports 在构造时一次解析)。
+    /// 修前 port_allowed/allocate_port 每次调用都逐条字符串解析 + Vec
+    /// 分配,批量建/改/启 N 条规则 = N 次重解析。
+    port_allow: std::sync::Arc<PortAllowList>,
 }
 
 impl HotConfig {
     pub fn from_cfg(cfg: &ServerConfig) -> Self {
+        let port_allow = Self::parse_allow_list(&cfg.ports.allow_ports);
         Self {
             allow_ports: cfg.ports.allow_ports.clone(),
             max_services_per_client: cfg.ports.max_services_per_client,
             log_level: cfg.log.level.clone(),
             ssh_gateway: cfg.ssh_gateway.clone(),
             metrics: cfg.metrics.clone(),
+            port_allow,
         }
     }
 
-    pub fn port_allow_list(&self) -> PortAllowList {
-        PortAllowList {
-            ranges: self
-                .allow_ports
+    /// 白名单热更新后重建解析缓存(api.rs 保存端口配置时调用)。
+    pub fn reparse_allow_list(&mut self) {
+        self.port_allow = Self::parse_allow_list(&self.allow_ports);
+    }
+
+    fn parse_allow_list(allow_ports: &[String]) -> std::sync::Arc<PortAllowList> {
+        std::sync::Arc::new(PortAllowList {
+            ranges: allow_ports
                 .iter()
                 .filter_map(|s| PortsRange::parse(s))
                 .collect(),
-        }
+        })
+    }
+
+    pub fn port_allow_list(&self) -> std::sync::Arc<PortAllowList> {
+        self.port_allow.clone()
     }
 }
 
@@ -876,15 +890,12 @@ pub struct ProxyRuntime {
     /// 独享端口类规则:listener 绑定成功标记(running 的必要条件,§4.1)。
     pub bound: AtomicBool,
     pub rule_cancel: CancellationToken,
-    /// tcp/tcpmux(独享或组内成员):Listener 由本运行时或 Group 持有。
-    pub tcp_listener: Mutex<Option<TcpListener>>,
     /// 本规则的独享 serve loop 句柄(A6 顺带项)。
     ///
     /// teardown→spawn 重建同一端口时,旧 serve loop 可能还没把监听 fd 释放,
     /// 新绑定就撞 `EADDRINUSE`(api.rs 拆完立刻重建的路径实测偶发)。
     /// 重建前带超时 await 它收敛,消除这个窗口。
     pub serve_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    pub udp_socket: Mutex<Option<Arc<UdpSocket>>>,
     pub pool: Mutex<Option<Arc<TcpPool>>>,
     /// UDP pump 通道投递。
     pub udp_new_channel_tx: Mutex<Option<tokio::sync::mpsc::Sender<BoxedIo>>>,
@@ -910,6 +921,11 @@ pub struct ProxyRuntime {
     ///   直连源站 41602 QPS / 纯 TCP 转发 10187 QPS / HTTP vhost 4262 QPS。
     /// vhost 只有直连的 10%,而纯 TCP 转发有 24% —— 主要损失在 vhost 这层。
     pub http_upstream: crate::vhost::UpstreamPool,
+    /// C6c:metrics label 的字符串形式(规则生命周期内 id 不变)。
+    /// 修前每条 TCP 连接建/关各一次 `id.to_string()` 分配;
+    /// 全仓无 `remove_label_values`,IntGaugeVec 子项按 proxy_id 无界累积,
+    /// 长跑 + 频繁建删规则时内存与 /metrics 输出持续增长(teardown 已回收)。
+    pub metrics_label: String,
 }
 
 impl ProxyRuntime {
@@ -934,11 +950,10 @@ impl ProxyRuntime {
             http_cache: std::sync::Mutex::new(HttpCache::default()),
             has_group: AtomicBool::new(has_group),
             http_upstream: crate::vhost::UpstreamPool::default(),
-            tcp_listener: Mutex::new(None),
             serve_handle: Mutex::new(None),
-            udp_socket: Mutex::new(None),
             pool: Mutex::new(None),
             udp_new_channel_tx: Mutex::new(None),
+            metrics_label: id.to_string(),
         }
     }
 
@@ -1004,6 +1019,11 @@ pub struct ProxyManager {
     pub vhost_http: RwLock<Arc<Vec<VhostRoute>>>,
     pub vhost_https: RwLock<Arc<Vec<VhostRoute>>>,
     pub vhost_tcpmux: RwLock<Arc<Vec<VhostRoute>>>,
+    /// B6:host → 路由下标索引(与上方三张表同批重建)。修前每请求
+    /// O(全部域名) 的 String== 线性扫描,规则数上千时每请求上万次比较。
+    pub vhost_http_idx: RwLock<Arc<std::collections::HashMap<String, Vec<usize>>>>,
+    pub vhost_https_idx: RwLock<Arc<std::collections::HashMap<String, Vec<usize>>>>,
+    pub vhost_tcpmux_idx: RwLock<Arc<std::collections::HashMap<String, Vec<usize>>>>,
     /// 热生效端口策略(网页可改,与 AppState.hot 同源)。
     pub hot: Arc<RwLock<HotConfig>>,
     /// vhost 路由「待重建」标记。
@@ -1048,7 +1068,9 @@ pub struct VhostRoute {
     /// M2:域名命中但路径未命中 locations 时的自定义 404。
     pub not_found_html: String,
     /// M2:静态缓存配置(仅 http 路由)。
-    pub cache: Option<rh_protocol::CacheConfig>,
+    /// B6:按 Arc 共享 —— 修前每请求 `route.cache.clone()` 深拷整份
+    /// CacheConfig(含 Vec<String> 扩展名白名单)。
+    pub cache: Option<std::sync::Arc<rh_protocol::CacheConfig>>,
 }
 
 /// M2 HTTP 静态缓存(每规则一份;std::Mutex 短临界区,不跨 await)。
@@ -1125,6 +1147,9 @@ impl ProxyManager {
             vhost_http: RwLock::new(Arc::new(Vec::new())),
             vhost_https: RwLock::new(Arc::new(Vec::new())),
             vhost_tcpmux: RwLock::new(Arc::new(Vec::new())),
+            vhost_http_idx: RwLock::new(Arc::new(Default::default())),
+            vhost_https_idx: RwLock::new(Arc::new(Default::default())),
+            vhost_tcpmux_idx: RwLock::new(Arc::new(Default::default())),
             vhost_dirty: AtomicBool::new(false),
             vhost_flush_scheduled: AtomicBool::new(false),
         }
@@ -1424,6 +1449,19 @@ impl ProxyManager {
                 _ => {}
             }
         }
+        // B6:同批构建 host 索引(路由顺序与表一致;同 host 多条规则
+        // 保留全部下标,http 的最长 locations 匹配仍需遍历候选)
+        let idx_of = |v: &[VhostRoute]| {
+            let mut m: std::collections::HashMap<String, Vec<usize>> =
+                std::collections::HashMap::with_capacity(v.len());
+            for (i, r) in v.iter().enumerate() {
+                m.entry(r.host.clone()).or_default().push(i);
+            }
+            Arc::new(m)
+        };
+        *self.vhost_http_idx.write().await = idx_of(&http);
+        *self.vhost_https_idx.write().await = idx_of(&https);
+        *self.vhost_tcpmux_idx.write().await = idx_of(&tcpmux);
         *self.vhost_http.write().await = Arc::new(http);
         *self.vhost_https.write().await = Arc::new(https);
         *self.vhost_tcpmux.write().await = Arc::new(tcpmux);
@@ -1449,7 +1487,7 @@ fn route_from(
         response_headers: c.response_headers.clone(),
         proxy_id: rt.id,
         not_found_html: c.not_found_html.clone(),
-        cache: c.cache.clone(),
+        cache: c.cache.clone().map(std::sync::Arc::new),
     }
 }
 
@@ -1480,27 +1518,34 @@ impl AppState {
         {
             return true;
         }
-        let Ok(rows) = self.db.list_proxies(None).await else {
+        // B8:改走按端口精确查询(可走 idx_proxies_bind 部分索引),
+        // 修前 list_proxies(None) 全表读 + 每行 spec JSON 反序列化,
+        // N 条规则下每次管理操作 O(N),批量操作 O(N²)。
+        let Ok(rows) = self.db.list_proxies_on_port(port).await else {
             return false;
         };
-        for (id, _cid, spec) in rows {
-            if Some(id as u64) == except_proxy || !spec.enabled || !spec.kind.uses_bind_port() {
+        for (id, kind, bind_ip, enabled, group) in rows {
+            if Some(id as u64) == except_proxy || !enabled {
                 continue;
             }
-            if new_group_key.is_some() && Self::group_key_of(&spec) == new_group_key {
+            // 组键派生(与 ProxyManager::group_key 同式:空组/非组类
+            // kind 不参与组共享)
+            let grouped =
+                !group.is_empty() && matches!(kind.as_str(), "tcp" | "http" | "https" | "tcpmux");
+            if grouped
+                && new_group_key
+                    .as_ref()
+                    .is_some_and(|k| *k == format!("{kind}|{bind_ip}|{port}|{group}"))
+            {
                 continue; // 同组共享监听
             }
             let other_ip =
-                rh_core::net::parse_bind_ip(&spec.bind_ip).unwrap_or(IpAddr::from([0, 0, 0, 0]));
-            if bind_conflicts(proto, ip, port, proto, other_ip, spec.bind_port) {
+                rh_core::net::parse_bind_ip(&bind_ip).unwrap_or(IpAddr::from([0, 0, 0, 0]));
+            if bind_conflicts(proto, ip, port, proto, other_ip, port) {
                 return true;
             }
         }
         false
-    }
-
-    fn group_key_of(spec: &ProxySpec) -> Option<String> {
-        ProxyManager::group_key(spec)
     }
 
     /// 向客户端签发一个数据通道请求(服务端指令发起)。
@@ -1536,11 +1581,21 @@ impl AppState {
             },
         )
         .await;
+        // A1 自锁修复:本函数的入口(control.rs 的 handle_client_message 与
+        // runtime.rs 的 on_apply_result → warm_proxy → tcp_refill)都内联在
+        // 控制读循环里,而读循环同时是 queue_tx 的唯一消费者。无界
+        // `send().await` 在队列满时 park 在"等自己消费"上 —— 心跳、cancel
+        // 全部失联。同文件 issue_relay_pair / on_apply_result 重发分支均已改
+        // 有界,这里对齐。失败路径语义保持:走 take_pending_request_quiet
+        //(不触发钩子),调用方自己归还 inflight。
         let ok = sess
-            .send(ServerMessage::CreateDataChannel(CreateDataChannel {
-                request_id: rid,
-                entity,
-            }))
+            .send_bounded(
+                ServerMessage::CreateDataChannel(CreateDataChannel {
+                    request_id: rid,
+                    entity,
+                }),
+                crate::config::CONTROL_SEND_TIMEOUT,
+            )
             .await;
         if ok {
             Some(rid)

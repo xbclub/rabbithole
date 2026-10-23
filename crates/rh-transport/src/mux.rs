@@ -460,26 +460,6 @@ const UP_BATCH_BYTES: usize = 1024 * 1024;
 /// "写不出"。
 pub mod pump_diag {
     use std::sync::atomic::{AtomicU64, Ordering};
-    pub static READ_NS: AtomicU64 = AtomicU64::new(0);
-    pub static WRITE_NS: AtomicU64 = AtomicU64::new(0);
-    pub static READS: AtomicU64 = AtomicU64::new(0);
-    pub static WRITES: AtomicU64 = AtomicU64::new(0);
-    pub static BYTES: AtomicU64 = AtomicU64::new(0);
-    pub static CHUNKS: AtomicU64 = AtomicU64::new(0);
-    /// 单次读等待 > 1ms 的次数(判定是否在等上游)
-    pub static SLOW_READS: AtomicU64 = AtomicU64::new(0);
-    /// 单次读等待 > 10ms 的次数
-    pub static VERY_SLOW_READS: AtomicU64 = AtomicU64::new(0);
-    pub static SLOW_WRITES: AtomicU64 = AtomicU64::new(0);
-    /// round-31:写路径时间再分解——`WRITE_NS` 里有多少花在**等限速器**
-    /// (`reserve`)上、多少花在**真正的 socket 写**上。跨机下行 1.7G
-    /// (上行 2.4G)时 `write_ms` 占 98%,必须区分"被限速器拖住"与
-    /// "socket 写不出去"两种完全不同的病因。
-    pub static RESERVE_NS: AtomicU64 = AtomicU64::new(0);
-    pub static SOCKWRITE_NS: AtomicU64 = AtomicU64::new(0);
-    /// 单次 socket 写返回 0 或部分写(< 请求量)的次数:部分写是
-    /// 发送缓冲满的直接证据。
-    pub static PARTIAL_WRITES: AtomicU64 = AtomicU64::new(0);
     /// round-13:上一轮 read 返回到本轮 read 开始之间的间隔(循环开销)。
     pub static LOOP_GAP_NS: AtomicU64 = AtomicU64::new(0);
     pub static LOOP_GAP_N: AtomicU64 = AtomicU64::new(0);
@@ -553,52 +533,6 @@ rd_per_blk_ms={:.2} wr_per_blk_ms={:.2}",
                 rf as f64 * 100.0 / tot as f64
             );
         }
-        // round-31:写时间分解——等限速器 vs 等 socket。
-        let rs = RESERVE_NS.load(Ordering::Relaxed) as f64 / 1e6;
-        let sw = SOCKWRITE_NS.load(Ordering::Relaxed) as f64 / 1e6;
-        let pw = PARTIAL_WRITES.load(Ordering::Relaxed);
-        if wr_ns > 0 {
-            eprintln!(
-                "PUMP_WSPLIT {tag} reserve_ms={rs:.0}({:.0}%) sockwrite_ms={sw:.0}({:.0}%) \
-partial_writes={pw} sockwrite_per_blk_ms={:.2}",
-                if wr_ms > 0.0 { rs * 100.0 / wr_ms } else { 0.0 },
-                if wr_ms > 0.0 { sw * 100.0 / wr_ms } else { 0.0 },
-                if wr_cnt > 0 { sw / wr_cnt as f64 } else { 0.0 },
-            );
-        }
-    }
-
-    pub fn dump(tag: &str) {
-        if !enabled() {
-            return;
-        }
-        let r = READ_NS.load(Ordering::Relaxed) as f64 / 1e6;
-        let w = WRITE_NS.load(Ordering::Relaxed) as f64 / 1e6;
-        let rd = READS.load(Ordering::Relaxed);
-        let wr = WRITES.load(Ordering::Relaxed);
-        let by = BYTES.load(Ordering::Relaxed);
-        let ch = CHUNKS.load(Ordering::Relaxed);
-        eprintln!(
-            "PUMP_STATS {tag} read_ms={r:.0} write_ms={w:.0} reads={rd} writes={wr} bytes={by} chunks={ch} avg_chunk={:.0} slow1ms={} slow10ms={} slowwrites={}",
-            if ch > 0 { by as f64 / ch as f64 } else { 0.0 },
-            SLOW_READS.load(Ordering::Relaxed),
-            VERY_SLOW_READS.load(Ordering::Relaxed),
-            SLOW_WRITES.load(Ordering::Relaxed),
-        );
-        let rf = READY_FIRST.load(Ordering::Relaxed);
-        let pf = PEND_FIRST.load(Ordering::Relaxed);
-        let tot = rf + pf;
-        if tot > 0 {
-            eprintln!(
-                "PUMP_RF {tag} ready_first={rf} pend_first={pf} ready_pct={:.1}%",
-                rf as f64 * 100.0 / tot as f64
-            );
-        }
-        eprintln!(
-            "PUMP_UP {tag} up_bytes={} up_chunks={}",
-            UP_BYTES.load(Ordering::Relaxed),
-            UP_CHUNKS.load(Ordering::Relaxed)
-        );
     }
 }
 
@@ -652,8 +586,6 @@ pub async fn mux_relay(
     limiter: Option<std::sync::Arc<dyn crate::ChunkLimiter>>,
     cancel: Option<crate::CancelFuture>,
 ) {
-    use tokio::io::AsyncWriteExt as _;
-
     // round-69:`tokio::io::split` 用一把 `std::sync::Mutex` 包住整个
     // stream(`tokio/src/io/split.rs` 的 `with_lock` 直接 `lock().unwrap()`)。
     // 在 async 任务里用同步锁的后果:一端在 poll 期间(含内核态
@@ -669,7 +601,7 @@ pub async fn mux_relay(
     // 读写之间没有任何共享锁。包装类型(CountedUserIo/QuotaIo/
     // PrependedIo/压缩流/mux 流)不支持,回落到 `tokio::io::split`。
     // 两种拆分方式产出不同类型,统一擦除成 trait object 供泵使用。
-    let (mut a_r, mut a_w): (
+    let (a_r, a_w): (
         Box<dyn tokio::io::AsyncRead + Send + Unpin>,
         Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
     ) = match crate::split_boxed_io(a) {
@@ -679,6 +611,25 @@ pub async fn mux_relay(
             (Box::new(r), Box::new(w))
         }
     };
+    mux_relay_split(a_r, a_w, b_read, b_write, limiter, cancel).await;
+}
+
+/// A2:中继主体,接收**已拆好**的 a 侧读写半。
+///
+/// 服务端用户侧恒为 `CountedUserIo<TcpStream>` 包装,`split_boxed_io` 的
+/// 精确类型探测永远 miss → 修前 100% 回落 `tokio::io::split`(读写泵
+/// 份属不同 task 却共享一把 `std::sync::Mutex`,即 round-69 修的 futex
+/// 病灶在服务端主路径上从未生效)。调用方(rh-server data.rs)先剥壳、
+/// `into_split` 无锁拆半、按方向重包计量后从本函数进入。
+pub async fn mux_relay_split(
+    mut a_r: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    mut a_w: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    b_read: RhMuxStreamRead,
+    b_write: RhMuxStreamWrite,
+    limiter: Option<std::sync::Arc<dyn crate::ChunkLimiter>>,
+    cancel: Option<crate::CancelFuture>,
+) {
+    use tokio::io::AsyncWriteExt as _;
 
     // 本向以错误(非 EOF、非取消)结束时置位:对向数据通路已死
     //(mux 连接断 / 用户侧错误),继续等对向只会在已死的通路上永存。
@@ -822,11 +773,16 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
     // round-68:由 `Option<Bytes>` 改为 `Vec<Bytes>`——修前只预取一块,
     // 同一时刻只有 1 个未完成读,每批都要等一次数据到达(RTT/2)。
     let mut pending: Vec<Bytes> = Vec::new();
+    // B10:批缓冲提到循环外复用(与 flush() 的 smalls 同型)。修前每轮
+    // 重建 batch/prefetched —— 小流/滴流时每批只有 1 块,等于每 chunk
+    // 一次 2KB 级分配,prefetched 还要额外 realloc。
+    let mut batch: Vec<Bytes> = Vec::with_capacity(UP_BATCH_SEGS);
+    let mut prefetched: Vec<Bytes> = Vec::new();
 
     loop {
         let t_read = std::time::Instant::now();
         // 组装本轮批:首块(pending 或新读)+ 所有已就绪块,直到上限。
-        let mut batch: Vec<Bytes> = Vec::with_capacity(UP_BATCH_SEGS);
+        batch.clear();
         let mut batch_bytes = 0usize;
         // 读侧终止原因必须分开记:`batch_eof` 只表示 **clean EOF**,
         // 读错误另置 `read_err`。两者混用会让错误被当成干净结束 ——
@@ -916,7 +872,7 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
         // 现在改成:在写尚未完成期间,**持续**发起新读,把读到的块全部
         // 堆进 `prefetched`,直到 `UP_BATCH_BYTES` 触顶。写完成后下一轮
         // 直接从这里取,不再等 RTT。
-        let mut prefetched: Vec<Bytes> = Vec::new();
+        prefetched.clear();
         let mut prefetched_bytes = 0usize;
         // 预取窗口里 read_err 已置位时不再发起新读(错误已确定,继续读无意义)。
         let ok = if prefetch_enabled() && batch_bytes < UP_BATCH_BYTES && !batch_eof && !read_err {
@@ -952,7 +908,8 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
             write_all.await
         };
         // 预取结果整体转入 pending 队列,下一轮直接消费(不再等 RTT)。
-        pending.extend(prefetched);
+        // append 保留 prefetched 缓冲容量(B10),避免下轮重新分配。
+        pending.append(&mut prefetched);
 
         if diag {
             let el = t_write.elapsed().as_nanos() as u64;
@@ -1182,6 +1139,8 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
     let mut wr_cnt: u64 = 0;
     let mut by_bytes: u64 = 0;
     let mut wr_slow: u64 = 0;
+    // B10:批缓冲循环外复用(pump_up 同型)。
+    let mut batch: Vec<Bytes> = Vec::with_capacity(SMALL_CHUNK_SEGS);
     let clean = 'outer: loop {
         let __t0 = if pump_diag::enabled() {
             Some(std::time::Instant::now())
@@ -1203,7 +1162,7 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         // 本轮先把它加上已就绪块组成批,然后 select("写这批" vs "读下一块")
         // ——读先完成就把块存进 pending 供下一轮用,写先完成就进入下一轮。
         // 写一旦失败立即返回(**收敛红线**:不能 join,写错后读可能永挂)。
-        let mut batch: Vec<Bytes> = Vec::new();
+        batch.clear();
         let mut batch_bytes = 0usize;
         // 同 pump_up:clean EOF 与读错误必须分开记,否则错误被当成干净结束
         // (上层返回 clean=true → 不置 dn_errored → 不走 1s 有界收尾 →

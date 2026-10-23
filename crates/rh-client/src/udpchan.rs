@@ -318,8 +318,13 @@ fn parse_addr_cached(src: &str) -> Option<std::net::SocketAddr> {
             const { RefCell::new([const { None }; SLOTS]) };
     }
 
-    // 用字符串首字节做槽位:同一源地址恒定落同槽。
-    let slot = (src.as_bytes().first().copied().unwrap_or(0) as usize) % SLOTS;
+    // B10:槽位用整串字节折叠哈希。修前用**首字节**取模 —— IPv4 源地址
+    // 首字符几乎恒为 '1'/'2',实际只用 2-3 槽,多用户时每包都 miss,
+    // "命中率接近 100%"只在单用户下成立。
+    let slot = src
+        .bytes()
+        .fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(b as usize))
+        % SLOTS;
     CACHE.with(|c| {
         let mut c = c.borrow_mut();
         if let Some((k, v)) = &c[slot] {
@@ -368,6 +373,10 @@ pub async fn run_visitor_side(
     let mut fbuf = bytes::BytesMut::with_capacity(2048);
     // 按需分配:首次收包才占 64 KiB。
     let mut pkt: Option<Vec<u8>> = None;
+    // B10:源地址字符串直接映射缓存(SocketAddr → String)。修前每包
+    // `peer.to_string()`(格式化 + 分配);proxy 侧已把地址提到建会话时
+    // 算一次,visitor 侧漏改。单用户命中率 ~100%,多用户按端口分槽。
+    let mut addr_cache: [Option<(std::net::SocketAddr, String)>; 4] = [const { None }; 4];
     let mut last_alive = Instant::now();
     let mut last_ping = Instant::now();
     // 同 run_proxy_side:探活用固定周期 interval,不随事件重置。
@@ -379,7 +388,12 @@ pub async fn run_visitor_side(
         tokio::select! {
             rr = sock.recv_from(buf) => {
                 let Ok((n, peer)) = rr else { break };
-                let payload = udp_packet::encode(&peer.to_string(), &buf[..n]);
+                let slot = (peer.port() as usize) % addr_cache.len();
+                if !matches!(&addr_cache[slot], Some((p, _)) if *p == peer) {
+                    addr_cache[slot] = Some((peer, peer.to_string()));
+                }
+                let addr_str = addr_cache[slot].as_ref().map(|(_, s)| s.as_str()).unwrap_or("");
+                let payload = udp_packet::encode(addr_str, &buf[..n]);
                 if tx.send(Pending { ty: FrameType::UDP_PACKET, payload }).await.is_err() {
                     break;
                 }

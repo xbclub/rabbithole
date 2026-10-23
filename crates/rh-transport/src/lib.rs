@@ -1020,6 +1020,8 @@ impl Multiplexer {
     }
 
     /// 现有载体数(诊断/日志;非池变体返回 None)。只读,不改变池语义。
+    /// C8:生产路径零调用,**仅供 rh-client 的池收敛集成测试观测**;
+    /// 不要在生产数据面调用(每次取成员表读锁)。
     pub async fn pool_live_carriers(&self) -> Option<usize> {
         match &self.inner {
             MultiplexerInner::YamuxPool(p) => Some(p.live_carriers().await),
@@ -1033,17 +1035,6 @@ impl Multiplexer {
     pub async fn set_active_prefix(&self, n: usize) {
         if let MultiplexerInner::YamuxPool(p) = &self.inner {
             p.set_active_prefix(n).await;
-        }
-    }
-
-    /// 移除多载体池中的一个成员(round-10 报到收敛)。仅
-    /// [`MultiplexerInner::YamuxPool`] 有动作,其余变体 no-op(单载体
-    /// 路径没有可摘除的成员)。index 语义见
-    /// [`mux::YamuxMultiplexerPool::detach_carrier`]:先清重拨配方再
-    /// 关停物理连接,幂等。
-    pub async fn detach_carrier(&self, index: usize) {
-        if let MultiplexerInner::YamuxPool(p) = &self.inner {
-            p.detach_carrier(index).await;
         }
     }
 
@@ -1128,16 +1119,6 @@ impl Multiplexer {
             MultiplexerInner::Yamux(m) => m.accept_stream().await,
             MultiplexerInner::YamuxPool(p) => p.accept_stream().await,
             MultiplexerInner::Quic(q) => q.accept_stream().await,
-        }
-    }
-
-    /// 连接是否已死(无法再产生新流)。
-    pub async fn is_dead(&self) -> bool {
-        match &self.inner {
-            MultiplexerInner::Yamux(m) => m.is_dead(),
-            MultiplexerInner::YamuxPool(p) => p.is_dead(),
-            MultiplexerInner::Quic(q) => q.is_dead(),
-            _ => false,
         }
     }
 }

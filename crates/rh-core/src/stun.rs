@@ -138,6 +138,9 @@ fn parse_xor_addr(body: &[u8], tx_id: &[u8; 12]) -> std::io::Result<SocketAddr> 
 }
 
 /// 测试/隔离环境用迷你 STUN 服务器:回 Binding Response(XOR-MAPPED-ADDRESS)。
+/// 仅测试使用(不编进生产二进制;C8)。跨 crate 测试如需使用,
+/// 经 rh-core 自身测试覆盖。
+#[cfg(test)]
 pub async fn spawn_test_stun_server() -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)>
 {
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;

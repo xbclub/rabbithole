@@ -246,6 +246,50 @@ pub fn client_config_with_alpn(
     ))
 }
 
+/// B5:按配置键缓存 [`client_config_with_alpn`] 的产物。
+///
+/// 修前 `dial_io` 每次拨号(含多载体 K 条、`PoolRedial` 每次重拨)都重建
+/// 配置:`trusted_ca` 重新解析 PEM + `RootCertStore::add`,且
+/// `in_memory_sessions(256)` 每次都是**全新的空票据缓存** —— rustls 的
+/// 会话恢复挂在该 ClientConfig 实例上,实例即弃 → 掉线重连/池补位永远
+/// 走完整握手,1-RTT PSK 恢复形同虚设。缓存键覆盖全部影响配置产物的
+/// 字段(server_name 不参与配置构造,不进键)。
+pub fn client_config_cached(
+    opts: &crate::TlsClientOptions,
+    alpn: &[String],
+) -> io::Result<(Arc<rustls::ClientConfig>, ClientVerify)> {
+    use std::collections::HashMap;
+    use std::hash::Hash;
+    use std::sync::{Mutex, OnceLock};
+
+    fn cache_key(opts: &crate::TlsClientOptions, alpn: &[String]) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        opts.trusted_ca.hash(&mut h);
+        opts.insecure_skip_verify.hash(&mut h);
+        opts.pin_sha256.hash(&mut h);
+        opts.secret_verified.hash(&mut h);
+        for a in alpn {
+            a.hash(&mut h);
+        }
+        std::hash::Hasher::finish(&h)
+    }
+
+    type ConfigCache = HashMap<u64, (Arc<rustls::ClientConfig>, ClientVerify)>;
+    static CACHE: OnceLock<Mutex<ConfigCache>> = OnceLock::new();
+    let key = cache_key(opts, alpn);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(g) = cache.lock() {
+        if let Some(v) = g.get(&key) {
+            return Ok(v.clone());
+        }
+    }
+    let v = client_config_with_alpn(opts, alpn)?;
+    if let Ok(mut g) = cache.lock() {
+        g.insert(key, v.clone());
+    }
+    Ok(v)
+}
+
 fn with_alpn(mut cfg: rustls::ClientConfig, alpn: &[String]) -> Arc<rustls::ClientConfig> {
     cfg.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
     // 0-RTT 禁用(B12 / docs/0rtt-remediation.md §3.2):会话恢复仅 1-RTT

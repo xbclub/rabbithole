@@ -412,10 +412,17 @@ pub(crate) fn initial_k_for_with(
 /// - 第二个返回值是"报到顺序尾部"的成员表下标,仅诊断/兼容既有断言——
 ///   真正的摘除按身份走 [`plan_detach_set`](保留额按表内成功数计,不按
 ///   位置取尾部),下标会随成员表压缩漂移。
-fn plan_convergence(initial_k: usize, server_caps: &[usize]) -> (usize, Vec<usize>) {
+fn plan_convergence(initial_k: usize, server_caps: &[usize]) -> usize {
     let server_cap = server_caps.iter().copied().min().unwrap_or(1);
-    let final_k = initial_k.min(server_cap).clamp(1, 8);
     // 前缀始终保留至少一条(成员 0 = 控制流所在载体)
+    initial_k.min(server_cap).clamp(1, 8)
+}
+
+/// C9:诊断/兼容既有断言的第二返回值(尾部成员下标)。生产调用方只取
+/// final_k —— 修前生产路径每次调用都白白分配一个临时 Vec。
+#[cfg(test)]
+fn plan_convergence_diag(initial_k: usize, server_caps: &[usize]) -> (usize, Vec<usize>) {
+    let final_k = plan_convergence(initial_k, server_caps);
     (final_k, (final_k..initial_k).collect())
 }
 
@@ -1020,7 +1027,7 @@ async fn connect_and_run_inner(
     let failed_ids = failed_ids.into_inner().unwrap_or_else(|e| e.into_inner());
     // 服务端上限 = 成功报到载体的最小值;一个都没成功(旧服务端/全拒)
     // 按 1 处理——有意的保守行为(见兼容说明)。
-    let (final_k, _tail) = plan_convergence(initial_k, &server_caps);
+    let final_k = plan_convergence(initial_k, &server_caps);
     let server_cap = server_caps.iter().copied().min().unwrap_or(1);
     // 每载体 shard 在拨号时按 initial_k 固化(见 connect_stream_pool);
     // 收敛保留控制载体 + (final_k-1) 个成功载体、不重建,故此处记录实际
@@ -1173,7 +1180,7 @@ async fn run_loop(
                 match r {
                     Ok((ty, payload)) => {
                         last_rx = std::time::Instant::now();
-                        if let Err(e) = dispatch_frame(&sess, &mut control, &mut buf, ty, &payload, &shutdown).await {
+                        if let Err(e) = dispatch_frame(&sess, ty, &payload, &shutdown).await {
                             warn!(error = %e, "control dispatch error");
                             // 致命错误(如服务端在会话中途下发 AUTH_FAILED /
                             // CLIENT_DISABLED)必须带出去;其它错误只是断线,
@@ -1289,8 +1296,6 @@ async fn run_loop(
 /// 供 main 循环调用的读分发(见 run_session)。
 pub async fn dispatch_frame(
     sess: &Arc<ClientSession>,
-    control: &mut BoxedIo,
-    buf: &mut bytes::BytesMut,
     ty: FrameType,
     payload: &[u8],
     shutdown: &CancellationToken,
@@ -1331,7 +1336,14 @@ pub async fn dispatch_frame(
                 });
             }
             ServerMessage::NatHolePrepare(p) => {
-                crate::nathole_cli::on_prepare(sess.clone(), p).await;
+                // A8:与 NatHoleConnect 对齐改为 spawn。on_prepare 做 UDP
+                // bind + STUN(最长 5s),修前内联 await 在 run_loop 的
+                // select 读分支里 —— STUN 不可达时读帧/写帧/心跳/cancel
+                // 四条分支全部轮不到,会话停摆 5s。
+                let s2 = sess.clone();
+                tokio::spawn(async move {
+                    crate::nathole_cli::on_prepare(s2, p).await;
+                });
             }
             ServerMessage::NatHoleConnect(c) => {
                 let s2 = sess.clone();
@@ -1382,7 +1394,6 @@ pub async fn dispatch_frame(
         }
         FrameType::PONG => {}
         other => {
-            let _ = (control, buf);
             warn!(frame = ?other, "ignored frame");
         }
     }
@@ -1395,12 +1406,12 @@ pub async fn dispatch_frame(
 /// 业务判断,理由见下。
 ///
 /// **丢 ACK 的后果不是自愈的**(与丢心跳/PING 应答不同):
-/// 服务端的 `unconfirmed` 只被 `mark_unconfirmed` 写入、被
-/// `confirm_applied` retain,**没有任何超时重发机制**(已 grep 全仓核实:
-/// 无后台任务读它;`confirm_applied` 的返回值 `still_waiting` 在
-/// `runtime.rs:124` 被 `let _ =` 丢弃)。所以丢一条 `ok:true` 的 ACK,
-/// 会让那条规则停在 Pending,**直到下一次该客户端有任何配置变更或重连**
-/// 才自愈。管理员改完一条规则后若不再操作,界面会一直显示"未确认"。
+/// 服务端对 `ok:true` 的 ACK 没有任何超时重发机制(`applied_revision`
+/// 只随 ACK 单调推进,不会主动重发 SYNC)。所以丢一条 `ok:true` 的
+/// ACK,会让那条规则停在 Pending,**直到下一次该客户端有任何配置变更
+/// 或重连**才自愈。管理员改完一条规则后若不再操作,界面会一直显示
+/// "未确认"。(历史上曾有一张 `unconfirmed` 表跟踪未确认版本,但返回
+/// 值无人消费、无重发方,纯白付,已在静态审计 C5 中删除。)
 ///
 /// **为什么不 spawn**:`ack` 的语义是「本次配置已应用」,它在
 /// `dispatch_frame` 里紧跟 `apply_sync` / `upsert` / `remove_entity`。
@@ -1778,10 +1789,10 @@ mod sizing_tests {
         // (K=1 单载体封顶与流数无关)。详见 default_carriers 文档。
         assert_eq!(k, 2, "tcp 默认载体数为 2");
         // 显式请求多载体时收敛逻辑不变(基线回退不影响显式路径)。
-        let (final_k, drops) = plan_convergence(4, &[8, 8, 8]);
+        let (final_k, drops) = plan_convergence_diag(4, &[8, 8, 8]);
         assert_eq!(final_k, 4, "显式 K=4 且服务端允许 8 时保持 4");
         assert!(drops.is_empty(), "K=4 <= 服务端 8,无成员可摘");
-        let (capped, _) = plan_convergence(4, &[2]);
+        let (capped, _) = plan_convergence_diag(4, &[2]);
         assert_eq!(capped, 2, "服务端只允许 2 时收敛到 2");
     }
 
@@ -1973,7 +1984,7 @@ mod sizing_tests {
         );
 
         // 服务端上限路径的 8 钳制(与硬件无关,纯函数可判定)
-        assert_eq!(plan_convergence(8, &[99]), (8, Vec::new()));
+        assert_eq!(plan_convergence_diag(8, &[99]), (8, Vec::new()));
 
         let cfg = ClientConfig {
             mux_pool_size: Some(1),
@@ -1989,7 +2000,7 @@ mod sizing_tests {
     // T-E3:服务端 cap=1 → final_k=1,超出部分全部摘除。
     #[test]
     fn server_cap_converges_to_one() {
-        let (final_k, drops) = plan_convergence(2, &[1]);
+        let (final_k, drops) = plan_convergence_diag(2, &[1]);
         assert_eq!(final_k, 1);
         assert_eq!(drops, vec![1], "只摘成员 1(成员 0 = 控制流)");
     }
@@ -1998,12 +2009,12 @@ mod sizing_tests {
     // 尾部(不按失败下标摘——失败可能是轮转落点漂移造成的假失败)。
     #[test]
     fn missing_acks_conservatively_converge() {
-        let (final_k, drops) = plan_convergence(3, &[]);
+        let (final_k, drops) = plan_convergence_diag(3, &[]);
         assert_eq!(final_k, 1);
         assert_eq!(drops, vec![1, 2], "尾部全部摘除");
 
         // 部分成功:取成功者最小值,只摘尾部
-        let (final_k, drops) = plan_convergence(4, &[8, 2]);
+        let (final_k, drops) = plan_convergence_diag(4, &[8, 2]);
         assert_eq!(final_k, 2);
         assert_eq!(drops, vec![2, 3]);
     }
@@ -2039,7 +2050,7 @@ mod sizing_tests {
     // 服务端 cap 大于 initial_k:不补拨(红线 3),drop_set 为空。
     #[test]
     fn larger_server_cap_never_adds_carriers() {
-        let (final_k, drops) = plan_convergence(2, &[8]);
+        let (final_k, drops) = plan_convergence_diag(2, &[8]);
         assert_eq!(final_k, 2, "不因 max_carriers 变大而补拨");
         assert!(drops.is_empty());
     }
@@ -3241,9 +3252,9 @@ mod carrier_attach_tests {
     #[test]
     fn server_caps_order_does_not_matter() {
         // 同一组 cap,不同到达顺序
-        let a = plan_convergence(4, &[8, 2, 5]);
-        let b = plan_convergence(4, &[2, 5, 8]);
-        let c = plan_convergence(4, &[5, 8, 2]);
+        let a = plan_convergence_diag(4, &[8, 2, 5]);
+        let b = plan_convergence_diag(4, &[2, 5, 8]);
+        let c = plan_convergence_diag(4, &[5, 8, 2]);
         assert_eq!(a, b, "server_caps 顺序不得影响收敛结果");
         assert_eq!(a, c, "server_caps 顺序不得影响收敛结果");
         assert_eq!(a.0, 2, "收敛到最小 cap");
@@ -3298,7 +3309,7 @@ mod carrier_attach_tests {
     fn partial_failure_detaches_correct_identity() {
         // 成员表:控制载体 100 + 两个附加 200、300;200 报到失败
         let members = vec![100u64, 200, 300];
-        let (final_k, _) = plan_convergence(3, &[8]);
+        let (final_k, _) = plan_convergence_diag(3, &[8]);
         assert_eq!(final_k, 3, "服务端允许 3,不应收敛");
         let detach = plan_detach_set(&members, final_k, &[200], 100);
         assert_eq!(detach, vec![200], "只摘除失败身份,不得误摘健康的 300");
@@ -4056,9 +4067,6 @@ mod dispatch_frame_try_send_tests {
             "前置:先占掉唯一名额"
         );
 
-        let (_c, _s) = tokio::io::duplex(64);
-        let mut control: rh_transport::BoxedIo = Box::new(_c);
-        let mut buf = bytes::BytesMut::new();
         let sd = CancellationToken::new();
         let payload = serde_json::to_vec(&Ping {
             ts_ms: 12345,
@@ -4069,14 +4077,7 @@ mod dispatch_frame_try_send_tests {
         let t0 = std::time::Instant::now();
         let r = tokio::time::timeout(
             Duration::from_millis(500),
-            dispatch_frame(
-                &sess,
-                &mut control,
-                &mut buf,
-                FrameType::PING,
-                &payload,
-                &sd,
-            ),
+            dispatch_frame(&sess, FrameType::PING, &payload, &sd),
         )
         .await;
         let elapsed = t0.elapsed();
@@ -4093,9 +4094,6 @@ mod dispatch_frame_try_send_tests {
     #[tokio::test]
     async fn ping_reply_delivered_when_space() {
         let (sess, mut rx) = session_with_capacity(8);
-        let (_c, _s) = tokio::io::duplex(64);
-        let mut control: rh_transport::BoxedIo = Box::new(_c);
-        let mut buf = bytes::BytesMut::new();
         let sd = CancellationToken::new();
         let payload = serde_json::to_vec(&Ping {
             ts_ms: 999,
@@ -4103,16 +4101,9 @@ mod dispatch_frame_try_send_tests {
         })
         .unwrap();
 
-        dispatch_frame(
-            &sess,
-            &mut control,
-            &mut buf,
-            FrameType::PING,
-            &payload,
-            &sd,
-        )
-        .await
-        .unwrap();
+        dispatch_frame(&sess, FrameType::PING, &payload, &sd)
+            .await
+            .unwrap();
 
         assert!(rx.try_recv().is_ok(), "有空位时 PING 应答必须入队");
     }
@@ -4188,9 +4179,6 @@ mod ack_bounded_send_tests {
             }))
         );
 
-        let (_c, _s) = tokio::io::duplex(64);
-        let mut control: rh_transport::BoxedIo = Box::new(_c);
-        let mut buf = bytes::BytesMut::new();
         let sd = CancellationToken::new();
         let payload = serde_json::to_vec(&ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
             revision: 1,
@@ -4201,14 +4189,7 @@ mod ack_bounded_send_tests {
         let t0 = std::time::Instant::now();
         let r = tokio::time::timeout(
             Duration::from_secs(3),
-            dispatch_frame(
-                &sess,
-                &mut control,
-                &mut buf,
-                FrameType::SERVICE_UPDATE,
-                &payload,
-                &sd,
-            ),
+            dispatch_frame(&sess, FrameType::SERVICE_UPDATE, &payload, &sd),
         )
         .await;
         let elapsed = t0.elapsed();

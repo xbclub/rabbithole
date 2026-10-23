@@ -62,7 +62,6 @@ pub struct Session {
     /// 下发队列(控制消息,容量受限)。
     pub queue_tx: mpsc::Sender<ServerMessage>,
     /// 已入队未确认的 revision → 时间(确认超时管理)。
-    pub unconfirmed: Mutex<BTreeMap<u64, Instant>>,
     /// 客户端已应用到的 revision(APPLY_RESULT 上报)。
     pub applied_revision: AtomicU64,
     /// 上次响应 `SyncRequest` 的时刻(限速用)。
@@ -104,7 +103,6 @@ impl Session {
             epoch,
             cancel: cancel.clone(),
             queue_tx,
-            unconfirmed: Mutex::new(BTreeMap::new()),
             applied_revision: AtomicU64::new(0),
             last_sync_request: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
@@ -165,26 +163,23 @@ impl Session {
     pub async fn invalidate_proxy_requests(&self, proxy_id: u64) {
         // 同 add_pending_request:被失效的条目也要跑回收钩子,否则规则重建/
         // 删除时在途 CREATE 的 inflight 永久泄漏。
+        //
+        // 持锁期间原地 `extract_if` 摘除(与 add_pending_request 同型):
+        // 修前 `mem::take` + 整表搬进新 BTreeMap 再逐条重插,锁窗口与
+        // 表大小成正比,批量删除/禁用 N 条规则时是 O(N·P log P)。
         let removed: Vec<PendingRequest> = {
             let mut m = self.pending_requests.lock().await;
-            let mut keep = std::collections::BTreeMap::new();
-            let mut drop_list = Vec::new();
-            for (k, v) in std::mem::take(&mut *m) {
-                let hit = matches!(
+            m.extract_if(.., |_, v| {
+                matches!(
                     v.purpose,
                     crate::session::RequestPurpose::UdpChannel { proxy_id: id }
                         | crate::session::RequestPurpose::RelayProxy { proxy_id: id, .. }
                         | crate::session::RequestPurpose::TcpPool { proxy_id: id }
                     if id == proxy_id
-                );
-                if hit {
-                    drop_list.push(v);
-                } else {
-                    keep.insert(k, v);
-                }
-            }
-            *m = keep;
-            drop_list
+                )
+            })
+            .map(|(_, v)| v)
+            .collect()
         };
         for mut p in removed {
             if let Some(f) = p.on_expire.take() {
@@ -217,34 +212,23 @@ impl Session {
         Some(req)
     }
 
-    pub async fn mark_unconfirmed(&self, revision: u64) {
-        self.unconfirmed
-            .lock()
-            .await
-            .insert(revision, Instant::now());
-    }
-
-    /// 确认处理:清除 ≤ revision 的等待;返回仍在等待的最小 revision。
-    pub async fn confirm_applied(&self, revision: u64, ok: bool) -> Option<u64> {
+    /// 确认处理:单调推进已应用版本。
+    ///
+    /// C5:修前还有一张 `unconfirmed` 表(mark_unconfirmed 写入、这里
+    /// retain),但它的返回值「仍在等待的最小 revision」在两个调用点
+    /// 都被丢弃,也没有任何后台任务消费(无超时重发)—— 每次 ACK 的
+    /// retain(O(P))+ insert 对任何行为都没有影响,纯白付,已删除。
+    pub async fn confirm_applied(&self, revision: u64, ok: bool) {
         if ok {
             let prev = self.applied_revision.load(Ordering::Relaxed);
             if revision > prev {
                 self.applied_revision.store(revision, Ordering::Relaxed);
             }
-            let mut m = self.unconfirmed.lock().await;
-            m.retain(|&r, _| r > revision);
-            m.keys().next().copied()
-        } else {
-            self.unconfirmed.lock().await.keys().next().copied()
         }
     }
 
     pub fn applied(&self) -> u64 {
         self.applied_revision.load(Ordering::Relaxed)
-    }
-
-    pub async fn send(&self, msg: ServerMessage) -> bool {
-        self.queue_tx.send(msg).await.is_ok()
     }
 
     /// 有界发送,**专供控制读循环的内联路径**。

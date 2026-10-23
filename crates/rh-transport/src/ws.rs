@@ -201,7 +201,10 @@ pin_project_lite::pin_project! {
 struct WsIo {
     #[pin]
     ws: tokio_tungstenite::WebSocketStream<BoxedIo>,
-    rd_buf: Vec<u8>,
+    // B2:tungstenite 0.30 的 Message::Binary 载荷就是 `Bytes`,
+    // 直接持有共享引用(修前 `data.to_vec()` 多拷一次),消费完置空
+    // 即释放;不再需要"容量 > 64KiB 丢弃缓冲"特判。
+    rd_buf: bytes::Bytes,
     rd_pos: usize,
     eof: bool,
     // start_send 已接受一条消息、尚未 flush 完毕。
@@ -216,7 +219,7 @@ impl WsIo {
     fn new(ws: tokio_tungstenite::WebSocketStream<BoxedIo>) -> Self {
         Self {
             ws,
-            rd_buf: Vec::new(),
+            rd_buf: bytes::Bytes::new(),
             rd_pos: 0,
             eof: false,
             send_queued: false,
@@ -238,14 +241,9 @@ impl AsyncRead for WsIo {
                 buf.put_slice(&avail[..n]);
                 *this.rd_pos += n;
                 if *this.rd_pos == this.rd_buf.len() {
-                    // B16:大帧消费后归还容量。`clear()` 只置长度不释放,
-                    // 一条 1MiB 帧会让该连接长期占着 1MiB;超过 64KiB 的
-                    // 缓冲直接丢弃,下次按实际帧大小重新分配。
-                    if this.rd_buf.capacity() > 64 * 1024 {
-                        *this.rd_buf = Vec::new();
-                    } else {
-                        this.rd_buf.clear();
-                    }
+                    // B2:Bytes 引用计数,置空即释放(大帧不再长期占内存,
+                    // 也不需要 Vec 时代的容量特判)。
+                    *this.rd_buf = bytes::Bytes::new();
                     *this.rd_pos = 0;
                 }
                 return Poll::Ready(Ok(()));
@@ -259,7 +257,8 @@ impl AsyncRead for WsIo {
                     return Poll::Ready(Ok(()));
                 }
                 Some(Ok(Message::Binary(data))) => {
-                    *this.rd_buf = data.to_vec();
+                    // B2:零拷贝交付(载荷本身是 Bytes,修前 to_vec 整帧再拷)
+                    *this.rd_buf = data;
                     *this.rd_pos = 0;
                 }
                 Some(Ok(Message::Close(_))) => {
@@ -301,6 +300,48 @@ impl AsyncWrite for WsIo {
             Err(e) => Poll::Ready(Err(io::Error::other(format!("ws flush: {e}")))),
         }
     }
+    /// B2:向量写透传。修前未覆盖,落到 tokio 默认实现——只取第一个
+    /// 非空 slice;YamuxCarrier 的批量写(poll_writev,≤33 段)在
+    /// ws/wss 载体上整批失效,每个 yamux 帧退化成 ≥2 条 WS 消息
+    /// (12B 头一条、帧体一条,各带 WS 帧头与一次 flush)。与
+    /// PrependedIo 的同型缺陷修复(lib.rs 回归测试)对齐。
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let mut this = self.project();
+        let total: usize = bufs.iter().map(|b| b.len()).sum();
+        if !*this.send_queued {
+            let mut payload = bytes::BytesMut::with_capacity(total);
+            for b in bufs {
+                payload.extend_from_slice(b);
+            }
+            let msg = Message::Binary(payload.freeze());
+            match futures::ready!(this.ws.as_mut().poll_ready(cx)) {
+                Ok(()) => match this.ws.as_mut().start_send(msg) {
+                    // start_send 返回 Ok 即消息已被 tungstenite 接受并入队,
+                    // 绝不重发(与标量写同契约)
+                    Ok(()) => *this.send_queued = true,
+                    Err(e) => return Poll::Ready(Err(io::Error::other(format!("ws: {e}")))),
+                },
+                Err(e) => return Poll::Ready(Err(io::Error::other(format!("ws: {e}")))),
+            }
+        }
+        match futures::ready!(this.ws.as_mut().poll_flush(cx)) {
+            Ok(()) => {
+                *this.send_queued = false;
+                Poll::Ready(Ok(total))
+            }
+            Err(e) => Poll::Ready(Err(io::Error::other(format!("ws flush: {e}")))),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        // 多段在 poll_write_vectored 里拼成一条消息,能力位如实上报
+        true
+    }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut this = self.project();
         Poll::Ready(
@@ -418,6 +459,66 @@ mod tests {
         );
         // 8KiB 恰好一份(重复入队会使字节数翻倍)
         assert_eq!(joined.len(), 9 * 1024);
+    }
+
+    /// B2(红→绿):向量写透传。修前未实现 poll_write_vectored,落到
+    /// tokio 默认实现只取第一个非空 slice —— YamuxCarrier 的批量写在
+    /// ws/wss 载体上整批失效。断言:能力位为 true;一次双段向量写
+    /// 在线上恰好一条 binary 帧,载荷为两段拼接(与 PrependedIo 的
+    /// 同型回归测试对齐)。
+    #[tokio::test]
+    async fn ws_vectored_write_single_frame() {
+        use std::time::Duration;
+        let (a, b) = tokio::io::duplex(64);
+        let ws = tokio_tungstenite::WebSocketStream::from_partially_read(
+            Box::new(a) as BoxedIo,
+            vec![],
+            Role::Client,
+            None,
+        )
+        .await;
+        let mut c = WsIo::new(ws);
+        assert!(c.is_write_vectored(), "能力位必须如实上报(B2)");
+
+        let reader = tokio::spawn(async move {
+            let mut b = b;
+            let mut out = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(5), b.read_to_end(&mut out)).await;
+            out
+        });
+
+        let header = [0u8; 12];
+        let body = vec![7u8; 4096];
+        // poll_fn 提供真实任务 waker:首次 poll_ready 可能 Pending
+        //(sink 需先注册对 duplex 的可写兴趣),就绪后自动重试。
+        let n = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                std::pin::Pin::new(&mut c).poll_write_vectored(
+                    cx,
+                    &[std::io::IoSlice::new(&header), std::io::IoSlice::new(&body)],
+                )
+            }),
+        )
+        .await
+        .expect("deadline: vectored write")
+        .expect("vectored write");
+
+        drop(c);
+        let wire = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("deadline: reader join")
+            .unwrap();
+        let frames = parse_client_frames(&wire);
+        assert_eq!(n, header.len() + body.len(), "全部段字节应一次带走");
+        assert_eq!(
+            frames.len(),
+            1,
+            "双段向量写必须合并为一条 WS 消息(修前只写首段,B2)"
+        );
+        let mut want = header.to_vec();
+        want.extend_from_slice(&body);
+        assert_eq!(frames.concat(), want);
     }
 
     /// R5 不变量锁(修前即绿):手动 poll 级观察——poll_write 在 flush

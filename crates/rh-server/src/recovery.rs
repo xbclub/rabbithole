@@ -333,8 +333,8 @@ mod recovery_tests {
     /// | 无在线会话 | 58.29ms | 58.55ms |
     /// | 有在线会话 | 58.21ms | 71.80ms |
     ///
-    /// 原因:`spawn_runtime` 里的 await 点(`get_client`、`send_bounded`、
-    /// `mark_unconfirmed`)在 `:memory:` SQLite + 有消费者的大队列下**几乎
+    /// 原因:`spawn_runtime` 里的 await 点(`get_client`、`send_bounded`)
+    /// 在 `:memory:` SQLite + 有消费者的大队列下**几乎
     /// 不产生等待**,于是并发只剩调度开销。真实部署的收益来自:
     ///   1. 文件型 SQLite 的读延迟(每次 `get_client` 是真实磁盘/页缓存往返);
     ///   2. `send_bounded` 在客户端读得慢时真的会 park;

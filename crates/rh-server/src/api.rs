@@ -175,7 +175,7 @@ async fn login(
             .await;
         return err(1001, "用户名或密码错误");
     }
-    let ttl = chrono_hours(state.cfg.web.jwt_ttl_hours);
+    let ttl = state.cfg.web.jwt_ttl_hours;
     // B11:令牌携带签发时的 pwd_version,登出/改密递增后旧令牌立即 401。
     let pv = state.db.user_pwd_version(&req.username).await.unwrap_or(0);
     let token = match mint_jwt(&state, &req.username, ttl, pv).await {
@@ -249,10 +249,6 @@ async fn change_password(
         .emit("info", "auth", &format!("密码已修改:{}", user))
         .await;
     ok(json!({ "relogin": true }))
-}
-
-fn chrono_hours(h: u64) -> u64 {
-    h
 }
 
 fn verify_password(plain: &str, hash: &str) -> bool {
@@ -2467,6 +2463,8 @@ async fn put_server_config(
         if let Some(p) = req.ports {
             if let Some(list) = p.allow_ports {
                 hot.allow_ports = list;
+                // B7:解析缓存随白名单同步重建(不得只改 Vec 不改缓存)
+                hot.reparse_allow_list();
                 applied.push("ports.allow_ports".into());
             }
             if let Some(n) = p.max_services_per_client {
