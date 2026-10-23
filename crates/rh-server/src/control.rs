@@ -20,6 +20,8 @@ use tracing::{debug, info, warn};
 /// 绑定签发连接:仅在签发连接上被消费。
 pub struct ChallengeTable {
     inner: Mutex<HashMap<String, ChallengeEntry>>,
+    /// R5:retain 限频时刻(见 issue;修前每认证一次全表扫描)
+    last_sweep: std::sync::Mutex<Instant>,
 }
 
 /// 表容量上限:防止 连接→HELLO→收挑战→断开 的慢速积累耗尽内存。
@@ -59,6 +61,7 @@ impl ChallengeTable {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            last_sweep: std::sync::Mutex::new(Instant::now()),
         }
     }
 
@@ -66,9 +69,17 @@ impl ChallengeTable {
         let nonce =
             uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string();
         let mut g = self.inner.lock().await;
-        // 顺手清理过期项(定期的清扫兜底,见 sweeper)
+        // 顺手清理过期项(定期的清扫兜底,见 sweeper)。
+        // R5:retain 限频(≥1s 一次)—— 修前每次认证都在这把全局锁内
+        // O(n) 全表扫描(表 65536、TTL 30s,分布式预认证洪泛灌满后每个
+        // 新 HELLO 都扫 6 万项,合法认证在同把锁上排队)。限频后表上界
+        // = 30s 窗口 + 1s 新到,过期项最迟由 sweeper(30s 一轮)收走。
         let now = Instant::now();
-        g.retain(|_, e| e.expires > now);
+        let mut sweep = self.last_sweep.lock().unwrap();
+        if sweep.elapsed() >= Duration::from_secs(1) {
+            *sweep = now;
+            g.retain(|_, e| e.expires > now);
+        }
         // ★表满时淘汰"最旧的一条",**不是**拒绝新挑战。
         //
         // 修前 `return String::new()`:空 nonce 让后续 consume 必然失败,

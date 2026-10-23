@@ -228,13 +228,31 @@ pub async fn get_channel(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Optio
     let (tx, rx) = tokio::sync::oneshot::channel::<BoxedIo>();
     let waiter_id = pool.waiter_seq.fetch_add(1, Ordering::Relaxed);
     pool.waiters.lock().await.push((waiter_id, tx));
-    // 签发
+    // 签发。R5:等待路径必须带过期回收钩子 —— 与 tcp_refill 同型
+    //(session.rs 注释:「客户端在线但 10s 不回报通道时,inflight 永久 +1
+    // → 池慢性饿死」)。修前这里用无钩子的 issue_create_channel,pending
+    // 过期被清扫时无人递减,池容量永久少一格;该钩子补上 inflight 归还
+    // 与 waiter 摘除。签发失败路径语义不变(自己归还)。
     pool.inflight.fetch_add(1, Ordering::Relaxed);
+    let pool_for_expire = pool.clone();
+    let wid_for_expire = waiter_id;
+    let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let _ = pool_for_expire
+            .inflight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+        let pool = pool_for_expire;
+        tokio::spawn(async move {
+            pool.remove_waiter(wid_for_expire).await;
+        });
+    });
     let issued = state
-        .issue_create_channel(
+        .issue_create_channel_with(
             &sess,
             ChannelEntity::Proxy { proxy_id: rt.id },
             RequestPurpose::TcpPool { proxy_id: rt.id },
+            Some(hook),
         )
         .await
         .is_some();

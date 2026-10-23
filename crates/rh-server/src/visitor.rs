@@ -51,6 +51,10 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
             else {
                 return;
             };
+            // R5:目标侧同样先捕获 gen(pspec 属目标客户端;R4 只做了
+            // 属主半边 —— 「读 pspec(旧)→ 目标 bump → 读 gen_target(新)」
+            // 仍可把旧 pspec 钉进新 gen)
+            let gen0_target = state.cfg_gen(&v_target_client);
             let proxies = state
                 .db
                 .list_proxies(Some(&v_target_client))
@@ -73,7 +77,7 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
                 vspec,
                 pspec,
             });
-            if gen_owner == gen0_owner {
+            if gen_owner == gen0_owner && gen_target == gen0_target {
                 state.visitor_cache.insert(cache_key.clone(), entry.clone());
             }
             entry
