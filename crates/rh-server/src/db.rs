@@ -481,6 +481,19 @@ impl Db {
         Ok(())
     }
 
+    /// R3:全部规则的 (id, client_id) 轻量列表(batch_services 的属主
+    /// 映射;不做 spec JSON 反序列化 —— 修前 list_proxies(None) 全表
+    /// 解析只为取两列)。
+    pub async fn list_proxy_owners(&self) -> Result<Vec<(i64, String)>> {
+        let rows = sqlx::query("SELECT id, client_id FROM proxies")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<i64, _>(0), r.get::<String, _>(1)))
+            .collect())
+    }
+
     /// R1:全部规则的 (id, port_auto) 轻量列表(启动恢复的端口重分配
     /// 判定;不做 spec JSON 反序列化)。
     pub async fn list_port_auto(&self) -> Result<Vec<(i64, bool)>> {

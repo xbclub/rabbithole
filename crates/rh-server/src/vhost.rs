@@ -348,7 +348,10 @@ async fn handle_http_request(
             domain_hit = Some(r);
         }
         if r.locations.is_empty() {
-            if best.map(|(_, l)| l == 0).unwrap_or(true) && best.is_none() {
+            // R3:修前 `best.map(|(_, l)| l == 0).unwrap_or(true) && best.is_none()`
+            // 左操作数恒被右操作数短路/否决 —— 条件等价于 best.is_none()
+            // (best 为 Some 时 && 右项必 false),死代码已删,行为不变。
+            if best.is_none() {
                 best = Some((r, 0));
             }
             continue;

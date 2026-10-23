@@ -165,9 +165,10 @@ pub struct CertEntry {
 
 impl CertEntry {
     /// 域名匹配:精确或单层通配(*.example.com 覆盖 sub.example.com)。
+    /// R3:调用方(parse_sni)已统一返回小写,移除每连接每证书一次的
+    /// to_lowercase 分配;非小写输入由调用方保证。
     pub fn matches(&self, sni: &str) -> bool {
-        let sni = sni.to_lowercase();
-        self.domains.iter().any(|d| d == &sni)
+        self.domains.iter().any(|d| d == sni)
             || self.wildcard_suffixes.iter().any(|suffix| {
                 sni.ends_with(suffix.as_str())
                     && sni.len() > suffix.len()
@@ -373,8 +374,20 @@ impl AppState {
                     flow_limit: c.flow_limit,
                 });
             }
-            // 清理已删客户端的残留条目
+            // 清理已删客户端的残留条目。
+            // R3(B2):client_usage 之外,三个同生命周期的 per-client map
+            // 此前漏清 —— runtimes_by_client 残留空 Vec、client_locks 与
+            // client_cfg_gen 只增不减,反复建删客户端时慢性累积。
             self.client_usage.retain(|k, _| live.contains(k.as_str()));
+            self.proxies
+                .runtimes_by_client
+                .retain(|k, _| live.contains(k.as_str()));
+            self.client_locks.retain(|k, _| live.contains(k.as_str()));
+            self.client_cfg_gen.retain(|k, _| live.contains(k.as_str()));
+            // visitor_cache 一并清:同 id 客户端删除重建后 gen 从 0 重新
+            // 起算,旧条目(gen=0 时缓存的)可能误命中。
+            self.visitor_cache
+                .retain(|(cid, _), _| live.contains(cid.as_str()));
         }
     }
 

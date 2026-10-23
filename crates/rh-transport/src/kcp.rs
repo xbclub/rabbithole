@@ -1255,12 +1255,14 @@ impl SessionGate {
             return false;
         }
         e.0 -= 1.0;
-        // 惰性淘汰:超过 4096 个 IP 时清掉令牌满(即长期未用)的条目,
-        // 避免随机源地址洪泛把 per_ip 表撑成无界内存。
+        // 惰性淘汰(R3):纯时间口径 —— 超过 4096 个 IP 时清掉闲置 >60s
+        // 的条目。修前谓词 `tokens < cap || last < 1s` 恰好**保留**所有
+        // 一次性源(新条目立即扣 1 令牌,恒 tokens=cap−1<cap,永不淘汰),
+        // 与"防随机源地址洪泛撑爆表"的目标正好相反:1M 伪造源 ≈70MB
+        // 常驻,且表一旦超过 4096 此后每次 admit 都在锁内 O(n) 全表扫描。
+        // 时间口径下洪泛表上限 = 60s 窗口内的唯一源数,自然有界。
         if g.len() > 4096 {
-            g.retain(|_, (tokens, last)| {
-                *tokens < cap || now.duration_since(*last) < Duration::from_secs(1)
-            });
+            g.retain(|_, (_, last)| now.duration_since(*last) < Duration::from_secs(60));
         }
         self.live.fetch_add(1, Ordering::Relaxed);
         true

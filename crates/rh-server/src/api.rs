@@ -1675,8 +1675,10 @@ async fn batch_services(
         return ok(results.into_iter().flatten().collect::<Vec<_>>());
     }
     // 一次全表查询建立 id -> client_id 映射(而不是逐 id 查一次)。
-    let owner: std::collections::HashMap<i64, String> = match state.db.list_proxies(None).await {
-        Ok(rows) => rows.into_iter().map(|(id, cid, _)| (id, cid)).collect(),
+    // R3:轻量两列投影(修前 list_proxies 把每行 spec JSON 全量反序列化
+    // 只为取两列)。
+    let owner: std::collections::HashMap<i64, String> = match state.db.list_proxy_owners().await {
+        Ok(rows) => rows.into_iter().collect(),
         Err(e) => return err(500, &format!("{e}")),
     };
     // 按 client_id 分组,组内保持 ids 的原顺序;同时记住每项的原下标。

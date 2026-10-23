@@ -15,14 +15,24 @@ use tracing::{debug, info, warn};
 
 /// 会话建立:重置确认、状态推进、预热。
 pub async fn on_session_up(state: &Arc<AppState>, sess: &Arc<Session>) {
-    let proxies = match state.db.list_proxies(Some(&sess.client_id)).await {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    for (_id, _cid, spec) in proxies {
-        let Some(rt) = state.proxies.get(spec.id) else {
-            continue;
+    // R3(B1):数据源改 by-client 索引(on_apply_result B9 同款:旧代码全量
+    // 读 DB + 逐行 spec 反序列化,循环内却只消费 spec.id —— 每次连接建立/
+    // 断开都在付 N 行 spec blob 传输与解析,重连风暴下翻倍)。
+    let rts: Vec<Arc<crate::state::ProxyRuntime>> =
+        match state.proxies.runtimes_by_client.get(&sess.client_id) {
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| state.proxies.runtimes.get(id).map(|e| e.value().clone()))
+                .collect(),
+            None => state
+                .proxies
+                .runtimes
+                .iter()
+                .filter(|e| e.value().client_id == sess.client_id)
+                .map(|e| e.value().clone())
+                .collect(),
         };
+    for rt in rts {
         // confirmed 重置(会话替换/重连)
         rt.confirmed_revision.store(0, Ordering::Relaxed);
         let (st, _r) = rt.snapshot_state().await;
@@ -46,10 +56,22 @@ pub async fn on_session_up(state: &Arc<AppState>, sess: &Arc<Session>) {
 pub async fn on_session_down(state: &Arc<AppState>, sess: &Arc<Session>) {
     let lock = state.serial_lock(&sess.client_id);
     let _g = lock.lock().await;
-    let proxies = match state.db.list_proxies(Some(&sess.client_id)).await {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+    // R3(B1):同 on_session_up —— 索引取代全量 DB 读(此处还在
+    // serial_lock 持有窗口内,DB 读会延长串行域临界区)。
+    let rts: Vec<Arc<crate::state::ProxyRuntime>> =
+        match state.proxies.runtimes_by_client.get(&sess.client_id) {
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| state.proxies.runtimes.get(id).map(|e| e.value().clone()))
+                .collect(),
+            None => state
+                .proxies
+                .runtimes
+                .iter()
+                .filter(|e| e.value().client_id == sess.client_id)
+                .map(|e| e.value().clone())
+                .collect(),
+        };
     // 会话死亡:该客户端全部 SUDP 常驻中继槽位一并清理
     if let Ok(visitors) = state.db.list_visitors(Some(&sess.client_id)).await {
         let mut relays = state.udp_relays.lock().await;
@@ -66,10 +88,7 @@ pub async fn on_session_down(state: &Arc<AppState>, sess: &Arc<Session>) {
     if replaced {
         return;
     }
-    for (_id, _cid, spec) in proxies {
-        let Some(rt) = state.proxies.get(spec.id) else {
-            continue;
-        };
+    for rt in rts {
         rt.confirmed_revision.store(0, Ordering::Relaxed);
         // C6c:IntGaugeVec 子项按 proxy_id 回收(修前只增不减,长跑 +
         // 频繁建删规则时 /metrics 输出与内存无界增长)。
