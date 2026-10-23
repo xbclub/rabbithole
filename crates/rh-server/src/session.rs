@@ -128,20 +128,29 @@ impl Session {
         // 已 `inflight.fetch_add(1)`,只有交付或 send 失败才减。于是"客户端
         // 在线但 10s 不回报通道"会让 inflight 永久 +1,池慢性饿死。
         //
-        // 锁内只做摘除,回调在锁外执行(钩子可能 await 或持别的锁)。
+        // 锁内只做摘除 + 插入,回调在锁外执行(钩子可能 await 或持别的锁)。
+        //
+        // ★清扫改为原地摘除,不再 `mem::take` + 重建整张表。
+        //
+        // 修前每登记一个请求都要把整张在途表搬进新 BTreeMap(每个节点重新
+        // 分配);`tcp_refill` 逐条签发时是 O(P) 一次,预热 N 条就是 O(N·P)。
+        //
+        // 用 `BTreeMap::extract_if` 一次遍历就把过期项**连所有权一起**移出,
+        // 不重建表、不二次查找,复杂度 O(P)。`retain` 不行 —— 它的闭包只拿
+        // `&mut V`,移不出所有权,再 `remove` 一次是白跑一趟(O(log P))。
+        // 两次加锁合并成一次。
+        //
+        // 这里刻意**没有**加"仅当 len 超过阈值才清扫"的优化:清扫是唯一
+        // 保证过期条目的回收钩子被调用的地方(交付路径只处理成功的),
+        // 跳过一次就多饿死一个池名额。
         let expired: Vec<PendingRequest> = {
             let mut m = self.pending_requests.lock().await;
             let now = Instant::now();
-            let mut keep = std::collections::BTreeMap::new();
-            let mut drop_list = Vec::new();
-            for (k, v) in std::mem::take(&mut *m) {
-                if v.expires > now {
-                    keep.insert(k, v);
-                } else {
-                    drop_list.push(v);
-                }
-            }
-            *m = keep;
+            let drop_list: Vec<PendingRequest> = m
+                .extract_if(.., |_, v| v.expires <= now)
+                .map(|(_, v)| v)
+                .collect();
+            m.insert(id, req);
             drop_list
         };
         for mut p in expired {
@@ -149,8 +158,6 @@ impl Session {
                 f();
             }
         }
-        let mut m = self.pending_requests.lock().await;
-        m.insert(id, req);
     }
 
     /// 一次性消费 request_id;迟到/过期/未知一律 None。
@@ -780,5 +787,157 @@ mod bounded_send_tests {
             .await;
         assert!(ok, "队列有空间时不得失败");
         let _ = consumer.await;
+    }
+}
+
+#[cfg(test)]
+mod pending_request_cleanup_tests {
+    //! #9 回归:`add_pending_request` 的过期清扫改成 `BTreeMap::retain` 后,
+    //! 语义必须完全不变 —— 过期项被摘除、钩子被调用、未过期项保留。
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn session() -> Arc<Session> {
+        let (tx, _rx) = mpsc::channel(8);
+        Session::new("c".into(), "s".into(), 1, CancellationToken::new(), tx)
+    }
+
+    fn req(expires_in: std::time::Duration, counter: Arc<AtomicUsize>) -> PendingRequest {
+        PendingRequest {
+            expires: Instant::now() + expires_in,
+            purpose: RequestPurpose::TcpPool { proxy_id: 1 },
+            on_expire: Some(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })),
+        }
+    }
+
+    /// 过期项的钩子必须被调用,条目必须被摘除。
+    #[tokio::test]
+    async fn expired_entries_removed_and_hook_called() {
+        let sess = session();
+        let hit = Arc::new(AtomicUsize::new(0));
+        // 先塞一条已经过期的
+        sess.pending_requests.lock().await.insert(
+            1,
+            PendingRequest {
+                expires: Instant::now() - std::time::Duration::from_secs(1),
+                purpose: RequestPurpose::TcpPool { proxy_id: 1 },
+                on_expire: Some({
+                    let hit = hit.clone();
+                    Box::new(move || {
+                        hit.fetch_add(1, Ordering::SeqCst);
+                    })
+                }),
+            },
+        );
+        // 再登记一条新的 → 触发清扫
+        sess.add_pending_request(2, req(std::time::Duration::from_secs(60), hit.clone()))
+            .await;
+
+        assert_eq!(hit.load(Ordering::SeqCst), 1, "过期项的钩子必须被调用一次");
+        let m = sess.pending_requests.lock().await;
+        assert!(!m.contains_key(&1), "过期项必须被摘除");
+        assert!(m.contains_key(&2), "新登记的条目必须在表内");
+    }
+
+    /// 未过期项不得被误删、钩子不得被误调。
+    #[tokio::test]
+    async fn live_entries_preserved() {
+        let sess = session();
+        let hit = Arc::new(AtomicUsize::new(0));
+        sess.add_pending_request(1, req(std::time::Duration::from_secs(60), hit.clone()))
+            .await;
+        sess.add_pending_request(2, req(std::time::Duration::from_secs(60), hit.clone()))
+            .await;
+        sess.add_pending_request(3, req(std::time::Duration::from_secs(60), hit.clone()))
+            .await;
+        assert_eq!(hit.load(Ordering::SeqCst), 0, "未过期项不得触发钩子");
+        let m = sess.pending_requests.lock().await;
+        assert_eq!(m.len(), 3, "全部未过期项都必须保留");
+    }
+
+    /// 多条过期项:每条的钩子都要被调用,一条不漏。
+    #[tokio::test]
+    async fn multiple_expired_all_hooks_called() {
+        let sess = session();
+        let hit = Arc::new(AtomicUsize::new(0));
+        for id in 1..=5u64 {
+            sess.pending_requests.lock().await.insert(
+                id,
+                PendingRequest {
+                    expires: Instant::now() - std::time::Duration::from_secs(1),
+                    purpose: RequestPurpose::TcpPool { proxy_id: 1 },
+                    on_expire: Some({
+                        let hit = hit.clone();
+                        Box::new(move || {
+                            hit.fetch_add(1, Ordering::SeqCst);
+                        })
+                    }),
+                },
+            );
+        }
+        sess.add_pending_request(9, req(std::time::Duration::from_secs(60), hit.clone()))
+            .await;
+        assert_eq!(hit.load(Ordering::SeqCst), 5, "5 条过期项必须各调一次钩子");
+        let m = sess.pending_requests.lock().await;
+        assert_eq!(m.len(), 1, "只剩新登记的那条");
+        assert!(m.contains_key(&9));
+    }
+
+    /// #9 基准(手动运行):在途表有 P 条时,单次登记耗时的变化。
+    ///
+    /// ```text
+    /// cargo test -p rh-server --release pending_request_cleanup_tests::bench -- --ignored --nocapture
+    /// ```
+    ///
+    /// 对比"重建整表"(修前 `mem::take` + 新 BTreeMap)与"原地摘除"
+    /// (修后 `extract_if`)。这里的耗时是**单次登记**在锁内的部分,
+    /// 不含钩子执行。
+    #[tokio::test]
+    #[ignore = "耗时基准,手动运行(--ignored --nocapture)"]
+    async fn bench_pending_cleanup_scaling() {
+        for p in [10usize, 100, 500, 1000] {
+            // 准备:表里 P 条未过期条目
+            let sess = session();
+            {
+                let mut m = sess.pending_requests.lock().await;
+                for id in 0..p as u64 {
+                    m.insert(
+                        id,
+                        PendingRequest {
+                            expires: Instant::now() + std::time::Duration::from_secs(600),
+                            purpose: RequestPurpose::TcpPool { proxy_id: 1 },
+                            on_expire: None,
+                        },
+                    );
+                }
+            }
+            let hit = Arc::new(AtomicUsize::new(0));
+            let reps = 200;
+            let t0 = std::time::Instant::now();
+            for i in 0..reps as u64 {
+                sess.add_pending_request(
+                    p as u64 + i,
+                    req(std::time::Duration::from_secs(600), hit.clone()),
+                )
+                .await;
+            }
+            let per = t0.elapsed() / reps;
+            println!("P={p:>5}  add_pending_request={per:>12?}/次");
+        }
+    }
+
+    /// 同一 id 重复登记:后写覆盖,不产生重复。
+    #[tokio::test]
+    async fn reinsert_same_id_overwrites() {
+        let sess = session();
+        let hit = Arc::new(AtomicUsize::new(0));
+        sess.add_pending_request(1, req(std::time::Duration::from_secs(60), hit.clone()))
+            .await;
+        sess.add_pending_request(1, req(std::time::Duration::from_secs(120), hit.clone()))
+            .await;
+        let m = sess.pending_requests.lock().await;
+        assert_eq!(m.len(), 1, "同一 id 不得重复");
     }
 }
