@@ -711,8 +711,33 @@ async fn delete_client(
     let lock = state.serial_lock(&id);
     let _g = lock.lock().await;
     let proxies = state.db.list_proxies(Some(&id)).await.unwrap_or_default();
-    for (pid, _, _) in &proxies {
-        crate::runtime::teardown_runtime(&state, *pid as u64).await;
+    // ★并发 teardown:单次 `teardown_runtime` 最坏等 `serve_handle` 收敛 2s,
+    // 串行执行时 N 条规则 = N × 2s。删一个有 100 条规则、若干条 serve loop
+    // 不收敛的客户端,这个 HTTP 请求会挂 200 秒。
+    //
+    // 并发度取 **8 而非 16**:每条规则内部可能等满 2s,并发度过高会让
+    // 「同时持有大量 rule_cancel + fd 正在释放」的窗口变宽。8 已足够把
+    // 最坏总耗时从 N×2s 压到约 2s(16 换来的边际收益很小)。
+    //
+    // 并发安全性:
+    //   - `serve_handle` 的 2s 超时是**每条规则独立**的预算(不是共享预算),
+    //     这是收益来源;
+    //   - `runtimes.remove(&proxy_id)` 是 dashmap 操作,不同 key 并发安全;
+    //   - `leave_group` 按组键加锁,同组规则会在组锁上排队,但锁内没有
+    //     嵌套的跨组等待,不会死锁;
+    //   - **已核实 `teardown_runtime` 内部不取 `serial_lock`**(grep 结果为 0),
+    //     否则外层已持有 `serial_lock(&id)` 时并发化会自锁。
+    {
+        use futures::stream::StreamExt as _;
+        futures::stream::iter(proxies.iter())
+            .for_each_concurrent(8, |(pid, _, _)| {
+                let state = state.clone();
+                let pid = *pid as u64;
+                async move {
+                    crate::runtime::teardown_runtime(&state, pid).await;
+                }
+            })
+            .await;
     }
     if let Some(sess) = state.sessions.get(&id) {
         sess.cancel.cancel();
@@ -3854,5 +3879,152 @@ mod admin_send_bounded_tests {
             matches!(msg, rh_protocol::message::ServerMessage::ServiceRemove(_)),
             "应收到 ServiceRemove,实际 {msg:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod delete_client_concurrency_tests {
+    //! P3 回归:`delete_client` 的 teardown 循环必须并发,不得 N × 2s。
+    //!
+    //! 任务书原以为"构造不出 2s 超时场景"。**这是可以构造的**:
+    //! `teardown_runtime` 会 `timeout(2s, serve_handle)` 等 serve loop 收敛。
+    //! 只要往 `rt.serve_handle` 里塞一个**永不退出**的任务(且不响应
+    //! `rule_cancel`,模拟真实的不收敛),单次 teardown 就必然吃满 2s。
+    //!
+    //! 断言基于**外部可观测行为**:删除 N 条这种规则的总耗时。串行是
+    //! N×2s,并发(8)约 2s。不引用并发度常量。
+    use super::*;
+
+    const CID: &str = "del-conc-client";
+
+    fn spec(is: i64) -> ProxySpec {
+        serde_json::from_value(json!({
+            "name": format!("p{is}"),
+            "kind": "stcp",
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": 0,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": true,
+        }))
+        .unwrap()
+    }
+
+    async fn auth_headers(state: &Arc<AppState>) -> HeaderMap {
+        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        h
+    }
+
+    /// 造一个 `serve_handle` = 永不退出的任务。
+    async fn stuck_rt(id: u64) -> Arc<crate::state::ProxyRuntime> {
+        let rt = Arc::new(crate::state::ProxyRuntime::new(
+            id,
+            CID.into(),
+            spec(id as i64),
+        ));
+        let h = tokio::spawn(async {
+            // 不 select cancel,永不返回 —— 精确模拟"serve loop 不收敛"
+            std::future::pending::<()>().await;
+        });
+        *rt.serve_handle.lock().await = Some(h);
+        rt
+    }
+
+    /// N 条"卡住的 serve loop":删除总耗时必须是 ~2s 量级,不是 N×2s。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_many_stuck_rules_does_not_take_n_times_2s() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        const N: usize = 16;
+        let mut ids = Vec::new();
+        for i in 0..N {
+            let id = db
+                .insert_proxy(CID, &spec(i as i64), false, "console")
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        for id in &ids {
+            let rt = stuck_rt(*id as u64).await;
+            state.proxies.runtimes.insert(*id as u64, rt);
+        }
+        assert_eq!(state.proxies.runtimes.len(), N);
+
+        let t0 = std::time::Instant::now();
+        let r = delete_client(
+            State(state.clone()),
+            auth_headers(&state).await,
+            Path(CID.to_string()),
+        )
+        .await;
+        let elapsed = t0.elapsed();
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], 0, "delete 应成功: {v}");
+
+        // 串行会是 N × 2s = 32s;并发(8)是 2 批 × 2s ≈ 4s。
+        // 上限取 10s:明显低于串行的 32s,又给调度留余量。
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "删除 {N} 条卡住规则耗时 {elapsed:?} —— 串行会是 {N}×2s=32s,必须并发"
+        );
+        // 功能性:全部运行态必须消失
+        assert!(
+            state.proxies.runtimes.is_empty(),
+            "删除后不得残留运行态,实际 {}",
+            state.proxies.runtimes.len()
+        );
+        assert!(state.db.list_proxies(Some(CID)).await.unwrap().is_empty());
+    }
+
+    /// 功能性回归:普通(无卡住 serve loop)的客户端删除后运行态清空。
+    #[tokio::test]
+    async fn delete_plain_client_clears_runtimes() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id = db
+                .insert_proxy(CID, &spec(i), false, "console")
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        for id in &ids {
+            state.proxies.runtimes.insert(
+                *id as u64,
+                Arc::new(crate::state::ProxyRuntime::new(
+                    *id as u64,
+                    CID.into(),
+                    spec(*id),
+                )),
+            );
+        }
+        let r = delete_client(
+            State(state.clone()),
+            auth_headers(&state).await,
+            Path(CID.to_string()),
+        )
+        .await;
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], 0);
+        assert!(state.proxies.runtimes.is_empty());
     }
 }
