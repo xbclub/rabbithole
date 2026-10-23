@@ -1446,10 +1446,13 @@ pub async fn group_pick_sticky_public(
 /// 这是 TCP 数据面的默认选路:同一组的连接依次落到不同成员,组内负载均摊。
 /// 带缓存语义的路径(vhost HTTP)不要用它 —— 见 [`group_pick_sticky`]。
 async fn group_pick(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Option<Arc<ProxyRuntime>> {
-    let key = {
-        let spec = rt.spec.read().await;
-        crate::state::ProxyManager::group_key(&spec)?
-    };
+    // R2:读缓存的派生组键(与 spec 同步维护;修前每次 spec.read().await
+    // + format! 派生 —— 分组规则每次 accept 都在付)
+    let key = rt
+        .group_key_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
     let g = state.proxies.groups.get(&key)?;
     let members = g.members.read().await.clone();
     if members.len() <= 1 {
@@ -1479,10 +1482,12 @@ async fn group_pick_sticky(
     rt: &Arc<ProxyRuntime>,
     affinity: &str,
 ) -> Option<Arc<ProxyRuntime>> {
-    let key = {
-        let spec = rt.spec.read().await;
-        crate::state::ProxyManager::group_key(&spec)?
-    };
+    // R2:同 group_pick —— 读缓存组键
+    let key = rt
+        .group_key_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
     let g = state.proxies.groups.get(&key)?;
     let members = g.members.read().await.clone();
     if members.len() <= 1 {

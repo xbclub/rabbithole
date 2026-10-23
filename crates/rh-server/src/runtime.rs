@@ -133,13 +133,22 @@ pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &App
     // 对每条 ServiceUpdate 回一个 ApplyResult,批量改 N 条规则就是 O(N²)
     // 的 DB 反序列化,且发生在控制读循环内联路径上。运行时集合与
     // 「DB 行 ∩ 已建运行时」等价(旧代码对无运行时的行 continue 跳过)。
-    let rts: Vec<Arc<crate::state::ProxyRuntime>> = state
-        .proxies
-        .runtimes
-        .iter()
-        .filter(|e| e.value().client_id == sess.client_id)
-        .map(|e| e.value().clone())
-        .collect();
+    // R2:优先走 by-client 索引(测试直接 insert 的运行态无索引条目,
+    // 回退全表扫描)。索引可能略滞后,取不到的 id 由 get 跳过。
+    let rts: Vec<Arc<crate::state::ProxyRuntime>> =
+        match state.proxies.runtimes_by_client.get(&sess.client_id) {
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| state.proxies.runtimes.get(id).map(|e| e.value().clone()))
+                .collect(),
+            None => state
+                .proxies
+                .runtimes
+                .iter()
+                .filter(|e| e.value().client_id == sess.client_id)
+                .map(|e| e.value().clone())
+                .collect(),
+        };
     for rt in rts {
         rt.confirmed_revision.store(r.revision, Ordering::Relaxed);
         let latest = rt.latest_revision.load(Ordering::Relaxed);
@@ -258,6 +267,13 @@ pub async fn spawn_runtime(
     ));
     rt.latest_revision.store(revision, Ordering::Relaxed);
     state.proxies.runtimes.insert(spec.id, rt.clone());
+    // R2:by-client 索引(spawn 生命周期点)
+    state
+        .proxies
+        .runtimes_by_client
+        .entry(client_id.to_string())
+        .or_default()
+        .push(spec.id);
     let session = state.sessions.get(client_id);
     let online = session.is_some();
     let enabled_client = state
@@ -353,7 +369,7 @@ pub async fn spawn_runtime(
             .send_bounded(
                 ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
                     revision,
-                    entity: SyncEntity::Proxy(Box::new(spec.clone())),
+                    entity: SyncEntity::Proxy(Box::new((*spec).clone())),
                 })),
                 CONTROL_SEND_TIMEOUT,
             )
@@ -465,7 +481,7 @@ async fn bind_error_retry(state: Arc<AppState>, rt: Arc<ProxyRuntime>) {
                     .send_bounded(
                         ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
                             revision: rev,
-                            entity: SyncEntity::Proxy(Box::new(spec.clone())),
+                            entity: SyncEntity::Proxy(Box::new((*spec).clone())),
                         })),
                         CONTROL_SEND_TIMEOUT,
                     )
@@ -489,6 +505,11 @@ async fn bind_error_retry(state: Arc<AppState>, rt: Arc<ProxyRuntime>) {
 /// 移除运行态(取消域级联)。
 pub async fn teardown_runtime(state: &Arc<AppState>, proxy_id: u64) {
     if let Some((_, rt)) = state.proxies.runtimes.remove(&proxy_id) {
+        // R2:by-client 索引摘除(teardown 生命周期点;按值清全部出现,
+        // 防御重复 push)
+        if let Some(mut e) = state.proxies.runtimes_by_client.get_mut(&rt.client_id) {
+            e.retain(|&id| id != proxy_id);
+        }
         // 组成员退出(组清空时取消共享监听)
         let key = crate::state::ProxyManager::group_key(&*rt.spec.read().await);
         if let Some(k) = key {
@@ -588,12 +609,12 @@ pub async fn publish_spec_in_place(
     spec: &ProxySpec,
     revision: u64,
 ) -> bool {
-    *rt.spec.write().await = spec.clone();
+    *rt.spec.write().await = std::sync::Arc::new(spec.clone());
     // 与 spec 同步维护无锁快路径标记(见 ProxyRuntime::has_group)
-    rt.has_group.store(
-        crate::state::ProxyManager::group_key(spec).is_some(),
-        Ordering::Relaxed,
-    );
+    // 与派生组键缓存(R2:group_pick* 直读)
+    let key = crate::state::ProxyManager::group_key(spec);
+    rt.has_group.store(key.is_some(), Ordering::Relaxed);
+    *rt.group_key_cache.lock().unwrap_or_else(|e| e.into_inner()) = key;
     rt.latest_revision.store(revision, Ordering::Relaxed);
     // 规则变更:上游连接池里的连接可能仍指向旧目标(改 target_host /
     // target_port 后复用旧连接会把请求转发到错误后端)。整池丢弃,
@@ -606,7 +627,7 @@ pub async fn publish_spec_in_place(
             .send_bounded(
                 ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
                     revision,
-                    entity: SyncEntity::Proxy(Box::new(spec.clone())),
+                    entity: SyncEntity::Proxy(Box::new((*spec).clone())),
                 })),
                 CONTROL_SEND_TIMEOUT,
             )

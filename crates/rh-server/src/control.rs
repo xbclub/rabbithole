@@ -1137,14 +1137,6 @@ impl QuotaIo {
         Box::new(Self { inner, sess })
     }
 
-    /// 内部流引用(splice 快路径:剥壳提取裸 TCP;限额语义随原对象生命周期)。
-    /// 唯一调用方是 data.rs 的 linux-only splice 分支,与
-    /// `CountedUserIo::inner_ref` 同款按平台裁剪,非 linux 平台不留死代码。
-    #[cfg(target_os = "linux")]
-    pub(crate) fn inner_ref(&self) -> &rh_transport::BoxedIo {
-        &self.inner
-    }
-
     /// 按所有权剥壳(goal-repair B1:仅 TcpPool→assign_forward 转发路径):
     /// 返回(内层流, 限额守卫)。守卫释放(或本体 Drop)即递减
     /// data_conn_count,与 QuotaIo::Drop 完全等价——限额占用期 = 转发期,

@@ -242,8 +242,10 @@ async fn change_password(
         Ok(true) => {}
         _ => return err(500, "更新失败"),
     }
-    // R1:update_user_password 内部递增 pwd_version,缓存失效
-    state.pwd_version_cache.remove(&user);
+    // R1/R2:update_user_password 内部递增 pwd_version,递增失效代
+    state
+        .pwd_version_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     // 轮换会话密钥:旧令牌(含本请求所用)全部失效
     *state.web_jwt_secret.lock().await = Some(uuid::Uuid::new_v4().simple().to_string());
     state
@@ -331,13 +333,22 @@ async fn require_auth(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Stri
             }
             // B11:令牌版本必须与用户当前 pwd_version 一致。登出/改密递增
             // 后,旧令牌在下一次请求即失效(无状态 JWT 的吊销点)。
-            // R1:读内存缓存(两处失效点在本文件 logout / change_password)。
+            // R1:读内存缓存(失效点在本文件 logout / change_password)。
+            // R2:epoch 守卫 —— miss 填充与失效交错时,以「填充前捕获的
+            // epoch」入条目;任何后续 bump 都令其失配,旧值不会钉死。
             let want = d.claims.get("pv").and_then(|v| v.as_i64()).unwrap_or(0);
-            let cur = match state.pwd_version_cache.get(&user) {
-                Some(v) => *v,
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            let epoch_now = state.pwd_version_epoch.load(AtomicOrdering::Acquire);
+            let cached = state
+                .pwd_version_cache
+                .get(&user)
+                .filter(|e| e.value().1 == epoch_now)
+                .map(|e| e.value().0);
+            let cur = match cached {
+                Some(v) => v,
                 None => {
                     let v = state.db.user_pwd_version(&user).await.unwrap_or(0);
-                    state.pwd_version_cache.insert(user.clone(), v);
+                    state.pwd_version_cache.insert(user.clone(), (v, epoch_now));
                     v
                 }
             };
@@ -357,8 +368,10 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             if let Err(e) = state.db.bump_user_pwd_version(&user).await {
                 tracing::warn!(error = %e, user = %user, "logout: bump pwd_version failed");
             }
-            // R1:pwd_version 已递增,缓存失效
-            state.pwd_version_cache.remove(&user);
+            // R1/R2:递增失效代,本代条目全部失配(含并发填充中的旧值)
+            state
+                .pwd_version_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             state
                 .events
                 .emit("info", "auth", &format!("已登出:{user}"))

@@ -60,8 +60,14 @@ pub struct AppState {
     pub visitor_cache: dashmap::DashMap<(String, u64), std::sync::Arc<VisitorResolution>>,
     /// R1:用户 pwd_version 内存缓存(require_auth 每请求读;修前每个
     /// 已认证 API 请求一次 SQLite 往返 —— UI 轮询下是全进程最高频 DB 查询)。
-    /// 失效点:logout(bump)与 change_password,api.rs 两处 remove。
-    pub pwd_version_cache: dashmap::DashMap<String, i64>,
+    /// 失效点:logout(bump)与 change_password,api.rs 两处递增 epoch。
+    /// R2:epoch 守卫防填充竞态 —— miss 侧「读 DB → insert」与失效侧
+    /// 「bump → remove」交错时,旧值可能被插回且无人再清(已吊销令牌
+    /// 永久有效)。条目带填充时的 epoch,任何后续 bump 都令其失配;
+    /// 失配条目被下一次 miss 覆盖,不会钉死旧值。
+    pub pwd_version_cache: dashmap::DashMap<String, (i64, u64)>,
+    /// pwd_version 缓存的失效代(每次 bump 递增;见上)。
+    pub pwd_version_epoch: std::sync::atomic::AtomicU64,
     /// C1:每个客户端的本地配置版本(任何规则/访问器变更 +1)。比 DB 的
     /// config_revision 更廉价:纯内存原子,不需要每次解析都读 DB。
     pub client_cfg_gen: Arc<dashmap::DashMap<String, u64>>,
@@ -147,8 +153,13 @@ impl HotConfig {
 }
 
 /// M3 服务端终结证书(预构建 rustls 配置,按 SNI 精确/通配匹配)。
+/// R2:域名在构建时预小写、通配后缀预拼接(修前每连接 sni.to_lowercase
+/// + 每域名 to_lowercase + format!)。
 pub struct CertEntry {
+    /// 预小写的精确域名。
     pub domains: Vec<String>,
+    /// 预小写、预去 * 前缀的通配后缀(*.example.com → ".example.com")。
+    pub wildcard_suffixes: Vec<String>,
     pub cfg: Arc<rustls::ServerConfig>,
 }
 
@@ -156,16 +167,12 @@ impl CertEntry {
     /// 域名匹配:精确或单层通配(*.example.com 覆盖 sub.example.com)。
     pub fn matches(&self, sni: &str) -> bool {
         let sni = sni.to_lowercase();
-        self.domains.iter().any(|d| {
-            let d = d.to_lowercase();
-            if let Some(suffix) = d.strip_prefix("*.") {
-                sni.ends_with(&format!(".{suffix}"))
-                    && sni.len() > suffix.len() + 1
-                    && !sni[..sni.len() - suffix.len() - 1].contains('.')
-            } else {
-                d == sni
-            }
-        })
+        self.domains.iter().any(|d| d == &sni)
+            || self.wildcard_suffixes.iter().any(|suffix| {
+                sni.ends_with(suffix.as_str())
+                    && sni.len() > suffix.len()
+                    && !sni[..sni.len() - suffix.len()].contains('.')
+            })
     }
 }
 
@@ -280,6 +287,7 @@ impl Clone for AppState {
             metrics_listen_addr: self.metrics_listen_addr.clone(),
             visitor_cache: self.visitor_cache.clone(),
             pwd_version_cache: self.pwd_version_cache.clone(),
+            pwd_version_epoch: std::sync::atomic::AtomicU64::new(0),
             client_cfg_gen: self.client_cfg_gen.clone(),
         }
     }
@@ -327,8 +335,20 @@ impl AppState {
                             doms = domains;
                         }
                         let _ = (fingerprint, not_after); // 由 /api/certs 从 DB 读取展示
+                                                          // R2:预小写 + 预拼接通配后缀(matches 零分配)
+                        let mut exact = Vec::with_capacity(doms.len());
+                        let mut wild = Vec::new();
+                        for d in doms {
+                            let d = d.to_lowercase();
+                            if let Some(suffix) = d.strip_prefix("*.") {
+                                wild.push(format!(".{suffix}"));
+                            } else {
+                                exact.push(d);
+                            }
+                        }
                         out.push(Arc::new(CertEntry {
-                            domains: doms,
+                            domains: exact,
+                            wildcard_suffixes: wild,
                             cfg: Arc::new(cfg),
                         }));
                     }
@@ -415,6 +435,7 @@ impl AppState {
             unauth_conns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             visitor_cache: dashmap::DashMap::new(),
             pwd_version_cache: dashmap::DashMap::new(),
+            pwd_version_epoch: std::sync::atomic::AtomicU64::new(0),
             client_cfg_gen: Arc::new(dashmap::DashMap::new()),
         }
     }
@@ -887,7 +908,10 @@ impl TcpPool {
 pub struct ProxyRuntime {
     pub id: u64,
     pub client_id: String,
-    pub spec: RwLock<ProxySpec>,
+    /// R2:按 Arc 持有 —— 读侧 clone 只动引用计数(修前每次深克隆整份
+    /// ProxySpec ≈ 15-30 次分配;assign_forward 每条 TCP 连接、vhost
+    /// 每请求/每 CONNECT 都在付)。写侧(publish_spec_in_place)原子换 Arc。
+    pub spec: RwLock<std::sync::Arc<ProxySpec>>,
     pub state: RwLock<ProxyState>,
     pub state_reason: RwLock<String>,
     pub confirmed_revision: AtomicU64,
@@ -919,6 +943,11 @@ pub struct ProxyRuntime {
     /// 非分组规则直接跳过整个 group_pick。
     /// 与 spec 由同一写入点(runtime::publish_spec_in_place)同步维护。
     pub has_group: AtomicBool,
+    /// R2:派生组键缓存(与 has_group 同点维护)。group_pick* 每次都要
+    /// `spec.read().await` + 一次 format! 才能拿到键 —— 分组规则的每次
+    /// TCP accept / HTTP 请求都在付;现在读锁与分配都省掉。
+    /// 同步点:ProxyRuntime::new 与 publish_spec_in_place。
+    pub group_key_cache: std::sync::Mutex<Option<String>>,
     /// HTTP vhost 上游连接池(仅 http/https 规则使用)。
     ///
     /// 修前每个 HTTP 请求都 `hyper::client::conn::http1::handshake` 新建
@@ -939,10 +968,11 @@ impl ProxyRuntime {
         // 从 spec 初始化无锁快路径标记:无论从 API / recovery / 测试哪条
         // 路径创建,标记都与 spec 一致(不依赖调用方记得设置)。
         let has_group = ProxyManager::group_key(&spec).is_some();
+        let group_key_cache = ProxyManager::group_key(&spec);
         Self {
             id,
             client_id,
-            spec: RwLock::new(spec),
+            spec: RwLock::new(std::sync::Arc::new(spec)),
             state: RwLock::new(ProxyState::Offline),
             state_reason: RwLock::new(String::new()),
             confirmed_revision: AtomicU64::new(0),
@@ -955,6 +985,7 @@ impl ProxyRuntime {
             conns_current: AtomicI64::new(0),
             http_cache: std::sync::Mutex::new(HttpCache::default()),
             has_group: AtomicBool::new(has_group),
+            group_key_cache: std::sync::Mutex::new(group_key_cache),
             http_upstream: crate::vhost::UpstreamPool::default(),
             serve_handle: Mutex::new(None),
             pool: Mutex::new(None),
@@ -983,6 +1014,12 @@ impl ProxyRuntime {
 pub struct VisitorResolution {
     /// 生成该结果时的客户端配置版本。
     pub gen: u64,
+    /// R2:目标客户端的配置版本。pspec 属于**另一客户端**,bump_cfg_gen
+    /// 只失效本客户端前缀 —— 目标规则 disable/改密/改 target 后,访问器
+    /// 属主的 gen 不变,旧 pspec(enabled/secret_key)会一直被命中使用
+    /// (停了规则仍放行、每条连接挂 15s;轮换密钥后仍与旧密钥比对)。
+    /// 复核双 gen,任一失配即重建。
+    pub target_gen: u64,
     pub visitor_id: u64,
     pub target_client: String,
     pub vspec: rh_protocol::VisitorSpec,
@@ -1017,19 +1054,23 @@ impl GroupRuntime {
 pub struct ProxyManager {
     pub cfg: Arc<ServerConfig>,
     pub runtimes: dashmap::DashMap<u64, Arc<ProxyRuntime>>,
+    /// R2:client_id → proxy_id 索引(on_apply_result 每 ACK 曾全表迭代
+    /// runtimes 只为取本客户端规则 —— 控制读循环内联路径上的 O(全部规则)
+    /// 扫描)。由 spawn/teardown 两个生命周期点维护;测试直接 insert 的
+    /// 运行态不经索引,on_apply_result 对缺失条目回退全表扫描。
+    pub runtimes_by_client: dashmap::DashMap<String, Vec<u64>>,
     /// 组运行时
     pub groups: dashmap::DashMap<String, Arc<GroupRuntime>>,
     /// vhost HTTP 路由表:domain/host → proxy_id
     // C3:路由表用 Arc 快照 —— 请求路径只 clone 一次 Arc(O(1)),
     // 修前每请求 `read().await.clone()` 深拷贝整张表(含全部 String/Vec)。
-    pub vhost_http: RwLock<Arc<Vec<VhostRoute>>>,
-    pub vhost_https: RwLock<Arc<Vec<VhostRoute>>>,
-    pub vhost_tcpmux: RwLock<Arc<Vec<VhostRoute>>>,
-    /// B6:host → 路由下标索引(与上方三张表同批重建)。修前每请求
-    /// O(全部域名) 的 String== 线性扫描,规则数上千时每请求上万次比较。
-    pub vhost_http_idx: RwLock<Arc<std::collections::HashMap<String, Vec<usize>>>>,
-    pub vhost_https_idx: RwLock<Arc<std::collections::HashMap<String, Vec<usize>>>>,
-    pub vhost_tcpmux_idx: RwLock<Arc<std::collections::HashMap<String, Vec<usize>>>>,
+    /// B6:host → 路由下标索引随路由表**同锁原子**发布(R2:修前 routes
+    /// 与 idx 各持一把锁,重建非原子,读侧两把锁之间可交错 —— 轻则索引
+    /// 越界 panic,重则 dashmap 迭代序漂移导致下标指向别的规则、跨域名
+    /// 错路由)。
+    pub vhost_http: RwLock<Arc<VhostTable>>,
+    pub vhost_https: RwLock<Arc<VhostTable>>,
+    pub vhost_tcpmux: RwLock<Arc<VhostTable>>,
     /// 热生效端口策略(网页可改,与 AppState.hot 同源)。
     pub hot: Arc<RwLock<HotConfig>>,
     /// vhost 路由「待重建」标记。
@@ -1079,13 +1120,24 @@ pub struct VhostRoute {
     pub cache: Option<std::sync::Arc<rh_protocol::CacheConfig>>,
 }
 
+/// B6/R2:vhost 路由表 + host 索引的原子快照(单锁发布,读侧一次 clone
+/// 即得一致视图;Default 供 AppState 初始化)。
+#[derive(Default)]
+pub struct VhostTable {
+    pub routes: Vec<VhostRoute>,
+    pub by_host: std::collections::HashMap<String, Vec<usize>>,
+}
+
 /// M2 HTTP 静态缓存(每规则一份;std::Mutex 短临界区,不跨 await)。
 #[derive(Clone)]
 pub struct HttpCacheEntry {
     pub expires: std::time::Instant,
     pub status: u16,
     pub content_type: String,
-    pub body: std::sync::Arc<[u8]>,
+    /// R2:Bytes 引用计数(collected 本就是 Bytes;修前入库 to_vec + into
+    /// Arc<[u8]> 两次拷贝,HIT 再 to_vec 整包拷回 —— 1MiB 静态资源每命中
+    /// 1MiB memcpy)。
+    pub body: bytes::Bytes,
 }
 
 #[derive(Default)]
@@ -1149,13 +1201,11 @@ impl ProxyManager {
             cfg,
             hot,
             runtimes: dashmap::DashMap::new(),
+            runtimes_by_client: dashmap::DashMap::new(),
             groups: dashmap::DashMap::new(),
-            vhost_http: RwLock::new(Arc::new(Vec::new())),
-            vhost_https: RwLock::new(Arc::new(Vec::new())),
-            vhost_tcpmux: RwLock::new(Arc::new(Vec::new())),
-            vhost_http_idx: RwLock::new(Arc::new(Default::default())),
-            vhost_https_idx: RwLock::new(Arc::new(Default::default())),
-            vhost_tcpmux_idx: RwLock::new(Arc::new(Default::default())),
+            vhost_http: RwLock::new(Arc::new(VhostTable::default())),
+            vhost_https: RwLock::new(Arc::new(VhostTable::default())),
+            vhost_tcpmux: RwLock::new(Arc::new(VhostTable::default())),
             vhost_dirty: AtomicBool::new(false),
             vhost_flush_scheduled: AtomicBool::new(false),
         }
@@ -1455,22 +1505,21 @@ impl ProxyManager {
                 _ => {}
             }
         }
-        // B6:同批构建 host 索引(路由顺序与表一致;同 host 多条规则
-        // 保留全部下标,http 的最长 locations 匹配仍需遍历候选)
-        let idx_of = |v: &[VhostRoute]| {
+        // B6:路由表与 host 索引同批构建、**单锁原子**发布(R2)。
+        let mk = |v: Vec<VhostRoute>| {
             let mut m: std::collections::HashMap<String, Vec<usize>> =
                 std::collections::HashMap::with_capacity(v.len());
             for (i, r) in v.iter().enumerate() {
                 m.entry(r.host.clone()).or_default().push(i);
             }
-            Arc::new(m)
+            Arc::new(VhostTable {
+                routes: v,
+                by_host: m,
+            })
         };
-        *self.vhost_http_idx.write().await = idx_of(&http);
-        *self.vhost_https_idx.write().await = idx_of(&https);
-        *self.vhost_tcpmux_idx.write().await = idx_of(&tcpmux);
-        *self.vhost_http.write().await = Arc::new(http);
-        *self.vhost_https.write().await = Arc::new(https);
-        *self.vhost_tcpmux.write().await = Arc::new(tcpmux);
+        *self.vhost_http.write().await = mk(http);
+        *self.vhost_https.write().await = mk(https);
+        *self.vhost_tcpmux.write().await = mk(tcpmux);
     }
 }
 
@@ -2386,7 +2435,7 @@ mod vhost_coalesce_tests {
         // 合并窗口是毫秒级:等它过去
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let routes = state.proxies.vhost_http.read().await.clone();
+        let routes = &state.proxies.vhost_http.read().await.clone().routes;
         assert_eq!(
             routes.len(),
             n as usize,
@@ -2414,7 +2463,7 @@ mod vhost_coalesce_tests {
             .insert(1, Arc::new(ProxyRuntime::new(1, CID.into(), spec)));
         state.proxies.mark_vhost_dirty();
         state.proxies.flush_vhost_routes().await;
-        let routes = state.proxies.vhost_http.read().await.clone();
+        let routes = &state.proxies.vhost_http.read().await.clone().routes;
         assert_eq!(routes.len(), 1, "flush 后必须立即可见");
         assert_eq!(routes[0].host, "immediate.test");
     }
@@ -2439,7 +2488,7 @@ mod vhost_coalesce_tests {
             .runtimes
             .insert(2, Arc::new(ProxyRuntime::new(2, CID.into(), spec2)));
         state.proxies.flush_vhost_routes().await;
-        let routes = state.proxies.vhost_http.read().await.clone();
+        let routes = &state.proxies.vhost_http.read().await.clone().routes;
         assert_eq!(routes.len(), 1, "未标脏时 flush 不得重建");
     }
 
@@ -2516,7 +2565,7 @@ mod vhost_coalesce_tests {
         state.proxies.schedule_vhost_rebuild();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let routes = state.proxies.vhost_http.read().await.clone();
+        let routes = &state.proxies.vhost_http.read().await.clone().routes;
         assert_eq!(routes.len(), 2, "窗口内追加的规则不得丢失");
     }
 }

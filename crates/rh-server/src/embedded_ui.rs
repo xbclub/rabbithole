@@ -60,8 +60,17 @@ fn asset_response(path: &str) -> Option<Response> {
                 None => ("index.html", EmbeddedUi::get("index.html")?),
             }
         };
-        let body = Vec::from(file.data.as_ref());
-        return Some((StatusCode::OK, [("content-type", mime_of(name))], body).into_response());
+        // R2:rust-embed 的 data 是 Cow<'static, _>(release 内嵌 =
+        // Borrowed 静态切片,零拷贝出响应;开发态 fs 加载 = Owned,
+        // 直接移动 Vec)。修前 Vec::from 每个管理页请求整份拷贝。
+        return Some(match file.data {
+            std::borrow::Cow::Borrowed(b) => {
+                (StatusCode::OK, [("content-type", mime_of(name))], b).into_response()
+            }
+            std::borrow::Cow::Owned(v) => {
+                (StatusCode::OK, [("content-type", mime_of(name))], v).into_response()
+            }
+        });
     }
     #[allow(unreachable_code)]
     {

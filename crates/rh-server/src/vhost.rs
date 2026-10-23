@@ -331,9 +331,15 @@ async fn handle_http_request(
     // B6:按 host 索引取候选(修前 O(全部域名) String== 扫描;索引与
     // 路由表同批重建,顺序一致)。host 不在索引 = 无任何路由命中,
     // 与全表扫描找不到同义。
-    let routes = state.proxies.vhost_http.read().await.clone(); // C3: Arc 快照,O(1)
-    let idx = state.proxies.vhost_http_idx.read().await.clone();
-    let candidates: &[usize] = idx.get(&host).map(|v| v.as_slice()).unwrap_or(&[]);
+    // R2:routes 与 by_host 同锁原子发布,一次快照即一致视图
+    //(修前两把锁,读侧交错可索引越界/错路由)。
+    let table = state.proxies.vhost_http.read().await.clone(); // C3: Arc 快照,O(1)
+    let routes = &table.routes;
+    let candidates: &[usize] = table
+        .by_host
+        .get(&host)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
     let mut best: Option<(&VhostRoute, usize)> = None;
     let mut domain_hit: Option<&VhostRoute> = None;
     for &ri in candidates {
@@ -447,7 +453,7 @@ async fn handle_http_request(
                 .status(hit.status)
                 .header("content-type", hit.content_type.clone())
                 .header("x-cache", "HIT")
-                .body(full_body_body(hyper::body::Bytes::from(hit.body.to_vec())))?;
+                .body(full_body_body(hit.body.clone()))?; // R2:Bytes 克隆零拷贝
             return Ok(resp);
         }
     }
@@ -577,7 +583,7 @@ async fn handle_http_request(
                     + std::time::Duration::from_secs(cfg.ttl_seconds.max(1)),
                 status: 200,
                 content_type: ct.clone(),
-                body: collected.to_vec().into(),
+                body: collected.clone(), // R2:Bytes 引用传递,不再双份拷贝
             };
             rt.http_cache.lock().unwrap().put(
                 cache_key.clone(),
@@ -895,13 +901,13 @@ async fn serve_https(
             return Ok(());
         }
     }
-    // B6:host 索引 O(1) 取代全表线性扫描
-    let idx = state.proxies.vhost_https_idx.read().await.clone();
-    let routes = state.proxies.vhost_https.read().await.clone(); // C3: Arc 快照
-    let route = idx
+    // B6:host 索引 O(1) 取代全表线性扫描(R2:单锁原子快照)
+    let table = state.proxies.vhost_https.read().await.clone(); // C3: Arc 快照
+    let route = table
+        .by_host
         .get(sni.as_str())
         .and_then(|v| v.first())
-        .map(|&i| &routes[i]);
+        .map(|&i| &table.routes[i]);
     let Some(route) = route else {
         return Ok(());
     };
@@ -1121,9 +1127,12 @@ async fn serve_tcpmux(
     let host = hostport.split(':').next().unwrap_or("").to_lowercase();
     // B6:一次读快照 + host 索引取路由(修前同一条 CONNECT 读两次
     // vhost_tcpmux 快照并各扫一遍全表)。
-    let idx = state.proxies.vhost_tcpmux_idx.read().await.clone();
-    let routes = state.proxies.vhost_tcpmux.read().await.clone(); // C3: Arc 快照
-    let route = idx.get(&host).and_then(|v| v.first()).map(|&i| &routes[i]);
+    let table = state.proxies.vhost_tcpmux.read().await.clone(); // C3: Arc 快照(R2:单锁原子)
+    let route = table
+        .by_host
+        .get(&host)
+        .and_then(|v| v.first())
+        .map(|&i| &table.routes[i]);
     // Basic 认证
     if let Some(r) = route {
         if !r.http_user.is_empty() {

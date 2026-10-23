@@ -265,7 +265,7 @@ mod recovery_tests {
         }
         let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
         recover_all(&state).await;
-        let routes = state.proxies.vhost_http.read().await.clone();
+        let routes = &state.proxies.vhost_http.read().await.clone().routes;
         assert_eq!(
             routes.len(),
             20,

@@ -1174,7 +1174,9 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         // 直到上限。预取队列可能有多块——这正是与 round-31~75 的差别。
         while let Some(c) = pending.pop_front() {
             if batch_bytes >= DOWN_BATCH_BYTES || batch.len() >= SMALL_CHUNK_SEGS {
-                pending_bytes += c.len();
+                // R2:不得再加 pending_bytes —— 此块弹出时未扣减(扣减只在
+                // 正常路径),计数仍含它;修前每放回一次虚增一块,约 16 批
+                // (≈16MiB)后计数恒超限,预取永久停摆、流退化为串行节奏。
                 pending.push_front(c); // 放回,留给下一轮
                 break;
             }

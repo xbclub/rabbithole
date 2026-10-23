@@ -1208,7 +1208,11 @@ async fn connect_upstream(local_addr: &str, tls: bool) -> anyhow::Result<BoxedIo
         insecure_skip_verify: true,
         ..Default::default()
     };
-    let (cfg, _verify) = rh_transport::tls::client_config(&opts)?;
+    // R2:走按配置键缓存的构造(B5 同族漏点:修前每请求重建配置,
+    // in_memory_sessions 每次全新 → 上游 TLS 的 PSK 会话恢复结构性不可能)。
+    // ALPN 与旧 client_config() 一致(DEFAULT_ALPN)。
+    let (cfg, _verify) =
+        rh_transport::tls::client_config_cached(&opts, &[rh_transport::DEFAULT_ALPN.to_string()])?;
     let connector = tokio_rustls::TlsConnector::from(cfg);
     let tls_stream = connector
         .connect(

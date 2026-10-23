@@ -191,7 +191,9 @@ pub async fn accept(listener: &mut QuicListener) -> io::Result<Incoming> {
 }
 
 pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>> {
-    let (tls, verify) = crate::tls::client_config_with_alpn(&cfg.tls, &cfg.alpn)?;
+    // R2:同 dial_io 走按配置键缓存(B5;QUIC 的 rustls 侧同样带
+    // 会话恢复票据缓存,重连每次重建会让它永远空转)
+    let (tls, verify) = crate::tls::client_config_cached(&cfg.tls, &cfg.alpn)?;
     let mut qcfg = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .map_err(|e| other_err(format!("quic client config: {e}")))?,

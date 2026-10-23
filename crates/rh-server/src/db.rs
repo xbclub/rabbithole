@@ -481,8 +481,6 @@ impl Db {
         Ok(())
     }
 
-    /// R1:按 id 精确取 visitor(update/toggle/delete 的属主定位;修前
-    /// `list_visitors(None)` 全表取回 + 线性 find,每次操作 O(M) 行构造)。
     /// R1:全部规则的 (id, port_auto) 轻量列表(启动恢复的端口重分配
     /// 判定;不做 spec JSON 反序列化)。
     pub async fn list_port_auto(&self) -> Result<Vec<(i64, bool)>> {
@@ -513,6 +511,8 @@ impl Db {
             .collect())
     }
 
+    /// R1:按 id 精确取 visitor(update/toggle/delete 的属主定位;修前
+    /// `list_visitors(None)` 全表取回 + 线性 find,每次操作 O(M) 行构造)。
     pub async fn get_visitor(&self, id: i64) -> Result<Option<(i64, String, String, VisitorSpec)>> {
         // 列集与 list_visitors 一致(visitors 表无 spec JSON 列,按列构造)
         let row = sqlx::query(
@@ -592,7 +592,6 @@ impl Db {
     /// JSON 反序列化成 ProxySpec;N 条规则下每次建/改/启一条都是 O(N),
     /// 批量 N 条 = O(N²)。本查询只取判定 `bind_conflicts` 所需的列,
     /// 且可走 `idx_proxies_bind(kind, bind_port)` 部分索引。
-    /// 返回 (id, bind_ip, enabled, group_key)。
     /// 返回 (id, kind, bind_ip, enabled, group)。组键在调用方按
     /// `kind|bind_ip|bind_port|group` 派生(与 ProxyManager::group_key
     /// 同式)—— DB 的 group_key 列存的是 spec 字段,不是派生键。

@@ -25,8 +25,14 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
     // **控制读循环**里(visitor 连接建立速率一高就把控制面拖住)。配置只在
     // revision 变化时更新,缓存命中即为最新。
     let cache_key = (sess.client_id.clone(), u.visitor_id);
+    // R2:双 gen 复核 —— 访问器属主与目标客户端任一配置变更都失效
     let resolve = match state.visitor_cache.get(&cache_key) {
-        Some(c) if c.gen == state.cfg_gen(&sess.client_id) => c.clone(),
+        Some(c)
+            if c.gen == state.cfg_gen(&sess.client_id)
+                && c.target_gen == state.cfg_gen(&c.target_client) =>
+        {
+            c.clone()
+        }
         _ => {
             let visitors = state
                 .db
@@ -53,6 +59,7 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
             };
             let entry = Arc::new(VisitorResolution {
                 gen: state.cfg_gen(&sess.client_id),
+                target_gen: state.cfg_gen(&v_target_client),
                 visitor_id: vspec.id,
                 target_client: v_target_client,
                 vspec,
