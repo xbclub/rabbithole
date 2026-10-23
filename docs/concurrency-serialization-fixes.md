@@ -515,27 +515,101 @@ cargo clippy --workspace --all-targets -- -D warnings → 干净
 cargo fmt --all -- --check → 干净
 ```
 
-### 已知的基线失败(非本次改动引入)
+### 已知的基线失败(非本次改动引入)—— 已于 2026-10-23 修复
 
 `rh-client` 的 `dnsquery::cache_tests::concurrent_requests_share_one_query`
-与 `second_resolve_hits_cache` 会失败,报「10 个请求触发了 2 次真实解析」。
+(以及同模块的 `second_resolve_hits_cache`)会失败,报
+「10 个请求触发了 2 次真实解析」。
 
-**失败频率(2026-10-23 实测更正)**:初版写「约 6 次里 2 次」,**偏低了**。
-连跑 8 次 `cargo test --workspace`,**4 次失败 / 4 次通过(约 50%)** ——
-不是低频抖动,而是一半概率挂。单跑 `cargo test -p rh-client dnsquery::cache_tests`
-连跑 6 次**全过**。
+#### 失败频率(两次更正)
 
-这个差异正好印证根因:失败只在**全量并行**时出现,因为
-`QUERIES` / `DELAY_MS` / `RESULT_OK` 是进程级 `static`,由同 crate 的多个
-`cache_tests` 共享;并发执行时互相污染。单跑（测试少、调度简单）几乎不会撞上。
+| 版本 | 说法 | 状态 |
+|---|---|---|
+| 初版 | 「6 次里 2 次」 | 偏低 |
+| 第二版 | 「约 50%」 | 仍偏低 |
+| **实测** | `cargo test -p rh-client` 20 次跑下来 **12 次失败 = 60%** | 准确 |
 
-**确认为基线问题**:切到第五批之前的提交 `9cb9082` 跑全量,同样失败
-(`132 passed; 1 failed`),与本次改动无关。**未修**(超出任务范围)。
+单跑该用例 10 次、单跑整个 `cache_tests` 模块 10 次、模块内并发 8 线程 15 次
+——**全部 0 失败**;`--test-threads=1` 跑整个 crate 3 次也全过。只有整个
+crate **并行**跑才挂。
 
-> 修法提示(给后续接手的人):把三个 `static` 改成每个测试独占的字段
-> （比如包一层 `struct TestCtx` 由测试持有),或给 `cache_tests` 加
-> `#[serial]`。现在这个状态会让 `cargo test --workspace` 一半概率变红 ——
-> 按 AGENTS.md「红的门禁比没有门禁更糟」的口径,应该修。
+#### 根因(已定位,不是原有的三个猜测)
+
+此前把根因写成「三个 `static` 由同 crate 的多个 `cache_tests` 共享,
+并发执行时互相污染」。**这个判断只对了一半** —— `cache_tests` 内部
+已经有 `LOCK` 串行化了(模块内并发 15 次全过就是证据)。
+
+真正的污染源在**模块外**:
+
+> `plugins::proxy_tests::socks5_domain_target_goes_through_resolver`
+> (`crates/rh-client/src/plugins.rs`)会发一个 ATYP=0x03 的 SOCKS5 请求,
+> 插件按 `resolve_addr` → `forward::resolve` → `resolve_cached`
+> 走**本端解析器** —— 而它**不持** `cache_tests` 的 `LOCK`。
+
+`cache_tests::setup()` 会把**全局**解析器换成 `counting_query`(计数 +
+50ms 延迟)。那条 plugins 测试在任意时刻命中这个注入器时:
+
+1. 把 `cache_tests::QUERIES` +1;
+2. 被 `DELAY_MS=50` 拖慢;
+3. 清掉/污染 `inflight` 与 `cache`。
+
+第 1 条是失败的直接原因:若那次 `fetch_add` 落在
+`concurrent_requests_share_one_query` 的 50ms 窗口内,断言就看见 2 次解析。
+
+**定位方法**(不是猜的):在 `counting_query` 里加临时探针,把每次调用的
+host/port/delay 与 `rh_client` 栈帧写进文件(`eprintln` 会被并发交错吞掉),
+跑整个 crate 直到失败。捕获到:
+
+```
+QUERY#1 host=cache-test.example port=80 delay=50 ok=1   ← 被测用例自己
+QUERY#2 host=rh-test.invalid   port=9  delay=50 ok=1   ← 污染源
+assertion failed: 并发去重失效:10 个请求触发了 2 次真实解析
+```
+
+栈帧:
+
+```
+plugins::serve_socks5 → dial_proxy_destination → resolve_addr
+→ forward::resolve → resolve_cached → counting_query
+```
+
+**关键判据**:`QUERY#1` 只有**一次**真实解析 —— 说明 singleflight 根本没坏,
+是计数器看见了**两条不同的 host**。这也解释了为什么是 2 而不是 10
+(若 singleflight 真坏了会是 10)。
+
+另用确定性探针复现过:不走并发,直接
+`forward::resolve("rh-test.invalid", 9)` 也能让 `QUERIES` 从 0 变 1。
+
+> ★**一处假设被推翻**:任务书曾排除「plugins.rs 的测试触达 DNS」。
+> 实测该测试**确实触达**,这是本次的关键发现。
+
+#### 修法
+
+把串行锁提升为 **crate 级共享**,让 plugins 那条测试也加入同一个串行域:
+
+- `dnsquery` 新增 `pub(crate) static DNS_GLOBAL_TEST_LOCK`;
+  `cache_tests` 原来的私有 `LOCK` 改为 `use super::DNS_GLOBAL_TEST_LOCK as LOCK`;
+- `socks5_domain_target_goes_through_resolver` 开头加
+  `let _dns = crate::dnsquery::DNS_GLOBAL_TEST_LOCK.lock().await;`。
+
+**为什么不选别的**:
+- epoch/generation 让过期任务不计数:要改注入点设计,而且管不住「被 50ms
+  拖慢」「清掉 inflight」这两个副作用;
+- `serial_test` crate:引入新依赖;
+- 放宽断言(`QUERIES >= 1 && <= 2`):会掩盖真实的 singleflight 失效,
+  **明确不采用**。
+
+生产代码(`inflight()` / `cache()` / `resolve_cached`)**一行未动**。
+
+#### 验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo test -p rh-client` 连跑 20 次 | **0 失败**(修前 60% 红) |
+| `cargo test --workspace` 连跑 10 次 | **0 失败** |
+| 测试仍然有效(破坏 singleflight) | 把 `resolve_cached` 的登记逻辑删掉后立刻变红:「10 个请求触发了 10 次真实解析」 |
+
+提交:`f2f00c6`。
 
 ---
 
@@ -570,7 +644,8 @@ cargo fmt --all -- --check → 干净
    SQLite 与在线会话,未在真实部署环境验证。
 3. **#10 端到端 RTT 测量**:未做。只有调度结构基准。
 4. **#11**:未单独测(测试环境 `:memory:` 掩盖了收益)。
-5. **基线 3 个 e2e 失败项 + DNS 缓存测试失败**:未修,超出范围。
+5. **基线 3 个 e2e 失败项**:未修,超出范围。(DNS 缓存测试的
+   60% flaky 已于 `f2f00c6` 修复,见 §13。)
    后者在全量并行下约 **50%** 概率失败(见 §13 的实测更正),不是低频抖动。
 6. ~~**`upsert` 的 proxy 分支仍持 `proxies` 写锁跨 await**~~ —— **已完成**
    (收尾批次 P1,commit `cb0be73`)。详见 §15.6。
@@ -1082,7 +1157,8 @@ select 不再回顶。与服务端 A1 缺陷同形。
 3. #2 恢复并发 / P4 `notify_client_recovery` 并发:**本机测不出收益**,
    真实收益依赖文件型 SQLite 与在线会话,未在部署环境验证。
 4. #10 的端到端 RTT 测量:未做,只有调度结构基准。
-5. 基线 3 个 e2e 失败项 + `dnsquery::cache_tests` 失败:未修,超出范围。
+5. 基线 3 个 e2e 失败项:未修,超出范围。(`dnsquery::cache_tests`
+   的 60% flaky 已于 `f2f00c6` 修复,见 §13。)
    后者全量并行下约 **50%** 概率挂(§13 已实测更正),建议优先修 ——
    它让 `cargo test --workspace` 一半概率变红,会掩盖真实回归。
 
