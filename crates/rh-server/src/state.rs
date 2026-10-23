@@ -1127,6 +1127,49 @@ impl ProxyManager {
         })
     }
 
+    /// 收集与查询地址 `(proto, ip)` 冲突的**已占用端口**集合。
+    ///
+    /// 语义与「对每个候选端口调一次 [`Self::port_in_use`]」完全等价:
+    /// `bind_conflicts` 只在同 proto、同端口、且地址层面冲突(任一方通配,
+    /// 或两者相等)时成立 —— 端口维度交给 `HashSet::contains`,集合里只放
+    /// 「地址层面就与查询地址冲突」的 runtime 的 `bind_port`。
+    ///
+    /// 这里传端口 0/0 给 `bind_conflicts`,是让它只走地址判定分支;不另写一份
+    /// IP 冲突规则,避免两处判定漂移。
+    ///
+    /// ★先快照再遍历:dashmap 的 `iter()` 会持有**分片写锁**,而下面
+    /// `rt.spec.read().await` 是 await 点 —— 守卫跨 await 会长期占住该分片,
+    /// 其它 runtime 的增删/查找全被挡住。快照后立即释放。
+    async fn collect_occupied_ports(
+        &self,
+        proto: &str,
+        ip: IpAddr,
+        except_proxy: Option<u64>,
+        new_group_key: Option<&str>,
+    ) -> std::collections::HashSet<u16> {
+        let runtimes: Vec<Arc<ProxyRuntime>> =
+            self.runtimes.iter().map(|e| e.value().clone()).collect();
+        let mut out = std::collections::HashSet::new();
+        for rt in runtimes.iter() {
+            if Some(rt.id) == except_proxy {
+                continue;
+            }
+            let spec = rt.spec.read().await;
+            if new_group_key.is_some() && Self::group_key(&spec).as_deref() == new_group_key {
+                continue; // 同组:共享监听
+            }
+            if !spec.kind.uses_bind_port() || !spec.enabled {
+                continue;
+            }
+            let other_ip =
+                rh_core::net::parse_bind_ip(&spec.bind_ip).unwrap_or(IpAddr::from([0, 0, 0, 0]));
+            if bind_conflicts(proto, ip, 0, proto, other_ip, 0) {
+                out.insert(spec.bind_port);
+            }
+        }
+        out
+    }
+
     /// 端口占用冲突判定(运行中的独享监听 + 组监听 + DB 其他启用行)。
     /// new_group_key:新建/更新规则的组键;同组成员共享监听,不构成冲突。
     pub async fn port_in_use(
@@ -1137,34 +1180,9 @@ impl ProxyManager {
         except_proxy: Option<u64>,
         new_group_key: Option<String>,
     ) -> bool {
-        for e in self.runtimes.iter() {
-            let rt = e.value();
-            if Some(rt.id) == except_proxy {
-                continue;
-            }
-            let spec = rt.spec.read().await;
-            if Some(rt.id) != except_proxy
-                && new_group_key.is_some()
-                && Self::group_key(&spec) == new_group_key
-            {
-                continue; // 同组:共享监听
-            }
-            if spec.kind.uses_bind_port()
-                && spec.enabled
-                && bind_conflicts(
-                    proto,
-                    ip,
-                    port,
-                    proto,
-                    rh_core::net::parse_bind_ip(&spec.bind_ip)
-                        .unwrap_or(IpAddr::from([0, 0, 0, 0])),
-                    spec.bind_port,
-                )
-            {
-                return true;
-            }
-        }
-        false
+        self.collect_occupied_ports(proto, ip, except_proxy, new_group_key.as_deref())
+            .await
+            .contains(&port)
     }
 
     /// 白名单校验(读热配置,网页改动即时生效)。
@@ -1173,15 +1191,26 @@ impl ProxyManager {
     }
 
     /// 从自动分配范围挑选空闲端口(白名单 + 运行时冲突 + OS 探测)。
+    ///
+    /// ★占用集合只构建一次,循环内退化为 O(1) 查找。
+    ///
+    /// 修前循环体内每跳过一个候选端口就调一次 `port_in_use` —— 那是一次
+    /// 全 runtime 快照 + 逐条 `spec.read().await`。默认 `auto_range` 是
+    /// `10000-25000`,端口被占得越多、前面跳过的越多,最坏
+    /// 15001 × N_runtime 次读锁。改为先建一次「已占用端口集合」后,
+    /// 端口维度是哈希查找,只剩 OS 探测(每个候选端口一次 bind)。
     pub async fn allocate_port(&self, proto: &str, bind_ip: IpAddr) -> Option<u16> {
         let ranges: Vec<PortsRange> = self.cfg.auto_port_ranges();
         let allow = self.hot.read().await.port_allow_list();
+        let occupied = self
+            .collect_occupied_ports(proto, bind_ip, None, None)
+            .await;
         for r in ranges {
             for p in r.start..=r.end {
                 if !allow.allows(p) {
                     continue;
                 }
-                if self.port_in_use(proto, bind_ip, p, None, None).await {
+                if occupied.contains(&p) {
                     continue;
                 }
                 let addr = SocketAddr::new(bind_ip, p);
@@ -1714,5 +1743,315 @@ mod metrics_listening_tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert!(state.metrics_listening().await, "运行中应报 true");
         let _ = tx.send(());
+    }
+}
+
+#[cfg(test)]
+mod port_scan_tests {
+    //! 端口占用判定的**语义等价性**回归(#4 / #5)。
+    //!
+    //! 修前 `port_in_use` 直接 `dashmap::iter()`(持分片写锁)跨 `spec.read().await`;
+    //! `allocate_port` 每个候选端口都重扫一遍全表。改为「一次快照 + 端口集合」后,
+    //! 这里守住两件事:
+    //!   1. 快照改造没有改变占用判定的结果(逐端口比对旧实现的等价口径);
+    //!   2. 判定期间表仍可被其它任务写 —— 分片锁不得跨 await 持有。
+    use super::*;
+
+    const CID: &str = "port-scan-client";
+
+    fn spec(kind: &str, ip: &str, port: u16, enabled: bool, group: Option<&str>) -> ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": format!("p{port}"),
+            "kind": kind,
+            "client_id": CID,
+            "bind_ip": ip,
+            "bind_port": port,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": enabled,
+            "group": group,
+        }))
+        .unwrap()
+    }
+
+    async fn state_with(specs: &[ProxySpec]) -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        for (i, s) in specs.iter().enumerate() {
+            let id = (i + 1) as u64;
+            state
+                .proxies
+                .runtimes
+                .insert(id, Arc::new(ProxyRuntime::new(id, CID.into(), s.clone())));
+        }
+        state
+    }
+
+    /// 占用判定的**旧实现口径**(逐条 runtime 直判),用于对照。
+    ///
+    /// 保留为独立函数而不是调 `port_in_use`,否则就成了自己和自己比。
+    async fn reference_in_use(
+        state: &Arc<AppState>,
+        proto: &str,
+        ip: IpAddr,
+        port: u16,
+        except: Option<u64>,
+        new_group_key: Option<&str>,
+    ) -> bool {
+        for e in state.proxies.runtimes.iter() {
+            let rt = e.value();
+            if Some(rt.id) == except {
+                continue;
+            }
+            let spec = rt.spec.read().await;
+            if new_group_key.is_some() && ProxyManager::group_key(&spec).as_deref() == new_group_key
+            {
+                continue;
+            }
+            if spec.kind.uses_bind_port()
+                && spec.enabled
+                && bind_conflicts(
+                    proto,
+                    ip,
+                    port,
+                    proto,
+                    rh_core::net::parse_bind_ip(&spec.bind_ip)
+                        .unwrap_or(IpAddr::from([0, 0, 0, 0])),
+                    spec.bind_port,
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 逐端口比对:新实现与旧口径在所有端口上必须一致。
+    #[tokio::test]
+    async fn occupied_set_matches_per_port_scan() {
+        let state = state_with(&[
+            spec("tcp", "127.0.0.1", 20001, true, None),
+            spec("tcp", "0.0.0.0", 20002, true, None),
+            spec("udp", "127.0.0.1", 20001, true, None),
+            spec("tcp", "127.0.0.1", 20003, false, None), // 停用:不占端口
+            spec("http", "127.0.0.1", 20004, true, None), // 无独享端口
+            spec("tcp", "127.0.0.1", 20005, true, Some("g1")),
+        ])
+        .await;
+        let probe_ips: [&str; 3] = ["127.0.0.1", "0.0.0.0", "192.168.1.9"];
+        for ip_s in probe_ips {
+            let ip: IpAddr = ip_s.parse().unwrap();
+            for proto in ["tcp", "udp"] {
+                for port in 20000u16..=20010 {
+                    let want = reference_in_use(&state, proto, ip, port, None, None).await;
+                    let got = state.proxies.port_in_use(proto, ip, port, None, None).await;
+                    assert_eq!(want, got, "proto={proto} ip={ip} port={port}");
+                }
+            }
+        }
+    }
+
+    /// 同组共享监听、以及 except_proxy 排除自身,两个分支都要保持。
+    #[tokio::test]
+    async fn group_and_except_semantics_preserved() {
+        let g1 = spec("tcp", "127.0.0.1", 20005, true, Some("g1"));
+        let gkey = ProxyManager::group_key(&g1);
+        let state = state_with(&[g1]).await;
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // 无组键:同端口算冲突
+        assert!(
+            state
+                .proxies
+                .port_in_use("tcp", ip, 20005, None, None)
+                .await
+        );
+        // 同组:共享监听,不算冲突
+        assert!(
+            !state
+                .proxies
+                .port_in_use("tcp", ip, 20005, None, gkey.clone())
+                .await,
+            "同组必须视为共享监听"
+        );
+        // 排除自身后不算冲突
+        assert!(
+            !state
+                .proxies
+                .port_in_use("tcp", ip, 20005, Some(1), None)
+                .await,
+            "except_proxy 必须排除自身"
+        );
+    }
+
+    /// 分片守卫不得跨 await:端口判定挂起时,runtime 表仍必须可写。
+    ///
+    /// ★关于「写锁」的口径:任务书与 `rebuild_vhost_routes` 的注释都说
+    /// `dashmap::iter()` 持**分片写锁**。核对 dashmap 6.2.1 源码
+    /// (`iter.rs` 的 `GuardIter = Arc<RwLockReadGuard<..>>`,`next()` 里调
+    /// `_yield_read_shard`)可知实际是**读锁**。危害因此收窄但依然真实:
+    /// 同分片的 `insert`/`remove`(runtime 注册/注销)需要写锁,会被跨
+    /// await 持有的读锁挡住,而 dashmap 分片锁是**同步锁** —— 挡住的是
+    /// 整条 OS 线程,不只是某个 future。
+    ///
+    /// 复现:让一条 runtime 的 `spec` 写锁被长期持有,`port_in_use` 就会
+    /// 挂起在 `spec.read().await` 上并继续持有该分片读锁;此时另起 OS 线程
+    /// 往表里灌大量 key,只要有一个落在同分片就会阻塞。断言用**总耗时**,
+    /// 不依赖 key→shard 的具体映射。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shard_guard_not_held_across_await() {
+        let state = state_with(&[spec("tcp", "127.0.0.1", 20001, true, None)]).await;
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let rt = state.proxies.get(1).unwrap();
+
+        // 长期持有 spec 写锁:让 port_in_use 卡在 spec.read().await
+        let holder = {
+            let rt = rt.clone();
+            tokio::spawn(async move {
+                let _g = rt.spec.write().await;
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            })
+        };
+        // 等写锁真的被拿到
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let probe = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = state
+                    .proxies
+                    .port_in_use("tcp", ip, 20001, None, None)
+                    .await;
+            })
+        };
+        // 让 probe 进入循环并挂起在 spec.read() 上
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let t0 = std::time::Instant::now();
+        let writer = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                for id in 10..5000u64 {
+                    state.proxies.runtimes.insert(
+                        id,
+                        Arc::new(ProxyRuntime::new(
+                            id,
+                            CID.into(),
+                            spec("tcp", "127.0.0.1", 30000 + (id % 1000) as u16, true, None),
+                        )),
+                    );
+                }
+            })
+        };
+        writer.join().unwrap();
+        let elapsed = t0.elapsed();
+        probe.await.unwrap();
+        holder.await.unwrap();
+
+        // 修复后:快照在进入 await 前就释放了分片守卫,写入不受 probe 影响。
+        // 阈值(300ms)明显小于写锁窗口(400ms),留足机器抖动余量。
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "runtime 表写入被端口判定的分片守卫挡住 {elapsed:?} —— \
+             dashmap 迭代器不得跨 await 持有"
+        );
+    }
+
+    /// `allocate_port` 必须跳过运行时已占用的端口,并给出真实可绑定的端口。
+    ///
+    /// 断言基于外部可观测行为:返回的端口既不在占用集合里,也确实能 bind。
+    /// 不去断言「跳过了几个」—— 那是实现细节。
+    #[tokio::test]
+    async fn allocate_port_skips_occupied_and_returns_bindable() {
+        // auto_range 收窄到一段小窗口,避免测试扫 15001 个端口
+        let mut cfg = crate::config::ServerConfig::default();
+        cfg.ports.auto_range = Some("24100-24120".into());
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(cfg, db));
+        // 占住前 5 个
+        for (i, p) in (24100u16..24105).enumerate() {
+            let id = (i + 1) as u64;
+            state.proxies.runtimes.insert(
+                id,
+                Arc::new(ProxyRuntime::new(
+                    id,
+                    CID.into(),
+                    spec("tcp", "127.0.0.1", p, true, None),
+                )),
+            );
+        }
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let got = state.proxies.allocate_port("tcp", ip).await;
+        let Some(p) = got else {
+            panic!("窗口内应仍有可分配端口");
+        };
+        assert!(
+            !(24100..24105).contains(&p),
+            "不得分配运行时已占用的端口,得到 {p}"
+        );
+        assert!((24100..=24120).contains(&p), "必须落在 auto_range 内:{p}");
+        assert!(
+            std::net::TcpListener::bind(SocketAddr::new(ip, p)).is_ok(),
+            "分配结果必须真的可绑定:{p}"
+        );
+    }
+
+    /// #4 / #5 纯函数基准(不依赖网络,手动运行):
+    ///
+    /// ```text
+    /// cargo test -p rh-server --release port_scan_tests::bench -- --ignored --nocapture
+    /// ```
+    ///
+    /// 测量「给定 N 个 runtime,`port_in_use` 单次耗时」与「`allocate_port`
+    /// 在端口被大量占用时的总耗时」。改前的对照数据用 git stash 切回旧实现
+    /// 得到,结果记在 `docs/concurrency-serialization-fixes.md`。
+    #[tokio::test]
+    #[ignore = "纯函数基准,手动运行(--ignored --nocapture)"]
+    async fn bench_port_scan_scaling() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        for n in [100usize, 500, 1000, 2000] {
+            let mut specs = Vec::with_capacity(n);
+            for i in 0..n {
+                // 端口铺开在 10000-25000 内,保证都启用且互不冲突
+                specs.push(spec(
+                    "tcp",
+                    "127.0.0.1",
+                    10000 + (i as u16 % 15000),
+                    true,
+                    None,
+                ));
+            }
+            let state = state_with(&specs).await;
+
+            // ① port_in_use 单次耗时:取"未占用"端口,逼迫实现走完全表
+            let t0 = std::time::Instant::now();
+            let reps = 100;
+            for _ in 0..reps {
+                let _ = state
+                    .proxies
+                    .port_in_use("tcp", ip, 30000, None, None)
+                    .await;
+            }
+            let per_call = t0.elapsed() / reps;
+
+            // ② allocate_port:auto_range 默认 10000-25000,前 n 个端口全被占
+            let mut cfg = crate::config::ServerConfig::default();
+            cfg.ports.auto_range = Some("10000-25000".into());
+            let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+            let state2 = Arc::new(AppState::new(cfg, db));
+            for (i, s) in specs.iter().enumerate() {
+                let id = (i + 1) as u64;
+                state2
+                    .proxies
+                    .runtimes
+                    .insert(id, Arc::new(ProxyRuntime::new(id, CID.into(), s.clone())));
+            }
+            let t1 = std::time::Instant::now();
+            let got = state2.proxies.allocate_port("tcp", ip).await;
+            let alloc = t1.elapsed();
+            println!(
+                "N={n:>5}  port_in_use={per_call:>12?}/次  allocate_port={alloc:>12?}  → {got:?}"
+            );
+        }
     }
 }
