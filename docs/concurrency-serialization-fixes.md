@@ -515,15 +515,27 @@ cargo clippy --workspace --all-targets -- -D warnings → 干净
 cargo fmt --all -- --check → 干净
 ```
 
-### 已知的基线偶发失败(非本次改动引入)
+### 已知的基线失败(非本次改动引入)
 
 `rh-client` 的 `dnsquery::cache_tests::concurrent_requests_share_one_query`
-与 `second_resolve_hits_cache` 会偶发失败(约 6 次里 2 次),报
-「10 个请求触发了 2 次真实解析」。
+与 `second_resolve_hits_cache` 会失败,报「10 个请求触发了 2 次真实解析」。
 
-**已用 `git stash` 剥离本次改动后复现**,确认是基线问题。根因是测试隔离缺陷:
-`QUERIES` / `DELAY_MS` / `RESULT_OK` 是进程级 `static`,由多个 `cache_tests`
-共享;测试 panic 时 `teardown()` 不执行,污染后续测试。**未修**(超出任务范围)。
+**失败频率(2026-10-23 实测更正)**:初版写「约 6 次里 2 次」,**偏低了**。
+连跑 8 次 `cargo test --workspace`,**4 次失败 / 4 次通过(约 50%)** ——
+不是低频抖动,而是一半概率挂。单跑 `cargo test -p rh-client dnsquery::cache_tests`
+连跑 6 次**全过**。
+
+这个差异正好印证根因:失败只在**全量并行**时出现,因为
+`QUERIES` / `DELAY_MS` / `RESULT_OK` 是进程级 `static`,由同 crate 的多个
+`cache_tests` 共享;并发执行时互相污染。单跑（测试少、调度简单）几乎不会撞上。
+
+**确认为基线问题**:切到第五批之前的提交 `9cb9082` 跑全量,同样失败
+(`132 passed; 1 failed`),与本次改动无关。**未修**(超出任务范围)。
+
+> 修法提示(给后续接手的人):把三个 `static` 改成每个测试独占的字段
+> （比如包一层 `struct TestCtx` 由测试持有),或给 `cache_tests` 加
+> `#[serial]`。现在这个状态会让 `cargo test --workspace` 一半概率变红 ——
+> 按 AGENTS.md「红的门禁比没有门禁更糟」的口径,应该修。
 
 ---
 
@@ -558,7 +570,8 @@ cargo fmt --all -- --check → 干净
    SQLite 与在线会话,未在真实部署环境验证。
 3. **#10 端到端 RTT 测量**:未做。只有调度结构基准。
 4. **#11**:未单独测(测试环境 `:memory:` 掩盖了收益)。
-5. **基线 3 个 e2e 失败项 + DNS 缓存测试偶发失败**:未修,超出范围。
+5. **基线 3 个 e2e 失败项 + DNS 缓存测试失败**:未修,超出范围。
+   后者在全量并行下约 **50%** 概率失败(见 §13 的实测更正),不是低频抖动。
 6. ~~**`upsert` 的 proxy 分支仍持 `proxies` 写锁跨 await**~~ —— **已完成**
    (收尾批次 P1,commit `cb0be73`)。详见 §15.6。
 
@@ -1069,7 +1082,9 @@ select 不再回顶。与服务端 A1 缺陷同形。
 3. #2 恢复并发 / P4 `notify_client_recovery` 并发:**本机测不出收益**,
    真实收益依赖文件型 SQLite 与在线会话,未在部署环境验证。
 4. #10 的端到端 RTT 测量:未做,只有调度结构基准。
-5. 基线 3 个 e2e 失败项 + `dnsquery::cache_tests` 偶发失败:未修,超出范围。
+5. 基线 3 个 e2e 失败项 + `dnsquery::cache_tests` 失败:未修,超出范围。
+   后者全量并行下约 **50%** 概率挂(§13 已实测更正),建议优先修 ——
+   它让 `cargo test --workspace` 一半概率变红,会掩盖真实回归。
 
 ---
 
