@@ -653,6 +653,35 @@ impl Db {
 
     // ---------- events ----------
 
+    /// 批量写入事件,**单事务提交**。
+    ///
+    /// SQLite 下每次单独的 INSERT 都是一次隐式事务(各带一次 fsync)。
+    /// 事件是旁路数据,不值得为每条付一次 fsync —— 一个事务包住整批,
+    /// 把 N 次同步压成 1 次。这是 [`crate::events`] 批量 writer 的收益来源。
+    ///
+    /// 空批次直接返回,不开启事务。
+    pub async fn insert_events(&self, rows: &[(&str, &str, &str, &str)]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        let ts = now_ms();
+        for (level, source, message, detail) in rows {
+            sqlx::query(
+                "INSERT INTO events (ts, level, source, message, detail) VALUES (?1,?2,?3,?4,?5)",
+            )
+            .bind(ts)
+            .bind(level)
+            .bind(source)
+            .bind(message)
+            .bind(detail)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn insert_event(
         &self,
         level: &str,

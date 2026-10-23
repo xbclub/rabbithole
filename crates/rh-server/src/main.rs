@@ -478,6 +478,14 @@ async fn main() -> anyhow::Result<()> {
             state.shutdown.cancel();
             // 给运行时任务一点时间收尾
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // ★事件落库收尾。
+            //
+            // `EventBus` 改为异步批量写之后,进程退出时必须显式 drain,
+            // 否则队列里最后几条事件随进程消失 —— 而"最后几条"恰恰是
+            // 停机相关的事件(客户端下线、配置变更),最不该丢。
+            // 先 flush(等 writer 追上)再 shutdown(关队列 + 等它退出)。
+            state.events.flush().await;
+            state.events.shutdown().await;
         }
     };
     // 可选 TLS:包装 TcpListener 为 axum Listener
