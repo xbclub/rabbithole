@@ -789,21 +789,32 @@ async fn list_services(
         if let Some(secret_cfg) = spec_view.sudp.as_mut() {
             secret_cfg.secret_key.clear();
         }
-        let (status, reason) = match state.proxies.get(id as u64) {
+        // ★一次 `get` 拿 rt,四处复用。
+        //
+        // 修前这里调了 **4 次** `state.proxies.get(id)`(任务书与报告
+        // 早期都写成 3 次,实际还有 `healthy` 那一处,已核实为 4 次):
+        // status / pool_ready / rt_meter / healthy。N 条规则 = 4N 次
+        // dashmap 查找,每次都要 hash + 分片锁。
+        //
+        // 只做零风险的合并:**不动 `snapshot_state` 的阻塞语义**。
+        // 改成 `try_read` 会让列表页在竞争时显示 "unknown",那是接口
+        // 语义变化(报告 §7 已否决),不在本项范围。
+        let rt = state.proxies.get(id as u64);
+        let (status, reason) = match rt.as_ref() {
             Some(rt) => {
                 let (st, r) = rt.snapshot_state().await;
                 (st.as_str().to_string(), r)
             }
             None => ("disabled".into(), String::new()),
         };
-        let pool_ready = match state.proxies.get(id as u64) {
+        let pool_ready = match rt.as_ref() {
             Some(rt) => match rt.pool.lock().await.as_ref() {
                 Some(p) => p.ready.lock().await.len(),
                 None => 0,
             },
             None => 0,
         };
-        let rt_meter = state.proxies.get(id as u64).map(|rt| {
+        let rt_meter = rt.as_ref().map(|rt| {
             (
                 rt.bytes_in.load(std::sync::atomic::Ordering::Relaxed),
                 rt.bytes_out.load(std::sync::atomic::Ordering::Relaxed),
@@ -827,7 +838,7 @@ async fn list_services(
             "group": spec.group,
             "status": status,
             "status_reason": reason,
-            "healthy": state.proxies.get(id as u64).map(|rt| rt.healthy.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(true),
+            "healthy": rt.as_ref().map(|rt| rt.healthy.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(true),
             "pool_ready": pool_ready,
             "spec": spec_view,
             // F1 分规则计量(用户侧口径;运行时不在(已禁用)则为 0)
@@ -4026,5 +4037,257 @@ mod delete_client_concurrency_tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["code"], 0);
         assert!(state.proxies.runtimes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod list_services_tests {
+    //! P5 回归:`list_services` 把 4 次 `proxies.get` 合并为 1 次后,
+    //! 返回的字段必须与修前完全一致。
+    //!
+    //! ★能力边界:这条**测不出性能差异**(4 次 dashmap 查找 vs 1 次是
+    //! 微秒级)。它的价值是保证合并没有弄丢/弄错任何字段 —— 特别是
+    //! `healthy` 那一处,原来用的是**独立的第 4 次 get**,合并时最容易漏改。
+    use super::*;
+
+    const CID: &str = "list-svc-client";
+
+    fn spec(name: &str, port: u16, kind: &str) -> ProxySpec {
+        serde_json::from_value(json!({
+            "name": name,
+            "kind": kind,
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": port,
+            "target_host": "10.0.0.1",
+            "target_port": 8080,
+            "enabled": true,
+            "stcp": { "secret_key": "should-be-hidden" },
+        }))
+        .unwrap()
+    }
+
+    async fn auth(state: &Arc<AppState>) -> HeaderMap {
+        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        h
+    }
+
+    async fn call_list(state: &Arc<AppState>) -> Vec<serde_json::Value> {
+        let resp = list_services(
+            State(state.clone()),
+            auth(state).await,
+            Query(ListQuery { client_id: None }),
+        )
+        .await;
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        v["data"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// 运行态存在时:status / healthy / 计量字段都必须正确。
+    #[tokio::test]
+    async fn fields_reflect_runtime() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        let id = db
+            .insert_proxy(CID, &spec("s1", 24600, "stcp"), false, "console")
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+
+        let rt = Arc::new(crate::state::ProxyRuntime::new(
+            id as u64,
+            CID.into(),
+            spec("s1", 24600, "stcp"),
+        ));
+        rt.set_state(ProxyState::Running, "test").await;
+        rt.healthy
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        rt.bytes_in.store(111, std::sync::atomic::Ordering::Relaxed);
+        rt.bytes_out
+            .store(222, std::sync::atomic::Ordering::Relaxed);
+        rt.conns_current
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        state.proxies.runtimes.insert(id as u64, rt);
+
+        let rows = call_list(&state).await;
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r["id"], id);
+        assert_eq!(r["status"], "running");
+        assert_eq!(r["status_reason"], "test");
+        assert_eq!(r["healthy"], false, "healthy 必须反映运行态(false)");
+        assert_eq!(r["bytes_in"], 111);
+        assert_eq!(r["bytes_out"], 222);
+        assert_eq!(r["conns_current"], 3);
+    }
+
+    /// 运行态不存在(已禁用):status=disabled、healthy 默认 true、计量为 0。
+    ///
+    /// 这条专门盯 `healthy` —— 它原本是**独立的第 4 次 get**,合并时
+    /// 最容易被漏改成别的变量。
+    #[tokio::test]
+    async fn absent_runtime_uses_defaults() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        let id = db
+            .insert_proxy(CID, &spec("s2", 24601, "stcp"), false, "console")
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+
+        let rows = call_list(&state).await;
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r["id"], id);
+        assert_eq!(r["status"], "disabled");
+        assert_eq!(r["healthy"], true, "运行态不存在时 healthy 默认为 true");
+        assert_eq!(r["bytes_in"], 0);
+        assert_eq!(r["bytes_out"], 0);
+        assert_eq!(r["conns_current"], 0);
+        assert_eq!(r["pool_ready"], 0);
+    }
+
+    /// secret_key 必须被抹掉(与本次合并无关,但同一条回归路径)。
+    #[tokio::test]
+    async fn secret_key_redacted() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        db.insert_proxy(CID, &spec("s3", 24602, "stcp"), false, "console")
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        let rows = call_list(&state).await;
+        assert_eq!(
+            rows[0]["spec"]["stcp"]["secret_key"], "",
+            "列表不得回显 secret_key"
+        );
+    }
+
+    /// 多条规则:每条都要有正确的计量(不能因复用 rt 变量而串号)。
+    #[tokio::test]
+    async fn multiple_rows_have_independent_meters() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..5u16 {
+            let id = db
+                .insert_proxy(
+                    CID,
+                    &spec(&format!("m{i}"), 24700 + i, "stcp"),
+                    false,
+                    "console",
+                )
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        // 每条给不同的 bytes_in
+        for (k, id) in ids.iter().enumerate() {
+            let rt = Arc::new(crate::state::ProxyRuntime::new(
+                *id as u64,
+                CID.into(),
+                spec(&format!("m{k}"), 24700 + k as u16, "stcp"),
+            ));
+            rt.bytes_in
+                .store((k as u64 + 1) * 100, std::sync::atomic::Ordering::Relaxed);
+            state.proxies.runtimes.insert(*id as u64, rt);
+        }
+        let rows = call_list(&state).await;
+        assert_eq!(rows.len(), 5);
+        for (k, r) in rows.iter().enumerate() {
+            assert_eq!(
+                r["bytes_in"],
+                (k as u64 + 1) * 100,
+                "第 {k} 条的计量串号了 —— rt 复用必须逐条重新取"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod list_services_bench {
+    //! P5 基准(手动运行):4 次 `proxies.get` vs 1 次。
+    //!
+    //! ```text
+    //! cargo test -p rh-server --release list_services_bench -- --ignored --nocapture
+    //! ```
+    //!
+    //! 直接测 dashmap 查找本身(不经过 HTTP/JSON),隔离出本项改动的那一部分。
+    //! 如实预期:这是**微秒级**优化,报告里原本就把它列为"可选"。
+    use super::*;
+
+    fn spec(name: &str, port: u16) -> ProxySpec {
+        serde_json::from_value(json!({
+            "name": name,
+            "kind": "stcp",
+            "client_id": "bench",
+            "bind_ip": "127.0.0.1",
+            "bind_port": port,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": true,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "耗时基准,手动运行(--ignored --nocapture)"]
+    async fn bench_get_once_vs_four_times() {
+        for n in [100usize, 500, 1000] {
+            let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+            let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+            for i in 0..n as u64 {
+                state.proxies.runtimes.insert(
+                    i + 1,
+                    Arc::new(crate::state::ProxyRuntime::new(
+                        i + 1,
+                        "bench".into(),
+                        spec(&format!("p{i}"), 0),
+                    )),
+                );
+            }
+            let reps = 20;
+            // 4 次查找(修前)
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                for i in 1..=n as u64 {
+                    let _ = state.proxies.get(i);
+                    let _ = state.proxies.get(i);
+                    let _ = state.proxies.get(i);
+                    let _ = state.proxies.get(i);
+                }
+            }
+            let four = t0.elapsed() / reps;
+
+            // 1 次查找(修后)
+            let t1 = std::time::Instant::now();
+            for _ in 0..reps {
+                for i in 1..=n as u64 {
+                    let _ = state.proxies.get(i);
+                }
+            }
+            let one = t1.elapsed() / reps;
+            println!(
+                "N={n:>5}  4×get={four:>12?}  1×get={one:>12?}  省={:?}",
+                four.saturating_sub(one)
+            );
+        }
     }
 }
