@@ -295,7 +295,7 @@ impl ClientSession {
     /// select 不再回顶,读帧 / 写帧 / 心跳 / cancel 四条分支全部失联。
     ///
     /// 丢弃一条消息让调用方在**下一拍自愈**,远好于把整条会话钉死。
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn try_send_msg(&self, m: ClientMessage) -> bool {
         match encode_control_frame(&m) {
             Some(bytes) => self.send_tx.try_send(bytes).is_ok(),
@@ -308,7 +308,6 @@ impl ClientSession {
     /// 心跳路径需要这个区分:
     /// - `Full`  → 丢这一拍,会话继续(下一拍自愈);
     /// - `Closed` → 写侧任务已退出,会话确实该结束。
-    #[allow(dead_code)]
     fn try_send_msg_err(&self, m: ClientMessage) -> Result<(), TrySendError> {
         match encode_control_frame(&m) {
             Some(bytes) => self.send_tx.try_send(bytes).map_err(|e| match e {

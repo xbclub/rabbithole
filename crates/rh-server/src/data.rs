@@ -257,7 +257,15 @@ pub async fn get_channel(state: &Arc<AppState>, rt: &Arc<ProxyRuntime>) -> Optio
         .await
         .is_some();
     if !issued {
-        pool.inflight.fetch_sub(1, Ordering::Relaxed);
+        // R6:饱和递减(与 tcp_on_channel/tcp_refill 两兄弟位点对齐)——
+        // fetch_add 与此处之间跨着最长 2s 的 send_bounded await,期间
+        // 新会话 claim_pool 会把 inflight 清零,裸 fetch_sub 落在 0 上
+        // 回绕 u64::MAX,预热闸门恒真、池永久不再预热。
+        let _ = pool
+            .inflight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
         pool.remove_waiter(waiter_id).await;
         return None;
     }

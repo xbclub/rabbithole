@@ -19,9 +19,19 @@ use tracing::{debug, info, warn};
 /// nonce 表:nonce_hex → (client_id, expires)。
 /// 绑定签发连接:仅在签发连接上被消费。
 pub struct ChallengeTable {
-    inner: Mutex<HashMap<String, ChallengeEntry>>,
+    /// map + 插入序队列同锁(R6:order 支撑摊还 O(1) 的满表淘汰,
+    /// 修前表钉在 cap 时每次 issue 都在全局锁内 O(65536) min_by_key
+    /// 全表扫描)。
+    inner: Mutex<ChallengeInner>,
     /// R5:retain 限频时刻(见 issue;修前每认证一次全表扫描)
     last_sweep: std::sync::Mutex<Instant>,
+}
+
+struct ChallengeInner {
+    map: HashMap<String, ChallengeEntry>,
+    /// 插入序 nonce(TTL 恒 30s,「最旧」≡「最早插入」;弹出时跳过
+    /// 已被 consume 摘除的 nonce,每个元素至多弹出一次,摊还 O(1))。
+    order: std::collections::VecDeque<String>,
 }
 
 /// 表容量上限:防止 连接→HELLO→收挑战→断开 的慢速积累耗尽内存。
@@ -60,7 +70,10 @@ struct ChallengeEntry {
 impl ChallengeTable {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(ChallengeInner {
+                map: HashMap::new(),
+                order: std::collections::VecDeque::new(),
+            }),
             last_sweep: std::sync::Mutex::new(Instant::now()),
         }
     }
@@ -78,7 +91,14 @@ impl ChallengeTable {
         let mut sweep = self.last_sweep.lock().unwrap();
         if sweep.elapsed() >= Duration::from_secs(1) {
             *sweep = now;
-            g.retain(|_, e| e.expires > now);
+            let ChallengeInner { map, order } = &mut *g;
+            let before = map.len();
+            map.retain(|_, e| e.expires > now);
+            if map.len() != before {
+                // 过期清理后同步修剪 order(被清条目的槽位在下次满表
+                // 淘汰时作为空弹跳过,摊还仍 O(1);这里只是尽快回收)
+                order.retain(|n| map.contains_key(n));
+            }
         }
         // ★表满时淘汰"最旧的一条",**不是**拒绝新挑战。
         //
@@ -90,16 +110,17 @@ impl ChallengeTable {
         //
         // 淘汰最旧条目后,新挑战总能拿到 nonce;被淘汰的那一条若仍在等待
         // 应答,会因 consume 失败而重连一次(自愈),代价远小于全服拒绝。
-        if g.len() >= CHALLENGE_TABLE_CAP {
-            if let Some(oldest) = g
-                .iter()
-                .min_by_key(|(_, e)| e.expires)
-                .map(|(k, _)| k.clone())
-            {
-                g.remove(&oldest);
-            }
+        // R6:满表淘汰改插入序队列摊还 O(1)(修前 min_by_key 全表扫描
+        // + key clone;饱和洪泛态下 R5 的 retain 限频收益归零,本分支
+        // 成为每 HELLO 一次的 O(65536) 锁内扫描)。
+        while g.map.len() >= CHALLENGE_TABLE_CAP {
+            let Some(oldest) = g.order.pop_front() else {
+                break;
+            };
+            g.map.remove(&oldest);
         }
-        g.insert(
+        g.order.push_back(nonce.clone());
+        g.map.insert(
             nonce.clone(),
             ChallengeEntry {
                 client_id: client_id.to_string(),
@@ -112,7 +133,8 @@ impl ChallengeTable {
     /// 取出即删;返回归属 client_id。
     pub async fn consume(&self, nonce: &str) -> Option<String> {
         let mut g = self.inner.lock().await;
-        let e = g.remove(nonce)?;
+        // order 中的残留槽位由满表淘汰/修剪时的空弹跳过(consume 不扫队列)
+        let e = g.map.remove(nonce)?;
         if e.expires < Instant::now() {
             return None;
         }
@@ -128,9 +150,14 @@ impl ChallengeTable {
             let now = Instant::now();
             let removed = {
                 let mut g = self.inner.lock().await;
-                let before = g.len();
-                g.retain(|_, e| e.expires > now);
-                before - g.len()
+                let ChallengeInner { map, order } = &mut *g;
+                let before = map.len();
+                map.retain(|_, e| e.expires > now);
+                let removed = before - map.len();
+                if removed > 0 {
+                    order.retain(|n| map.contains_key(n));
+                }
+                removed
             };
             if removed > 0 {
                 tracing::debug!(removed, "challenge table swept");
