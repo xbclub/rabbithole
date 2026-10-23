@@ -1710,18 +1710,32 @@ struct CreateVisitorReq {
 /// 同名规则可能存在于多个客户端:优先当前在线的客户端;全部离线时取
 /// 创建序首个,歧义时告警。修前 update 取"首个匹配"(不看在不在线),
 /// create 优先在线 —— 同名一在线一离线时,update 会把归属改到离线端。
+///
+/// ★一次全表查询后内存匹配,而不是每客户端查一次。
+///
+/// 修前是 `1 + N_clients` 次 SQLite 查询(create_visitor 与 update_visitor
+/// 各调一次本函数)。逐客户端查的代价不只是多 N 次往返 —— 每次还要把该
+/// 客户端的全部规则反序列化一遍。改成一次 `list_proxies(None)` 后,反序列化
+/// 总量与"所有客户端规则之和"持平,但往返只剩一次。
+///
+/// 候选顺序必须与修前一致:修前按 `list_clients()` 的返回顺序
+/// (`ORDER BY created_at`)逐个追加。所以这里**按 clients 的原顺序过滤**,
+/// 而不是按 client_id 排序 —— 后者会改变"全部离线时取首个"的语义。
 async fn resolve_visitor_target(state: &Arc<AppState>, spec: &VisitorSpec) -> Option<String> {
     let clients = state.db.list_clients().await.unwrap_or_default();
-    let mut candidates: Vec<String> = Vec::new();
-    for c in &clients {
-        if let Ok(list) = state.db.list_proxies(Some(&c.id)).await {
-            if list.iter().any(|(_, _, p)| {
-                p.name == spec.target_proxy_name && p.kind.as_str() == spec.kind.as_str()
-            }) {
-                candidates.push(c.id.clone());
-            }
-        }
-    }
+    let all = state.db.list_proxies(None).await.unwrap_or_default();
+    let matched: std::collections::HashSet<&str> = all
+        .iter()
+        .filter(|(_, _, p)| {
+            p.name == spec.target_proxy_name && p.kind.as_str() == spec.kind.as_str()
+        })
+        .map(|(_, cid, _)| cid.as_str())
+        .collect();
+    let candidates: Vec<String> = clients
+        .iter()
+        .filter(|c| matched.contains(c.id.as_str()))
+        .map(|c| c.id.clone())
+        .collect();
     if candidates.len() > 1 {
         tracing::warn!(
             proxy = %spec.target_proxy_name,
@@ -3218,6 +3232,170 @@ mod update_disable_teardown_tests {
                 .port_in_use("tcp", "127.0.0.1".parse().unwrap(), 23457, None, None)
                 .await,
             "A5:teardown 后端口必须报告未占用(否则新规则可与之双占)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod visitor_target_tests {
+    //! #8 回归:`resolve_visitor_target` 从 N+1 查询改成一次全取后,
+    //! 匹配规则与候选顺序语义必须与修前一致。
+    //!
+    //! 这里断言的是**外部可观测行为** —— 解析出哪个 client_id。不碰
+    //! "查了几次 DB" 这种实现细节(那正是这次要改掉的东西,断言它会形成
+    //! 自证循环)。
+    use super::*;
+
+    fn proxy_spec(client_id: &str, name: &str, kind: &str) -> ProxySpec {
+        serde_json::from_value(json!({
+            "name": name,
+            "kind": kind,
+            "client_id": client_id,
+            "bind_ip": "127.0.0.1",
+            "bind_port": 24500,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": true,
+        }))
+        .unwrap()
+    }
+
+    fn visitor_spec(target_proxy_name: &str, kind: &str) -> VisitorSpec {
+        serde_json::from_value(json!({
+            "name": "v",
+            "kind": kind,
+            "enabled": true,
+            "bind_addr": "127.0.0.1",
+            "bind_port": 24600,
+            "target_proxy_name": target_proxy_name,
+        }))
+        .unwrap()
+    }
+
+    async fn state_with(clients: &[(&str, &str)]) -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        for (i, (id, secret)) in clients.iter().enumerate() {
+            db.create_client(id, id, &format!("{i}").repeat(64), "")
+                .await
+                .unwrap();
+            let _ = secret;
+        }
+        Arc::new(AppState::new(crate::config::ServerConfig::default(), db))
+    }
+
+    async fn add_proxy(state: &Arc<AppState>, client_id: &str, name: &str, kind: &str) {
+        state
+            .db
+            .insert_proxy(
+                client_id,
+                &proxy_spec(client_id, name, kind),
+                false,
+                "console",
+            )
+            .await
+            .unwrap();
+    }
+
+    /// 唯一匹配:直接返回该客户端。
+    #[tokio::test]
+    async fn single_match_resolves() {
+        let state = state_with(&[("c1", "a"), ("c2", "b")]).await;
+        add_proxy(&state, "c2", "target", "stcp").await;
+        let got = resolve_visitor_target(&state, &visitor_spec("target", "stcp")).await;
+        assert_eq!(got.as_deref(), Some("c2"));
+    }
+
+    /// 类型不匹配不算命中(stcp 访问器不能挂到 http 规则上)。
+    #[tokio::test]
+    async fn kind_must_match() {
+        let state = state_with(&[("c1", "a")]).await;
+        add_proxy(&state, "c1", "target", "http").await;
+        let got = resolve_visitor_target(&state, &visitor_spec("target", "stcp")).await;
+        assert!(got.is_none(), "类型不匹配时不得解析到该规则");
+    }
+
+    /// 名字不匹配不算命中。
+    #[tokio::test]
+    async fn name_must_match() {
+        let state = state_with(&[("c1", "a")]).await;
+        add_proxy(&state, "c1", "other", "stcp").await;
+        let got = resolve_visitor_target(&state, &visitor_spec("target", "stcp")).await;
+        assert!(got.is_none());
+    }
+
+    /// 多个客户端同名同类型:优先**在线**的那个。
+    ///
+    /// 这是 B15 的核心语义,也是最容易被"改成一次查询 + 内存分组"时弄丢的:
+    /// 一旦候选顺序变了,在线优先之外的回退分支(全部离线取首个)就会选错人。
+    #[tokio::test]
+    async fn prefers_online_client_over_created_order() {
+        let state = state_with(&[("c1", "a"), ("c2", "b")]).await;
+        add_proxy(&state, "c1", "target", "stcp").await;
+        add_proxy(&state, "c2", "target", "stcp").await;
+        // c2 在线(注册一个会话),c1 离线
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        state.sessions.register(crate::session::Session::new(
+            "c2".into(),
+            "sid-c2".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        ));
+        let got = resolve_visitor_target(&state, &visitor_spec("target", "stcp")).await;
+        assert_eq!(
+            got.as_deref(),
+            Some("c2"),
+            "多客户端同名时必须优先在线客户端,而不是创建序首个"
+        );
+    }
+
+    /// #8 基准(手动运行):N 个客户端各 1 条规则时的解析耗时。
+    ///
+    /// ```text
+    /// cargo test -p rh-server --release visitor_target_tests::bench -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "耗时基准,手动运行(--ignored --nocapture)"]
+    async fn bench_resolve_scaling() {
+        for n in [50usize, 200, 500, 1000] {
+            let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+            for i in 0..n {
+                let cid = format!("c{i}");
+                db.create_client(&cid, &cid, &"0".repeat(64), "")
+                    .await
+                    .unwrap();
+                db.insert_proxy(
+                    &cid,
+                    &proxy_spec(&cid, &format!("p{i}"), "stcp"),
+                    false,
+                    "console",
+                )
+                .await
+                .unwrap();
+            }
+            let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+            let spec = visitor_spec(&format!("p{}", n - 1), "stcp");
+            let reps = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                let got = resolve_visitor_target(&state, &spec).await;
+                assert!(got.is_some());
+            }
+            println!("N_clients={n:>5}  resolve={:>12?}/次", t0.elapsed() / reps);
+        }
+    }
+
+    /// 全部离线:按 `list_clients()` 的创建序取首个。
+    #[tokio::test]
+    async fn all_offline_falls_back_to_creation_order() {
+        let state = state_with(&[("c1", "a"), ("c2", "b")]).await;
+        add_proxy(&state, "c1", "target", "stcp").await;
+        add_proxy(&state, "c2", "target", "stcp").await;
+        let got = resolve_visitor_target(&state, &visitor_spec("target", "stcp")).await;
+        assert_eq!(
+            got.as_deref(),
+            Some("c1"),
+            "全部离线时应取创建序首个(顺序语义不得因改法漂移)"
         );
     }
 }
