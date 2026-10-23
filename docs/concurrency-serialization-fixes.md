@@ -939,3 +939,129 @@ async fn stop_proxy(sess: &Arc<ClientSession>, id: u64) {
 - 没有动 `snapshot_state` 的 `try_read` 改造(§7 已否决的理由仍成立)。
 - 没有动 rh-transport / mux.rs 批量聚合 / apply_sync 的 to_start 循环。
 
+
+---
+
+## 18. 第四批:新发现的 3 项 + 1 项待判断(2026-10-23)
+
+本批 4 项都不在之前的清单里。每项一个独立提交。
+
+| 项 | 提交 | 复杂度变化 | 实测 |
+|---|---|---|---|
+| Q1 `update_client` 禁用分支 teardown 循环 | `4c0d203` | O(N·2s) → ~2s | **32.06s → 4.03s**(16 条卡住规则) |
+| Q2 客户端心跳 `send_msg` 自锁 | `a9eb0f5` | 可自锁 → 非阻塞 | **端到端复现不出**,见 §18.2 |
+| Q3 `CONTROL_SEND_TIMEOUT` 三处重复 | `c695736` | 3 处定义 → 1 处 | 纯去重,零风险 |
+| Q4 REMOVE 发送并发化 | `d6f5dd4` | N×2s → ⌈N/8⌉×2s | **送达数相同,耗时 16.26s → 2.22s** |
+
+### 18.1 Q1:与 P3 同款的漏点
+
+`update_client` 的禁用分支原先是「teardown 一条 → send 一条」交替循环,
+teardown 串行。上一轮 P3 只改了 `delete_client`,漏了这个调用点。
+
+**顺序变化**:拆成「先全部 teardown、再全部 send」后,REMOVE 帧从穿插发出
+变成集中在 teardown 完成后发出。判断**不破坏语义**:
+
+- REMOVE 的语义是「通知客户端删掉这条规则」,客户端收到后只是
+  `sess.proxies.lock().await.remove(&id)`,不依赖服务端运行态是否还在;
+- 若客户端在收到 REMOVE 前断线重连,与「交替结构下收到一半就断线」的差别
+  只是少收几条 —— 重连后服务端用全量 ServiceSync 覆盖。
+
+**实测**(16 条卡住规则,与 P3 同一套构造):
+
+| | 总耗时 |
+|---|---|
+| 串行(修前) | **32.06s**(恰好 16 × 2s) |
+| 并发 8(修后) | **4.03s** |
+
+**一处测试自身的修正**:最初断言 `proxy.enabled == false`,这是错的 ——
+`set_client_enabled` 只改 `clients` 表,不改 proxies 行的 `enabled`。
+已改为断言 clients 表。
+
+### 18.2 Q2:自锁判断成立,但**端到端复现不出来**
+
+**自锁判断本身已核实无误**:
+- (a) `send_rx` 的唯一消费者就是同一个 `select!` 的 `recv` 分支
+  (grep 确认:全仓只有 `run_loop` 里一处 `send_rx.recv()`);
+- (b) 队列容量 256(有限)。
+
+所以「心跳分支 `send().await` + 队列满」确实会 park 在"等自己消费"上,
+select 不再回顶。与服务端 A1 缺陷同形。
+
+**但端到端自锁我试了三版构造都复现不出来**,每版的失败原因都查清了:
+
+1. duplex 对端未保活 → `read_frame` 立刻 EOF,run_loop 在首次心跳前 break;
+2. 保活但缓冲 4096 → `send_rx.recv()` 分支照常排空队列,队列永不真满;
+3. 保活 + 缓冲 1 + server 不读 → `send_rx` 分支**先**取走队列里唯一那条,
+   然后阻塞在 `write_all`,3s 后写超时(`watchdog = 3×heartbeat_s`)break。
+   实测 loop 只迭代一次,**心跳分支从未执行**。
+
+要复现「心跳 `send().await` 在满队列上 park」,必须让队列在心跳 tick 那一刻
+恰好满、且 `send_rx` 分支恰好没在消费 —— 这是调度时序竞态,单测里造不稳。
+
+**所以我不假装端到端测试是缺陷回归**,证据链改成两条:
+
+- `try_send_prime_never_blocks`(原语层):满队列立即返回 false,不阻塞;
+- `blocking_send_would_hang_on_full_queue`(**反向证据**):旧的 `send_msg`
+  在同样场景下确实挂住(200ms timeout 捕获)。
+
+二者合起来证明「换 try_send 是必要且有效的」。调用点是否用对,靠源码结构
++ 一条**功能性**回归(`cancel_terminates_run_loop_even_with_full_queue`,
+满队列时 run_loop 不会永久卡死;注释里写明它抓不住缺陷)。
+
+**顺带修掉的另一个独立错误**:原代码 `if !send_msg(...) { break; }` 把
+「发送失败」一律当成会话结束。而队列满导致的失败是可自愈的背压,不该断连。
+现在区分 `Full`(丢一拍,继续)与 `Closed`(接收端没了,break)。
+
+**★未做的相关发现(建议下一批)**:`dispatch_frame` 里的 PING 应答
+(`session.rs:1303`)与 `ack()`(`:1320`)同样在 `select!` 读分支的内联
+路径上,同样有自锁风险。任务书只要求改心跳,本次没动。
+
+### 18.3 Q3:三处重复定义合并,位置必须选 config.rs
+
+任务书建议「runtime.rs 那处已是 `pub(crate)`,删另外两处改成 use」。
+**这条路走不通**:`runtime.rs` 依赖 `state.rs`,若 `state.rs` 反过来
+`use crate::runtime::CONTROL_SEND_TIMEOUT` 就是循环依赖。
+
+`config.rs` 不依赖任何业务模块(state / runtime / nathole 都依赖它),
+是唯一干净的中立位置。已核实 `grep -n "crate::state\|crate::runtime\|crate::nathole" config.rs`
+无输出。
+
+结果:定义 1 处(config.rs),导入 4 处(runtime / state / nathole / api),
+24 个使用点不变。
+
+### 18.4 Q4:实测推翻了「可能不做」的顾虑
+
+**原顾虑**(任务书提出):并发 `send_bounded` 在队列满时会"同时等 2s、
+然后同时失败",一次性丢掉 N 条 REMOVE;串行至少能渐进送达前几条。
+
+**实测(用本仓库的 tokio,队列容量固定、不消费)**:
+
+| 场景 | 串行送达 | 并发送达 | 串行耗时 | 并发耗时 |
+|---|---|---|---|---|
+| cap=3, n=10 | 3 | **3** | 14.02s | **2.01s** |
+| cap=3, n=20 | 3 | **3** | 34.05s | **6.01s** |
+| cap=10, n=10 | 10 | **10** | 41µs | 70µs |
+| cap=10, n=20 | 10 | **10** | 20.03s | **4.01s** |
+
+送达条数**完全相同**。原因:`send_bounded` 不重试 —— 串行时第一条撞满队列
+等 2s 超时丢弃,第二条照样如此,**并不是"渐进送达"**。队列容量 k 决定能送
+几条,送完之后串行和并发都只剩超时。所以并发严格更优。
+
+**反向验证也印证**:把发送循环还原成串行,两条测试**依然全过**(送达数
+一样),但耗时从 2.22s 涨到 16.26s —— 正是 N×2s vs ⌈N/8⌉×2s。
+
+**顺序无要求**(已查协议):客户端 `remove_entity` 按 entity 独立处理,
+无跨条依赖;所有 REMOVE 用同一个 revision,只用于 ApplyResult 回执,
+不参与排序。
+
+---
+
+## 19. 仍未解决的事项(截至本批)
+
+1. **客户端 `dispatch_frame` 里的 PING 应答与 `ack()`** 同样在 select 内联
+   路径上,有与 Q2 同源的自锁风险(§18.2 末尾)。**未修**。
+2. **Q2 的端到端自锁测试复现不出来**(§18.2),目前只有原语层证据链。
+3. #2 恢复并发 / P4 `notify_client_recovery` 并发:**本机测不出收益**,
+   真实收益依赖文件型 SQLite 与在线会话,未在部署环境验证。
+4. #10 的端到端 RTT 测量:未做,只有调度结构基准。
+5. 基线 3 个 e2e 失败项 + `dnsquery::cache_tests` 偶发失败:未修,超出范围。
