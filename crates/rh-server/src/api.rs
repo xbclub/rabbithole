@@ -630,8 +630,49 @@ async fn update_client(
             let visitors = state.db.list_visitors(Some(&id)).await.unwrap_or_default();
             let rev = state.db.bump_revision(&id).await.unwrap_or(0);
             state.bump_cfg_gen(&id);
+            // ★teardown 并发,发送仍串行。
+            //
+            // 与 `delete_client`(上一轮 P3 已修)完全同构:单次
+            // `teardown_runtime` 最坏等 `serve_handle` 收敛 2s,串行执行时
+            // N 条规则 = N × 2s。禁用一个有 100 条 serve loop 不收敛规则的
+            // 客户端,这个 HTTP 请求会挂 200 秒。P3 当时只改了 delete_client,
+            // 漏了这个同款调用点。
+            //
+            // ★为什么拆成「先全部 teardown、再全部 send」而不是保持原来的
+            // 「teardown 一条 → send 一条」交替:
+            // 交替结构无法并发化(每次 send 都要等前一条 teardown 完成)。
+            // 拆分后的顺序变化是:REMOVE 帧从「穿插发出」变成「集中在
+            // teardown 全部完成后发出」。
+            //
+            // 这个变化不破坏语义:REMOVE 的语义是「通知客户端删掉这条规则」,
+            // 客户端收到它之后只是 `sess.proxies.lock().await.remove(&id)`
+            // (session.rs 的 `remove_entity`),不依赖服务端运行态是否还在。
+            // 服务端先拆干净再发通知,方向更清晰。
+            //
+            // 若客户端在收到 REMOVE 前断线重连,与「交替结构下收到一半
+            // REMOVE 就断线」的差别只是「少收几条 REMOVE」—— 重连后服务端
+            // 会用全量 ServiceSync 覆盖,结果一致。
+            //
+            // 并发度 8:与 delete_client 一致(理由见那里 —— 每条规则内部
+            // 可能等满 2s,过高会让「同时持有大量 rule_cancel + fd 正在
+            // 释放」的窗口变宽)。
+            //
+            // 自锁核查:本函数外层持有 `serial_lock(&id)`,而
+            // `teardown_runtime` 内部不取 `serial_lock`(grep 结果 0)。
+            {
+                use futures::stream::StreamExt as _;
+                futures::stream::iter(proxies.iter())
+                    .for_each_concurrent(8, |(pid, _, _)| {
+                        let state = state.clone();
+                        let pid = *pid as u64;
+                        async move {
+                            crate::runtime::teardown_runtime(&state, pid).await;
+                        }
+                    })
+                    .await;
+            }
+            // 发送仍串行(见报告 Q4:并发发会在队列满时批量丢弃 REMOVE)。
             for (pid, _, _spec) in &proxies {
-                crate::runtime::teardown_runtime(&state, *pid as u64).await;
                 if let Some(sess) = state.sessions.get(&id) {
                     use rh_protocol::message::{ServerMessage, ServiceRemove};
                     let _ = sess
@@ -4289,5 +4330,191 @@ mod list_services_bench {
                 four.saturating_sub(one)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod update_client_teardown_tests {
+    //! Q1 回归:`update_client` 禁用分支的 teardown 循环必须并发,
+    //! 不得 N × 2s。
+    //!
+    //! 与 `delete_client_concurrency_tests`(上一轮 P3)同一套构造:
+    //! 往 `rt.serve_handle` 塞一个**永不返回且不响应 `rule_cancel`** 的任务,
+    //! 精确模拟"serve loop 不收敛",单次 teardown 必然吃满 2s。
+    //!
+    //! 断言基于外部可观测行为:总耗时 + 最终状态。不引用并发度常量。
+    use super::*;
+    use axum::extract::Path as AxumPath;
+
+    const CID: &str = "upd-teardown-client";
+
+    fn proxy_spec(i: i64) -> ProxySpec {
+        serde_json::from_value(json!({
+            "name": format!("p{i}"),
+            "kind": "stcp",
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": 0,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": true,
+        }))
+        .unwrap()
+    }
+
+    async fn auth(state: &Arc<AppState>) -> HeaderMap {
+        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        h
+    }
+
+    async fn stuck_rt(id: u64) -> Arc<crate::state::ProxyRuntime> {
+        let rt = Arc::new(crate::state::ProxyRuntime::new(
+            id,
+            CID.into(),
+            proxy_spec(id as i64),
+        ));
+        let h = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        *rt.serve_handle.lock().await = Some(h);
+        rt
+    }
+
+    /// 16 条卡住规则 + 禁用客户端:总耗时必须是 ~2s 量级,不是 16×2s。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disable_client_does_not_take_n_times_2s() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        const N: usize = 16;
+        let mut ids = Vec::new();
+        for i in 0..N {
+            let id = db
+                .insert_proxy(CID, &proxy_spec(i as i64), false, "console")
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        for id in &ids {
+            let rt = stuck_rt(*id as u64).await;
+            state.proxies.runtimes.insert(*id as u64, rt);
+        }
+
+        let t0 = std::time::Instant::now();
+        let r = update_client(
+            State(state.clone()),
+            auth(&state).await,
+            AxumPath(CID.to_string()),
+            Json(UpdateClientReq {
+                enabled: Some(false),
+                name: None,
+                remark: None,
+                rate_limit: None,
+                max_conns: None,
+                max_services: None,
+                flow_limit: None,
+            }),
+        )
+        .await;
+        let elapsed = t0.elapsed();
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], 0, "update 应成功: {v}");
+
+        // 串行是 16 × 2s = 32s;并发(8)是 2 批 × 2s ≈ 4s。
+        // 上限取 10s:明显低于 32s,又给调度留余量。
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "禁用 {N} 条卡住规则耗时 {elapsed:?} —— 串行会是 {N}×2s=32s,必须并发"
+        );
+        // 功能性:全部运行态必须消失
+        assert!(
+            state.proxies.runtimes.is_empty(),
+            "禁用后不得残留运行态,实际 {}",
+            state.proxies.runtimes.len()
+        );
+        // 客户端本身必须被置为禁用。
+        // (注意:`set_client_enabled` 只改 clients 表,不改 proxies 行的
+        //  enabled —— 规则行保留自己的 enabled,客户端禁用期间不恢复。
+        //  这里断言的是 clients 表,不是 proxy 行。)
+        let c = state.db.get_client(CID).await.unwrap().unwrap();
+        assert!(!c.enabled, "clients 表必须已置 disabled");
+    }
+
+    /// 功能性回归:普通客户端禁用后运行态清空,且 REMOVE 帧真的入队。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disable_plain_client_clears_and_sends_remove() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let id = db
+                .insert_proxy(CID, &proxy_spec(i), false, "console")
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        for id in &ids {
+            state.proxies.runtimes.insert(
+                *id as u64,
+                Arc::new(crate::state::ProxyRuntime::new(
+                    *id as u64,
+                    CID.into(),
+                    proxy_spec(*id),
+                )),
+            );
+        }
+        // 注册在线会话,收 REMOVE 帧
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        state.sessions.register(crate::session::Session::new(
+            CID.into(),
+            "sid".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        ));
+
+        let r = update_client(
+            State(state.clone()),
+            auth(&state).await,
+            AxumPath(CID.to_string()),
+            Json(UpdateClientReq {
+                enabled: Some(false),
+                name: None,
+                remark: None,
+                rate_limit: None,
+                max_conns: None,
+                max_services: None,
+                flow_limit: None,
+            }),
+        )
+        .await;
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], 0);
+
+        assert!(state.proxies.runtimes.is_empty(), "运行态必须清空");
+        // 5 条 REMOVE 必须全部入队(拆成两个循环后不能漏发)
+        let mut n_remove = 0;
+        while let Ok(m) = rx.try_recv() {
+            if matches!(m, rh_protocol::message::ServerMessage::ServiceRemove(_)) {
+                n_remove += 1;
+            }
+        }
+        assert_eq!(n_remove, 5, "每条规则都必须发 REMOVE,实际 {n_remove}");
     }
 }
