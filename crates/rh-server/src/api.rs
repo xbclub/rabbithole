@@ -4359,6 +4359,191 @@ mod list_services_bench {
 }
 
 #[cfg(test)]
+mod secret_key_management_tests {
+    //! 密钥访问规则的凭据完全服务端管理 —— 这条语义原先**只由 e2e 覆盖**
+    //! (`tests/e2e.sh` 读 `/api/services` 的 `spec.stcp.secret_key` 断言 32 hex)。
+    //
+    //! `07b1aa2`(安全加固)让列表接口抹掉 `secret_key` 之后,e2e 那条断言
+    //! 恒为 0 长度而失败。但**语义本身没有变**,变的是「从哪个口径能观察到它」:
+    //!   - 现在没有任何 API 再返回库中的密钥(创建响应不含、列表抹除、轮换响应
+    //!     返回的是**新**值而不是旧值);
+    //!   - 于是这条语义必须在**服务端内部**接住,而不是把 e2e 断言删掉了事。
+    //!
+    //! 这里直接驱动 `create_service_inner` / `rotate_service_secret`,断言落在
+    //! 「库里存的是什么」—— 这是密钥语义的**唯一事实源**(转发时用的就是它)。
+    //! e2e 侧改为验证它仍能验证的、外部可观察的性质(列表不回显),见
+    //! `tests/e2e.sh` 的 STCP 段。
+    use super::*;
+
+    const CID: &str = "secret-mgmt-client";
+
+    async fn state() -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        Arc::new(AppState::new(crate::config::ServerConfig::default(), db))
+    }
+
+    fn stcp_spec(name: &str, secret: &str) -> ProxySpec {
+        serde_json::from_value(json!({
+            "name": name,
+            "kind": "stcp",
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": 0,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": true,
+            "stcp": { "secret_key": secret },
+        }))
+        .unwrap()
+    }
+
+    /// 32 位小写 hex 的判定(不放宽:长度 + 字符集都要满足)。
+    fn is_32_hex(s: &str) -> bool {
+        s.len() == 32
+            && s.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    }
+
+    /// 创建:入参提供的 secret_key 必须被**忽略**,库中是服务端生成的 32 hex。
+    #[tokio::test]
+    async fn create_ignores_caller_secret_and_generates_32_hex() {
+        let st = state().await;
+        let mut spec = stcp_spec("sdb", "client-side-should-be-ignored");
+        let v = create_service_inner(&st, &mut spec).await.unwrap();
+        let id = v["id"].as_i64().unwrap();
+
+        let (_, _, stored, _) = st.db.get_proxy(id).await.unwrap().unwrap();
+        let got = stored.secret_cfg().unwrap().secret_key.clone();
+        assert_ne!(
+            got, "client-side-should-be-ignored",
+            "调用方提供的 secret_key 必须被忽略"
+        );
+        assert!(
+            is_32_hex(&got),
+            "库中密钥必须是服务端随机生成的 32 位小写 hex,实际是 {got:?}(长度 {})",
+            got.len()
+        );
+    }
+
+    /// 每次创建都不同(随机性):防止退化成固定值。
+    #[tokio::test]
+    async fn generated_secrets_are_distinct_across_creates() {
+        let st = state().await;
+        let mut a = stcp_spec("a", "");
+        let mut b = stcp_spec("b", "");
+        create_service_inner(&st, &mut a).await.unwrap();
+        create_service_inner(&st, &mut b).await.unwrap();
+        let rows = st.db.list_proxies(Some(CID)).await.unwrap();
+        let secrets: Vec<String> = rows
+            .iter()
+            .map(|(_, _, s)| s.secret_cfg().unwrap().secret_key.clone())
+            .collect();
+        assert_eq!(secrets.len(), 2);
+        assert_ne!(secrets[0], secrets[1], "两条规则的密钥不得相同");
+        assert!(secrets.iter().all(|s| is_32_hex(s)));
+    }
+
+    /// 轮换:必须是**新**的 32 hex,且落库(转发时读的就是库里的值)。
+    #[tokio::test]
+    async fn rotate_generates_new_32_hex_and_persists() {
+        let st = state().await;
+        let mut spec = stcp_spec("sdb2", "");
+        let v = create_service_inner(&st, &mut spec).await.unwrap();
+        let id = v["id"].as_i64().unwrap();
+        let before = st
+            .db
+            .get_proxy(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .2
+            .secret_cfg()
+            .unwrap()
+            .secret_key
+            .clone();
+
+        let resp =
+            rotate_service_secret(State(st.clone()), auth_headers(&st).await, Path(id)).await;
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let returned = body["data"]["secret"].as_str().unwrap().to_string();
+
+        let after = st
+            .db
+            .get_proxy(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .2
+            .secret_cfg()
+            .unwrap()
+            .secret_key
+            .clone();
+
+        assert_ne!(before, after, "轮换必须换掉库中的密钥");
+        assert!(
+            is_32_hex(&after),
+            "轮换后库中必须是新的 32 hex,实际 {after:?}"
+        );
+        assert_eq!(returned, after, "轮换响应返回的必须是新值(且只此一次)");
+    }
+
+    /// 编辑:入参空的 secret_key 表示「不修改」,原密钥必须保留。
+    /// (这是列表接口敢于抹除密钥的前提 —— 前端拿不到值也不会把它清空。)
+    #[tokio::test]
+    async fn update_with_empty_secret_keeps_existing() {
+        let st = state().await;
+        let mut spec = stcp_spec("keep", "");
+        let v = create_service_inner(&st, &mut spec).await.unwrap();
+        let id = v["id"].as_i64().unwrap() as u64;
+        let before = st
+            .db
+            .get_proxy(id as i64)
+            .await
+            .unwrap()
+            .unwrap()
+            .2
+            .secret_cfg()
+            .unwrap()
+            .secret_key
+            .clone();
+
+        // 模拟前端:从列表拿到的是空 secret_key,原样回传
+        let mut roundtrip = stcp_spec("keep", "");
+        roundtrip.id = id;
+        update_service_inner(&st, id as i64, roundtrip).await;
+
+        let after = st
+            .db
+            .get_proxy(id as i64)
+            .await
+            .unwrap()
+            .unwrap()
+            .2
+            .secret_cfg()
+            .unwrap()
+            .secret_key
+            .clone();
+        assert_eq!(after, before, "空 secret_key 的编辑必须保留原密钥");
+    }
+
+    async fn auth_headers(state: &Arc<AppState>) -> HeaderMap {
+        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        h
+    }
+}
+
+#[cfg(test)]
 mod update_client_teardown_tests {
     //! Q1 回归:`update_client` 禁用分支的 teardown 循环必须并发,
     //! 不得 N × 2s。

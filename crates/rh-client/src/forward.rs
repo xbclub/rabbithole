@@ -321,23 +321,48 @@ fn mk_client_limiter(
 
 /// 拨号本地目标(插件优先)。
 ///
-/// # 为什么用 `spec` 而不是 `fwd`(一致性,不是安全修复)
+/// # 目标来源:`fwd`(线路下发)权威,`spec` 只做兜底
 ///
-/// 常规中继的目标取自**本地 `spec`**(与 `health.rs` 的探活目标同源),
-/// 而非线路下发的 `fwd.target_host/port`。两点必须分清:
+/// 常规中继的目标以**线路下发的 `fwd.target_host/port`** 为准。
 ///
-/// **这不是 SSRF 修复。** `ProxySpec` 完全由服务端 `ServiceSync` 下发
-/// (`session.rs` 的 `apply_sync` 构建;客户端 `ClientConfig` 里**没有**
-/// 本地规则字段)。也就是说 `spec.target_host` 与 `fwd.target_host`
-/// **同为服务端可控** —— 在"服务端被攻破"这一威胁模型下,改与不改都拦不住
-/// 它让客户端去拨内网地址。真正的信任边界是**服务端本身可信**(客户端用
-/// secret / TLS pin / CA 认证服务端身份),本函数不做、也做不了任何加固。
+/// ## 为什么不能用 `spec`(`25b7505` 引入的回归)
 ///
-/// **它的价值是单一事实源与一致性。** `health.rs` 的探活早已用 `spec`,
-/// 而拨号此前用 `fwd`,同一份规则在同一进程里有两个取值来源。两者一旦漂移
-/// (服务端下发与本地下发不同步、或将来引入本地覆盖),就会出现"探活打到 A、
-/// 转发打到 B"这类极难归因的故障。`nathole_cli` 的直连路径早已用 `spec`
-/// 覆盖 `fwd`,这里补齐后两条路径口径一致。
+/// `spec` 是客户端 `proxies` 表里的副本,而它被读取的时机在
+/// `session.rs::open_data_channel` —— **数据通道建立的那一刻**,远早于该通道
+/// 真正承载用户连接的时刻(TCP 池预热通道尤其如此:池里的通道在规则创建时
+/// 就建好了,可以静置到几分钟后被取用)。
+///
+/// 于是"同端口只改 target"这类原位发布会出现:
+/// 1. 服务端 `publish_spec_in_place` 更新 `rt.spec` 并下发 `ServiceUpdate`;
+/// 2. 池里那 2 条**预热通道**早已带着旧 `spec` 快照在 `dial_target` 的调用栈里
+///    等待 `START_FORWARD`;
+/// 3. 用户连接落到这些通道上 → 拨的是**旧 target**;要等池被消耗一遍、新签发的
+///    通道才带上新快照。
+///
+/// 实测(HEAD,池大小 2):改 target 后前 **2** 次连接仍打旧目标,第 3 次起才切。
+/// 对照 `90f6f6b`(用 `fwd`)第 1 次即切换;把本函数临时改回 `fwd` 亦第 1 次即切换
+/// —— 见 `docs/concurrency-serialization-fixes.md` §13.3。
+///
+/// `fwd` 是服务端 `data.rs::assign_forward` 在**指派这一条通道的那一刻**从
+/// `rt.spec` 读出的,与规则当前状态同步;`StartForward` 的定义即
+/// 「指派信号:目标自包含」(`rh-protocol/src/message.rs`)。
+///
+/// ## 这为什么不构成 SSRF 面的回退
+///
+/// 引入 `spec` 的那次提交的理由是"被攻破的 server 可让 client 拨内网任意地址"。
+/// 但 `ProxySpec` 本身**完全由服务端 `ServiceSync` 下发**(客户端 `ClientConfig`
+/// 里没有本地规则字段),`spec.target_host` 与 `fwd.target_host` **同为服务端可控**。
+/// 在"服务端被攻破"的威胁模型下,两者改与不改都拦不住 —— 信任边界是**服务端本身
+/// 可信**(客户端用 secret / TLS pin / CA 认证服务端身份)。这一点 `25b7505` 之后
+/// 的 `81cc9eb` 已经如实写明("这不是 SSRF 修复")。
+///
+/// 用的是同一个服务端、同一份规则,只是取「指派时刻的权威值」而不是「建通道时刻的
+/// 陈旧副本」—— 不引入任何新的信任假设。
+///
+/// ## 保底与插件分支
+///
+/// `fwd.target_host` 为空时回落到 `spec`(旧端服务端可能不下发该字段,
+/// `serde(default)` 会得到空串;此时行为与修前一致,不会把连接打到空地址)。
 ///
 /// 插件分支**不读** `fwd`:所有插件的目标都来自 `spec.plugin` 自身
 /// (`local_addr`/`unix_path`),`http_proxy`/`socks5` 的目的地更是来自
@@ -346,12 +371,17 @@ fn mk_client_limiter(
 pub async fn dial_target(
     _sess: &Arc<ClientSession>,
     spec: &ProxySpec,
-    _fwd: &StartForward,
+    fwd: &StartForward,
 ) -> anyhow::Result<BoxedIo> {
     if let Some(plugin) = &spec.plugin {
         return crate::plugins::dial_plugin(plugin).await;
     }
-    let addr = resolve(&spec.target_host, spec.target_port).await?;
+    let (host, port) = if fwd.target_host.is_empty() {
+        (spec.target_host.as_str(), spec.target_port)
+    } else {
+        (fwd.target_host.as_str(), fwd.target_port)
+    };
+    let addr = resolve(host, port).await?;
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::net::TcpStream::connect(addr),
@@ -1162,5 +1192,143 @@ mod tests {
             .await
             .expect("回落路径也必须收敛")
             .unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // 拨号目标来源(§13.3 回归)
+    //
+    // `25b7505` 把 `dial_target` 的目标从线路下发的 `fwd` 改为本地 `spec`
+    // 副本。`spec` 是**数据通道建立时**的快照(池预热通道尤其陈旧),于是
+    // "同端口只改 target"的原位发布后,池里的旧通道仍打旧目标。
+    //
+    // 下面这条用**两个真实监听器**判定拨号最终落在哪一边 —— 不是断言常量、
+    // 不是断言"用了 fwd"这个实现细节,而是断言**流量到哪去了**,
+    // 所以对实现方式中立(将来换任何取值方案,只要语义对就仍然通过)。
+    // ------------------------------------------------------------------
+
+    /// 最小 `ClientSession`:`dial_target` 不读它的任何字段(参数是 `_sess`),
+    /// 故只构到能通过编译即可,避免依赖 session.rs 的测试辅助(跨模块)。
+    fn bare_session() -> Arc<ClientSession> {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+        Arc::new(ClientSession {
+            cfg: Arc::new(crate::config::ClientConfig::default()),
+            session_id: "s".into(),
+            heartbeat_s: 30,
+            send_tx: tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            proxies: tokio::sync::Mutex::new(Default::default()),
+            visitors: tokio::sync::Mutex::new(Default::default()),
+            visitor_cancels: tokio::sync::Mutex::new(Default::default()),
+            health_cancels: tokio::sync::Mutex::new(Default::default()),
+            waiting: tokio::sync::Mutex::new(Default::default()),
+            punched: tokio::sync::Mutex::new(Default::default()),
+            nat_socks: tokio::sync::Mutex::new(Default::default()),
+            punched_auth: tokio::sync::Mutex::new(Default::default()),
+            sudp_deliver: tokio::sync::Mutex::new(Default::default()),
+            mux: rh_transport::mux::wrap_stream_as_client(
+                Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
+                true,
+                100,
+            ),
+            conn_counter: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// 起一个只回 `tag` 的监听器(收到任意字节即写 tag 并关闭)。
+    async fn tag_listener(tag: &'static [u8]) -> (u16, tokio::task::JoinHandle<()>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = tokio::spawn(async move {
+            // 只接受一条连接足够:测试每次只拨一次
+            if let Ok((mut s, _)) = l.accept().await {
+                use tokio::io::AsyncWriteExt as _;
+                let mut buf = [0u8; 16];
+                let _ = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await;
+                let _ = s.write_all(tag).await;
+                let _ = s.shutdown().await;
+            }
+        });
+        (port, h)
+    }
+
+    fn spec_with_target(id: u64, host: &str, port: u16) -> ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": "t",
+            "kind": "tcp",
+            "client_id": "c",
+            "bind_ip": "127.0.0.1",
+            "bind_port": 24900,
+            "target_host": host,
+            "target_port": port,
+            "enabled": true,
+        }))
+        .unwrap()
+    }
+
+    fn fwd_to(id: u64, host: &str, port: u16) -> StartForward {
+        StartForward {
+            proxy_id: id,
+            user_src: "127.0.0.1:1".into(),
+            target_host: host.into(),
+            target_port: port,
+            flags: 0,
+            proxy_proto: rh_protocol::message::ProxyProto::None,
+            proxy_name: "t".into(),
+            xtcp_auth: String::new(),
+        }
+    }
+
+    /// `fwd` 与 `spec` 指向**不同**目标时,必须拨 `fwd`(服务端指派时刻的权威值)。
+    ///
+    /// `spec` 指向的端口是一个**已经关掉的**监听器(必然拒连),所以只要实现
+    /// 仍在用 `spec`,这条测试就会失败(拨号错误),而不是"碰巧连上也拿到 tag"。
+    #[tokio::test]
+    async fn dial_target_prefers_fwd_over_stale_spec() {
+        let spec_port = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        }; // 监听器在此 drop → 该端口无监听,拨它必失败
+        let (fwd_port, fwd_srv) = tag_listener(b"AUTHORITATIVE").await;
+
+        let spec = spec_with_target(1, "127.0.0.1", spec_port);
+        let fwd = fwd_to(1, "127.0.0.1", fwd_port);
+
+        let sess = bare_session();
+        let mut io = dial_target(&sess, &spec, &fwd)
+            .await
+            .expect("必须拨 fwd 指定的目标;拨到 spec 的陈旧端口会连不上");
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        io.write_all(b"ping").await.unwrap();
+        let mut buf = Vec::new();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), io.read_to_end(&mut buf)).await;
+        assert_eq!(
+            buf, b"AUTHORITATIVE",
+            "拨号必须落在 START_FORWARD 指定的目标上,而不是通道建立时的 spec 副本"
+        );
+        fwd_srv.await.unwrap();
+    }
+
+    /// 反向:旧服务端不下发 target(`serde(default)` → 空串)时回落 `spec`,
+    /// 不能把连接打到空地址。保证修法不会破坏兼容性。
+    #[tokio::test]
+    async fn dial_target_falls_back_to_spec_when_fwd_target_empty() {
+        let (spec_port, spec_srv) = tag_listener(b"FROM-SPEC").await;
+        let spec = spec_with_target(1, "127.0.0.1", spec_port);
+        // 空 host = 旧端行为
+        let fwd = fwd_to(1, "", 0);
+
+        let sess = bare_session();
+        let mut io = dial_target(&sess, &spec, &fwd)
+            .await
+            .expect("fwd 未下发 target 时必须回落 spec,而不是连空地址");
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        io.write_all(b"ping").await.unwrap();
+        let mut buf = Vec::new();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), io.read_to_end(&mut buf)).await;
+        assert_eq!(buf, b"FROM-SPEC");
+        spec_srv.await.unwrap();
     }
 }

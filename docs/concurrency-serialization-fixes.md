@@ -497,23 +497,204 @@ M2 规则级 404 / 静态缓存、M3 证书上传与删除。这一套直接验�
 
 ### 主 E2E(`tests/e2e.sh`)
 
-**PASS=79 FAIL=3**。
+**PASS=82 FAIL=0**(修复后,HEAD 实测)。
 
-3 个失败项:
-- `STCP 密钥由服务端随机生成(入参被忽略)`
-- `轮换端点生成新 32 hex 密钥`
-- `非端口更新原位切换目标`
+#### ★ 重大更正:原先「3 项是基线已有问题」的结论是错的
 
-**已确认与本次改动无关**:用 `git worktree` 检出基线 `1b8bfd6`、独立构建后跑
-同一套脚本,结果**完全相同**(79/3,失败项同名)。这 3 项是基线已有的问题。
+初版这一节写的是「PASS=79 FAIL=3,已用 `git worktree` 检出 `1b8bfd6` 验证
+过基线同样是 79/3,故这 3 项与本次改动无关」。
+
+**这个结论不成立,而且它的取证方式本身就是错的。** 实际复测数据:
+
+| 版本 | 实测 | 说明 |
+|---|---|---|
+| `90f6f6b` | **PASS=82 FAIL=0** | 全绿 |
+| `1b8bfd6` | **PASS=79 FAIL=3** | 与 HEAD 同款 3 项失败 |
+| `80a61b5`(修前 HEAD) | **PASS=79 FAIL=3** | — |
+| 修后 HEAD | **PASS=82 FAIL=0** | — |
+
+也就是说:
+
+- **`1b8bfd6` 本来就是坏的**(79/3),拿它当"基线"自然"复现"出同样结果 ——
+  这是**同义反复**,不是证据。初版把「用损坏的版本当基线」得出的结论写成了
+  「基线已有问题」。
+- **真正的全绿基线是 `90f6f6b`(82/0)**。以它为参照,这 3 项全部是回归。
+- 其中第 1、2 项是**回归但性质为「测试脚本过时」**(产品语义变严了,
+  脚本还在用旧口径);第 3 项是**真产品缺陷**。
+
+> **教训**:任何「基线问题」的结论都必须**有实跑数据**支撑,且必须选一个
+> **实测全绿**的版本当基线。用坏版本当基线,只会得到「两边一样坏」。
+>
+> 另外,任务书里「`1b8bfd6` 里 `grep -c "secret_key.clear()"` = 0」这句
+> 也与仓库实际不符 —— 实测 `1b8bfd6:crates/rh-server/src/api.rs` 里是 **2 处**,
+> `90f6f6b` 才是 0 处。清空逻辑由 `07b1aa2`(2026-10-22)引入,
+> 而 `90f6f6b` 早于它、`1b8bfd6` 晚于它。
+
+#### 第 1、2 项:测试脚本过时(不是产品缺陷)
+
+**现象**:断言读 `/api/services` 返回的 `spec.stcp.secret_key` 判 32 hex,
+实际恒为空串。
+
+**原因**:`07b1aa2`(「fix(security): 多载体证书绑定 + pending 过期回收 +
+两处密钥泄露」)在 `list_services` 里主动抹除了 `secret_key`:
+
+```rust
+let mut spec_view = spec.clone();
+if let Some(secret_cfg) = spec_view.stcp.as_mut() { secret_cfg.secret_key.clear(); }
+if let Some(secret_cfg) = spec_view.sudp.as_mut() { secret_cfg.secret_key.clear(); }
+```
+
+于是 `${#SEC_SDB}` 恒为 0。**产品语义没有退化,反而收紧了** ——
+变的是「从哪个口径能观察到那条语义」。
+
+**已确认无法用方案 B(换口径仍验证 32 hex)**:现在**没有任何 API 返回库中的
+密钥** —— 创建响应只回 `id/bind_port/port_auto/revision`(无密钥)、
+列表抹除、`rotate-secret` 返回的是**新**值而非旧值。黑盒确实取不到。
+
+**修法(两层,合起来覆盖原语义,不放宽)**:
+
+1. **e2e(黑盒)**:改为断言列表**不**回显密钥 ——
+   `[ -z "$SEC_SDB" ]`。这是**强断言**(空才过),验证的是安全加固本身。
+2. **服务端单测(白盒)**:新增 `api::secret_key_management_tests`(4 条),
+   直接驱动 `create_service_inner` / `rotate_service_secret` /
+   `update_service_inner`,断言落在**库里存的值**上 ——
+   那才是转发时真正使用的唯一事实源:
+   - `create_ignores_caller_secret_and_generates_32_hex`:入参
+     `"client-side-should-be-ignored"` 必须被忽略,库中是 32 位小写 hex;
+   - `generated_secrets_are_distinct_across_creates`:两次创建的值不同(防
+     退化成固定值);
+   - `rotate_generates_new_32_hex_and_persists`:轮换后库中是新 32 hex,
+     且响应返回值 == 库中值;
+   - `update_with_empty_secret_keeps_existing`:编辑时空 `secret_key` 保留
+     原值(这正是列表敢抹除的前提)。
+
+   这 4 条**原本不存在**(`grep` 确认:密钥语义此前只由 e2e 覆盖),
+   属于净增覆盖,不是把断言挪走。
+
+3. **第 2 项的口径其实更强了**:直接用轮换端点返回值,连续轮换两次互比 ——
+   既验证「32 hex」,又验证「每次都重新生成」(原断言在抹除后连
+   `SEC1 != SEC2` 都恒假),并额外断言列表仍不回显(安全加固不被绕过)。
+
+**反向验证(证明测试仍抓得住)**:临时把 `create_service_inner` 里的
+`cfg.secret_key = generate_secret()` 去掉,4 条单测中 **3 条立刻变红**
+(`create_ignores...`:left/right 都是 `client-side-should-be-ignored`;
+`update_with_empty...`:密钥被清成空串)。恢复后全绿。
+
+**未删除任何安全加固**:`list_services` 的 `secret_key.clear()` 两处原样保留。
+
+#### 第 3 项:真产品缺陷 —— 原位发布后池内通道仍打旧 target
+
+**现象**:同端口只改 `target_port`(18091 echo → 18093 http origin),
+更新后建连拿不到 `origin-ok`,客户端侧报 `TimeoutError: timed out`
+(注意不是 ConnectionRefused —— 说明**连上了,只是连的是旧目标**:echo 服务
+把 `GET / HTTP/1.0` 原样回显且不关连接,于是 `recv` 一直等到超时)。
+
+**根因**:`crates/rh-client/src/forward.rs::dial_target` 的目标来源被改了。
+
+- `90f6f6b`(正常):`resolve(&fwd.target_host, fwd.target_port)` ——
+  用**线路下发**的 `StartForward`,服务端在指派这条通道的那一刻从 `rt.spec`
+  读出,天然是最新值。
+- `1b8bfd6` 起(坏):`resolve(&spec.target_host, spec.target_port)` ——
+  用客户端 `proxies` 表里的副本。而该副本的读取时机在
+  `session.rs::open_data_channel`,即**数据通道建立的那一刻**,远早于它真正
+  承载用户连接的时刻。
+
+由 `25b7505`(「fix(server,client): 静态审查发现的 1 项 P0 + 11 项 P1」)引入,
+理由写的是安全(「被攻破的 server 可让 client 拨内网任意地址」)。但那个理由
+不成立:`ProxySpec` 本身完全由服务端 `ServiceSync` 下发,客户端 `ClientConfig`
+里没有本地规则字段,`spec.target_host` 与 `fwd.target_host` **同为服务端可控**
+—— 改与不改都拦不住"被攻破的服务端"。同一批提交里更晚的 `81cc9eb`
+已经如实改口写明「这不是 SSRF 修复」。
+
+**放大机制(为什么是 2 次而不是 0 次)**:TCP 池预热通道(`pool_size` 默认 2,
+三个版本一致)在规则创建时就建好、静置在池里;它们的 `spec` 快照是**旧**的。
+更新后,池里那 2 条被先后取用 → 前 2 次连接打旧目标;池被消耗完、新签发的
+通道才带新快照 → 第 3 次起正常。
+
+**定位过程(不是猜的)**:
+
+1. 先做最小复现脚本(两个目标端口 + 连续 8 次建连),发现「前 2 次旧、第 3 次起新」;
+2. 打开客户端 `RUST_LOG=debug` —— 已有的 `handle_start_forward` 会打印
+   `forward assigned ... target=... port=...`。日志显示服务端下发的
+   `target` **第 2 次就已经是 18093**,但实际拨号仍打 18091 →
+   **服务端下发正确,问题在客户端取值**,排除全部服务端方向;
+3. 版本对照:`90f6f6b` 第 1 次即切换;`1b8bfd6`/HEAD 前 2 次旧;
+4. `git log -S "resolve(&spec.target_host"` 定位到 `25b7505`;
+5. **反向验证**:只把 `dial_target` 临时改回读 `fwd`,同 HEAD 其余代码不动
+   → 第 1 次即切换。根因闭环。
+
+> ★**任务书给的猜想「`fwd` 被完全忽略」方向对、归因错了一层**。
+> 不是「`dial_target` 一直忽略 `fwd`」(那样 `90f6f6b` 也该坏),而是
+> 「**`25b7505` 把目标来源从 `fwd` 换成了 `spec` 快照**」。`90f6f6b`
+> 用 `fwd`,所以基线本来就是好的。
+>
+> 另外任务书列的 5 条已排除假设里,**没有一条**指向这里 —— 因为大家都把
+> 注意力放在服务端(队列容量、`publish_spec_in_place`、`update_service`
+> 分支、客户端 `upsert`、`pool_size`)。真凶在客户端的**取值时机**,不在
+> 服务端的下发逻辑。
+
+**修法**:`dial_target` 恢复以 `fwd` 为准,`spec` 仅作兜底。
+
+```rust
+let (host, port) = if fwd.target_host.is_empty() {
+    (spec.target_host.as_str(), spec.target_port)   // 旧端不下发 target 时
+} else {
+    (fwd.target_host.as_str(), fwd.target_port)     // 服务端指派时刻的权威值
+};
+```
+
+- 兜底分支保证兼容:旧版服务端若不下发该字段(`serde(default)` → 空串),
+  行为与修前一致,不会把连接打到空地址。
+- 插件分支不变,仍**不读** `fwd`(插件目标来自 `spec.plugin` 自身,
+  `http_proxy`/`socks5` 的目的地来自用户请求)—— `81cc9eb` 那个修复不受影响。
+- 没有新的信任假设:同一个服务端、同一份规则,只是取「指派时刻的权威值」
+  而非「建通道时刻的陈旧副本」。
+
+**为什么不用方案 B/C**:
+
+- 方案 B(`open_data_channel` 改成收到 `START_FORWARD` 后再读 `proxies`):
+  池通道的实际取用时刻可能远晚于建通道时刻,读到的 `spec` **仍可能再变**;
+  且它同样只是"更晚的快照",不如直接用服务端随指派下发的权威值。
+- 方案 C(服务端在 target 变更时 `pool.clear()`):可行且与
+  `http_upstream.clear()` 的既有处理一致,但代价是每次改 target 都要付一次
+  池冷启动,且需要额外保证「清池」与「在途取用」不打架。**A 更小、更根本,
+  且顺带修好所有"池内陈旧快照"场景**(不止 target 变更)。
+
+**验证**:
+
+1. 单测 2 条(`forward::tests`):
+   - `dial_target_prefers_fwd_over_stale_spec`:`spec` 指向一个**已关闭**的
+     端口(必拒连),`fwd` 指向只回 `AUTHORITATIVE` 的监听器 → 必须连上后者。
+     断言落在「流量最终到哪」,对实现方式中立。
+   - `dial_target_falls_back_to_spec_when_fwd_target_empty`:兜底分支,
+     防止兼容性被破坏。
+2. **反向验证**:把 `dial_target` 恢复成 `resolve(&spec...)`,第一条立刻变红
+   (`Connection refused (os error 61)` —— 证明它真的去拨了 `spec` 的陈旧端口)。
+3. **独立手动验证**(两个内容可区分的服务 A/B,见下):修复后 A→B、B→A
+   各连续 5/3 次建连,**全部命中新服务**;修复前同一脚本 **4 次** 未切换。
+
+```
+修复后:  更新前 SERVICE-A → 更新后 5 次全 SERVICE-B → 切回后 3 次全 SERVICE-A
+         未切换次数: 0
+修复前:  更新前 SERVICE-A → 更新后 第1、2 次 SERVICE-A,第3 次起 SERVICE-B
+         切回后第1、2 次 SERVICE-B,第3 次 SERVICE-A
+         未切换次数: 4
+```
+
+**不是"改测试让它过"**:e2e 该用例一行未动(`tests/e2e.sh` 第 603-617 行原样),
+手动验证用的是独立脚本、独立服务,与 e2e 断言口径无关。
 
 ### 单元/集成测试
 
 ```
-cargo test --workspace   → 609 passed, 0 failed
+cargo test --workspace   → 651 passed, 0 failed   (修 3 项 E2E 回归后;此前 645)
 cargo clippy --workspace --all-targets -- -D warnings → 干净
 cargo fmt --all -- --check → 干净
 ```
+
+本轮新增 6 条测试(全部做过"恢复旧实现 → 变红 → 恢复"的反向验证):
+- `rh-server::api::secret_key_management_tests` × 4(第 1、2 项,承接密钥语义)
+- `rh-client::forward::tests::dial_target_*` × 2(第 3 项,目标来源回归)
 
 ### 已知的基线失败(非本次改动引入)—— 已于 2026-10-23 修复
 
@@ -644,7 +825,11 @@ plugins::serve_socks5 → dial_proxy_destination → resolve_addr
    SQLite 与在线会话,未在真实部署环境验证。
 3. **#10 端到端 RTT 测量**:未做。只有调度结构基准。
 4. **#11**:未单独测(测试环境 `:memory:` 掩盖了收益)。
-5. **基线 3 个 e2e 失败项**:未修,超出范围。
+5. ~~**基线 3 个 e2e 失败项**~~ —— **已修,且原定性是错的**。这 3 项**不是**
+   基线问题:实测 `1b8bfd6` 本身就是 79/3(拿它当基线是同义反复),
+   真正的全绿基线是 `90f6f6b`(82/0)。第 1、2 项是测试脚本过时(产品反而
+   收紧了 —— 列表不再回显密钥),第 3 项是真产品缺陷(`dial_target` 读陈旧
+   `spec` 快照)。修复后 e2e **82/0**。详见 §13。
    (DNS 缓存测试的 60% flaky 已于 `f2f00c6` 修复,见 §13 —— 不再是未解决项。)
 6. ~~**`upsert` 的 proxy 分支仍持 `proxies` 写锁跨 await**~~ —— **已完成**
    (收尾批次 P1,commit `cb0be73`)。详见 §15.6。
@@ -1156,7 +1341,9 @@ select 不再回顶。与服务端 A1 缺陷同形。
 3. #2 恢复并发 / P4 `notify_client_recovery` 并发:**本机测不出收益**,
    真实收益依赖文件型 SQLite 与在线会话,未在部署环境验证。
 4. #10 的端到端 RTT 测量:未做,只有调度结构基准。
-5. 基线 3 个 e2e 失败项:未修,超出范围。
+5. ~~基线 3 个 e2e 失败项~~ —— 已修(详见 §13):其中 2 项是测试脚本过时、
+   1 项是真产品缺陷;「基线已有」这个定性本身也是错的(`1b8bfd6` 实测同样是
+   79/3)。修后 e2e 82/0。
    (`dnsquery::cache_tests` 的 60% flaky 已于 `f2f00c6` 修复,见 §13 ——
    不再是未解决项。)
 

@@ -477,9 +477,24 @@ while True:
     g += d
 sys.exit(0 if g == b"stcp\n" else 1)
 EOF
-# 入参密钥被忽略:库中值是服务端随机 32 hex,而非 client-side-should-be-ignored
+# 入参密钥被忽略 + 库中值是服务端随机 32 hex。
+#
+# ★口径变更(2026-10-23):`07b1aa2`(安全加固)让列表接口主动抹除
+# `spec.stcp.secret_key`,这条断言原本读列表取密钥来判 32 hex,**必然**
+# 读到空串而失败。那是回归,但不是产品缺陷 —— 变的是「从哪个口径能观察到
+# 这条语义」,不是语义本身。
+#
+# 新口径分两层,合起来覆盖原来的语义,不放宽:
+#   1. 这里(e2e,黑盒):列表**不**回显密钥 —— 安全性质本身必须被验证。
+#      `-z` 是强断言(空才过),不是"删掉断言"。
+#   2. 32 hex 与"入参被忽略":没有任何 API 再返回该密钥了(创建响应只回
+#      id/bind_port/revision;列表抹除;轮换回的**新**值),所以黑盒拿不到。
+#      改由服务端单测承接:`api::secret_key_management_tests`
+#      (create_ignores_caller_secret_and_generates_32_hex 等 4 条),直接断言
+#      库中值 —— 那才是转发时真正用的唯一事实源。
+#      见 crates/rh-server/src/api.rs。
 SEC_SDB=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([s["spec"]["stcp"]["secret_key"] for s in d if s["name"]=="sdb"][0])')
-[ "$SEC_SDB" != "client-side-should-be-ignored" ] && [ ${#SEC_SDB} -eq 32 ]; check $? "STCP 密钥由服务端随机生成(入参被忽略)"
+[ -z "$SEC_SDB" ]; check $? "列表接口不回显 secret_key(安全加固;随机生成语义见服务端单测)"
 
 # 轮换:服务端重新生成,访问器(无副本)自动继承新值,在途之外的新中继继续可用
 mk_svc "{\"client_id\":\"$CID\",\"name\":\"sdb2\",\"kind\":\"stcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"stcp\":{}}" >/dev/null
@@ -496,11 +511,27 @@ while True:
     g += d
 sys.exit(0 if g == b"stcp-pre\n" else 1)
 EOF
-SEC1=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([s["spec"]["stcp"]["secret_key"] for s in d if s["name"]=="sdb2"][0])')
 SDB2_ID=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([s["id"] for s in d if s["name"]=="sdb2"][0])')
-api -X POST "http://127.0.0.1:$API_PORT/api/services/$SDB2_ID/rotate-secret" >/dev/null
+# ★口径变更(2026-10-23):轮换端点**本身**返回新密钥(且按设计"仅此一次"),
+# 而列表接口已抹除密钥(`07b1aa2`)。原断言拿列表取 SEC1/SEC2 比较必然两边都是
+# 空串 → `SEC1 != SEC2` 恒假。改成直接用轮换响应,口径**更强**:
+#   - 返回的必须是 32 位 hex(原来也测这个);
+#   - 且必须回滚出"新值"—— 用两次轮换互比,证明每次都重新生成,不是固定值;
+#   - 同时列表仍不回显(安全加固不被绕过)。
+ROT1=$(api -X POST "http://127.0.0.1:$API_PORT/api/services/$SDB2_ID/rotate-secret" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["secret"])')
+ROT2=$(api -X POST "http://127.0.0.1:$API_PORT/api/services/$SDB2_ID/rotate-secret" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["secret"])')
 SEC2=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([s["spec"]["stcp"]["secret_key"] for s in d if s["name"]=="sdb2"][0])')
-[ "$SEC1" != "$SEC2" ] && [ ${#SEC2} -eq 32 ]; check $? "轮换端点生成新 32 hex 密钥"
+python3 - "$ROT1" "$ROT2" "$SEC2" <<'EOF' && ok "轮换端点每次生成新的 32 hex 密钥(且列表不回显)" || bad "轮换端点每次生成新的 32 hex 密钥(且列表不回显)"
+import sys, re
+rot1, rot2, listed = sys.argv[1], sys.argv[2], sys.argv[3]
+hex32 = re.compile(r"^[0-9a-f]{32}$")
+assert hex32.match(rot1), f"第一次轮换返回值不是 32 hex: {rot1!r}"
+assert hex32.match(rot2), f"第二次轮换返回值不是 32 hex: {rot2!r}"
+assert rot1 != rot2, "两次轮换返回了相同的密钥(没有重新生成)"
+assert listed == "", f"列表仍回显密钥(安全加固被绕过): {listed!r}"
+EOF
 sleep 2
 python3 - "$V_STCP2" <<'EOF' && ok "STCP 轮换后中继不断(访问器自动继承新密钥)" || bad "STCP 轮换后中继不断(访问器自动继承新密钥)"
 import socket, sys
