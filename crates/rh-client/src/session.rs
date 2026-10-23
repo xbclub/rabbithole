@@ -1429,19 +1429,46 @@ async fn apply_sync(
 async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) {
     match e {
         rh_protocol::message::SyncEntity::Proxy(p) => {
-            let mut cur = sess.proxies.lock().await;
-            let changed = cur.get(&p.id).map(|o| *o != *p).unwrap_or(true);
-            if changed {
-                if let Some(old) = cur.remove(&p.id) {
-                    let id = p.id;
-                    cur.insert(id, old); // 供 stop 读取
-                    stop_proxy(sess, p.id).await;
+            // ★锁内只做纯内存收集,stop_proxy / start_health 移到锁外。
+            //
+            // 修前整段在 `proxies` 写锁内 await:`stop_proxy` 与
+            // `start_health` 都要取 `health_cancels` 锁。期间
+            // `open_data_channel` 的 `sess.proxies.lock().await.get(&proxy_id)`
+            // 被挡住 —— 表现为「改一条规则时,新建数据通道短暂变慢」。
+            //
+            // 这条路径的触发频率**高于** `apply_sync`(已修):后者只在
+            // 客户端重连时的全量 ServiceSync 走一次,而 `upsert` 由
+            // `ServiceUpdate` 驱动 —— 服务端每改一条规则、每启停一条规则
+            // 就发一条。
+            //
+            // ★原代码的 `cur.remove -> cur.insert(id, old) -> stop_proxy ->
+            // cur.remove` 顺序,中间那次插入的注释写着「供 stop 读取」。
+            // 核对 `stop_proxy` 的实现:它**只**操作 `health_cancels`
+            // (`remove` + `cancel`),完全不读 `proxies` 表。所以那次
+            // 「供 stop 读取」的插入是历史遗留(可能来自更早的实现,当时
+            // stop 需要读 spec),这里直接简化掉 —— 不再有「删除又插回再
+            // 删除」的往返。
+            //
+            // 语义等价性:修前 changed 分支的净效果是「表里换成新 spec」
+            // (旧条目最终被 remove 掉),修后同样是「先 remove 旧条目、
+            // 再 insert 新 spec」,表内容一致。
+            let to_start = {
+                let mut cur = sess.proxies.lock().await;
+                let changed = cur.get(&p.id).map(|o| *o != *p).unwrap_or(true);
+                if !changed {
+                    None
+                } else {
                     cur.remove(&p.id);
+                    let mut p2 = (*p).clone();
+                    p2.normalize_kind_configs();
+                    cur.insert(p2.id, p2.clone());
+                    Some(p2)
                 }
-                let mut p = p;
-                p.normalize_kind_configs();
-                cur.insert(p.id, (*p).clone());
-                start_health(sess, p.id, &p).await;
+            }; // ← proxies 写锁在这里释放
+            if let Some(spec) = to_start {
+                // 停止旧健康检查:只碰 health_cancels,与 proxies 表无关。
+                stop_proxy(sess, spec.id).await;
+                start_health(sess, spec.id, &spec).await;
             }
         }
         rh_protocol::message::SyncEntity::Visitor(v) => {
@@ -3450,6 +3477,175 @@ mod upsert_retry_blocking_tests {
         }
         assert!(ok, "端口空闲时 visitor 必须最终监听可达");
         // 收尾:取消,避免测试结束后 listener 泄漏
+        sess.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod upsert_proxy_lock_tests {
+    //! P1 回归:`upsert` 的 proxy 分支不得持 `proxies` 写锁跨 await。
+    //!
+    //! 修前整段在锁内 await `stop_proxy` / `start_health`(两者都取
+    //! `health_cancels` 锁)。期间 `open_data_channel` 的
+    //! `sess.proxies.lock().await.get(&proxy_id)` 被挡住。
+    //!
+    //! ★这条路径的触发频率高于 `apply_sync`:它由 `ServiceUpdate` 驱动,
+    //! 服务端每改一条规则就发一条。
+    use super::*;
+    use rh_protocol::message::SyncEntity;
+
+    fn proxy_with_health(id: u64, port: u16) -> ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": format!("p{id}"),
+            "kind": "tcp",
+            "client_id": "c",
+            "bind_ip": "127.0.0.1",
+            "bind_port": port,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": true,
+            // 配了健康检查才会走 start_health 的完整路径
+            "health_check": { "type": "tcp", "interval_seconds": 60, "timeout_seconds": 5 }
+        }))
+        .unwrap()
+    }
+
+    fn test_session() -> Arc<ClientSession> {
+        let (tx, _rx) = mpsc::channel::<bytes::Bytes>(256);
+        Arc::new(ClientSession {
+            cfg: Arc::new(ClientConfig::default()),
+            session_id: "s".into(),
+            heartbeat_s: 30,
+            send_tx: tx,
+            cancel: CancellationToken::new(),
+            proxies: Mutex::new(HashMap::new()),
+            visitors: Mutex::new(HashMap::new()),
+            visitor_cancels: Mutex::new(HashMap::new()),
+            health_cancels: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            punched: Mutex::new(HashMap::new()),
+            nat_socks: Mutex::new(HashMap::new()),
+            punched_auth: Mutex::new(HashMap::new()),
+            sudp_deliver: Mutex::new(HashMap::new()),
+            mux: rh_transport::mux::wrap_stream_as_client(
+                Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
+                true,
+                100,
+            ),
+            conn_counter: AtomicU64::new(0),
+        })
+    }
+
+    /// ★这条测试的定位(如实记录,已用反向验证确认):**抓不住缺陷**。
+    ///
+    /// 我原本想用它断言"upsert 期间 proxies 锁可读",但把代码临时还原成
+    /// 「持锁跨 await」的旧实现后,它**依然通过**。原因:
+    /// `stop_proxy` / `start_health` 内部的 await 只有微秒级(取一次
+    /// `health_cancels` 锁 + 一次 spawn),而读写锁的公平队列下,读者的
+    /// 等待被 `yield_now` 的调度粒度淹没 —— 与上一轮 #6 同一个坑
+    /// (那次阈值 200ms、实际差异 5~7ms)。
+    ///
+    /// 所以这里**不再假装**它守住了锁语义。真正保证锁纪律的是源码结构
+    /// (锁内只做纯内存收集,见 `upsert` 的 `to_start` 拆分),这条测试
+    /// 只作**功能性回归**:upsert 期间取锁不会死锁、不会永久独占。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxies_lock_available_during_upsert() {
+        let sess = test_session();
+        // 预置 300 条无关 proxy
+        {
+            let mut m = sess.proxies.lock().await;
+            for i in 1000..1300u64 {
+                m.insert(i, proxy_with_health(i, 20000 + i as u16 % 1000));
+            }
+        }
+        let target = proxy_with_health(1, 24100);
+        sess.proxies.lock().await.insert(1, target.clone());
+
+        let up = {
+            let sess = sess.clone();
+            tokio::spawn(async move {
+                upsert(&sess, SyncEntity::Proxy(Box::new(target))).await;
+            })
+        };
+        let reader = {
+            let sess = sess.clone();
+            tokio::spawn(async move {
+                let mut worst = Duration::ZERO;
+                for _ in 0..200 {
+                    let t = std::time::Instant::now();
+                    let _g = sess.proxies.lock().await;
+                    worst = worst.max(t.elapsed());
+                    tokio::task::yield_now().await;
+                }
+                worst
+            })
+        };
+        up.await.unwrap();
+        let worst = reader.await.unwrap();
+        // 门槛放到 2s:只拦"永久独占/死锁",不假装能区分微秒级差异。
+        assert!(
+            worst < Duration::from_secs(2),
+            "upsert 期间 proxies 读锁最长等待 {worst:?} —— 不得死锁或长期独占"
+        );
+        sess.cancel.cancel();
+    }
+
+    /// 语义回归:更新后表里是新 spec,且健康检查被重新拉起。
+    #[tokio::test]
+    async fn upsert_replaces_spec_and_restarts_health() {
+        let sess = test_session();
+        let v1 = proxy_with_health(5, 24200);
+        upsert(&sess, SyncEntity::Proxy(Box::new(v1.clone()))).await;
+        {
+            let m = sess.proxies.lock().await;
+            assert_eq!(m.get(&5).unwrap().bind_port, 24200, "首次必须入表");
+        }
+        assert!(
+            sess.health_cancels.lock().await.contains_key(&5),
+            "配了 health_check 就必须登记取消器"
+        );
+        let first = sess.health_cancels.lock().await.get(&5).cloned().unwrap();
+
+        // 改成不同端口 → changed 为真 → 旧取消器被 cancel,换新的
+        let mut v2 = proxy_with_health(5, 24201);
+        v2.name = "p5-changed".into();
+        upsert(&sess, SyncEntity::Proxy(Box::new(v2))).await;
+        {
+            let m = sess.proxies.lock().await;
+            assert_eq!(m.get(&5).unwrap().bind_port, 24201, "必须换成新 spec");
+            assert_eq!(m.len(), 1, "不得产生重复条目");
+        }
+        assert!(first.is_cancelled(), "旧健康检查必须被 cancel");
+        sess.cancel.cancel();
+    }
+
+    /// 语义回归:**未变化**的 spec 不得改动表、不得重启健康检查。
+    ///
+    /// 修前 `changed == false` 时整段跳过(连 stop_proxy 都不调);重构后
+    /// 必须保持这一点 —— 否则每次 ServiceUpdate 都会无谓地杀掉并重建
+    /// 健康检查任务。
+    #[tokio::test]
+    async fn unchanged_spec_is_noop() {
+        let sess = test_session();
+        let v = proxy_with_health(6, 24300);
+        upsert(&sess, SyncEntity::Proxy(Box::new(v.clone()))).await;
+        let token = sess.health_cancels.lock().await.get(&6).cloned().unwrap();
+
+        upsert(&sess, SyncEntity::Proxy(Box::new(v))).await;
+        assert!(!token.is_cancelled(), "spec 未变化时不得重启健康检查");
+        assert_eq!(sess.proxies.lock().await.len(), 1);
+        sess.cancel.cancel();
+    }
+
+    /// 删除语义:proxy 不在表里时(changed=true 且 remove 返回 None)也能
+    /// 正常插入,不 panic。
+    #[tokio::test]
+    async fn insert_when_absent() {
+        let sess = test_session();
+        let v = proxy_with_health(9, 24400);
+        upsert(&sess, SyncEntity::Proxy(Box::new(v))).await;
+        assert_eq!(sess.proxies.lock().await.len(), 1);
         sess.cancel.cancel();
     }
 }
