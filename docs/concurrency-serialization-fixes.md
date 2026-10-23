@@ -12,20 +12,36 @@
 
 ## 0. 总览
 
-| # | 缺陷 | 位置 | 复杂度变化 | 实测 |
-|---|---|---|---|---|
-| 1 | vhost 路由全量重建被放进单条规则生命周期 | `runtime.rs` 262/336/510/589 | O(N²) → O(N) | N=2000: 746.2ms → 0.46ms (1630x) |
-| 2 | 启动恢复逐条串行 | `recovery.rs` 43/106 | O(N·t) → O(N/16·t) | **本机未测出收益**(见 §2) |
-| 3 | `batch_services` 逐 id 串行 | `api.rs` 1527 | O(N·t) → O(N/8·t) | N=1000: 261.8ms → 157.6ms (1.66x) |
-| 4 | `port_in_use` 跨 await 持 dashmap 分片守卫 | `state.rs` 1140 | 持锁窗口 → 0 | 旧实现 387ms 阻塞,新实现通过 |
-| 5 | `allocate_port` 双重循环 × 每端口全表扫 | `state.rs` 1176 | O(P·N) → O(N + P) | N=2000: 241.4ms → 0.39ms (620x) |
-| 6 | 客户端 `apply_sync` 持 `proxies` 锁跨 await | `rh-client/session.rs` 1294 | 持锁跨 await → 锁内纯内存 | **测试抓不住**(见 §6) |
-| 7 | `list_services` 循环内 3 次 get + 3 await + 嵌套锁 | `api.rs` 741 | 3N 次锁 → N 次 | **未做**(见 §7) |
-| 8 | `resolve_visitor_target` N+1 查询 | `api.rs` 1713 | O(N) 往返 → O(1) 往返 | N=1000: 31.08ms → 3.38ms (9.2x) |
-| 9 | `tcp_refill` 逐条签发 + `add_pending_request` 全表重建 | `session.rs` 124 | O(P) 重建 → O(P) 原地 | P=1000: 40.71µs → 2.00µs (20x) |
-| 10 | 多载体报到串行,每条等 2s ACK | `rh-client/session.rs` 864 | O(K·D) → O(K/4·D) | K=8: 386.0ms → 105.5ms (3.66x) |
-| 11 | `build_sync_entities` 两次串行 DB 查询 | `state.rs` 1551 | O(2t) → O(t) | **未单独测**(见 §11) |
-| 12 | `events.emit` 同步落库 | `events.rs` 15/19 | 业务路径含 DB → 纯内存 | N=1000: 31.91ms → 0.07ms (454x) |
+> **⚠ 位置列的行号口径**:「修前位置」列的行号是**修前基线 `1b8bfd6`** 的,
+> 修复后已整体偏移(有的 +100 行以上,有的因重构而不再存在)。
+> **查当前代码请用符号名搜索,不要按「修前位置」跳转。**
+>
+> 「修后位置」列给的是当前代码里对应实现的落点(随后续提交仍可能漂移),
+> 仅作导航提示,不作为精确引用。
+
+| # | 缺陷 | 修前位置(`1b8bfd6`) | 修后位置(当前) | 复杂度变化 | 实测 |
+|---|---|---|---|---|---|
+| 1 | vhost 路由全量重建被放进单条规则生命周期 | `runtime.rs` 262/336/510/589 | `runtime.rs` 263/337/513/593 的 `schedule_vhost_rebuild()` 调用点 | O(N²) → O(N) | N=2000: 746.2ms → 0.46ms (1630x) |
+| 2 | 启动恢复逐条串行 | `recovery.rs` 43/106 | `recovery.rs:139` `for_each_concurrent` | O(N·t) → O(N/16·t) | **本机未测出收益**(见 §2) |
+| 3 | `batch_services` 逐 id 串行 | `api.rs` 1527 | `api.rs:1518` `batch_services` | O(N·t) → O(N/8·t) | N=1000: 261.8ms → 157.6ms (1.66x) |
+| 4 | `port_in_use` 跨 await 持 dashmap 分片守卫 | `state.rs` 1140 | `state.rs:1252` `port_in_use` | 持锁窗口 → 0 | 旧实现 387ms 阻塞,新实现通过 |
+| 5 | `allocate_port` 双重循环 × 每端口全表扫 | `state.rs` 1176 | `state.rs:1279` `allocate_port` | O(P·N) → O(N + P) | N=2000: 241.4ms → 0.39ms (620x) |
+| 6 | 客户端 `apply_sync` 持 `proxies` 锁跨 await | `rh-client/session.rs` 1294 | `rh-client/session.rs:1362` 起(锁内只收集) | 持锁跨 await → 锁内纯内存 | **测试抓不住**(见 §6) |
+| 7 | `list_services` 循环内 3 次 get + 3 await + 嵌套锁 | `api.rs` 741 | `api.rs:728` `list_services`(**未改**) | 3N 次锁 → N 次 | **未做**(见 §7) |
+| 8 | `resolve_visitor_target` N+1 查询 | `api.rs` 1713 | `api.rs:1792` `resolve_visitor_target` | O(N) 往返 → O(1) 往返 | N=1000: 31.08ms → 3.38ms (9.2x) |
+| 9 | `tcp_refill` 逐条签发 + `add_pending_request` 全表重建 | **`rh-server`**`/session.rs` 124 | **`rh-server`**`/session.rs:150` `extract_if` | O(P) 重建 → O(P) 原地 | P=1000: 40.71µs → 2.00µs (20x) |
+| 10 | 多载体报到串行,每条等 2s ACK | `rh-client/session.rs` 864 | `rh-client/session.rs:971` `buffer_unordered(4)` | O(K·D) → O(K/4·D) | K=8: 386.0ms → 105.5ms (3.66x) |
+| 11 | `build_sync_entities` 两次串行 DB 查询 | `state.rs` 1551 | `state.rs:1663` `build_sync_entities` | O(2t) → O(t) | **未单独测**(见 §11) |
+| 12 | `events.emit` 同步落库 | `events.rs` 15/19 | `events.rs:124/132` `emit` / `emit_detail` | 业务路径含 DB → 纯内存 | N=1000: 31.91ms → 0.07ms (454x) |
+
+> **两处需要特别说明的位置**:
+>
+> - **#10**:修前的 `for i in 1..initial_k` 串行循环**已不存在**(被
+>   `buffer_unordered(4)` 替代),所以「修后位置」指向的是并发化的落点,
+>   而不是同一个循环的原地修改。
+> - **#9**:`session.rs` 在 `rh-server` 与 `rh-client` 各有一份,本项在
+>   **`rh-server`**(`add_pending_request` / `Session` 结构体)。原表漏写
+>   crate 前缀,按 `rh-client/session.rs:124` 找会落到 `visitors` 字段上。
 
 ---
 
@@ -266,6 +282,8 @@ cargo test -p rh-server --release port_scan_tests::bench -- --ignored --nocaptur
 
 **未做**:`upsert` 的 proxy 分支有同样形态(持 `proxies` 锁调
 `stop_proxy`/`start_health`),但不在任务书 #6 范围内,没有顺手改。
+**这一项已提升为正式未完成项,详见 §15.6** —— 它的触发频率(`ServiceUpdate`,
+每次单条规则变更)实际上高于本条已修的 `apply_sync`(`ServiceSync`,仅重连时)。
 
 > 注:该项已在 §15.6 提升为**正式未完成项**。原因:`upsert` 由
 > `ServiceUpdate`(每改一条规则触发一次)驱动,触发频率**高于**本条修的
