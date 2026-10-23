@@ -841,11 +841,20 @@ async fn connect_and_run_inner(
     // (复核 finding 4)。失败按身份记录,收敛阶段据此精确摘除,并额外
     // 保留 final_k 条成功载体(见 [`plan_detach_set`])。
     // 尽力而为:单条失败/超时不阻断主会话。
-    let mut server_caps: Vec<usize> = Vec::new();
+    //
+    // ★报到改为并发(`buffer_unordered`),收集容器必须是并发安全的。
+    // 用 `Mutex<Vec<_>>` 而不是原子计数:需要保留每个失败载体的**身份**
+    // (`member_id`),收敛阶段据此精确摘除。
+    //
+    // 顺序语义:`server_caps` 的顺序不参与语义(`plan_convergence` 只看
+    // `min()`);`failed_ids` 在 `plan_detach_set` 里只做 `contains` 与
+    // 并集,同样与顺序无关(结果最终 `sort_unstable` + `dedup`)。
+    // 因此并发写入导致的顺序不确定不影响任何下游判定。
+    let server_caps: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     // 报到失败/被拒/超时的载体身份(round-10.1):身份在下标漂移(成员表
     // 压缩、重拨补位)下仍稳定,收敛阶段据此精确摘除。open_stream_tagged
     // 本身失败时无法得知落点,不记 id(该载体可能仍健康)。
-    let mut failed_ids: Vec<u64> = Vec::new();
+    let failed_ids: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
     if initial_k > 1 {
         // B9:报到流必须证明持有 secret —— 仅凭明文 session_id 即可聚合
         // 会把"id 泄漏"升级为"会话池被混入"。
@@ -860,64 +869,111 @@ async fn connect_and_run_inner(
             session_id: Some(session_id.clone()),
             attach_auth: Some(attach_auth),
         };
-        let payload = serde_json::to_vec(&attach)?;
-        for i in 1..initial_k {
-            let (mut s, member_id) = match mux.open_stream_tagged().await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(carrier = i, error = %e, "pool carrier attach failed (open stream)");
-                    continue;
-                }
-            };
-            if frame::write_frame(&mut s, FrameType::HELLO, &payload)
-                .await
-                .is_err()
-            {
-                warn!(
-                    carrier = i,
-                    member_id, "pool carrier attach failed (hello write)"
-                );
-                failed_ids.push(member_id);
-                let _ = s.shutdown().await;
-                continue;
-            }
-            let mut abuf = bytes::BytesMut::with_capacity(512);
-            let ack =
-                tokio::time::timeout(Duration::from_secs(2), frame::read_frame(&mut s, &mut abuf))
-                    .await;
-            match ack {
-                Ok(Ok((FrameType::CARRIER_ATTACH_ACK, p))) => match parse_attach_ack_payload(&p) {
-                    AckPayload::Ok(cap) => server_caps.push(cap),
-                    AckPayload::Rejected(code) => {
+        let payload = std::sync::Arc::new(serde_json::to_vec(&attach)?);
+        // ★并发报到。
+        //
+        // 修前逐条 `open_stream_tagged` → 写 HELLO → 等 ACK(最多 2s),
+        // K 条载体串行累加。`initial_k` 默认 2,但 RTT ≥ 15ms 时可达 4;
+        // 一条卡住就拖住后续所有载体,进而拖住整个会话建立 —— 这是
+        // **连接建立路径**,直接决定重连速度。
+        //
+        // 并发度上限 4,与 `initial_k` 的 clamp 上限一致(见
+        // `plan_convergence` 的 `clamp(1, 8)` 与池化定容逻辑),再高没有
+        // 更多载体可报到。
+        use futures::stream::StreamExt as _;
+        futures::stream::iter(1..initial_k)
+            .map(|i| {
+                let mux = mux.clone();
+                let payload = payload.clone();
+                let server_caps = &server_caps;
+                let failed_ids = &failed_ids;
+                async move {
+                    let (mut s, member_id) = match mux.open_stream_tagged().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(carrier = i, error = %e, "pool carrier attach failed (open stream)");
+                            return;
+                        }
+                    };
+                    if frame::write_frame(&mut s, FrameType::HELLO, &payload)
+                        .await
+                        .is_err()
+                    {
                         warn!(
                             carrier = i,
-                            member_id,
-                            error_code = ?code,
-                            "pool carrier attach rejected"
+                            member_id, "pool carrier attach failed (hello write)"
                         );
-                        failed_ids.push(member_id);
+                        failed_ids
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(member_id);
+                        let _ = s.shutdown().await;
+                        return;
                     }
-                    AckPayload::Bad(e) => {
-                        warn!(carrier = i, member_id, error = %e, "bad carrier attach ack");
-                        failed_ids.push(member_id);
+                    let mut abuf = bytes::BytesMut::with_capacity(512);
+                    let ack = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        frame::read_frame(&mut s, &mut abuf),
+                    )
+                    .await;
+                    match ack {
+                        Ok(Ok((FrameType::CARRIER_ATTACH_ACK, p))) => {
+                            match parse_attach_ack_payload(&p) {
+                                AckPayload::Ok(cap) => server_caps
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push(cap),
+                                AckPayload::Rejected(code) => {
+                                    warn!(
+                                        carrier = i,
+                                        member_id,
+                                        error_code = ?code,
+                                        "pool carrier attach rejected"
+                                    );
+                                    failed_ids
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .push(member_id);
+                                }
+                                AckPayload::Bad(e) => {
+                                    warn!(
+                                        carrier = i,
+                                        member_id,
+                                        error = %e,
+                                        "bad carrier attach ack"
+                                    );
+                                    failed_ids
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .push(member_id);
+                                }
+                            }
+                        }
+                        other => {
+                            // 旧服务端(不回 ACK)走这里:该载体无法确认已聚合,
+                            // 按失败处理并摘除(§2.2);不阻断主会话。
+                            warn!(
+                                carrier = i,
+                                member_id,
+                                ?other,
+                                "carrier attach ack missing/timeout"
+                            );
+                            failed_ids
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(member_id);
+                        }
                     }
-                },
-                other => {
-                    // 旧服务端(不回 ACK)走这里:该载体无法确认已聚合,
-                    // 按失败处理并摘除(§2.2);不阻断主会话。
-                    warn!(
-                        carrier = i,
-                        member_id,
-                        ?other,
-                        "carrier attach ack missing/timeout"
-                    );
-                    failed_ids.push(member_id);
+                    // 报到完成即 FIN;物理载体在收敛后按需 detach。
+                    let _ = s.shutdown().await;
                 }
-            }
-            // 报到完成即 FIN;物理载体在收敛后按需 detach。
-            let _ = s.shutdown().await;
-        }
+            })
+            .buffer_unordered(4)
+            .collect::<Vec<()>>()
+            .await;
     }
+    let server_caps = server_caps.into_inner().unwrap_or_else(|e| e.into_inner());
+    let failed_ids = failed_ids.into_inner().unwrap_or_else(|e| e.into_inner());
     // 服务端上限 = 成功报到载体的最小值;一个都没成功(旧服务端/全拒)
     // 按 1 处理——有意的保守行为(见兼容说明)。
     let (final_k, _tail) = plan_convergence(initial_k, &server_caps);
@@ -2993,5 +3049,133 @@ mod apply_sync_lock_tests {
         assert!(tok.is_cancelled(), "被移除的规则必须 cancel 其健康检查");
         assert!(sess.health_cancels.lock().await.get(&1).is_none());
         assert!(sess.proxies.lock().await.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod carrier_attach_tests {
+    //! #10 回归:多载体报到并发化后,失败身份收集必须完整,
+    //! 且收敛阶段仍能正确摘除。
+    //!
+    //! 纯函数部分(`plan_detach_set` / `plan_convergence`)与报到顺序无关,
+    //! 这是并发收集安全性的**前提**;下面逐条守住。
+    use super::*;
+
+    /// `server_caps` 顺序不影响收敛结果(并发 push 顺序不确定)。
+    #[test]
+    fn server_caps_order_does_not_matter() {
+        // 同一组 cap,不同到达顺序
+        let a = plan_convergence(4, &[8, 2, 5]);
+        let b = plan_convergence(4, &[2, 5, 8]);
+        let c = plan_convergence(4, &[5, 8, 2]);
+        assert_eq!(a, b, "server_caps 顺序不得影响收敛结果");
+        assert_eq!(a, c, "server_caps 顺序不得影响收敛结果");
+        assert_eq!(a.0, 2, "收敛到最小 cap");
+    }
+
+    /// `failed_ids` 顺序不影响摘除集合(并发 push 顺序不确定)。
+    #[test]
+    fn failed_ids_order_does_not_matter() {
+        let members = vec![10u64, 20, 30, 40];
+        let a = plan_detach_set(&members, 2, &[20, 40], 10);
+        let b = plan_detach_set(&members, 2, &[40, 20], 10);
+        assert_eq!(a, b, "failed_ids 顺序不得影响摘除集合");
+        assert_eq!(a, vec![20, 40], "失败身份必须全部被摘除");
+    }
+
+    /// 部分载体失败时,failed_ids 必须**完整**(不漏任何一个失败身份)。
+    ///
+    /// 模拟并发收集:多个任务同时往同一个容器 push,最后全部都在。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_failed_ids_collection_is_complete() {
+        let failed: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let caps: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        use futures::stream::StreamExt as _;
+        // 8 个"载体",偶数失败、奇数成功
+        futures::stream::iter(1..8u64)
+            .map(|id| {
+                let failed = &failed;
+                let caps = &caps;
+                async move {
+                    if id % 2 == 0 {
+                        failed.lock().unwrap_or_else(|e| e.into_inner()).push(id);
+                    } else {
+                        caps.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(id as usize);
+                    }
+                }
+            })
+            .buffer_unordered(4)
+            .collect::<Vec<()>>()
+            .await;
+        let mut got = failed.into_inner().unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![2, 4, 6], "失败身份必须完整收集,不丢不重");
+        let mut caps = caps.into_inner().unwrap();
+        caps.sort_unstable();
+        assert_eq!(caps, vec![1, 3, 5, 7], "成功上报的 cap 必须完整");
+    }
+
+    /// 端到端语义:3 个载体、中间一个失败 → 摘除集合正确。
+    #[test]
+    fn partial_failure_detaches_correct_identity() {
+        // 成员表:控制载体 100 + 两个附加 200、300;200 报到失败
+        let members = vec![100u64, 200, 300];
+        let (final_k, _) = plan_convergence(3, &[8]);
+        assert_eq!(final_k, 3, "服务端允许 3,不应收敛");
+        let detach = plan_detach_set(&members, final_k, &[200], 100);
+        assert_eq!(detach, vec![200], "只摘除失败身份,不得误摘健康的 300");
+    }
+
+    /// #10 基准(手动运行):K 条载体、每条 ACK 延迟 D 时的报到总耗时。
+    ///
+    /// ```text
+    /// cargo test -p rh-client --release carrier_attach_tests::bench -- --ignored --nocapture
+    /// ```
+    ///
+    /// 不依赖真实网络:用 `tokio::time::sleep` 模拟每条载体的
+    /// "open_stream + HELLO + 等 ACK" 往返。串行是 K×D,并发(4)是
+    /// ceil(K/4)×D。这条基准测的是**调度结构**,不是真实 RTT。
+    #[tokio::test]
+    #[ignore = "耗时基准,手动运行(--ignored --nocapture)"]
+    async fn bench_carrier_attach_serial_vs_concurrent() {
+        use futures::stream::StreamExt as _;
+        for k in [2usize, 4, 8] {
+            let delay = Duration::from_millis(50);
+            // 串行(修前)
+            let t0 = std::time::Instant::now();
+            for _ in 1..k {
+                tokio::time::sleep(delay).await;
+            }
+            let serial = t0.elapsed();
+
+            // 并发(修后,buffer_unordered(4))
+            let t1 = std::time::Instant::now();
+            futures::stream::iter(1..k)
+                .map(|_| async move { tokio::time::sleep(delay).await })
+                .buffer_unordered(4)
+                .collect::<Vec<()>>()
+                .await;
+            let concurrent = t1.elapsed();
+
+            println!(
+                "K={k:>2} (附加载体 {} 条)  serial={serial:>10?}  concurrent={concurrent:>10?}  \
+                 speedup={:.2}x",
+                k - 1,
+                serial.as_secs_f64() / concurrent.as_secs_f64()
+            );
+        }
+    }
+
+    /// 控制载体即使出现在 failed_ids 里也不得被摘(否则整会话关闭)。
+    #[test]
+    fn control_carrier_never_detached() {
+        let members = vec![100u64, 200];
+        let detach = plan_detach_set(&members, 2, &[100], 100);
+        assert!(
+            !detach.contains(&100),
+            "控制载体必须保留,否则整条会话被关掉"
+        );
     }
 }
