@@ -329,6 +329,29 @@ pub async fn resolve_cached(host: &str, port: u16, ns: Option<String>) -> Option
     out
 }
 
+/// **仅测试**:跨模块串行域,保护 `dnsquery` 的进程级全局状态。
+///
+/// `cache()` / `inflight()` / `QUERY` 都是进程级 `static`,而
+/// `#[cfg(test)]` 的注入器(`resolve_set_query`)会**替换全局解析函数**。
+/// 因此凡是可能走到 `resolve_cached` 的测试,都必须在这把锁的串行域里,
+/// 否则会互相污染:
+///
+/// - `cache_tests` 里的用例用它隔离彼此的 `cache_clear()` 与注入器;
+/// - **`plugins.rs` 的 `socks5_domain_target_goes_through_resolver`**
+///   也必须持有它 —— 那条测试会把域名交给本端解析器
+///   (`plugins::resolve_addr` → `forward::resolve` → `resolve_cached`),
+///   从而:
+///   1. 命中 `cache_tests` 注入的 `counting_query`,把 `QUERIES` +1;
+///   2. 读到被别的用例设成 50ms 的 `DELAY_MS`,被拖慢;
+///   3. 消耗/污染 `inflight` 与 `cache` 两张表。
+///
+/// 第 1 条正是 `concurrent_requests_share_one_query` 偶发失败(实测 60%)
+/// 的根因:它的 50ms 窗口里若混进一条来自 plugins 的解析,`QUERIES` 就从
+/// 1 变成 2,断言失败 —— 而**单看调用栈只有一次真实解析**,说明
+/// singleflight 其实没坏,是计数器看见了两条不同的 host。
+#[cfg(test)]
+pub(crate) static DNS_GLOBAL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod cache_tests {
     use super::*;
@@ -360,7 +383,10 @@ mod cache_tests {
     }
 
     /// 串行锁:缓存是进程级全局,测试之间必须隔离。
-    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    ///
+    /// 用 crate 级共享的那把([`DNS_GLOBAL_TEST_LOCK`]),这样**其它模块**
+    /// 里触达解析的测试也能加入同一个串行域。
+    use super::DNS_GLOBAL_TEST_LOCK as LOCK;
 
     async fn setup(delay_ms: usize, ok: bool) -> tokio::sync::MutexGuard<'static, ()> {
         let g = LOCK.lock().await;

@@ -1584,6 +1584,22 @@ mod proxy_tests {
     /// 域名解析失败而返回 REP。
     #[tokio::test]
     async fn socks5_domain_target_goes_through_resolver() {
+        // ★必须与 `dnsquery` 的测试共用串行域。
+        //
+        // 本用例会把域名交给**本端**解析器(`resolve_addr` →
+        // `forward::resolve` → `resolve_cached`),而 `dnsquery::cache_tests`
+        // 在它的 `setup()` 里把全局解析器换成了「计数 + 50ms 延迟」的
+        // 注入器。不持锁的话,这条用例会在**任意时刻**命中那个注入器:
+        //   - 把 `cache_tests::QUERIES` +1 —— 于是
+        //     `concurrent_requests_share_one_query` 在自己的 50ms 窗口里
+        //     看到 2 次解析而失败(singleflight 其实没坏,是计数器看见了
+        //     两条不同的 host);
+        //   - 被那个 50ms 延迟拖慢;
+        //   - 清掉/污染 `inflight` 与 `cache`。
+        //
+        // 实测(2026-10-23):整个 rh-client crate 并发跑 20 次,12 次红
+        // (60%);单线程必过。加这把锁后稳定。
+        let _dns = crate::dnsquery::DNS_GLOBAL_TEST_LOCK.lock().await;
         let mut io = open(&socks_spec("", "")).await;
         io.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
         let mut m = [0u8; 2];
