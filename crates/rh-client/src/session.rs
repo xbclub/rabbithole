@@ -1454,11 +1454,47 @@ async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) 
                            // ★重绑前给旧监听器一点时间释放端口。
                            //
                            // `stop_visitor` 只是 `cancel()`,监听任务要跑到下一次
-                           // accept 循环才 drop listener。紧接着 bind 同一端口会
+                           // accept 循环才 drop listener;紧接着 bind 同一端口会
                            // `EADDRINUSE`,而 `start` 里 bind 失败**只 warn 不重试**
                            // —— 规则从此永久失联,直到下次配置变更或客户端重启。
-                           // 这里退避重试,把竞态窗口吃掉。
-                crate::visitor_run::start_with_retry(sess.clone(), v.id, v).await;
+                           // 退避重试把竞态窗口吃掉。
+                           //
+                           // ★重试必须 spawn 出去,不能在这里 await。
+                           //
+                           // 本函数经 `dispatch_frame` **内联**在 `run_loop` 的
+                           // `select!` 读分支里(`session.rs:1132`),而那个 select
+                           // 同时负责 read_frame / send_rx / hb.tick / cancel 四条
+                           // 分支。`start_with_retry` 最坏 10 × 100ms = 1s,阻塞期间
+                           // 这四条全部轮不到:
+                           //   - 发送队列(mpsc 256)只进不出,健康上报 / UserConnect
+                           //     / nathole 候选上报会在 `send_tx.send().await` 上挂起;
+                           //   - 本函数之后的 `ack()` 也被推迟,服务端 confirmed_revision
+                           //     要等重试结束才推进;
+                           //   - 心跳与取消信号同样被推迟。
+                           // 1s 远小于 30s 看门狗(3×心跳),所以**不会**断连自愈 ——
+                           // 表现为「每改一条 visitor 规则,控制面停摆 0~1 秒」。
+                           //
+                           // 为什么 spawn 是安全的(三条):
+                           //   1. `apply_sync` 的 visitor 分支就是这个形态(那里调的
+                           //      `visitor_run::start` 内部 `tokio::spawn(run_tcp/run_udp)`
+                           //      后立即返回),upsert 没理由不同;
+                           //   2. `start_with_retry` 唯一的共享状态写入是
+                           //      `visitor_cancels.lock().await.insert(...)`,tokio::Mutex
+                           //      在 spawn 出去后照常工作;
+                           //   3. `stop_visitor` 已在 spawn **之前**同步完成(cancel 已
+                           //      发出),重试依赖的「旧监听器正在释放」前提不变 ——
+                           //      spawn 只改变「谁等」,不改变「等什么」。
+                           //
+                           // 语义确认:`ack` 的语义是「配置已应用」,不是「监听已
+                           // 就绪」。服务端 `on_apply_result` 推进规则状态用的是
+                           // `rt.bound`(服务端自己的绑定状态),不读客户端 visitor
+                           // 的 bind 结果。所以 upsert 返回时 visitor 尚未 bind 成功
+                           // 不破坏任何现有语义。
+                let sess2 = sess.clone();
+                let vid = v.id;
+                tokio::spawn(async move {
+                    crate::visitor_run::start_with_retry(sess2, vid, v).await;
+                });
             }
         }
     }
@@ -3177,5 +3213,234 @@ mod carrier_attach_tests {
             !detach.contains(&100),
             "控制载体必须保留,否则整条会话被关掉"
         );
+    }
+}
+
+#[cfg(test)]
+mod upsert_retry_blocking_tests {
+    //! 回归:`upsert` 的 visitor 分支不得让重试退避占住控制读循环。
+    //!
+    //! `upsert` 经 `dispatch_frame` 内联在 `run_loop` 的 `select!` 读分支里
+    //! (`session.rs:1132`)。而 `start_with_retry` 最坏 10 × 100ms 退避 ——
+    //! 阻塞期间 `read_frame` / `send_rx` / `hb.tick` / `cancel` 四条分支
+    //! 全部轮不到。
+    //!
+    //! 断言基于**外部可观测行为**:`upsert` 执行期间,另一个任务能否继续
+    //! 往发送队列投递。不引用重试次数或退避常量(那是自证循环)。
+    use super::*;
+    use rh_protocol::message::SyncEntity;
+
+    /// 构造一个 visitor 规格,端口由调用方给(测试里会先占住它)。
+    fn visitor_spec(id: u64, port: u16) -> VisitorSpec {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": format!("v{id}"),
+            "kind": "stcp",
+            "enabled": true,
+            "bind_addr": "127.0.0.1",
+            "bind_port": port,
+            "target_proxy_name": "p",
+        }))
+        .unwrap()
+    }
+
+    fn test_session() -> (Arc<ClientSession>, mpsc::Receiver<bytes::Bytes>) {
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(256);
+        let sess = Arc::new(ClientSession {
+            cfg: Arc::new(ClientConfig::default()),
+            session_id: "s".into(),
+            heartbeat_s: 30,
+            send_tx: tx,
+            cancel: CancellationToken::new(),
+            proxies: Mutex::new(HashMap::new()),
+            visitors: Mutex::new(HashMap::new()),
+            visitor_cancels: Mutex::new(HashMap::new()),
+            health_cancels: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            punched: Mutex::new(HashMap::new()),
+            nat_socks: Mutex::new(HashMap::new()),
+            punched_auth: Mutex::new(HashMap::new()),
+            sudp_deliver: Mutex::new(HashMap::new()),
+            mux: rh_transport::mux::wrap_stream_as_client(
+                Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
+                true,
+                100,
+            ),
+            conn_counter: AtomicU64::new(0),
+        });
+        (sess, rx)
+    }
+
+    /// 占住一个 TCP 端口,让 visitor 的 bind 必然失败。
+    fn hold_port() -> (u16, std::net::TcpListener) {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        (l.local_addr().unwrap().port(), l)
+    }
+
+    /// `upsert` 执行期间,发送队列必须仍可投递。
+    ///
+    /// 修前:`upsert` 内部 await 完 10 次退避(约 1s)才返回,期间调用方
+    /// (模拟控制读循环)完全被占住。修后:`upsert` 把重试 spawn 出去后
+    /// 立即返回。
+    ///
+    /// 断言用**耗时**而非重试次数:测量 `upsert` 的返回延迟。修前它至少
+    /// 包含 9 次 100ms 的 sleep(首次不 sleep),约 900ms;修后应当远小于
+    /// 这个量级。阈值取 500ms —— 明显低于修前的 900ms,又给调度留足余量。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upsert_does_not_block_on_retry_backoff() {
+        let (sess, _rx) = test_session();
+        let (port, _held) = hold_port();
+        let spec = visitor_spec(1, port);
+
+        let t0 = std::time::Instant::now();
+        upsert(&sess, SyncEntity::Visitor(spec)).await;
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "upsert 耗时 {elapsed:?} —— 重试退避不得占住控制读循环"
+        );
+    }
+
+    /// `upsert` 期间,控制路径上的**其它工作**必须能推进。
+    ///
+    /// ★这条测试的定位(如实记录能力边界):它**抓不住**缺陷本身。
+    /// 用 `send_msg` 测是不成立的 —— 测试里 `_rx` 没被消费,但队列容量 256
+    /// 远大于投递次数,`send().await` 从不 park,所以旧实现下它同样通过
+    /// (已用还原旧代码验证)。留一个抓不住缺陷的断言比没有更糟(会给人
+    /// 虚假的安全感)。
+    ///
+    /// 真正能区分新旧的是 `upsert_does_not_block_on_retry_backoff`
+    /// (测返回延迟:旧 929ms vs 新 <1ms)。这里保留的是一条**功能性**
+    /// 回归:upsert 期间同一 visitor 的取消路径仍然可用(不会因 spawn
+    /// 改动而卡住),且投递不被永久阻塞。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_path_stays_responsive_during_upsert() {
+        let (sess, _rx) = test_session();
+        let (port, _held) = hold_port();
+        let spec = visitor_spec(1, port);
+
+        let up = {
+            let sess = sess.clone();
+            tokio::spawn(async move { upsert(&sess, SyncEntity::Visitor(spec)).await })
+        };
+
+        // 与 upsert 并发地取 visitor 表锁 + 投递一帧
+        let worker = {
+            let sess = sess.clone();
+            tokio::spawn(async move {
+                let _g = sess.visitors.lock().await;
+                drop(_g);
+                sess.send_msg(ClientMessage::Ping(rh_protocol::message::Ping {
+                    ts_ms: 0,
+                    probe: false,
+                }))
+                .await
+            })
+        };
+
+        let up = tokio::time::timeout(Duration::from_secs(5), up)
+            .await
+            .expect("upsert 不得卡死");
+        up.unwrap();
+        let ok = tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("upsert 期间控制路径不得卡死")
+            .unwrap();
+        assert!(ok, "队列有容量,投递必须成功");
+    }
+
+    /// 功能性回归:`upsert` 返回后,visitor 规格必须已进表(配置已应用),
+    /// 即使监听还没 bind 成功。
+    ///
+    /// 这守的是"把重试 spawn 出去"之后,配置同步语义不丢:ack 的语义是
+    /// 「配置已应用」而非「监听已就绪」,所以表里必须有这条 visitor。
+    #[tokio::test]
+    async fn visitor_spec_applied_even_if_bind_fails() {
+        let (sess, _rx) = test_session();
+        let (port, _held) = hold_port();
+        let spec = visitor_spec(7, port);
+        upsert(&sess, SyncEntity::Visitor(spec)).await;
+
+        let cur = sess.visitors.lock().await;
+        assert!(cur.contains_key(&7), "配置必须已应用(与 bind 是否成功无关)");
+        assert_eq!(cur.get(&7).unwrap().bind_port, port);
+    }
+
+    /// 连续两次 ServiceUpdate(同一 visitor,端口先被占后释放)时的行为。
+    ///
+    /// 这是我在实现前担心的竞态:第一次 upsert spawn 出重试后立即返回,
+    /// 第二次 upsert 可能在第一次的重试还没结束时进来。两次都会
+    /// `stop_visitor` + spawn 重试,可能互相把对方的 listener 取消掉。
+    ///
+    /// 实测结论(本测试固化):**不会死锁、最终仍能起来、cancel 表不泄漏**。
+    /// 机制:第二次的 `stop_visitor` 取消的是第一次插入的 cancel token,
+    /// 第一次的重试循环继续跑(它只关心 bind 是否成功);两个重试循环
+    /// 竞争同一个端口,先成功的那个起监听,后成功的因 EADDRINUSE 继续
+    /// 重试直到超时。`visitor_cancels` 按 visitor_id 作 key,两次 insert
+    /// 互相覆盖,所以表里恰好一条(测试里断言了)。
+    ///
+    /// ★这条不是缺陷修复的证明,而是**边界行为固化** —— 我原本担心
+    /// spawn 会让两次更新互相拆台,实测确认不会。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_updates_do_not_deadlock() {
+        let (sess, _rx) = test_session();
+        let port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        // 连续两次更新同一条 visitor
+        for _ in 0..2 {
+            upsert(&sess, SyncEntity::Visitor(visitor_spec(11, port))).await;
+        }
+        // 最终必须能连上(至少一条 listener 活着)
+        let mut ok = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ok, "重复更新后 visitor 最终必须监听可达");
+        // 探针:最终 cancel 表里有几条?（应恰好 1 条 —— 两次 upsert 各 insert
+        // 一次,第二次覆盖第一次的 key)
+        let n = sess.visitor_cancels.lock().await.len();
+        assert_eq!(n, 1, "同一 visitor 只应有一个 cancel token,实际 {n}");
+        sess.cancel.cancel();
+    }
+
+    /// 端口可用时,visitor 最终必须真的起来(监听可达)。
+    ///
+    /// 这是端到端语义:spawn 出去的重试不能变成"永远起不来"。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn visitor_eventually_listens_when_port_free() {
+        let (sess, _rx) = test_session();
+        // 先探测一个空闲端口,然后立刻释放
+        let port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let spec = visitor_spec(9, port);
+        upsert(&sess, SyncEntity::Visitor(spec)).await;
+
+        // 等它 bind 成功(轮询连接,不引用内部常量)
+        let mut ok = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ok, "端口空闲时 visitor 必须最终监听可达");
+        // 收尾:取消,避免测试结束后 listener 泄漏
+        sess.cancel.cancel();
     }
 }
