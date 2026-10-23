@@ -1058,10 +1058,108 @@ select 不再回顶。与服务端 A1 缺陷同形。
 
 ## 19. 仍未解决的事项(截至本批)
 
-1. **客户端 `dispatch_frame` 里的 PING 应答与 `ack()`** 同样在 select 内联
-   路径上,有与 Q2 同源的自锁风险(§18.2 末尾)。**未修**。
+> **2026-10-23 更新**:第 1 项已在第五批修完(R1 `f27b6c7` / R2 `50180ec`,
+> 见 §20)。下列其余项的状态未变。
+
+1. ~~**客户端 `dispatch_frame` 里的 PING 应答与 `ack()`**~~ —— **已修**
+   (第五批 R1 / R2)。顺带纠正:这两处**都测得出**,与前几批那些
+   "抓不住缺陷"的测试不同 —— 因为 `dispatch_frame` 是 pub 的纯函数式接口,
+   不需要跑整个 run_loop 就能喂帧进去断言。详见 §20。
 2. **Q2 的端到端自锁测试复现不出来**(§18.2),目前只有原语层证据链。
 3. #2 恢复并发 / P4 `notify_client_recovery` 并发:**本机测不出收益**,
    真实收益依赖文件型 SQLite 与在线会话,未在部署环境验证。
 4. #10 的端到端 RTT 测量:未做,只有调度结构基准。
 5. 基线 3 个 e2e 失败项 + `dnsquery::cache_tests` 偶发失败:未修,超出范围。
+
+---
+
+## 20. 第五批:dispatch_frame 内联路径的两处自锁(2026-10-23)
+
+两项都是第四批 Q2 修复时**发现但未动**的同源问题(记录在 §19 第 1 条)。
+每项一个独立提交。
+
+| 项 | 提交 | 改前 | 改后 |
+|---|---|---|---|
+| R1 PING 应答 | `f27b6c7` | `send_msg().await`(可永久 park) | `try_send_msg_err`(不阻塞) |
+| R2 `ack()` | `50180ec` | `send_msg().await`(可永久 park) | 短超时 50ms(有界) |
+
+### 20.1 R1:PING 应答改用 try_send
+
+与 Q2 心跳完全同源:`dispatch_frame` 由 `run_loop` 的 `select!` 读分支内联
+调用,而 `send_rx.recv()` 是 `send_tx` 的唯一消费者。队列满时 park →
+select 不回顶 → 五条分支全失联。
+
+**为什么可以直接丢**:服务端心跳判死是 90s(`control.rs` 的 `hb.tick` 只看
+`last_frame.elapsed() >= 90s`),PING 间隔通常 30s,丢一两拍无感;下一拍
+PING 到达时,只要队列已排空就会正常回。
+
+**★这条测试与前几批那些"抓不住缺陷"的不同,它真的有效**:
+`dispatch_frame` 是 `pub` 的纯函数式接口(只依赖 sess + control 流 +
+payload),**不需要跑整个 run_loop** 就能喂一个 PING 帧进去断言。
+
+- `ping_reply_does_not_block_on_full_queue`:队列容量 1 且已满,断言 500ms
+  内返回。**反向验证**:改回 `send_msg().await` 后失败
+  ("PING 应答在满队列上阻塞了超过 500ms"),改回来即通过。
+- `ping_reply_delivered_when_space`:有空间时应答必须真的入队。
+
+这也解释了为什么 Q2 的心跳端到端测试复现不出来(Q2 只能跑完整 run_loop,
+调度时序不可控),而 R1/R2 可以 —— **差别在测试接口的粒度,不在缺陷性质**。
+
+### 20.2 R2:ack 用有界超时,不是 try_send(本批核心判断)
+
+**没有照抄心跳的 try_send**,因为丢 ACK 与丢心跳/丢 PING 应答性质不同:
+
+> 丢心跳、丢 PING 应答 → **自愈**(下一拍就有)。
+> 丢 ACK → **不自愈**(要等下一次配置变更或重连)。
+
+**独立核实了服务端的行为**(不照抄任务书的 grep 结论):
+
+| 核实项 | 结果 |
+|---|---|
+| `unconfirmed` 有无后台消费者 | **无**。`grep -rn "unconfirmed" rh-server/src/` 除定义/写入/retain 外无其它读取 |
+| `confirm_applied` 返回值用途 | `runtime.rs:124` 的 `still_waiting` 被 `let _ =` **丢弃** |
+| 服务端心跳是否检查未确认 | **不检查**。`hb.tick` 只判 `last_frame.elapsed() >= 90s` |
+| `applied_revision` 有无后台读 | **无** |
+| 有没有 ApplyResult 超时重发 | **没有** |
+
+所以丢一条 `ok:true` 的 ACK,那条规则会停在 Pending,**直到下一次该客户端有
+任何配置变更或重连**。管理员改完一条规则后若不再操作,界面会一直显示
+"未确认" —— 业务上不可接受。
+
+**三个方案的取舍**:
+
+| 方案 | 做法 | 判断 |
+|---|---|---|
+| A | `try_send`,丢就丢 | **否**。丢 ACK 让规则长期卡 Pending |
+| B | 短超时 50ms | **选它** |
+| C | `spawn` 出去 | **否**,见下 |
+
+**为什么不选 C(spawn)**:
+1. `ack` 的语义是「本次配置已应用」,它在 `dispatch_frame` 里紧跟
+   `apply_sync` / `upsert` / `remove_entity`。spawn 会拆开这条因果顺序,
+   让 ACK 可能晚于下一条 `ServiceUpdate` 的 upsert 才发出,制造无谓乱序。
+   (服务端 `confirm_applied` 是**单调**的:只有 `revision > applied` 才推进,
+   `retain` 清 ≤ revision —— 所以乱序**无害**,但没必要制造。)
+2. spawn 无法保证发出:会话收尾时未执行的 spawn 照样丢。
+
+**选 B 的代价**:仍在 select 分支里 `await`,但有界 50ms。50ms 远小于
+watchdog(3×心跳 = 30s);正常情况 `send` 是微秒级,根本走不到超时,
+只有真正拥塞(大量 REMOVE 集中下发)才吃满 50ms 后放弃这一条。
+
+**测试(有区分力,已反向验证)**:
+
+- `service_update_returns_when_queue_full`:**走真实调用路径**
+  (dispatch_frame → upsert → ack),队列容量 1 且已满,断言 3s 内返回。
+  **反向验证**:改回裸 `send_msg().await` 后,在 3s 超时处失败
+  ("满队列时 ServiceUpdate 处理被 ACK 永久 park")。
+- `ack_delivered_when_space`:有空间时 ACK 必须真的入队,并解帧确认
+  revision / ok 正确(防止超时参数包错导致永远不发)。
+- `ack_timeout_does_not_corrupt_local_state`:丢 ACK 只影响服务端
+  `confirmed_revision`,不污染客户端本地配置。
+
+### 20.3 本批的附带收获
+
+R1/R2 证明了一件事:**同一类缺陷,测试可行性取决于接口粒度**。
+Q2 心跳只能跑完整 run_loop(调度竞态不可控,端到端复现不出来);
+R1/R2 的宿主 `dispatch_frame` 是纯函数式 pub 接口,可以直接喂帧断言。
+后续遇到类似情况,应优先找"最小可测的宿主函数",而不是硬啃端到端。
