@@ -498,3 +498,186 @@ cargo fmt --all -- --check → 干净
 3. **#10 端到端 RTT 测量**:未做。只有调度结构基准。
 4. **#11**:未单独测(测试环境 `:memory:` 掩盖了收益)。
 5. **基线 3 个 e2e 失败项 + DNS 缓存测试偶发失败**:未修,超出范围。
+
+---
+
+## 16. 任务书之外发现的额外串行点(仅报告,未改代码)
+
+以下 4 处是在完成 12 项之后继续扫描时发现的。**本次只做报告,没有改代码**
+(按用户指示)。逐处给出位置、现状、影响判断,以及我建议的改法与风险 ——
+其中 B 项附了一个重要的**风险口径更正**。
+
+### A. `notify_client_recovery` 的批量恢复循环仍串行
+
+**位置**:`crates/rh-server/src/runtime.rs:526-536`
+
+```rust
+for (_id, _cid, mut spec) in proxies {
+    if !spec.enabled { continue; }
+    { let l = state.limits.read()...; normalize_spec(&mut spec, ...); }
+    let _rt = spawn_runtime(state, client_id, &spec, revision).await;   // ← 串行
+    info!(proxy = spec.name, "recovered after client enable");
+}
+```
+
+**为什么算遗留**:任务书 §2 #1 明确点名了这个函数 ——
+
+> `notify_client_recovery`(`runtime.rs:531`):`for ... { spawn_runtime(...).await }`
+
+并把它归为"N 次 × 每次 O(N)"的路径之一。但 #1 的改动只覆盖了
+`spawn_runtime` **内部**的 vhost 重建(改成 `schedule_vhost_rebuild()`),
+**这个循环本身没有并发化**。所以现在的状态是:每次 `spawn_runtime` 不再做
+O(N) 重建(这已经是最主要的收益,§1 实测 N=2000 时 746ms → 0.46ms),
+但 N 条规则仍然是 N 次**串行** `spawn_runtime`。
+
+**当前复杂度**:O(N · t),t = 单条 `spawn_runtime`(含 1 次 `get_client`
++ bind + serve loop 启动 + mpsc 发送)。
+
+**与 #2(recovery)的关系**:形态完全同构,`recovery.rs` 已经改成
+`for_each_concurrent(16)`,这里没有。
+
+**并发是否安全(关键判断)**:比 `recovery.rs` **更安全**。
+
+- `recovery.rs` 里要处理 `port_auto` 被外部占用时的 `allocate_port` 重分配,
+  所以必须把端口决策留在串行段;
+- `notify_client_recovery` **完全没有** `allocate_port` 调用 —— 端口直接取
+  DB 里已有的 `spec.bind_port`。两条规则不会争同一个端口(DB 里本来就是
+  唯一的),所以整个循环都可以并发。
+- 调用点 `update_client`(`api.rs:622`)持 `serial_lock(&id)`,并发化不会
+  引入跨客户端竞态;而 `spawn_runtime` 本身不取 `serial_lock`,不会自锁。
+
+**建议改法**:照抄 `recovery.rs` 的 `for_each_concurrent(RECOVERY_CONCURRENCY)`。
+风险:低。收益:批量启用一个 N 条规则的客户端时,N 次串行变 N/16 次。
+
+**未测**:没有为它做基准。按 §2 的实测结论(本机 `:memory:` 环境下并发化
+测不出收益),预期同样测不出差异 —— 真实收益依赖文件型 SQLite 与在线会话。
+
+---
+
+### B. `update_client` 禁用分支的两处无界 `send().await`
+
+**位置**:`crates/rh-server/src/api.rs:632-658`
+
+```rust
+for (pid, _, _spec) in &proxies {
+    teardown_runtime(&state, *pid as u64).await;
+    if let Some(sess) = state.sessions.get(&id) {
+        let _ = sess.send(ServerMessage::ServiceRemove(...)).await;   // ← 无界
+    }
+}
+for (vid, _, _, _) in &visitors {
+    if let Some(sess) = state.sessions.get(&id) {
+        let _ = sess.send(ServerMessage::ServiceRemove(...)).await;   // ← 无界
+    }
+}
+```
+
+`Session::send`(`session.rs:246`)是 `self.queue_tx.send(msg).await` ——
+**无界等待**,队列(`limits.control_send_queue`,默认 256)满时永久 park。
+
+**★风险口径更正(重要,避免误判)**:
+
+我最初把这里判为"A1 自锁形态",**这是错的**。核对后确认:
+
+- `queue_tx` 的唯一消费者是 `run_session_loop` 的 `select!`(`control.rs:912`
+  的 `qrx.recv()` 分支);
+- 而 `update_client` 是**纯 HTTP handler**(`api.rs:548`,挂在 axum 路由上),
+  **不在**控制读循环的内联路径里 —— `handle_client_message`
+  (`control.rs:987`)只处理客户端发来的 `ClientMessage`,不调用任何 admin
+  CRUD。
+
+所以这里**不会自锁**,真实后果是:队列满时这个 HTTP 请求会挂到 axum/反向
+代理的超时(通常 30~60s),期间 `serial_lock(&id)` 一直被持有,该客户端的
+其它管理操作全部排队。
+
+**同一个 handler 里的一致性缺口**:这条路径的兄弟函数
+`enable_service_locked` / `disable_service_locked` / `delete_service_locked`
+都已经用了 `send_bounded(CONTROL_SEND_TIMEOUT)`(2s 上限),**只有
+`update_client` 的禁用分支漏了**。这是纯粹的不一致,不是设计取舍。
+
+**建议改法**:两处 `sess.send(...)` 换成
+`sess.send_bounded(..., CONTROL_SEND_TIMEOUT)`。语义等价(都是尽力而为,
+返回值本来就被 `let _ =` 丢弃),只是把"永久等待"变成"最多 2s"。
+
+**风险**:零。这是纯降级,与同文件另外三处对齐。
+
+**顺带发现的同类裸 send(需要单独评估,不建议顺手改)**:
+`api.rs` 还有 8 处裸 `send`(`:1452` `:1498` `:1694` `:1721` `:1858`
+`:1902` `:1977` `:1984` `:2032`),分别在 `disable_service` /
+`delete_service` / `create_visitor` / `update_visitor` / `delete_visitor` /
+`enable_service` 等 handler 里。它们同样不在控制循环内联路径上,同样不会
+自锁,但同样会在队列满时挂住 HTTP 请求。**属于同一类问题,但不在本次报告
+的 4 处范围内** —— 如果要修,建议一次性把所有 admin handler 的裸 `send`
+统一换成 `send_bounded`,作为独立的一批,而不是逐个打补丁。
+
+---
+
+### C. `delete_client` 的 teardown 循环串行
+
+**位置**:`crates/rh-server/src/api.rs:706-709`
+
+```rust
+let proxies = state.db.list_proxies(Some(&id)).await.unwrap_or_default();
+for (pid, _, _) in &proxies {
+    crate::runtime::teardown_runtime(&state, *pid as u64).await;   // ← 串行
+}
+```
+
+**为什么算遗留**:任务书 §2 #1 同样点名了这个调用点:
+
+> `delete_client`(`api.rs:707`):`for (pid,..) in &proxies { teardown_runtime(...).await }`
+
+#1 只改了 `teardown_runtime` 内部的 vhost 重建,循环本身仍是串行。
+
+**单次 `teardown_runtime` 的代价**(`runtime.rs:484-514`):
+- 取 `spec.read()`;
+- 可能的 `leave_group`(取组的 `members` 写锁 + `serve_cancel` 读锁);
+- `rule_cancel.cancel()`;
+- **等 `serve_handle` 收敛,最多 2s**(`tokio::time::timeout(2s, h)`);
+- `close_proxy_channels`(取 `pool.lock()` + `ready.lock()`);
+- `invalidate_proxy_requests`(取 `pending_requests` 锁)。
+
+最坏情况:一个持有监听但 serve loop 不收敛的客户端,N 条规则 = **N × 2s**。
+删除一个有 100 条规则、若干条卡住的客户端,这个 HTTP 请求会挂 200 秒。
+
+**当前复杂度**:O(N · t),最坏 t = 2s。
+
+**并发是否安全**:需要谨慎,有两点要注意:
+
+1. `teardown_runtime` 里的 `serve_handle` 2s 超时是**每条规则独立**的预算,
+   不是共享预算。并发后总耗时 ≈ 2s(而不是 N × 2s),这是收益来源;
+2. `state.proxies.runtimes.remove(&proxy_id)` 是 dashmap 操作,不同 key
+   并发安全;`leave_group` 按组键加锁,同组的多条规则并发 teardown 会在
+   组锁上排队(但不会死锁 —— 锁内没有嵌套的跨组等待)。
+
+**建议改法**:`for_each_concurrent(8)`。并发度取 8 而非 16,因为每条规则
+内部可能等 2s,并发度过高会让"同时持有大量 rule_cancel 与 fd 释放中"的
+窗口变宽。风险:中低。收益:最坏情况从 N×2s 降到 ~2s。
+
+**未测**:没有基准。这条的收益是"最坏情况"的,正常情况(serve loop 立即
+收敛)下单条 teardown 只有几十微秒,N 条也就几毫秒 —— 用 `:memory:` +
+无真实 listener 的测试环境**构造不出** 2s 超时的场景。
+
+---
+
+### D. `list_services`(任务书 #7)
+
+已在 §7 说明未做。此处不重复。
+
+---
+
+### 小结
+
+| 项 | 位置 | 当前复杂度 | 建议改法 | 风险 | 是否已改 |
+|---|---|---|---|---|---|
+| A | `runtime.rs:526` | O(N·t) 串行 | `for_each_concurrent(16)` | 低(比 recovery 更安全) | 否 |
+| B | `api.rs:632/649` | 无界等待 | `send_bounded(2s)` | **零**(纯降级) | 否 |
+| C | `api.rs:707` | O(N·t),最坏 N×2s | `for_each_concurrent(8)` | 中低 | 否 |
+| D | `api.rs:741` | 3N 次锁 | 见 §7 | — | 否(§7 已说明理由) |
+
+**优先级建议**:B(零风险、纯一致性)→ A(形态与已落地的 #2 完全同构)→
+C(收益在极端场景,需谨慎)。D 维持不做。
+
+**关于"要不要顺手改"**:这 4 处都不在任务书范围内。按仓库约定
+(AGENTS.md「不要顺手优化任务书之外的地方」),本次只报告不改。其中 B 的
+风险为零且是明显的一致性缺口,如果决定做,建议单独一个提交。
