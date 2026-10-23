@@ -556,7 +556,9 @@ impl StreamReadHalf {
         // 且"无待补 ACK"时启用——带 ACK 的 0-credit WU 属带 flag 帧,必须
         // 走旧 mpsc 通路保流内 FIFO(见 `send_window_update` 注释),那条
         // 路要求**先确认容量再记账**,与单锁热路径不相容,保持原样为冷路径。
-        if let Some(conn_shared) = self.conn_shared.clone() {
+        // R1(P2):借用替代克隆(修前每块读两次原子操作;push_to_send
+        // 只取 &self,与下方 shared() 的不可变借用共存)。
+        if let Some(conn_shared) = self.conn_shared.as_ref() {
             let step = {
                 let mut shared = self.shared();
                 if shared.ack_pending {

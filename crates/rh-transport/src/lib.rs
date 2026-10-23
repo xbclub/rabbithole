@@ -974,6 +974,10 @@ impl Multiplexer {
     /// 运行中把一条已 accept 的服务端 yamux 载体附加进本多路复用器
     /// (round-9 服务端会话聚合)。仅 [`MultiplexerInner::YamuxPool`] 变体
     /// 支持(返回 true);其余变体返回 false,载体由调用方处置。
+    ///
+    /// C8 备注:生产路径已全部走 [`Self::attach_yamux_carrier_with_cap`]/
+    /// `_gated` 变体;本裸变体**仅供 rh-transport 集成测试**
+    /// (tests/pool_wiring.rs)使用,新代码不要调用。
     pub async fn attach_yamux_carrier(&self, mux: mux::YamuxMultiplexer) -> bool {
         match &self.inner {
             MultiplexerInner::YamuxPool(p) => {
@@ -1061,6 +1065,10 @@ impl Multiplexer {
 
     /// 池成员身份快照(round-10.1,成员表顺序)。非池变体返回空表——
     /// 调用方(报到收敛)只在池路径使用;单载体路径无成员可摘。
+    ///
+    /// C8 备注:生产收敛只按 [`Self::live_member_ids`](round-10.2,
+    /// dead-but-unreaped 语义;按本方法计数会把保留额算给死成员)。
+    /// 本方法**仅供测试观测成员表**,新生产代码不要用。
     pub async fn member_ids(&self) -> Vec<u64> {
         match &self.inner {
             MultiplexerInner::YamuxPool(p) => p.member_ids().await,

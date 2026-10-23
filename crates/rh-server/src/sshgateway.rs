@@ -495,21 +495,21 @@ async fn pump(sock: tokio::net::TcpStream, mut channel: russh::Channel<russh::se
         }
         let _ = writer.shutdown().await;
     });
-    let mut pending = Vec::new();
     loop {
         let msg = channel.wait().await;
         match msg {
-            Some(ChannelMsg::Data { data }) => pending.extend_from_slice(&data),
-            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-            _ => {}
-        }
-        while !pending.is_empty() {
-            match sw.write_buf(&mut &pending[..]).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let _ = pending.drain(..n);
+            // R1:直接 write_all(tokio 内部处理部分写续传)。修前先
+            // extend 进 pending 再 write_buf + drain —— 每条消息整块多
+            // 一次拷贝,部分写时还有 O(剩余字节) memmove;而 pending
+            // 在等下一条消息前必然排空,不存在攒批收益。用户侧写失败
+            // = 用户已断,立即收敛(修前也只是每条消息重试失败)。
+            Some(ChannelMsg::Data { data }) => {
+                if sw.write_all(&data).await.is_err() {
+                    break;
                 }
             }
+            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+            _ => {}
         }
     }
     // 对端结束发送:向用户侧传播半关闭,否则 t1 会一直等用户主动断开

@@ -490,8 +490,28 @@ async fn copy_relay_pair(
     fail: RelayFailCtx,
 ) {
     use std::sync::atomic::Ordering;
-    let (mut u_r, mut u_w) = tokio::io::split(user);
-    let (mut c_r, mut c_w) = tokio::io::split(channel);
+    // R1(第 1 轮扫描):copy 路径同样先试无锁拆半 —— 非_mux TCP 载体
+    // 的主路径就在这里(DialPerStream 下 channel 是裸 TcpStream),
+    // 且 splice 仅 Linux 可用,macOS/Windows 的非 mux 模式 100% 走本函数。
+    // user 侧剥 CountedUserIo 计量壳(A-2 同款),channel 侧走
+    // split_boxed_io;包装类型(压缩流等)照旧回落同步锁拆分。
+    let (mut u_r, mut u_w): RelayHalves = match split_counted_tcp_user(user) {
+        Ok((r, w)) => (r, w),
+        Err(io) => match rh_transport::split_boxed_io(io) {
+            Ok((r, w)) => (Box::new(r), Box::new(w)),
+            Err(io) => {
+                let (r, w) = tokio::io::split(io);
+                (Box::new(r), Box::new(w))
+            }
+        },
+    };
+    let (mut c_r, mut c_w): RelayHalves = match rh_transport::split_boxed_io(channel) {
+        Ok((r, w)) => (Box::new(r), Box::new(w)),
+        Err(io) => {
+            let (r, w) = tokio::io::split(io);
+            (Box::new(r), Box::new(w))
+        }
+    };
     let bucket2 = bucket.clone();
     let cb2 = client_bucket.clone();
     let cancel = rule_cancel.clone();

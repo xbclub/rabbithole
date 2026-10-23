@@ -66,19 +66,22 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
     if resolve.visitor_id != u.visitor_id || !resolve.vspec.enabled || !resolve.pspec.enabled {
         return;
     }
-    let vspec = resolve.vspec.clone();
-    let pspec = resolve.pspec.clone();
-    let v_target_client = resolve.target_client.clone();
-    if !secret_ok(&pspec, &vspec) {
+    // R1(第 1 轮扫描):Arc 借用即可,修前每连接三次深克隆(vspec/pspec/
+    // target_client)——secret_ok/relay_* 全部按引用使用。pspec 在 xtcp/relay
+    // 分支也只需引用;relay_tcp 内部的 spawn 深克隆另修(传 proxy_id)。
+    let vspec = &resolve.vspec;
+    let pspec = &resolve.pspec;
+    let v_target_client = &resolve.target_client;
+    if !secret_ok(pspec, vspec) {
         return;
     }
-    let Some(target_sess) = state.sessions.get(&v_target_client) else {
+    let Some(target_sess) = state.sessions.get(v_target_client) else {
         warn!(visitor = vspec.name, target = %v_target_client, "target client offline");
         return;
     };
 
     if u.udp {
-        relay_udp(state, sess, &vspec, &pspec, &target_sess).await;
+        relay_udp(state, sess, vspec, pspec, &target_sess).await;
         return;
     }
     if vspec.kind == rh_protocol::VisitorKind::Xtcp {
@@ -96,7 +99,7 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
         );
         if !already {
             let fallback =
-                crate::nathole::start(state, sess, &vspec, &pspec, &target_sess, u.user_conn_id)
+                crate::nathole::start(state, sess, vspec, pspec, &target_sess, u.user_conn_id)
                     .await;
             if !fallback {
                 return; // 打洞协调已发起
@@ -108,7 +111,7 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
         conn = u.user_conn_id,
         "visitor relay established"
     );
-    relay_tcp(state, sess, &vspec, &pspec, &target_sess, u.user_conn_id).await;
+    relay_tcp(state, sess, vspec, pspec, &target_sess, u.user_conn_id).await;
 }
 
 /// 密钥校验。访问授权由访问器记录本身保证(仅管理员可建,记录绑定客户端与
@@ -165,26 +168,24 @@ async fn relay_tcp(
         return;
     };
     let st = state.clone();
-    let pspec2 = pspec.clone();
+    let pid = pspec.id; // R1:spawn 只需 id,修前深克隆整个 ProxySpec
     let vid_sess = sess.session_id.clone();
     let pid_sess = target_sess.session_id.clone();
     tokio::spawn(async move {
-        // 通道签发后 ≤15s 内必须两侧都到达;超时清理配对槽位,防任务与表项泄漏
-        let visitor_stream = match tokio::time::timeout(Duration::from_secs(15), vr).await {
-            Ok(Ok(s)) => s,
+        // 通道签发后 ≤15s 内必须两侧都到达;超时清理配对槽位,防任务与表项泄漏。
+        // R1:两侧并发等待(互不依赖;修前串行,失败路径最坏 2×15s)。
+        let (vr_res, pr_res) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(15), vr),
+            tokio::time::timeout(Duration::from_secs(15), pr)
+        );
+        let (visitor_stream, proxy_stream) = match (vr_res, pr_res) {
+            (Ok(Ok(v)), Ok(Ok(p))) => (v, p),
             _ => {
                 cleanup_pair(&st, &vid_sess, _visitor_rid, &pid_sess, _proxy_rid).await;
                 return;
             }
         };
-        let proxy_stream = match tokio::time::timeout(Duration::from_secs(15), pr).await {
-            Ok(Ok(s)) => s,
-            _ => {
-                cleanup_pair(&st, &vid_sess, _visitor_rid, &pid_sess, _proxy_rid).await;
-                return;
-            }
-        };
-        splice_relay(st, pspec2, proxy_stream, visitor_stream).await;
+        splice_relay(st, pid, proxy_stream, visitor_stream).await;
     });
 }
 
@@ -248,16 +249,14 @@ async fn relay_udp(
     let vid = vspec.id;
     let prt = state.proxies.get(pspec.id);
     tokio::spawn(async move {
-        // 通道签发后 ≤15s 内必须到达;否则清理 relay 槽位避免死占
-        let a = match tokio::time::timeout(Duration::from_secs(15), pr).await {
-            Ok(Ok(s)) => s,
-            _ => {
-                st.udp_relays.lock().await.remove(&vid);
-                return;
-            }
-        };
-        let b = match tokio::time::timeout(Duration::from_secs(15), vr).await {
-            Ok(Ok(s)) => s,
+        // 通道签发后 ≤15s 内必须到达;否则清理 relay 槽位避免死占。
+        // R1:两侧并发等待(修前串行,失败路径最坏 2×15s)。
+        let (pr_res, vr_res) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(15), pr),
+            tokio::time::timeout(Duration::from_secs(15), vr)
+        );
+        let (a, b) = match (pr_res, vr_res) {
+            (Ok(Ok(x)), Ok(Ok(y))) => (x, y),
             _ => {
                 st.udp_relays.lock().await.remove(&vid);
                 return;
@@ -325,25 +324,30 @@ pub async fn on_relay_proxy_channel(
         warn!(proxy_id, "relay proxy channel: proxy runtime missing");
         return;
     };
-    let pspec = rt.spec.read().await.clone();
-    if pspec.kind == ProxyKind::Sudp {
-        // UDP 语义:无指派帧,直接交付(客户端按 UDP 通道处理)
-        deliver_pair(state, session_id, request_id, stream).await;
-        return;
-    }
-    let mut flags = 0u8;
-    if compress {
-        flags |= forward_flags::COMPRESSED;
-    }
-    let fwd = StartForward {
-        proxy_id: pspec.id,
-        user_src: src_hint.to_string(),
-        target_host: pspec.target_host.clone(),
-        target_port: pspec.target_port,
-        flags,
-        proxy_proto: conv_proxy_proto(pspec.transport.proxy_proto),
-        proxy_name: pspec.name.clone(),
-        xtcp_auth: String::new(),
+    // R1:锁内只取 START_FORWARD 需要的 6 个字段,修前 `spec.clone()`
+    // 深克隆整个 ProxySpec(每条被中继的连接一次)。
+    let fwd = {
+        let spec = rt.spec.read().await;
+        if spec.kind == ProxyKind::Sudp {
+            // UDP 语义:无指派帧,直接交付(客户端按 UDP 通道处理)
+            drop(spec);
+            deliver_pair(state, session_id, request_id, stream).await;
+            return;
+        }
+        let mut flags = 0u8;
+        if compress {
+            flags |= forward_flags::COMPRESSED;
+        }
+        StartForward {
+            proxy_id: spec.id,
+            user_src: src_hint.to_string(),
+            target_host: spec.target_host.clone(),
+            target_port: spec.target_port,
+            flags,
+            proxy_proto: conv_proxy_proto(spec.transport.proxy_proto),
+            proxy_name: spec.name.clone(),
+            xtcp_auth: String::new(),
+        }
     };
     let payload = serde_json::to_vec(&fwd).unwrap();
     if rh_protocol::write_frame(&mut stream, FrameType::START_FORWARD, &payload)
@@ -377,13 +381,13 @@ async fn deliver_pair(state: &Arc<AppState>, session_id: &str, request_id: u64, 
 /// 已在两侧通道抵达时写入并带压缩 flags,压缩由两端客户端各自完成。
 async fn splice_relay(
     state: Arc<AppState>,
-    pspec: ProxySpec,
+    proxy_id: u64,
     proxy_stream: BoxedIo,
     visitor_stream: BoxedIo,
 ) {
     let mut a = proxy_stream;
     // 计量取 visitor 侧(用户口径),归因到目标代理(design-parity 决策 3)
-    let rt = state.proxies.get(pspec.id);
+    let rt = state.proxies.get(proxy_id);
     let _conn_guard = match crate::data::try_open_user_conn(&state, rt.as_ref()) {
         Some(g) => g,
         None => return, // F2 配额超限:中继不建立

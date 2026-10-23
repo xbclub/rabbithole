@@ -9,6 +9,7 @@
 //! 完成后经 [`Reservation`] 显式消费/退款(送达计费合同)。
 //! 既有 `acquire`/`take` 的签名与语义不变(copy 路径照旧)。
 
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -22,6 +23,8 @@ pub struct TokenBucket {
     capacity: f64,
     rate_per_sec: f64,
     /// 已消费且未退还的令牌累计(诊断/测试口径:退款递减)。
+    /// 仅测试读(消费记账断言);R1:cfg(test) 门控,生产不付原子 RMW。
+    #[cfg(test)]
     consumed_total: AtomicU64,
 }
 
@@ -41,6 +44,7 @@ impl TokenBucket {
             }),
             capacity: bytes_per_sec.max(1.0),
             rate_per_sec: bytes_per_sec.max(0.001),
+            #[cfg(test)]
             consumed_total: AtomicU64::new(0),
         }
     }
@@ -56,6 +60,7 @@ impl TokenBucket {
         let granted = avail.min(n);
         s.tokens -= granted as f64;
         drop(s);
+        #[cfg(test)]
         if granted > 0 {
             self.consumed_total
                 .fetch_add(granted as u64, Ordering::Relaxed);
@@ -77,6 +82,7 @@ impl TokenBucket {
     }
 
     /// 已消费且未退还的令牌累计(退款递减;诊断/回归断言用)。
+    #[cfg(test)]
     pub fn consumed_total(&self) -> u64 {
         self.consumed_total.load(Ordering::Relaxed)
     }
@@ -92,6 +98,7 @@ impl TokenBucket {
         s.tokens = (s.tokens + elapsed * self.rate_per_sec + n as f64).min(self.capacity);
         s.last = now;
         drop(s);
+        #[cfg(test)]
         self.consumed_total.fetch_sub(n as u64, Ordering::Relaxed);
     }
 

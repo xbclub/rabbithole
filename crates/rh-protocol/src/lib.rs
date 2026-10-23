@@ -23,6 +23,3 @@ pub use visitor::{VisitorKind, VisitorSpec};
 
 /// 协议版本号(语义化,主版本不一致时服务端拒绝)。
 pub const PROTOCOL_VERSION: &str = "0.1.0";
-
-/// 会话内数据通道请求 ID 的上限(防泄漏计数的护栏,非协议约束)。
-pub const MAX_PENDING_REQUESTS_PER_SESSION: usize = 1024;

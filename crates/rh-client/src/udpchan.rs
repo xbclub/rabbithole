@@ -131,7 +131,19 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: ProxySpec, prefix: Vec<u8>) 
             return;
         }
     };
-    let (mut r, w) = tokio::io::split(channel);
+    // R1:读主循环与写任务分属两个 task,先试无锁拆半(非 mux 载体下
+    // channel 是裸 TcpStream,into_split 两个独立 fd);mux 流回落
+    // 同步锁拆分(与修前一致)。
+    let (mut r, w): (
+        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    ) = match rh_transport::split_boxed_io(channel) {
+        Ok((r, w)) => (r, w),
+        Err(io) => {
+            let (r, w) = tokio::io::split(io);
+            (Box::new(r), Box::new(w))
+        }
+    };
     let (tx, rx) = mpsc::channel::<Pending>(WRITE_QUEUE);
     // 写任务独占写半:此后主循环与各回写任务都不再持有它,
     // 也就不存在"跨 await 持锁"和"全部会话等同一把锁"。
@@ -351,7 +363,19 @@ pub async fn run_visitor_side(
     cancel: tokio_util::sync::CancellationToken,
     pending: std::collections::VecDeque<(std::net::SocketAddr, Vec<u8>)>,
 ) {
-    let (mut r, w) = tokio::io::split(channel);
+    // R1:读主循环与写任务分属两个 task,先试无锁拆半(非 mux 载体下
+    // channel 是裸 TcpStream,into_split 两个独立 fd);mux 流回落
+    // 同步锁拆分(与修前一致)。
+    let (mut r, w): (
+        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    ) = match rh_transport::split_boxed_io(channel) {
+        Ok((r, w)) => (r, w),
+        Err(io) => {
+            let (r, w) = tokio::io::split(io);
+            (Box::new(r), Box::new(w))
+        }
+    };
     let (tx, rx) = mpsc::channel::<Pending>(WRITE_QUEUE);
     let writer = tokio::spawn(writer_task(w, rx));
     // 先冲通道到位前缓冲的本地包(仍在写任务里按序写出)

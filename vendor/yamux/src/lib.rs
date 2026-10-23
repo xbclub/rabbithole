@@ -35,6 +35,8 @@ pub mod sched_diag;
 pub(crate) mod connection;
 mod tagged_stream;
 
+// Packet / Sequential 为上游 parity 导出(rabbithole crates/ 内零使用,
+// 保留以贴近上游结构,勿在生产代码新增引用 —— C8/D5 口径)。
 pub use crate::connection::{
     Connection, Mode, Packet, RecvHalf, SendHalf, SendWorker, ShardWorker, SplitSocket, Stream,
     StreamReadHalf, StreamWriteHalf,

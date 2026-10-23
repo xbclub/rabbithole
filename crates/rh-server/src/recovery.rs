@@ -69,6 +69,15 @@ pub async fn recover_all(state: &Arc<AppState>) {
     //
     // 第二段(并发):`spawn_runtime`。它内部的 bind 是对**已经定好**的
     // 端口做的,不同规则端口互不重叠(串行段已保证),因此可以安全并发。
+    // R1:port_auto 一次性轻量取全表(修前每条启用规则一次 get_proxy,
+    // 每次都把该行 spec JSON 完整反序列化,只为拿一个 bool —— N+1)。
+    let port_auto_map: std::collections::HashMap<i64, bool> = state
+        .db
+        .list_port_auto()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     let mut prepared: Vec<(String, rh_protocol::ProxySpec, u64)> = Vec::new();
     for (id, client_id, mut spec) in proxies {
         if !spec.enabled || !enabled_clients.contains(&client_id) {
@@ -80,14 +89,7 @@ pub async fn recover_all(state: &Arc<AppState>) {
         }
         // port_auto 被外部占用 → 立即重分配(同事务改库);
         // 固定端口被占不重分配(§4.6):交由 spawn_runtime 进入 bind_error 60s 重试
-        let port_auto = state
-            .db
-            .get_proxy(id)
-            .await
-            .ok()
-            .flatten()
-            .map(|(_, _, _, auto)| auto)
-            .unwrap_or(false);
+        let port_auto = port_auto_map.get(&id).copied().unwrap_or(false);
         if port_auto && spec.kind.uses_bind_port() && spec.bind_port > 0 {
             let bind_ip = rh_core::net::parse_bind_ip(&spec.bind_ip)
                 .unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));

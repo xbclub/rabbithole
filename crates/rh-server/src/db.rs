@@ -306,9 +306,11 @@ impl Db {
         // C6b:INSERT 与 id 回填 UPDATE 放进同一事务(与 insert_proxy_bump
         // 同款)。修前是两次独立往返且 `let _ =` 吞错 —— UPDATE 失败会
         // 留下 spec.id=0 的行(读取方依赖 spec.id),且静默不可见。
+        // R1:INSERT 的 spec 列用 '{}' 占位(事务内中间态不可见),真实
+        // spec 只序列化一次 —— 修前 id=0 版本先序列化、回填后再序列化,
+        // 每次创建白付一份。
         let mut tx = self.pool.begin().await?;
         let mut spec = spec.clone();
-        let spec_json = serde_json::to_string(&spec)?;
         let r = sqlx::query(
             "INSERT INTO proxies (client_id, name, kind, enabled, bind_ip, bind_port, port_auto, target_host, target_port, pool_size, group_name, group_key, source, spec, created_at, updated_at) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
@@ -326,7 +328,7 @@ impl Db {
         .bind(spec.group.clone().unwrap_or_default())
         .bind(&spec.group_key)
         .bind(source)
-        .bind(&spec_json)
+        .bind("{}")
         .bind(now_ms())
         .execute(&mut *tx)
         .await?;
@@ -351,9 +353,11 @@ impl Db {
         port_auto: bool,
         source: &str,
     ) -> Result<(i64, u64)> {
+        // R1:同 insert_proxy —— 占位 INSERT + 单次序列化;UPDATE 失败
+        // 随事务回滚(修前 `let _ =` 吞错,与 insert_proxy 的 C6b 口径
+        // 不一致,失败会留下 spec.id=0 的行且静默)。
         let mut tx = self.pool.begin().await?;
         let mut spec = spec.clone();
-        let spec_json = serde_json::to_string(&spec)?;
         let r = sqlx::query(
             "INSERT INTO proxies (client_id, name, kind, enabled, bind_ip, bind_port, port_auto, target_host, target_port, pool_size, group_name, group_key, source, spec, created_at, updated_at) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
@@ -371,17 +375,17 @@ impl Db {
         .bind(spec.group.clone().unwrap_or_default())
         .bind(&spec.group_key)
         .bind(source)
-        .bind(&spec_json)
+        .bind("{}")
         .bind(now_ms())
         .execute(&mut *tx)
         .await?;
         let id = r.last_insert_rowid();
         spec.id = id as u64;
-        let _ = sqlx::query("UPDATE proxies SET spec=?2 WHERE id=?1")
+        sqlx::query("UPDATE proxies SET spec=?2 WHERE id=?1")
             .bind(id)
             .bind(serde_json::to_string(&spec)?)
             .execute(&mut *tx)
-            .await;
+            .await?;
         sqlx::query("UPDATE clients SET config_revision = config_revision + 1 WHERE id=?1")
             .bind(client_id)
             .execute(&mut *tx)
@@ -475,6 +479,90 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// R1:按 id 精确取 visitor(update/toggle/delete 的属主定位;修前
+    /// `list_visitors(None)` 全表取回 + 线性 find,每次操作 O(M) 行构造)。
+    /// R1:全部规则的 (id, port_auto) 轻量列表(启动恢复的端口重分配
+    /// 判定;不做 spec JSON 反序列化)。
+    pub async fn list_port_auto(&self) -> Result<Vec<(i64, bool)>> {
+        let rows = sqlx::query("SELECT id, port_auto FROM proxies")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<i64, _>(0), r.get::<i64, _>(1) != 0))
+            .collect())
+    }
+
+    /// R1:轻量 (client_id, name, kind) 列表(resolve_visitor_target 的
+    /// 名称匹配;不做 spec JSON 反序列化)。
+    pub async fn list_proxy_names(&self) -> Result<Vec<(String, String, String)>> {
+        let rows = sqlx::query("SELECT client_id, name, kind FROM proxies")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>(0),
+                    r.get::<String, _>(1),
+                    r.get::<String, _>(2),
+                )
+            })
+            .collect())
+    }
+
+    pub async fn get_visitor(&self, id: i64) -> Result<Option<(i64, String, String, VisitorSpec)>> {
+        // 列集与 list_visitors 一致(visitors 表无 spec JSON 列,按列构造)
+        let row = sqlx::query(
+            "SELECT id, client_id, target_client_id, name, kind, enabled, bind_addr, bind_port, target_proxy_name, secret_key, use_compression FROM visitors WHERE id=?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(r) => {
+                let spec = VisitorSpec {
+                    id: r.get::<i64, _>(0) as u64,
+                    name: r.get::<String, _>(3),
+                    kind: match r.get::<String, _>(4).as_str() {
+                        "sudp" => VisitorKind::Sudp,
+                        "xtcp" => VisitorKind::Xtcp,
+                        _ => VisitorKind::Stcp,
+                    },
+                    enabled: r.get::<i64, _>(5) != 0,
+                    bind_addr: r.get::<String, _>(6),
+                    bind_port: r.get::<i64, _>(7) as u16,
+                    target_proxy_name: r.get::<String, _>(8),
+                    secret_key: r.get::<String, _>(9),
+                    use_compression: r.get::<i64, _>(10) != 0,
+                };
+                Ok(Some((
+                    r.get::<i64, _>(0),
+                    r.get::<String, _>(1),
+                    r.get::<String, _>(2),
+                    spec,
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// R1:轻量计数(仪表盘轮询;修前 list_proxies/list_clients 全表取回
+    /// + 逐行 JSON 反序列化只为 `.len()`)。
+    pub async fn count_proxies(&self) -> Result<i64> {
+        let r: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proxies")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(r)
+    }
+
+    pub async fn count_clients(&self) -> Result<i64> {
+        let r: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM clients")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(r)
     }
 
     pub async fn get_proxy(&self, id: i64) -> Result<Option<(i64, String, ProxySpec, bool)>> {
@@ -857,6 +945,15 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(r.last_insert_rowid())
+    }
+
+    /// R1:证书存在性(update_cert 前置校验;修前全表取回 PEM)。
+    pub async fn cert_exists(&self, id: i64) -> Result<bool> {
+        let r: Option<i64> = sqlx::query_scalar("SELECT id FROM certs WHERE id=?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(r.is_some())
     }
 
     pub async fn list_certs(&self) -> Result<Vec<CertRow>> {

@@ -1447,9 +1447,14 @@ mod halves {
         fn push_new_receiver(&self, id: StreamId, r: mpsc::Receiver<StreamCommand>) {
             // round-33:与帧路由同式(剥奇偶位),否则 N=4 时 Worker 0/2
             // 永远收不到任何流命令——即"偶数 Worker 终生闲置"的另一半。
-            let n = self.send_regs.lock().len();
-            let index = shard::shard_index(id, n);
-            self.send_regs.lock()[index].push_back((id, r));
+            // R1(P1):长度读取与入队合并进同一 guard(修前同一把锁连取两次,
+            // send_regs 是 halves 路径所有建流共写的热锁)。
+            let index = {
+                let mut regs = self.send_regs.lock();
+                let index = shard::shard_index(id, regs.len());
+                regs[index].push_back((id, r));
+                index
+            };
             if let Some(w) = self.send_worker_wakers.lock()[index].take() {
                 w.wake();
             }

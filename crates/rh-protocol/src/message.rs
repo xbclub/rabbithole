@@ -15,8 +15,6 @@ pub enum SyncEntity {
     Visitor(VisitorSpec),
 }
 
-impl SyncEntity {}
-
 /// 数据通道实体定位:代理或 visitor 侧。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "side", rename_all = "lowercase")]

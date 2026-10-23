@@ -136,6 +136,7 @@ pub trait Writev2: AsyncWrite {
 
 /// 顺序写出适配器:把 [`Writev2`] 实现为「先 a 后 b」的两段顺序写。
 /// yamux 内部测试与不支持向量写的载体使用。
+/// (上游 parity 导出,rabbithole crates/ 内零使用;C8/D5 口径保留。)
 pub struct Sequential<T>(pub T);
 
 impl<T: AsyncRead + Unpin> AsyncRead for Sequential<T> {

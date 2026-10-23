@@ -58,6 +58,10 @@ pub struct AppState {
     /// 随后 `resolve.visitor_id != u.visitor_id` 直接 return —— 无日志丢弃,
     /// 表现为"同客户端的多个访问器只有一个能用"。
     pub visitor_cache: dashmap::DashMap<(String, u64), std::sync::Arc<VisitorResolution>>,
+    /// R1:用户 pwd_version 内存缓存(require_auth 每请求读;修前每个
+    /// 已认证 API 请求一次 SQLite 往返 —— UI 轮询下是全进程最高频 DB 查询)。
+    /// 失效点:logout(bump)与 change_password,api.rs 两处 remove。
+    pub pwd_version_cache: dashmap::DashMap<String, i64>,
     /// C1:每个客户端的本地配置版本(任何规则/访问器变更 +1)。比 DB 的
     /// config_revision 更廉价:纯内存原子,不需要每次解析都读 DB。
     pub client_cfg_gen: Arc<dashmap::DashMap<String, u64>>,
@@ -275,6 +279,7 @@ impl Clone for AppState {
             metrics_task: self.metrics_task.clone(),
             metrics_listen_addr: self.metrics_listen_addr.clone(),
             visitor_cache: self.visitor_cache.clone(),
+            pwd_version_cache: self.pwd_version_cache.clone(),
             client_cfg_gen: self.client_cfg_gen.clone(),
         }
     }
@@ -409,6 +414,7 @@ impl AppState {
             web_jwt_secret: Arc::new(Mutex::new(Some(jwt_secret))),
             unauth_conns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             visitor_cache: dashmap::DashMap::new(),
+            pwd_version_cache: dashmap::DashMap::new(),
             client_cfg_gen: Arc::new(dashmap::DashMap::new()),
         }
     }

@@ -1152,13 +1152,13 @@ async fn serve_tls_term(
     };
     let mut plain = tls_stream;
     match connect_upstream(&local_addr, upstream_tls).await {
-        Ok(mut up) => {
-            if rewrite_and_splice(&mut plain, &mut up, &host_rewrite, &headers)
+        Ok(up) => {
+            // up 的所有权移入 rewrite_and_splice(错误收尾在其内部完成)
+            if rewrite_and_splice(&mut plain, up, &host_rewrite, &headers)
                 .await
                 .is_err()
             {
                 let _ = plain.shutdown().await;
-                let _ = up.shutdown().await;
             }
         }
         Err(_) => {
@@ -1180,13 +1180,12 @@ async fn dial_rewrite_upstream(
     let headers = headers.clone();
     tokio::spawn(async move {
         let mut chan = b;
-        let mut up = up;
-        if rewrite_and_splice(&mut chan, &mut up, &hr, &headers)
+        let up = up;
+        if rewrite_and_splice(&mut chan, up, &hr, &headers)
             .await
             .is_err()
         {
             let _ = chan.shutdown().await;
-            let _ = up.shutdown().await;
         }
     });
     Ok(Box::new(a))
@@ -1224,25 +1223,39 @@ async fn connect_upstream(local_addr: &str, tls: bool) -> anyhow::Result<BoxedIo
 
 /// 读首个请求头 → 改写(Host/HeaderOp/Connection: close)→ 写上游 →
 /// 之后纯双向搬运(半关闭传递)。
-async fn rewrite_and_splice<A, B>(
+async fn rewrite_and_splice<A>(
     chan: &mut A,
-    up: &mut B,
+    up: rh_transport::BoxedIo,
     host_rewrite: &str,
     headers: &HeaderOp,
 ) -> anyhow::Result<()>
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     // 上限 64KiB(旧实现的 `buf.len() > 64 * 1024` 语义)
     let buf = read_http_head(chan, 64 * 1024)
         .await
         .map_err(|e| anyhow::anyhow!("request head: {e}"))?;
     let rewritten = rewrite_http_head(&buf, host_rewrite, headers);
-    up.write_all(&rewritten).await?;
-    // 双向搬运(半关闭):借用式 split + join,无需 'static
+    let mut up = up;
+    if let Err(e) = up.write_all(&rewritten).await {
+        let _ = up.shutdown().await;
+        return Err(e.into());
+    }
+    // 双向搬运(半关闭):借用式 split + join,无需 'static。
+    // R1:up 侧先试无锁拆半(http2http 等插件的上游是裸 TcpStream,
+    // into_split 两个独立 fd,读写两向不共锁);TLS 上游回落同步锁。
+    let (mut ur, mut uw): (
+        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    ) = match rh_transport::split_boxed_io(up) {
+        Ok((r, w)) => (r, w),
+        Err(io) => {
+            let (r, w) = tokio::io::split(io);
+            (Box::new(r), Box::new(w))
+        }
+    };
     let (mut cr, mut cw) = tokio::io::split(chan);
-    let (mut ur, mut uw) = tokio::io::split(up);
     async fn cp<R, W>(r: &mut R, w: &mut W)
     where
         R: tokio::io::AsyncRead + Unpin,
