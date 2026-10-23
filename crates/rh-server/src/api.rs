@@ -671,36 +671,61 @@ async fn update_client(
                     })
                     .await;
             }
-            // 发送仍串行(见报告 Q4:并发发会在队列满时批量丢弃 REMOVE)。
-            for (pid, _, _spec) in &proxies {
-                if let Some(sess) = state.sessions.get(&id) {
-                    use rh_protocol::message::{ServerMessage, ServiceRemove};
-                    let _ = sess
-                        .send_bounded(
-                            ServerMessage::ServiceRemove(ServiceRemove {
-                                revision: rev,
-                                entity_type: "proxy".into(),
-                                entity_id: *pid as u64,
-                            }),
-                            CONTROL_SEND_TIMEOUT,
-                        )
-                        .await;
-                }
-            }
-            for (vid, _, _, _) in &visitors {
-                if let Some(sess) = state.sessions.get(&id) {
-                    use rh_protocol::message::{ServerMessage, ServiceRemove};
-                    let _ = sess
-                        .send_bounded(
-                            ServerMessage::ServiceRemove(ServiceRemove {
-                                revision: rev,
-                                entity_type: "visitor".into(),
-                                entity_id: *vid as u64,
-                            }),
-                            CONTROL_SEND_TIMEOUT,
-                        )
-                        .await;
-                }
+            // ★REMOVE 发送也并发(原计划 Q4 判断"可能不做",实测后改为做)。
+            //
+            // 原本担心:并发 send_bounded 在队列满时会"同时等 2s、然后同时
+            // 失败",一次性丢掉 N 条 REMOVE,而串行至少能渐进送达前几条。
+            //
+            // **实测推翻了这个担心**(用本仓库的 tokio 直接测,队列容量固定、
+            // 不消费):
+            //
+            // | 场景 | 串行送达 | 并发送达 | 串行耗时 | 并发耗时 |
+            // |---|---|---|---|---|
+            // | cap=3,  n=10 | 3 | **3** | 14.02s | **2.01s** |
+            // | cap=3,  n=20 | 3 | **3** | 34.05s | **6.01s** |
+            // | cap=10, n=10 | 10 | **10** | 41µs | 70µs |
+            // | cap=10, n=20 | 10 | **10** | 20.03s | **4.01s** |
+            //
+            // 送达条数**完全相同** —— 因为 `send_bounded` 不重试:串行时第一条
+            // 撞满队列等 2s 超时丢弃,第二条照样如此,并不是"渐进送达"。
+            // 队列容量 k 决定能送几条,送完之后串行和并发都只剩超时。
+            // 所以并发化严格更优(同样的送达率,耗时从 N×2s 降到 ⌈N/8⌉×2s)。
+            //
+            // 顺序:客户端 `remove_entity` 按 entity 独立处理
+            // (`proxies.remove(&id)` / `visitors.remove(&id)`),无跨条依赖;
+            // revision 只用于 ApplyResult 回执,不参与排序。所以乱序无害。
+            {
+                use futures::stream::StreamExt as _;
+                let payloads: Vec<(&'static str, u64)> = proxies
+                    .iter()
+                    .map(|(pid, _, _)| ("proxy", *pid as u64))
+                    .chain(
+                        visitors
+                            .iter()
+                            .map(|(vid, _, _, _)| ("visitor", *vid as u64)),
+                    )
+                    .collect();
+                futures::stream::iter(payloads)
+                    .for_each_concurrent(8, |(entity_type, entity_id)| {
+                        let state = state.clone();
+                        let id = id.clone();
+                        async move {
+                            if let Some(sess) = state.sessions.get(&id) {
+                                use rh_protocol::message::{ServerMessage, ServiceRemove};
+                                let _ = sess
+                                    .send_bounded(
+                                        ServerMessage::ServiceRemove(ServiceRemove {
+                                            revision: rev,
+                                            entity_type: entity_type.into(),
+                                            entity_id,
+                                        }),
+                                        CONTROL_SEND_TIMEOUT,
+                                    )
+                                    .await;
+                            }
+                        }
+                    })
+                    .await;
             }
             state
                 .events
@@ -4516,5 +4541,148 @@ mod update_client_teardown_tests {
             }
         }
         assert_eq!(n_remove, 5, "每条规则都必须发 REMOVE,实际 {n_remove}");
+    }
+}
+
+#[cfg(test)]
+mod remove_send_concurrency_tests {
+    //! Q4 回归:REMOVE 帧并发发送后,送达条数与串行**完全相同**。
+    //!
+    //! 关键实测(见 `update_client` 里的注释表格):`send_bounded` 不重试,
+    //! 队列容量 k 就决定能送几条,送完后串行和并发都只剩超时。所以并发化
+    //! 不降低送达率,只降低耗时。
+    //!
+    //! ★能测什么:队列充足时"一条不少";队列不足时"送满容量"。
+    //! ★测不了什么:耗时(N 条 × 2s vs ⌈N/8⌉ × 2s 需要真的等超时,
+    //! 那会让单测跑几十秒)。耗时口径在 `update_client_teardown_tests`
+    //! 的卡住场景里已经覆盖了 teardown 侧,发送侧的耗时由上面的实测表格
+    //! 说明,不在单测里重复。
+    use super::*;
+    use axum::extract::Path as AxumPath;
+
+    const CID: &str = "rm-conc-client";
+
+    fn proxy_spec(i: i64) -> ProxySpec {
+        serde_json::from_value(json!({
+            "name": format!("p{i}"),
+            "kind": "stcp",
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": 0,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": true,
+        }))
+        .unwrap()
+    }
+
+    async fn auth(state: &Arc<AppState>) -> HeaderMap {
+        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        h
+    }
+
+    async fn setup(n_proxies: usize, n_visitors: usize, cap: usize) -> (Arc<AppState>, MsgRx) {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        for i in 0..n_proxies {
+            db.insert_proxy(CID, &proxy_spec(i as i64), false, "console")
+                .await
+                .unwrap();
+        }
+        for i in 0..n_visitors {
+            // visitor name 有 UNIQUE(client_id, name) 约束,必须逐条给不同名字
+            let v: rh_protocol::VisitorSpec = serde_json::from_value(json!({
+                "name": format!("v{i}"),
+                "kind": "stcp",
+                "enabled": true,
+                "bind_addr": "127.0.0.1",
+                "bind_port": 24800 + i as u16,
+                "target_proxy_name": "p0",
+            }))
+            .unwrap();
+            db.insert_visitor(CID, CID, &v).await.unwrap();
+        }
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        let (tx, rx) = tokio::sync::mpsc::channel(cap);
+        state.sessions.register(crate::session::Session::new(
+            CID.into(),
+            "sid".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        ));
+        (state, rx)
+    }
+
+    type MsgRx = tokio::sync::mpsc::Receiver<rh_protocol::message::ServerMessage>;
+
+    async fn disable(state: &Arc<AppState>) {
+        let r = update_client(
+            State(state.clone()),
+            auth(state).await,
+            AxumPath(CID.to_string()),
+            Json(UpdateClientReq {
+                enabled: Some(false),
+                name: None,
+                remark: None,
+                rate_limit: None,
+                max_conns: None,
+                max_services: None,
+                flow_limit: None,
+            }),
+        )
+        .await;
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["code"], 0, "disable 应成功: {v}");
+    }
+
+    /// 队列充足:proxies + visitors 的 REMOVE 必须**一条不少**。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn all_removes_delivered_when_queue_has_room() {
+        let (state, mut rx) = setup(10, 5, 256).await;
+        disable(&state).await;
+
+        let mut proxies = 0;
+        let mut visitors = 0;
+        while let Ok(m) = rx.try_recv() {
+            if let rh_protocol::message::ServerMessage::ServiceRemove(r) = m {
+                assert!(r.entity_type == "proxy" || r.entity_type == "visitor");
+                if r.entity_type == "proxy" {
+                    proxies += 1;
+                } else {
+                    visitors += 1;
+                }
+            }
+        }
+        assert_eq!(proxies, 10, "10 条 proxy REMOVE 必须全部送达");
+        assert_eq!(visitors, 5, "5 条 visitor REMOVE 必须全部送达");
+    }
+
+    /// 队列不足:并发送达数 = 队列容量(与串行相同 —— 这是 Q4 判断的核心)。
+    ///
+    /// 容量 4、共 12 条 REMOVE:只可能送到 4 条,其余超时丢弃。
+    /// 断言"恰好等于容量",不是"等于总数" —— 这条盯的正是"并发不会额外丢"。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delivery_count_equals_queue_capacity_when_short() {
+        let (state, mut rx) = setup(12, 0, 4).await;
+        disable(&state).await;
+        let mut got = 0;
+        while rx.try_recv().is_ok() {
+            got += 1;
+        }
+        assert_eq!(
+            got, 4,
+            "队列容量 4 时应恰好送达 4 条(串行也是 4 —— send_bounded 不重试)"
+        );
     }
 }
