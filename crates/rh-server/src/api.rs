@@ -1523,18 +1523,86 @@ async fn batch_services(
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }
-    let mut results = Vec::new();
-    for id in req.ids {
-        let r = match req.action.as_str() {
-            // 内部直调 inner(本端点已通过 Bearer 校验)
-            "enable" => enable_service_inner(&state, id).await,
-            "disable" => disable_service_inner(&state, id).await,
-            "delete" => delete_service_inner(&state, id).await,
-            _ => (9000, format!("未知操作:{}", req.action)),
-        };
-        results.push(json!({"id": id, "code": r.0, "message": r.1}));
+    // ★按 client_id 分组:组间并发、组内串行。
+    //
+    // 为什么必须分组:三个 `*_inner` 内部都会取 `serial_lock(client_id)`,
+    // 那是**每客户端串行域** —— 防端口竞态、防规则双占,是正确性要求。
+    // 不同客户端的串行域互不相交,可以并行;同客户端必须排队。
+    //
+    // 组内为什么仍调 `*_inner`(而不是外层持锁 + `*_locked`):inner 自己
+    // 会 `lock().await`,外层若已持同一把 `tokio::sync::Mutex` 就是二次
+    // 加锁 → 直接死锁(与 A5 注释描述的同一个坑)。让 inner 自己排队,
+    // 组内天然串行 —— `tokio::sync::Mutex` 是公平的,同客户端的多个
+    // future 会按到达顺序逐个进入临界区。
+    //
+    // ★结果必须与 `req.ids` 同序:前端按请求顺序回填。这里用下标回填,
+    // 而不是按完成顺序 push。
+    let ids = req.ids;
+    let action = req.action;
+    let mut results: Vec<Option<serde_json::Value>> = vec![None; ids.len()];
+    if !matches!(action.as_str(), "enable" | "disable" | "delete") {
+        let msg = format!("未知操作:{action}");
+        for (i, id) in ids.iter().enumerate() {
+            results[i] = Some(json!({"id": id, "code": 9000, "message": msg}));
+        }
+        return ok(results.into_iter().flatten().collect::<Vec<_>>());
     }
-    ok(results)
+    // 一次全表查询建立 id -> client_id 映射(而不是逐 id 查一次)。
+    let owner: std::collections::HashMap<i64, String> = match state.db.list_proxies(None).await {
+        Ok(rows) => rows.into_iter().map(|(id, cid, _)| (id, cid)).collect(),
+        Err(e) => return err(500, &format!("{e}")),
+    };
+    // 按 client_id 分组,组内保持 ids 的原顺序;同时记住每项的原下标。
+    let mut groups: std::collections::HashMap<String, Vec<(usize, i64)>> =
+        std::collections::HashMap::new();
+    let mut orphans: Vec<(usize, i64)> = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        match owner.get(id) {
+            Some(cid) => groups.entry(cid.clone()).or_default().push((i, *id)),
+            // 不存在的 id:不占锁,直接给出 not found
+            None => orphans.push((i, *id)),
+        }
+    }
+    for (i, id) in orphans {
+        results[i] = Some(json!({"id": id, "code": 3001, "message": "not found"}));
+    }
+
+    // 组间并发。并发度取 8:与 `serial_lock` 的粒度一致,再高也只是把
+    // 压力堆到 SQLite 写锁上(它是全局单写者),不会更快。
+    use futures::stream::StreamExt as _;
+    let outcomes: Vec<((usize, i64), (i32, String))> = {
+        let state = state.clone();
+        let action = action.clone();
+        futures::stream::iter(groups)
+            .map(|(_, items)| {
+                let state = state.clone();
+                let action = action.clone();
+                async move {
+                    // 组内串行:逐个 await,inner 内部自己取 serial_lock
+                    let mut out = Vec::with_capacity(items.len());
+                    for (idx, id) in items {
+                        let r = match action.as_str() {
+                            "enable" => enable_service_inner(&state, id).await,
+                            "disable" => disable_service_inner(&state, id).await,
+                            _ => delete_service_inner(&state, id).await,
+                        };
+                        out.push(((idx, id), r));
+                    }
+                    out
+                }
+            })
+            .buffer_unordered(8)
+            .flat_map(futures::stream::iter)
+            .collect()
+            .await
+    };
+    for ((idx, id), (code, message)) in outcomes {
+        results[idx] = Some(json!({"id": id, "code": code, "message": message}));
+    }
+    // 批量路径结束:把合并窗口里的路由重建落实一次,让调用方在响应返回时
+    // 就能看到新路由(批量操作是"一次请求改一大批",不该让用户等下一个事件)。
+    state.proxies.flush_vhost_routes().await;
+    ok(results.into_iter().flatten().collect::<Vec<_>>())
 }
 
 async fn enable_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
@@ -3396,6 +3464,213 @@ mod visitor_target_tests {
             got.as_deref(),
             Some("c1"),
             "全部离线时应取创建序首个(顺序语义不得因改法漂移)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod batch_services_tests {
+    //! #3 回归:`batch_services` 按 client_id 分组、组间并发、组内串行,
+    //! 且结果与请求 `ids` 同序。
+    //!
+    //! 断言基于外部可观测行为:返回码、DB 最终状态、`results` 的顺序。
+    use super::*;
+
+    async fn state_with_clients(n_clients: usize, per_client: usize) -> (Arc<AppState>, Vec<i64>) {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let mut ids = Vec::new();
+        for c in 0..n_clients {
+            let cid = format!("batch-c{c}");
+            db.create_client(&cid, &cid, &format!("{}", c % 10).repeat(64), "")
+                .await
+                .unwrap();
+            for p in 0..per_client {
+                let spec: ProxySpec = serde_json::from_value(json!({
+                    "name": format!("p{p}"),
+                    "kind": "stcp",
+                    "client_id": cid,
+                    "bind_ip": "127.0.0.1",
+                    "bind_port": 0,
+                    "target_host": "127.0.0.1",
+                    "target_port": 9,
+                    "enabled": true,
+                }))
+                .unwrap();
+                // stcp 无独享端口,不需要真实 bind
+                let id = db
+                    .insert_proxy(&cid, &spec, false, "console")
+                    .await
+                    .unwrap();
+                ids.push(id);
+            }
+        }
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        (state, ids)
+    }
+
+    async fn call_batch(
+        state: &Arc<AppState>,
+        ids: Vec<i64>,
+        action: &str,
+    ) -> Vec<serde_json::Value> {
+        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let resp = batch_services(
+            State(state.clone()),
+            headers,
+            Json(BatchReq {
+                ids,
+                action: action.into(),
+            }),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // `ok()` 把结果包在 {code,data,message} 里,这里取 data
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["data"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// 结果必须与请求 ids 同序(前端按下标回填)。
+    #[tokio::test]
+    async fn results_preserve_request_order() {
+        let (state, ids) = state_with_clients(3, 3).await;
+        // 打乱顺序,混入一个不存在的 id
+        let mut req_ids = vec![ids[7], ids[1], 999_999, ids[4], ids[0]];
+        let want = req_ids.clone();
+        let results = call_batch(&state, std::mem::take(&mut req_ids), "disable").await;
+        assert_eq!(results.len(), want.len(), "结果条数必须与请求一致");
+        for (got, want_id) in results.iter().zip(want.iter()) {
+            assert_eq!(
+                got["id"].as_i64(),
+                Some(*want_id),
+                "results 必须与 req.ids 同序"
+            );
+        }
+    }
+
+    /// 不存在的 id 给 3001,存在的给 0。
+    #[tokio::test]
+    async fn missing_ids_reported_individually() {
+        let (state, ids) = state_with_clients(1, 2).await;
+        let results = call_batch(&state, vec![ids[0], 888_888], "disable").await;
+        assert_eq!(results[0]["code"], 0, "存在的规则应成功");
+        assert_eq!(results[1]["code"], 3001, "不存在的 id 应报 not found");
+    }
+
+    /// 批量 disable 之后,DB 里全部规则都必须是 enabled=0。
+    #[tokio::test]
+    async fn batch_disable_applies_to_all() {
+        let (state, ids) = state_with_clients(4, 5).await;
+        let results = call_batch(&state, ids.clone(), "disable").await;
+        assert!(
+            results.iter().all(|r| r["code"] == 0),
+            "全部应成功: {results:?}"
+        );
+        for id in &ids {
+            let (_, _, spec, _) = state.db.get_proxy(*id).await.unwrap().unwrap();
+            assert!(!spec.enabled, "规则 {id} 必须已被停用");
+        }
+    }
+
+    /// 批量 delete 之后,DB 里一条都不剩。
+    #[tokio::test]
+    async fn batch_delete_removes_all() {
+        let (state, ids) = state_with_clients(2, 3).await;
+        let results = call_batch(&state, ids.clone(), "delete").await;
+        assert!(results.iter().all(|r| r["code"] == 0), "{results:?}");
+        let left = state.db.list_proxies(None).await.unwrap();
+        assert!(left.is_empty(), "删除后不得残留规则:{left:?}");
+    }
+
+    /// 未知 action:全部 9000,且不碰 DB。
+    #[tokio::test]
+    async fn unknown_action_reports_9000() {
+        let (state, ids) = state_with_clients(1, 2).await;
+        let results = call_batch(&state, ids.clone(), "explode").await;
+        assert_eq!(results.len(), ids.len());
+        assert!(results.iter().all(|r| r["code"] == 9000));
+        // 规则仍启用
+        for id in &ids {
+            let (_, _, spec, _) = state.db.get_proxy(*id).await.unwrap().unwrap();
+            assert!(spec.enabled, "未知操作不得改动任何规则");
+        }
+    }
+
+    /// 同客户端的多条规则:组内串行 → 不会死锁,且全部成功。
+    ///
+    /// 这条是分组并发最危险的地方:若组内改成并发,同一把
+    /// `serial_lock` 上的公平队列仍能保证串行,但若有任何路径二次加锁
+    /// (inner + locked 混用),这里会直接挂住。用超时把"挂住"变成可见失败。
+    #[tokio::test]
+    async fn same_client_batch_does_not_deadlock() {
+        let (state, ids) = state_with_clients(1, 12).await;
+        let fut = call_batch(&state, ids.clone(), "disable");
+        let results = tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+            .await
+            .expect("同客户端批量操作不得死锁");
+        assert!(results.iter().all(|r| r["code"] == 0), "{results:?}");
+    }
+
+    /// #3 基准(手动运行):N 条规则的批量操作耗时。
+    ///
+    /// ```text
+    /// cargo test -p rh-server --release batch_services_tests::bench -- --ignored --nocapture
+    /// ```
+    ///
+    /// 对比两种分组策略:全部放一个客户端(组内串行,退化为修前行为)
+    /// vs 分散到多个客户端(组间并发,修后路径)。同一份 DB 规模下比较。
+    #[tokio::test]
+    #[ignore = "耗时基准,手动运行(--ignored --nocapture)"]
+    async fn bench_batch_scaling() {
+        for n in [100usize, 500, 1000] {
+            for clients in [1usize, 16] {
+                let per = n.div_ceil(clients);
+                let (state, ids) = state_with_clients(clients, per).await;
+                let ids = ids.into_iter().take(n).collect::<Vec<_>>();
+                let token = mint_jwt(&state, "admin", 1, 0).await.unwrap();
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "authorization",
+                    axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+                );
+                let t0 = std::time::Instant::now();
+                let resp = batch_services(
+                    State(state.clone()),
+                    headers,
+                    Json(BatchReq {
+                        ids: ids.clone(),
+                        action: "disable".into(),
+                    }),
+                )
+                .await;
+                let _ = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                println!(
+                    "N={n:>5}  clients={clients:>3}  batch_disable={:>12?}",
+                    t0.elapsed()
+                );
+            }
+        }
+    }
+
+    /// 多客户端批量:全部成功(组间并发路径真的跑通)。
+    #[tokio::test]
+    async fn multi_client_batch_all_succeed() {
+        let (state, ids) = state_with_clients(8, 4).await;
+        let fut = call_batch(&state, ids.clone(), "disable");
+        let results = tokio::time::timeout(std::time::Duration::from_secs(30), fut)
+            .await
+            .expect("多客户端批量操作不得超时");
+        assert!(
+            results.iter().all(|r| r["code"] == 0),
+            "全部应成功: {results:?}"
         );
     }
 }
