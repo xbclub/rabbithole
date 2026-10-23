@@ -291,9 +291,18 @@ cargo test -p rh-server --release port_scan_tests::bench -- --ignored --nocaptur
 
 ---
 
-## 7. 缺陷 7:`list_services` 循环内 3 次 get + 3 个 await + 嵌套锁
+## 7. 缺陷 7:`list_services` 循环内 **4** 次 get + 3 个 await + 嵌套锁
 
-**★状态:未做。**
+> **口径更正**:本节原标题写「3 次 get」,**实际是 4 次**。除了
+> status / pool_ready / rt_meter 三处,还有 `healthy` 字段的独立 get
+> (`"healthy": state.proxies.get(id as u64).map(...)`)。它不在那三个
+> await 块里,容易被漏数。已在收尾批次 P5 核实并更正。
+
+**★状态:部分完成(2026-10-23)。**
+
+- **已完成**:「一次 `get` 拿到 `rt` 复用」—— 4 次合 1 次,commit `0d32269`。
+  实测 N=1000 时省 ~31µs(微秒级,与本节的"收益极小"判断一致)。
+- **仍未做**:`snapshot_state` 改 `try_read`。理由不变(见下)。
 
 **判断依据**:任务书把它列为【中】,但修法要求把 `snapshot_state` 的
 `RwLock::read` 改成 `try_read` 并在失败时降级为 `"unknown"`。这会**改变
@@ -307,9 +316,10 @@ cargo test -p rh-server --release port_scan_tests::bench -- --ignored --nocaptur
   影响面超出「展示接口」;
 - 「`snapshot_state` 改 `try_read`」:有语义变化,如上。
 
-**结论**:在没有实测证据表明 `list_services` 是瓶颈的前提下,不做比做更安全。
-如实记录为未完成项,不计入"已修复"。若后续确认列表页轮询有压力,建议只做
-第一子项(复用 `rt`),并保持 `snapshot_state` 的阻塞语义不变。
+**结论**:收尾批次按本节的建议做了第一子项(复用 `rt`),**保持
+`snapshot_state` 的阻塞语义不变**。另外两个子项(`try_read` 改造、
+`pool`/`ready` 嵌套锁)仍然不做 —— 前者有语义变化,后者要改 `TcpPool`
+结构、影响面超出展示接口。
 
 ---
 
@@ -536,14 +546,21 @@ cargo fmt --all -- --check → 干净
 
 ## 15. 未完成项汇总(如实记录)
 
-1. **#7 `list_services`**:未做。理由见 §7(改法涉及接口语义变化)。
+> **2026-10-23 更新**:下列第 1 与第 6 项已完成(见 §17 的收尾批次)。
+> 剩余项仍然如实标注为未做/未测。
+
+1. ~~**#7 `list_services`**~~ —— **已完成**(收尾批次 P5,
+   commit `0d32269`)。做了零风险的部分(4 次 `get` 合 1 次),
+   **仍然没有**动 `snapshot_state` 的 `try_read` 改造 —— 那条会改变接口
+   语义,依旧否决。**口径更正:是 4 次,不是 3 次**(多一个 `healthy`
+   字段的独立 get)。
 2. **#2 恢复并发**:代码已改,但**本机未测出收益**。真实收益依赖文件型
    SQLite 与在线会话,未在真实部署环境验证。
 3. **#10 端到端 RTT 测量**:未做。只有调度结构基准。
 4. **#11**:未单独测(测试环境 `:memory:` 掩盖了收益)。
 5. **基线 3 个 e2e 失败项 + DNS 缓存测试偶发失败**:未修,超出范围。
-6. **`upsert` 的 proxy 分支仍持 `proxies` 写锁跨 await** —— 与 #6 同形,
-   但触发频率更高。详见 §15.6。
+6. ~~**`upsert` 的 proxy 分支仍持 `proxies` 写锁跨 await**~~ —— **已完成**
+   (收尾批次 P1,commit `cb0be73`)。详见 §15.6。
 
 ### 15.6 `upsert` 的 proxy 分支:与 #6 同形,但触发频率更高
 
@@ -602,13 +619,20 @@ async fn upsert(sess: &Arc<ClientSession>, e: SyncEntity) {
 
 ---
 
-## 16. 任务书之外发现的额外串行点(仅报告,未改代码)
+## 16. 任务书之外发现的额外串行点
 
-以下 4 处是在完成 12 项之后继续扫描时发现的。**本次只做报告,没有改代码**
-(按用户指示)。逐处给出位置、现状、影响判断,以及我建议的改法与风险 ——
-其中 B 项附了一个重要的**风险口径更正**。
+以下 4 处是在完成 12 项之后继续扫描时发现的。
+
+> **2026-10-23 更新**:**A / B / C 三项均已完成**(收尾批次 P4 / P2 / P3)。
+> 本节保留原始的发现记录与判断依据,各项已标注提交号与实测结果。
+> 详见 §17 的收尾批次汇总。
 
 ### A. `notify_client_recovery` 的批量恢复循环仍串行
+
+> **★已修**:commit `37a070d`(收尾批次 P4),改 `for_each_concurrent(16)`。
+> ★**本机测不出收益**(N=1000:串行 30.14ms vs 并发 30.54ms,与 §2 的
+> recovery 结论一致)。真实收益依赖文件型 SQLite 与在线会话,未在部署
+> 环境验证。如实记录,不声称提升。
 
 **位置**:`crates/rh-server/src/runtime.rs:526-536`
 
@@ -656,6 +680,11 @@ O(N) 重建(这已经是最主要的收益,§1 实测 N=2000 时 746ms → 0.46m
 ---
 
 ### B. `api.rs` 的 admin handler 全部用裸 `send`(11 处,`update_client` 是其中 2 处)
+
+> **★已修**:commit `64c6d70`(收尾批次 P2)。11 处一次性统一改为
+> `send_bounded(msg, CONTROL_SEND_TIMEOUT)`。测试有区分力:**反向验证**
+> 把其中一处还原成裸 `send` 后,测试在 10s 超时处失败(`Elapsed(())`)。
+> 修后队列满时 2.2s 内返回。
 
 **位置**:`crates/rh-server/src/api.rs`,11 处(完整清单见下方表格)
 
@@ -759,6 +788,12 @@ $ awk '/async fn enable_service_locked/,/^}/' crates/rh-server/src/api.rs | grep
 
 ### C. `delete_client` 的 teardown 循环串行
 
+> **★已修**:commit `699a1c8`(收尾批次 P3),改 `for_each_concurrent(8)`。
+> ★**本节原来说"构造不出 2s 超时场景",这是错的**。只要往
+> `rt.serve_handle` 塞一个永不返回且不响应 `rule_cancel` 的任务,单次
+> teardown 就必然吃满 2s。实测 16 条卡住规则:**串行 32.07s(恰好
+> 16×2s)vs 并发 4.23s**。这条测试有决定性区分力。
+
 **位置**:`crates/rh-server/src/api.rs:706-709`
 
 ```rust
@@ -813,12 +848,14 @@ for (pid, _, _) in &proxies {
 
 ### 小结
 
-| 项 | 位置 | 当前复杂度 | 建议改法 | 风险 | 是否已改 |
+| 项 | 位置 | 当前复杂度 | 建议改法 | 风险 | 状态 |
 |---|---|---|---|---|---|
-| A | `runtime.rs:526` | O(N·t) 串行 | `for_each_concurrent(16)` | 低(比 recovery 更安全) | 否 |
-| B | `api.rs` 共 11 处(637/649/1452/1498/1694/1721/1858/1914/1977/1984/2032) | 无界等待 | 11 处统一 `send_bounded(2s)` | **零**(纯降级) | 否 |
-| C | `api.rs:707` | O(N·t),最坏 N×2s | `for_each_concurrent(8)` | 中低 | 否 |
-| D | `api.rs:741` | 3N 次锁 | 见 §7 | — | 否(§7 已说明理由) |
+| A | `runtime.rs:526` | ~~O(N·t) 串行~~ → O(N/16·t) | `for_each_concurrent(16)` | 低(比 recovery 更安全) | **已修** `37a070d` |
+| B | `api.rs` 共 11 处(638/650/1453/1499/1695/1722/1859/1915/1978/1985/2033) | ~~无界等待~~ → ≤2s | 11 处统一 `send_bounded(2s)` | **零**(纯降级) | **已修** `64c6d70` |
+| C | `api.rs:707` | ~~O(N·t),最坏 N×2s~~ → ~2s | `for_each_concurrent(8)` | 中低 | **已修** `699a1c8` |
+| D | `api.rs:741` | ~~4N 次锁~~ → N 次 | 见 §7 | — | **部分修** `0d32269`(只做 `get` 合并) |
+
+> 行号已按收尾批次后的实际位置更新(B 项 11 处各 +1)。
 
 **优先级建议**:B(零风险、纯一致性)→ A(形态与已落地的 #2 完全同构)→
 C(收益在极端场景,需谨慎)。D 维持不做。
@@ -829,3 +866,76 @@ C(收益在极端场景,需谨慎)。D 维持不做。
 其中 B 的风险为零,且**必须 11 处一次性统一改**(理由见本节 B 的事实更正:
 `api.rs` 里一处 `send_bounded` 都没有,逐个补会让"还有哪些裸 send"长期
 不可判定)。建议单独一个提交。
+
+---
+
+## 17. 收尾批次:剩余 5 项(2026-10-23)
+
+上一轮核查把 5 项列为未完成,本批次全部处理完毕。每项一个独立提交。
+
+| 项 | 提交 | 复杂度变化 | 实测 / 说明 |
+|---|---|---|---|
+| P1 `upsert` proxy 分支持锁跨 await | `cb0be73` | 持锁跨 await → 锁内纯内存 | 见下「关于可测性」—— **测不出**,如实记录 |
+| P2 api.rs 11 处裸 send | `64c6d70` | 永久 park → ≤2s | **反向验证**:裸 send 在 10s 超时失败;修后 2.2s 返回 |
+| P3 `delete_client` teardown 并发 | `699a1c8` | O(N·2s) → ~2s | **16 条卡住规则:32.07s → 4.23s** |
+| P4 `notify_client_recovery` 并发 | `37a070d` | O(N·t) → O(N/16·t) | **本机测不出**(30.14 vs 30.54ms),理由同 §2 |
+| P5 `list_services` 4 次 get 合 1 | `0d32269` | 4N 次查找 → N 次 | N=1000 省 ~31µs(微秒级,本就是"可选") |
+
+### 17.1 P1:关于 `stop_proxy` 那次「供 stop 读取」的插入
+
+原代码是 `cur.remove -> cur.insert(id, old) -> stop_proxy -> cur.remove`,
+中间那次插入的注释写着「供 stop 读取」。**核对结论:那是历史遗留。**
+
+`stop_proxy` 的全部实现只有:
+
+```rust
+async fn stop_proxy(sess: &Arc<ClientSession>, id: u64) {
+    if let Some(c) = sess.health_cancels.lock().await.remove(&id) {
+        c.cancel();
+    }
+}
+```
+
+它**只**操作 `health_cancels`,完全不读 `proxies` 表。所以重构后直接去掉
+那次往返,改为「先 remove 旧条目、再 insert 新 spec」,表内容一致。
+
+### 17.2 关于可测性(如实记录两条"抓不住"的情况)
+
+**P1 的锁测试抓不住缺陷。** 把代码临时还原成「持锁跨 await」后,
+`proxies_lock_available_during_upsert` **依然通过** ——
+`stop_proxy`/`start_health` 内部的 await 只有微秒级,被调度粒度淹没
+(与上一轮 #6 同一个坑:阈值 200ms、实际差异 5~7ms)。
+已把它降级为**功能性回归**(门槛放到 2s,只拦死锁/长期独占),并在注释里
+写明「不再假装它守住了锁语义」。锁纪律由源码结构保证。
+
+**P4 的测试测不出并发收益。** 反向验证确认:串行实现下 3 条测试同样全过。
+它们的价值是"并发化没有改变结果"。已在注释里写明。
+
+### 17.3 一处判断更正(任务书原判断有误)
+
+任务书 §P3 写「构造不出 2s 超时场景(需要真实 listener 且不收敛)」。
+**这个判断是错的。** `teardown_runtime` 等的是 `rt.serve_handle` 里那个
+`JoinHandle`;只要塞一个**永不返回且不响应 `rule_cancel`** 的任务,就能
+精确模拟"serve loop 不收敛",不需要真实 listener。
+
+实测因此从"无法验证"变成**可验证且区分力极强**:
+
+| 16 条卡住规则 | 总耗时 |
+|---|---|
+| 串行(修前) | **32.07s**(恰好 16 × 2s) |
+| 并发 8(修后) | **4.23s**(2 批 × 2s) |
+
+### 17.4 P5 的口径更正
+
+报告 §7 与任务书早期都写「3 次 get」,**实际是 4 次** —— 多出来的是
+`healthy` 字段的独立 `get`(`"healthy": state.proxies.get(...)`),
+它不在那三个 await 块里,容易被漏数。已更正 §7 标题与正文。
+
+### 17.5 本批次未做的事
+
+- 没有统一 `CONTROL_SEND_TIMEOUT` 的三处重复定义
+  (`runtime.rs` / `state.rs` / `nathole.rs`),按任务书要求超出范围。
+  只把 `runtime.rs` 那处改成 `pub(crate)` 供 api.rs 复用。
+- 没有动 `snapshot_state` 的 `try_read` 改造(§7 已否决的理由仍成立)。
+- 没有动 rh-transport / mux.rs 批量聚合 / apply_sync 的 to_start 循环。
+
