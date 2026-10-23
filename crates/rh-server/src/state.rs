@@ -2111,8 +2111,21 @@ mod port_scan_tests {
             let state = state_with(&specs).await;
 
             // ① port_in_use 单次耗时:取"未占用"端口,逼迫实现走完全表
-            let t0 = std::time::Instant::now();
+            //
+            // ★两个口径都测,让报告里的"修前"列可复现,不依赖 git stash。
+            //   `reference_in_use` 是等价性测试用的旧口径实现(直接
+            //   `runtimes.iter()` + 逐条 `spec.read().await`),它恰好完整
+            //   复刻了修前"跨 await 持有 dashmap 分片读锁"的形态,因此可以
+            //   直接当作性能对照 —— 同一份 runtime 表、同一个查询端口,
+            //   两个函数做的是同一件事,唯一差别就是快照与否。
             let reps = 100;
+            let t_old = std::time::Instant::now();
+            for _ in 0..reps {
+                let _ = reference_in_use(&state, "tcp", ip, 30000, None, None).await;
+            }
+            let per_call_old = t_old.elapsed() / reps;
+
+            let t0 = std::time::Instant::now();
             for _ in 0..reps {
                 let _ = state
                     .proxies
@@ -2136,8 +2149,29 @@ mod port_scan_tests {
             let t1 = std::time::Instant::now();
             let got = state2.proxies.allocate_port("tcp", ip).await;
             let alloc = t1.elapsed();
+
+            // ②' allocate_port 的修前口径:每个候选端口重扫一遍全表。
+            // 逐端口调 `reference_in_use` 就是修前 `allocate_port` 的循环体
+            // (它内部调的就是当时的 `port_in_use`)。这里只跑到**第一个空闲
+            // 端口**为止,与真实实现同语义,所以两者可直接比较。
+            let t2 = std::time::Instant::now();
+            let mut got_old = None;
+            'outer: for r in 10000u16..=25000 {
+                if reference_in_use(&state2, "tcp", ip, r, None, None).await {
+                    continue;
+                }
+                let addr = SocketAddr::new(ip, r);
+                if std::net::TcpListener::bind(addr).is_ok() {
+                    got_old = Some(r);
+                    break 'outer;
+                }
+            }
+            let alloc_old = t2.elapsed();
+            debug_assert_eq!(got, got_old, "新旧口径必须选出同一个端口");
+
             println!(
-                "N={n:>5}  port_in_use={per_call:>12?}/次  allocate_port={alloc:>12?}  → {got:?}"
+                "N={n:>5}  port_in_use: old={per_call_old:>10?} new={per_call:>10?}  \
+                 allocate_port: old={alloc_old:>10?} new={alloc:>10?}  → {got:?}"
             );
         }
     }
