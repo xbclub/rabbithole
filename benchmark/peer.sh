@@ -451,8 +451,11 @@ PYEOF
     log "  [$path] ${streams}流 $dir 第${sample}次: ${mbps} Mbps"
   }
 
-  # ---------- 吞吐(iperf3;RFC 6349;direct/tunnel 同 spec 紧邻成对) ----------
-  hdr "吞吐 (iperf3, 每档 ${PEER_DURATION}s × ${PEER_REPEAT} 次配对)"
+  # ---------- 吞吐(RFC 6349;direct/tunnel 同 spec 紧邻成对) ----------
+  # 标题里的工具名按 THP_TOOL 实际值渲染:写死 "iperf3" 时换 loadgen 会
+  # 打印错误工具名,看输出的人会据此误判压测器(证据里 drive 行是对的,
+  # 只有这个阶段标题会骗人)。
+  hdr "吞吐 (${THP_TOOL}, 每档 ${PEER_DURATION}s × ${PEER_REPEAT} 次配对)"
   local sample spec streams dir rev rest
   for sample in $(seq 1 "$PEER_REPEAT"); do
     for spec in "1:upload:" "1:download:-R" "4:upload:" "4:download:-R" "16:upload:" "16:download:-R"; do

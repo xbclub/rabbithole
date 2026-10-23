@@ -56,6 +56,42 @@ fn transport_config(keepalive: bool, max_streams: usize) -> quinn::TransportConf
     tc
 }
 
+/// QUIC 端点 UDP 缓冲目标值(字节),与 `kcp.rs::UDP_BUFFER_BYTES` 同源理由。
+///
+/// quinn 自己用 `Endpoint::client/server` 时**不设** `SO_RCVBUF`,吃内核
+/// 默认值 212992(208 KiB)。QUIC 在 600 Mbps / 1200B 下约 62k pps,
+/// 208 KiB 仅够缓冲 ~170 个报文(≈2.7ms);一次调度抖动就丢包,而丢包
+/// 直接触发 cubic 降窗 + 重传,吞吐被压在直连的 ~30%。
+///
+/// 4 MiB ≈ 3500 个报文(≈56ms)足以吸收抖动;不设更大是因为
+/// `net.core.rmem_max` 通常会静默截断,且过大只增排队延迟。
+const QUIC_UDP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// 绑定 UDP socket 并尽力放大收发缓冲,交给 quinn 复用。
+///
+/// 用 `Endpoint::new` 而非 `Endpoint::client/server`:后者内部自建 socket,
+/// 无法在握手前设缓冲。**设不上不算失败** —— `net.core.rmem_max` 可能
+/// 低于目标、内核静默截断,调优失败不应让连接建不起来。
+fn bind_tuned_udp(addr: std::net::SocketAddr) -> io::Result<std::net::UdpSocket> {
+    let sock = std::net::UdpSocket::bind(addr)?;
+    let sref = socket2::SockRef::from(&sock);
+    for (name, res) in [
+        (
+            "SO_RCVBUF",
+            sref.set_recv_buffer_size(QUIC_UDP_BUFFER_BYTES),
+        ),
+        (
+            "SO_SNDBUF",
+            sref.set_send_buffer_size(QUIC_UDP_BUFFER_BYTES),
+        ),
+    ] {
+        if let Err(e) = res {
+            tracing::debug!(option = name, error = %e, "quic udp buffer 设置失败(按尽力而为忽略)");
+        }
+    }
+    Ok(sock)
+}
+
 /// 服务端 QUIC 监听器:接受与握手解耦(慢握手不阻塞后续接入)。
 ///
 /// `Drop` 通过 watch 信号让 accept 循环退出(与 `TcpListenerShim::drop`
@@ -93,8 +129,13 @@ pub fn listen(
         false,
         mux_streams.load(Ordering::Relaxed),
     )));
-    let endpoint = quinn::Endpoint::server(server_config, cfg.bind_addr)
-        .map_err(|e| other_err(format!("quic bind: {e}")))?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        bind_tuned_udp(cfg.bind_addr)?,
+        quinn::default_runtime().ok_or_else(|| other_err("quic: no async runtime"))?,
+    )
+    .map_err(|e| other_err(format!("quic bind: {e}")))?;
     let local = endpoint
         .local_addr()
         .map_err(|e| other_err(format!("quic local addr: {e}")))?;
@@ -163,8 +204,13 @@ pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>
     } else {
         "[::]:0".parse().unwrap()
     };
-    let mut endpoint = quinn::Endpoint::client(bind_local)
-        .map_err(|e| other_err(format!("quic client bind: {e}")))?;
+    let mut endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        bind_tuned_udp(bind_local)?,
+        quinn::default_runtime().ok_or_else(|| other_err("quic: no async runtime"))?,
+    )
+    .map_err(|e| other_err(format!("quic client bind: {e}")))?;
     endpoint.set_default_client_config(qcfg);
     let name = cfg
         .tls

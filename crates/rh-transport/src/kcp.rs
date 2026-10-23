@@ -1324,11 +1324,51 @@ impl KcpListener {
     }
 }
 
+/// UDP socket 收发缓冲目标值(字节)。
+///
+/// 为什么要显式设:内核默认 `net.core.rmem_default` 在主流发行版是
+/// **212992(208 KiB)**。KCP 单会话在 1 Gbps 下是 ~85k pps × 1200B,
+/// 208 KiB 只能缓冲约 170 个报文(≈2ms)。接收循环一旦被调度延迟
+/// (会话任务在跑 update/flush、或多会话争用同一 worker),内核直接
+/// 丢包 —— 实测 `ss -uanmp` 上 `rb212992` 配 `d52901`(已丢 5.3 万包),
+/// 而 KCP 只能靠 RTO 重传补,吞吐塌到直连的 24~33%。
+///
+/// 4 MiB 的依据:1200B 报文约 3500 个(≈40ms 缓冲),足以吸收一次
+/// 调度抖动而不丢包;再大只会增加内存占用与首包排队延迟,对低 RTT
+/// 内网没有收益。
+///
+/// **设不上不算失败**:`net.core.rmem_max` 可能低于目标,内核会静默
+/// 截断到上限(与 `sndbuf_explicit_set_takes_effect` 踩过的坑同型)。
+/// 这里只尽力而为并 debug 记录实际值,绝不因调优失败而让连接建不起来。
+const UDP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// 绑定 UDP socket 并尽力放大收发缓冲。
+///
+/// `tokio::net::UdpSocket::bind` 之后、任何读写之前调用;失败只记日志。
+async fn bind_udp(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<UdpSocket> {
+    let sock = UdpSocket::bind(addr).await?;
+    tune_udp_buffer(&sock);
+    Ok(sock)
+}
+
+/// 尽力设置 `SO_RCVBUF` / `SO_SNDBUF`,不返回错误(见 `UDP_BUFFER_BYTES`)。
+fn tune_udp_buffer(sock: &UdpSocket) {
+    let sref = socket2::SockRef::from(sock);
+    for (name, res) in [
+        ("SO_RCVBUF", sref.set_recv_buffer_size(UDP_BUFFER_BYTES)),
+        ("SO_SNDBUF", sref.set_send_buffer_size(UDP_BUFFER_BYTES)),
+    ] {
+        if let Err(e) = res {
+            tracing::debug!(option = name, error = %e, "kcp udp buffer 设置失败(按尽力而为忽略)");
+        }
+    }
+}
+
 pub async fn listen(
     cfg: &ServerTransportConfig,
     mux_streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::io::Result<KcpListener> {
-    let udp = Arc::new(UdpSocket::bind(cfg.bind_addr).await?);
+    let udp = Arc::new(bind_udp(cfg.bind_addr).await?);
     let local = udp.local_addr()?;
     let (accept_tx, accept_rx) = mpsc::channel::<ReadyItem>(512);
     let ctl = Arc::new(DemuxCtl {
@@ -1567,7 +1607,7 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
     } else {
         "[::]:0"
     };
-    let udp = Arc::new(UdpSocket::bind(bind_local).await?);
+    let udp = Arc::new(bind_udp(bind_local).await?);
     udp.connect(cfg.server_addr).await?;
     let conv = (CONV_COUNTER.fetch_add(1, Ordering::Relaxed) as u32) ^ rand_u32();
     let (io, shared) = new_io();
