@@ -203,7 +203,29 @@ cargo test -p rh-server --release batch_services_tests::bench -- --ignored --noc
 
 > 口径:修后一列为 3 次重复运行的代表值(抖动 ±5%)。首次运行会偏慢
 > (冷缓存,`allocate_port` N=2000 曾测得 0.70ms),已按稳定值修正。
-> 修前一列为单次运行(其数值远大于抖动,不影响结论)。
+
+**★「修前」列现在可复现了**:原版这两列都是手工用 `git stash` 切回旧实现
+测的,后人无法复现。现在 `bench_port_scan_scaling`
+(`crates/rh-server/src/state.rs`)里同时测两个口径:
+
+- `reference_in_use` —— 等价性测试用的旧口径函数(直接 `runtimes.iter()`
+  + 逐条 `spec.read().await`),**恰好完整复刻了修前"跨 await 持有 dashmap
+  分片读锁"的形态**,可直接当性能对照;
+- `state.proxies.port_in_use` / `allocate_port` —— 新实现。
+
+`allocate_port` 的旧口径是"逐候选端口调一次 `reference_in_use`",这正是修前
+`allocate_port` 的循环体,两者同语义、可直接比较。基准里还加了
+`debug_assert_eq!(got, got_old)` 确保两个口径选出同一个端口(正确性锚点)。
+
+复现命令不变:
+```bash
+cargo test -p rh-server --release port_scan_tests::bench -- --ignored --nocapture
+```
+输出形如(一次实测):
+```
+N= 2000  port_in_use: old=  241.488µs new=  341.887µs  allocate_port: old=255.643375ms new=  450.459µs  → Some(12000)
+```
+旧口径读数与本表「修前」列一致(241.4µs / 241.4ms),确认可复现。
 
 **如实记录**:`port_in_use` 单次耗时**变慢了**(约 1.4~1.6x)。原因是现在它
 多了一次 `HashSet` 构建(修前是边遍历边短路返回)。这是有意的取舍:
@@ -244,6 +266,10 @@ cargo test -p rh-server --release port_scan_tests::bench -- --ignored --nocaptur
 
 **未做**:`upsert` 的 proxy 分支有同样形态(持 `proxies` 锁调
 `stop_proxy`/`start_health`),但不在任务书 #6 范围内,没有顺手改。
+
+> 注:该项已在 §15.6 提升为**正式未完成项**。原因:`upsert` 由
+> `ServiceUpdate`(每改一条规则触发一次)驱动,触发频率**高于**本条修的
+> `apply_sync`(只在客户端重连时触发),影响可能更大。详见 §15.6。
 
 ---
 
@@ -498,6 +524,63 @@ cargo fmt --all -- --check → 干净
 3. **#10 端到端 RTT 测量**:未做。只有调度结构基准。
 4. **#11**:未单独测(测试环境 `:memory:` 掩盖了收益)。
 5. **基线 3 个 e2e 失败项 + DNS 缓存测试偶发失败**:未修,超出范围。
+6. **`upsert` 的 proxy 分支仍持 `proxies` 写锁跨 await** —— 与 #6 同形,
+   但触发频率更高。详见 §15.6。
+
+### 15.6 `upsert` 的 proxy 分支:与 #6 同形,但触发频率更高
+
+**位置**:`crates/rh-client/src/session.rs:1429` 起
+
+```rust
+async fn upsert(sess: &Arc<ClientSession>, e: SyncEntity) {
+    match e {
+        SyncEntity::Proxy(p) => {
+            let mut cur = sess.proxies.lock().await;   // ← 持写锁
+            // ...
+            stop_proxy(sess, p.id).await;              // ← await(取 health_cancels 锁)
+            // ...
+            start_health(sess, p.id, &p).await;        // ← await(取 health_cancels 锁 + spawn)
+        }
+        SyncEntity::Visitor(v) => {
+            // 这个分支**已经有** drop(cur),注释写着「别持着 visitors 锁去做重绑定」
+            // ...
+        }
+    }
+}
+```
+
+**为什么这是缺陷**:与已修的 #6(`apply_sync`)完全同形 —— 持 `proxies`
+写锁跨 await,期间 `open_data_channel` 的
+`sess.proxies.lock().await.get(&proxy_id)` 被挡住。visitor 分支早就修过
+(`drop(cur)`),**proxy 分支是同一个漏点,上一轮没修**。
+
+**为什么它比已修的 #6 更值得优先**:
+
+| | 触发条件 | 频率 |
+|---|---|---|
+| `apply_sync`(#6,已修) | `ServiceSync` —— 客户端**重连**时的全量同步 | 低(每次重连一次) |
+| `upsert`(本条,未修) | `ServiceUpdate` —— 服务端**每改一条规则**就发一条 | **高**(管理面每次单条变更) |
+
+`session.rs:1256` 的 `SERVICE_UPDATE` 分支直接 `upsert(sess, u.entity).await`。
+也就是说,管理员每改一条规则、每启停一条规则,客户端都会走一次这条持锁
+路径。**实际触发频率高于 #6**,影响可能更大。
+
+**上一轮为什么漏了**:任务书 #6 只点名了 `apply_sync`(1294-1314 行),
+`upsert` 不在范围内;当时按「不要顺手优化任务书之外的地方」只记录未改
+(见 §6 末尾)。现在把它提升为正式未完成项,是因为它**不是"顺手的额外
+优化",而是同一个缺陷在同一文件里的另一半** —— #6 的修法(`drop(cur)`)
+可以直接照抄,成本极低。
+
+**建议改法**:照抄同文件 visitor 分支与 #6 的写法 —— 锁内只做纯内存收集
+(算出待 stop / 待 start),`drop(cur)` 后再 await。注意 proxy 分支的
+`cur.remove(&p.id)` / `cur.insert(...)` 顺序依赖(中间要留"供 stop 读取"
+的临时插入),重构时需保持这个语义。
+
+**风险**:中低(有现成模板,但 proxy 分支的插入/删除顺序比 visitor 分支
+复杂一点)。
+
+**未测**:没有基准。#6 的测试已证明这类锁问题在单测里**抓不住**(见 §6
+的"能力边界"说明),`upsert` 同理 —— 收益依赖生产环境的并发建连压力。
 
 ---
 
@@ -554,9 +637,11 @@ O(N) 重建(这已经是最主要的收益,§1 实测 N=2000 时 746ms → 0.46m
 
 ---
 
-### B. `update_client` 禁用分支的两处无界 `send().await`
+### B. `api.rs` 的 admin handler 全部用裸 `send`(11 处,`update_client` 是其中 2 处)
 
-**位置**:`crates/rh-server/src/api.rs:632-658`
+**位置**:`crates/rh-server/src/api.rs`,11 处(完整清单见下方表格)
+
+**以 `update_client` 禁用分支为例**(`api.rs:632-658`):
 
 ```rust
 for (pid, _, _spec) in &proxies {
@@ -581,34 +666,76 @@ for (vid, _, _, _) in &visitors {
 
 - `queue_tx` 的唯一消费者是 `run_session_loop` 的 `select!`(`control.rs:912`
   的 `qrx.recv()` 分支);
-- 而 `update_client` 是**纯 HTTP handler**(`api.rs:548`,挂在 axum 路由上),
+- 而 `api.rs` 的这 11 处都在**纯 HTTP handler** 里(挂在 axum 路由上),
   **不在**控制读循环的内联路径里 —— `handle_client_message`
   (`control.rs:987`)只处理客户端发来的 `ClientMessage`,不调用任何 admin
   CRUD。
 
-所以这里**不会自锁**,真实后果是:队列满时这个 HTTP 请求会挂到 axum/反向
-代理的超时(通常 30~60s),期间 `serial_lock(&id)` 一直被持有,该客户端的
-其它管理操作全部排队。
+所以这 11 处**都不会自锁**,真实后果是:队列满时该 HTTP 请求会挂到 axum/
+反向代理的超时(通常 30~60s),期间 `serial_lock(&id)` 一直被持有,该客户端
+的其它管理操作全部排队。
 
-**同一个 handler 里的一致性缺口**:这条路径的兄弟函数
-`enable_service_locked` / `disable_service_locked` / `delete_service_locked`
-都已经用了 `send_bounded(CONTROL_SEND_TIMEOUT)`(2s 上限),**只有
-`update_client` 的禁用分支漏了**。这是纯粹的不一致,不是设计取舍。
+**★事实更正(本节原版有一处错误论据,已删改)**:
 
-**建议改法**:两处 `sess.send(...)` 换成
-`sess.send_bounded(..., CONTROL_SEND_TIMEOUT)`。语义等价(都是尽力而为,
-返回值本来就被 `let _ =` 丢弃),只是把"永久等待"变成"最多 2s"。
+原版写「`enable_service_locked` / `disable_service_locked` /
+`delete_service_locked` 都已经用了 `send_bounded(CONTROL_SEND_TIMEOUT)`,
+**只有 `update_client` 的禁用分支漏了**」。**这是错的**,核查命令与结果:
 
-**风险**:零。这是纯降级,与同文件另外三处对齐。
+```bash
+$ grep -c send_bounded crates/rh-server/src/api.rs
+0
+$ awk '/async fn enable_service_locked/,/^}/' crates/rh-server/src/api.rs | grep -c send_bounded
+0     # disable / delete 同理
+```
 
-**顺带发现的同类裸 send(需要单独评估,不建议顺手改)**:
-`api.rs` 还有 8 处裸 `send`(`:1452` `:1498` `:1694` `:1721` `:1858`
-`:1902` `:1977` `:1984` `:2032`),分别在 `disable_service` /
-`delete_service` / `create_visitor` / `update_visitor` / `delete_visitor` /
-`enable_service` 等 handler 里。它们同样不在控制循环内联路径上,同样不会
-自锁,但同样会在队列满时挂住 HTTP 请求。**属于同一类问题,但不在本次报告
-的 4 处范围内** —— 如果要修,建议一次性把所有 admin handler 的裸 `send`
-统一换成 `send_bounded`,作为独立的一批,而不是逐个打补丁。
+`api.rs` 里**一处 `send_bounded` 都没有**。全仓的 `send_bounded` 调用点只在:
+
+| 文件 | 行 | 宿主 |
+|---|---|---|
+| `nathole.rs` | 110, 112, 177, 178, 194 | XTCP 打洞 prepare/connect/fallback |
+| `runtime.rs` | 345 | `spawn_runtime` |
+| `runtime.rs` | 459 | `bind_error_retry` |
+| `runtime.rs` | 542 | `notify_client_recovery` |
+| `runtime.rs` | 579 | `publish_spec_in_place` |
+
+原版把 `runtime.rs` 的这 4 处调用**误记成了 `api.rs` 的 `*_service_locked`**。
+
+**真实情况**:`api.rs` 的 admin handler **全部**用裸 `send`,
+`update_client` 不是「唯一漏点」,而是「11 处中的 2 处」。
+
+**11 处裸 `send` 完整清单**(`grep -c "\.send(ServerMessage" crates/rh-server/src/api.rs`
+= 11,逐行核对过):
+
+| 行 | 宿主函数 | 消息 |
+|---|---|---|
+| 637 | `update_client`(禁用分支) | `ServiceRemove`(proxy) |
+| 649 | `update_client`(禁用分支) | `ServiceRemove`(visitor) |
+| 1452 | `disable_service` | `ServiceRemove` |
+| 1498 | `delete_service` | `ServiceRemove` |
+| 1694 | `disable_service_locked` | `ServiceRemove` |
+| 1721 | `delete_service_inner` | `ServiceRemove` |
+| 1858 | `create_visitor` | `ServiceUpdate` |
+| 1914 | `update_visitor` | `ServiceUpdate` |
+| 1977 | `toggle_visitor`(enable 分支) | `ServiceUpdate` |
+| 1984 | `toggle_visitor`(disable 分支) | `ServiceRemove` |
+| 2032 | `delete_visitor` | `ServiceRemove` |
+
+> 原版写「还有 8 处」却列了 9 个行号(自相矛盾),且 `:1902` 是注释行,
+> 正确行号是 `:1914`。上表已按 grep 结果重建。
+
+**建议改法(统一处理,不逐个打补丁)**:
+
+这 11 处风险相同、改法相同 —— 全部换成
+`sess.send_bounded(msg, CONTROL_SEND_TIMEOUT)`。`CONTROL_SEND_TIMEOUT`
+定义在 `runtime.rs:16`,值为 2s(`state.rs:19` 与 `nathole.rs:19` 各有一份
+同名常量,同值)。语义等价:返回值本来就被 `let _ =` 丢弃,改动只是把
+"队列满时永久等待"变成"最多等 2s"。
+
+适合作为一个**独立提交**(11 处同构改动,review 时一眼能看完),而不是
+按 handler 逐个打补丁 —— 逐个改会让"哪些路径还有裸 send"这个事实长期
+不可判定。
+
+**风险**:零。纯降级,且与 `runtime.rs` / `nathole.rs` 已有的 9 处口径对齐。
 
 ---
 
@@ -671,7 +798,7 @@ for (pid, _, _) in &proxies {
 | 项 | 位置 | 当前复杂度 | 建议改法 | 风险 | 是否已改 |
 |---|---|---|---|---|---|
 | A | `runtime.rs:526` | O(N·t) 串行 | `for_each_concurrent(16)` | 低(比 recovery 更安全) | 否 |
-| B | `api.rs:632/649` | 无界等待 | `send_bounded(2s)` | **零**(纯降级) | 否 |
+| B | `api.rs` 共 11 处(637/649/1452/1498/1694/1721/1858/1914/1977/1984/2032) | 无界等待 | 11 处统一 `send_bounded(2s)` | **零**(纯降级) | 否 |
 | C | `api.rs:707` | O(N·t),最坏 N×2s | `for_each_concurrent(8)` | 中低 | 否 |
 | D | `api.rs:741` | 3N 次锁 | 见 §7 | — | 否(§7 已说明理由) |
 
@@ -679,5 +806,8 @@ for (pid, _, _) in &proxies {
 C(收益在极端场景,需谨慎)。D 维持不做。
 
 **关于"要不要顺手改"**:这 4 处都不在任务书范围内。按仓库约定
-(AGENTS.md「不要顺手优化任务书之外的地方」),本次只报告不改。其中 B 的
-风险为零且是明显的一致性缺口,如果决定做,建议单独一个提交。
+(AGENTS.md「不要顺手优化任务书之外的地方」),本次只报告不改。
+
+其中 B 的风险为零,且**必须 11 处一次性统一改**(理由见本节 B 的事实更正:
+`api.rs` 里一处 `send_bounded` 都没有,逐个补会让"还有哪些裸 send"长期
+不可判定)。建议单独一个提交。
