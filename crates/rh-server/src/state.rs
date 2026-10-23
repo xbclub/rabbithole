@@ -1577,16 +1577,26 @@ impl AppState {
     }
 
     /// 组装某客户端的全量 SYNC 实体集。
+    ///
+    /// 两次查询彼此独立、都只读 —— 并行发出,总耗时取两者较慢的一个而不是
+    /// 相加。调用点全在会话建立 / APPLY_RESULT 失败重发 / 客户端恢复路径上,
+    /// 每次省一个 SQLite 往返。SQLite 池在非内存库下是 8 连接(`db.rs`),
+    /// 并行安全;`:memory:` 库是 1 连接,并行会退化为串行 —— 结果仍正确,
+    /// 只是没有收益。
     pub async fn build_sync_entities(&self, client_id: &str) -> Vec<SyncEntity> {
+        let (proxies, visitors) = tokio::join!(
+            self.db.list_proxies(Some(client_id)),
+            self.db.list_visitors(Some(client_id)),
+        );
         let mut out = Vec::new();
-        if let Ok(proxies) = self.db.list_proxies(Some(client_id)).await {
+        if let Ok(proxies) = proxies {
             for (_id, _cid, spec) in proxies {
                 if spec.enabled {
                     out.push(SyncEntity::Proxy(Box::new(spec)));
                 }
             }
         }
-        if let Ok(visitors) = self.db.list_visitors(Some(client_id)).await {
+        if let Ok(visitors) = visitors {
             for (_id, _cid, _target, spec) in visitors {
                 if spec.enabled {
                     out.push(SyncEntity::Visitor(spec));
@@ -2052,6 +2062,111 @@ mod port_scan_tests {
             println!(
                 "N={n:>5}  port_in_use={per_call:>12?}/次  allocate_port={alloc:>12?}  → {got:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sync_entities_tests {
+    //! #11 回归:两次查询并行后,实体集内容与顺序语义必须不变。
+    use super::*;
+
+    const CID: &str = "sync-entities-client";
+
+    fn proxy_spec(name: &str, port: u16, enabled: bool) -> ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "kind": "tcp",
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": port,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": enabled,
+        }))
+        .unwrap()
+    }
+
+    fn visitor_spec(name: &str, enabled: bool) -> rh_protocol::VisitorSpec {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "kind": "stcp",
+            "enabled": enabled,
+            "bind_addr": "127.0.0.1",
+            "bind_port": 24500,
+            "target_proxy_name": "p1",
+        }))
+        .unwrap()
+    }
+
+    /// 并行取数后:启用的 proxy 与 visitor 都在,停用的都不在。
+    #[tokio::test]
+    async fn includes_enabled_proxies_and_visitors_only() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        db.insert_proxy(CID, &proxy_spec("p-on", 24401, true), false, "console")
+            .await
+            .unwrap();
+        db.insert_proxy(CID, &proxy_spec("p-off", 24402, false), false, "console")
+            .await
+            .unwrap();
+        db.insert_visitor(CID, CID, &visitor_spec("v-on", true))
+            .await
+            .unwrap();
+        db.insert_visitor(CID, CID, &visitor_spec("v-off", false))
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+
+        let entities = state.build_sync_entities(CID).await;
+        let proxy_names: Vec<String> = entities
+            .iter()
+            .filter_map(|e| match e {
+                SyncEntity::Proxy(p) => Some(p.name.clone()),
+                _ => None,
+            })
+            .collect();
+        let visitor_names: Vec<String> = entities
+            .iter()
+            .filter_map(|e| match e {
+                SyncEntity::Visitor(v) => Some(v.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(proxy_names, vec!["p-on".to_string()], "只发启用的规则");
+        assert_eq!(visitor_names, vec!["v-on".to_string()], "只发启用的访问器");
+    }
+
+    /// 别的客户端的实体不得混进来(两次查询各自带 client_id 过滤)。
+    #[tokio::test]
+    async fn scoped_to_client() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        db.create_client("other", "o", &"1".repeat(64), "")
+            .await
+            .unwrap();
+        db.insert_proxy(CID, &proxy_spec("mine", 24403, true), false, "console")
+            .await
+            .unwrap();
+        db.insert_proxy(
+            "other",
+            &proxy_spec("theirs", 24404, true),
+            false,
+            "console",
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+
+        let entities = state.build_sync_entities(CID).await;
+        assert_eq!(entities.len(), 1, "只应包含本客户端的实体");
+        match &entities[0] {
+            SyncEntity::Proxy(p) => assert_eq!(p.name, "mine"),
+            _ => panic!("期望 Proxy 实体"),
         }
     }
 }
