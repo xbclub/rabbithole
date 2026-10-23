@@ -1389,14 +1389,44 @@ pub async fn dispatch_frame(
     Ok(())
 }
 
+/// ACK(ApplyResult)的最长阻塞时间。
+///
+/// ★为什么是"短超时"而不是 try_send、也不是 spawn —— 这是本批唯一的
+/// 业务判断,理由见下。
+///
+/// **丢 ACK 的后果不是自愈的**(与丢心跳/PING 应答不同):
+/// 服务端的 `unconfirmed` 只被 `mark_unconfirmed` 写入、被
+/// `confirm_applied` retain,**没有任何超时重发机制**(已 grep 全仓核实:
+/// 无后台任务读它;`confirm_applied` 的返回值 `still_waiting` 在
+/// `runtime.rs:124` 被 `let _ =` 丢弃)。所以丢一条 `ok:true` 的 ACK,
+/// 会让那条规则停在 Pending,**直到下一次该客户端有任何配置变更或重连**
+/// 才自愈。管理员改完一条规则后若不再操作,界面会一直显示"未确认"。
+///
+/// **为什么不 spawn**:`ack` 的语义是「本次配置已应用」,它在
+/// `dispatch_frame` 里紧跟 `apply_sync` / `upsert` / `remove_entity`。
+/// spawn 出去会把这条因果顺序拆开 —— ACK 可能晚于下一条 `ServiceUpdate`
+/// 的 upsert 才发出,服务端就会先收到更高 revision 的 ACK。
+/// (服务端 `confirm_applied` 是单调的:只有 `revision > applied` 才推进,
+/// `retain` 清 ≤ revision,所以乱序**无害** —— 但这是无谓的乱序,没必要制造。)
+/// 且 spawn 无法保证一定发出:进程/会话收尾时未执行的 spawn 照样丢。
+///
+/// **为什么 50ms 足够**:它在 select 读分支内联执行,50ms 远小于
+/// watchdog(3×心跳 = 30s)。正常情况队列有空间,`send` 是微秒级立即返回,
+/// 根本走不到超时;只有真正拥塞(大量 REMOVE 集中下发)才会吃满 50ms,
+/// 此时放弃这一条,等下次配置变更重发。
+const ACK_SEND_TIMEOUT: Duration = Duration::from_millis(50);
+
 async fn ack(sess: &Arc<ClientSession>, revision: u64) {
-    let _ = sess
-        .send_msg(ClientMessage::ApplyResult(ApplyResult {
+    // 有界发送:队列满时最多阻塞 [`ACK_SEND_TIMEOUT`],不 park select。
+    let _ = tokio::time::timeout(
+        ACK_SEND_TIMEOUT,
+        sess.send_msg(ClientMessage::ApplyResult(ApplyResult {
             revision,
             ok: true,
             error: None,
-        }))
-        .await;
+        })),
+    )
+    .await;
 }
 
 // ---------------- 同步应用 ----------------
@@ -4085,5 +4115,152 @@ mod dispatch_frame_try_send_tests {
         .unwrap();
 
         assert!(rx.try_recv().is_ok(), "有空位时 PING 应答必须入队");
+    }
+}
+
+#[cfg(test)]
+mod ack_bounded_send_tests {
+    //! R2 回归:`ack` 不得在满队列上永久 park。
+    //!
+    //! `ack` 由 `dispatch_frame` 在 `select!` 读分支内联调用。修前是裸
+    //! `send_msg().await` —— 队列满时永久 park,select 不再回顶。
+    //!
+    //! 方案选择见 `ACK_SEND_TIMEOUT` 的文档注释:用**短超时**而不是
+    //! try_send,因为丢 ACK 不会自愈(规则会卡在 Pending 直到下次配置变更)。
+    use super::*;
+    use rh_protocol::message::{ServiceUpdate, SyncEntity};
+
+    fn session_with_capacity(cap: usize) -> (Arc<ClientSession>, mpsc::Receiver<bytes::Bytes>) {
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(cap);
+        let sess = Arc::new(ClientSession {
+            cfg: Arc::new(ClientConfig::default()),
+            session_id: "s".into(),
+            heartbeat_s: 30,
+            send_tx: tx,
+            cancel: CancellationToken::new(),
+            proxies: Mutex::new(HashMap::new()),
+            visitors: Mutex::new(HashMap::new()),
+            visitor_cancels: Mutex::new(HashMap::new()),
+            health_cancels: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            punched: Mutex::new(HashMap::new()),
+            nat_socks: Mutex::new(HashMap::new()),
+            punched_auth: Mutex::new(HashMap::new()),
+            sudp_deliver: Mutex::new(HashMap::new()),
+            mux: rh_transport::mux::wrap_stream_as_client(
+                Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
+                true,
+                100,
+            ),
+            conn_counter: AtomicU64::new(0),
+        });
+        (sess, rx)
+    }
+
+    fn proxy_spec(id: u64) -> ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": format!("p{id}"),
+            "kind": "tcp",
+            "client_id": "c",
+            "bind_ip": "127.0.0.1",
+            "bind_port": 24900 + id as u16,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": true,
+        }))
+        .unwrap()
+    }
+
+    /// ★核心断言:满队列时 `dispatch_frame` 处理 ServiceUpdate 必须
+    /// **有界返回**(≤ ACK_SEND_TIMEOUT 的量级),不得永久 park。
+    ///
+    /// 这条走的是**真实调用路径**(dispatch_frame → upsert → ack),
+    /// 不是直接测 ack —— 因为缺陷在调用点。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_update_returns_when_queue_full() {
+        let (sess, _rx) = session_with_capacity(1);
+        // 填满队列,且不消费
+        assert!(
+            sess.try_send_msg(ClientMessage::Ping(rh_protocol::message::Ping {
+                ts_ms: 0,
+                probe: false,
+            }))
+        );
+
+        let (_c, _s) = tokio::io::duplex(64);
+        let mut control: rh_transport::BoxedIo = Box::new(_c);
+        let mut buf = bytes::BytesMut::new();
+        let sd = CancellationToken::new();
+        let payload = serde_json::to_vec(&ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
+            revision: 1,
+            entity: SyncEntity::Proxy(Box::new(proxy_spec(1))),
+        })))
+        .unwrap();
+
+        let t0 = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(3),
+            dispatch_frame(
+                &sess,
+                &mut control,
+                &mut buf,
+                FrameType::SERVICE_UPDATE,
+                &payload,
+                &sd,
+            ),
+        )
+        .await;
+        let elapsed = t0.elapsed();
+
+        assert!(r.is_ok(), "满队列时 ServiceUpdate 处理被 ACK 永久 park");
+        assert!(r.unwrap().is_ok(), "dispatch_frame 应返回 Ok");
+        // 有界:应当很快(几乎都是 50ms 的 ACK 超时上限)
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "耗时 {elapsed:?} —— ACK 必须有界,不能永久 park"
+        );
+    }
+
+    /// 队列有空间时,ACK 必须真的发出(不能被超时误杀)。
+    #[tokio::test]
+    async fn ack_delivered_when_space() {
+        let (sess, mut rx) = session_with_capacity(8);
+        ack(&sess, 42).await;
+        let bytes = rx.try_recv().expect("ACL 必须已入队");
+        // 解出来确认是 ApplyResult
+        let mut cur = std::io::Cursor::new(bytes.to_vec());
+        let mut b = bytes::BytesMut::new();
+        let (ty, p) = rh_protocol::frame::read_frame(&mut cur, &mut b)
+            .await
+            .unwrap();
+        assert_eq!(ty, FrameType::APPLY_RESULT);
+        let m: ClientMessage = serde_json::from_slice(&p).unwrap();
+        match m {
+            ClientMessage::ApplyResult(a) => {
+                assert_eq!(a.revision, 42);
+                assert!(a.ok);
+            }
+            other => panic!("期望 ApplyResult,实际 {other:?}"),
+        }
+    }
+
+    /// 满队列时 ACK 被丢弃(超时),但**不会**污染客户端状态。
+    ///
+    /// 断言:ack 返回后,客户端本地状态(proxies 表)仍然是 upsert 后的值 ——
+    /// 丢 ACK 只影响服务端的 confirmed_revision,不影响客户端自身。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ack_timeout_does_not_corrupt_local_state() {
+        let (sess, _rx) = session_with_capacity(1);
+        assert!(
+            sess.try_send_msg(ClientMessage::Ping(rh_protocol::message::Ping {
+                ts_ms: 0,
+                probe: false,
+            }))
+        );
+        let before = sess.proxies.lock().await.len();
+        ack(&sess, 7).await;
+        let after = sess.proxies.lock().await.len();
+        assert_eq!(before, after, "丢 ACK 不得影响客户端配置状态");
     }
 }
