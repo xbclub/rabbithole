@@ -1,6 +1,7 @@
 //! 管理 REST API(axum):vben 契约 + 客户端/规则/visitor/统计/事件/指标。
 
 use crate::db::normalize_spec;
+use crate::runtime::CONTROL_SEND_TIMEOUT;
 use crate::state::{AppState, ProxyState};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -634,11 +635,14 @@ async fn update_client(
                 if let Some(sess) = state.sessions.get(&id) {
                     use rh_protocol::message::{ServerMessage, ServiceRemove};
                     let _ = sess
-                        .send(ServerMessage::ServiceRemove(ServiceRemove {
-                            revision: rev,
-                            entity_type: "proxy".into(),
-                            entity_id: *pid as u64,
-                        }))
+                        .send_bounded(
+                            ServerMessage::ServiceRemove(ServiceRemove {
+                                revision: rev,
+                                entity_type: "proxy".into(),
+                                entity_id: *pid as u64,
+                            }),
+                            CONTROL_SEND_TIMEOUT,
+                        )
                         .await;
                 }
             }
@@ -646,11 +650,14 @@ async fn update_client(
                 if let Some(sess) = state.sessions.get(&id) {
                     use rh_protocol::message::{ServerMessage, ServiceRemove};
                     let _ = sess
-                        .send(ServerMessage::ServiceRemove(ServiceRemove {
-                            revision: rev,
-                            entity_type: "visitor".into(),
-                            entity_id: *vid as u64,
-                        }))
+                        .send_bounded(
+                            ServerMessage::ServiceRemove(ServiceRemove {
+                                revision: rev,
+                                entity_type: "visitor".into(),
+                                entity_id: *vid as u64,
+                            }),
+                            CONTROL_SEND_TIMEOUT,
+                        )
                         .await;
                 }
             }
@@ -1449,11 +1456,14 @@ async fn disable_service(
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove};
         let _ = sess
-            .send(ServerMessage::ServiceRemove(ServiceRemove {
-                revision: rev,
-                entity_type: "proxy".into(),
-                entity_id: id as u64,
-            }))
+            .send_bounded(
+                ServerMessage::ServiceRemove(ServiceRemove {
+                    revision: rev,
+                    entity_type: "proxy".into(),
+                    entity_id: id as u64,
+                }),
+                CONTROL_SEND_TIMEOUT,
+            )
             .await;
     }
     state
@@ -1495,11 +1505,14 @@ async fn delete_service(
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove};
         let _ = sess
-            .send(ServerMessage::ServiceRemove(ServiceRemove {
-                revision: rev,
-                entity_type: "proxy".into(),
-                entity_id: id as u64,
-            }))
+            .send_bounded(
+                ServerMessage::ServiceRemove(ServiceRemove {
+                    revision: rev,
+                    entity_type: "proxy".into(),
+                    entity_id: id as u64,
+                }),
+                CONTROL_SEND_TIMEOUT,
+            )
             .await;
     }
     state
@@ -1691,11 +1704,14 @@ async fn disable_service_locked(state: &Arc<AppState>, id: i64) -> (i32, String)
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove};
         let _ = sess
-            .send(ServerMessage::ServiceRemove(ServiceRemove {
-                revision: rev,
-                entity_type: "proxy".into(),
-                entity_id: id as u64,
-            }))
+            .send_bounded(
+                ServerMessage::ServiceRemove(ServiceRemove {
+                    revision: rev,
+                    entity_type: "proxy".into(),
+                    entity_id: id as u64,
+                }),
+                CONTROL_SEND_TIMEOUT,
+            )
             .await;
     }
     state
@@ -1718,11 +1734,14 @@ async fn delete_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove};
         let _ = sess
-            .send(ServerMessage::ServiceRemove(ServiceRemove {
-                revision: rev,
-                entity_type: "proxy".into(),
-                entity_id: id as u64,
-            }))
+            .send_bounded(
+                ServerMessage::ServiceRemove(ServiceRemove {
+                    revision: rev,
+                    entity_type: "proxy".into(),
+                    entity_id: id as u64,
+                }),
+                CONTROL_SEND_TIMEOUT,
+            )
             .await;
     }
     state
@@ -1855,10 +1874,13 @@ async fn create_visitor(
     if let Some(sess) = state.sessions.get(&req.client_id) {
         use rh_protocol::message::{ServerMessage, ServiceUpdate, SyncEntity};
         let _ = sess
-            .send(ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
-                revision: rev,
-                entity: SyncEntity::Visitor(spec.clone()),
-            })))
+            .send_bounded(
+                ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
+                    revision: rev,
+                    entity: SyncEntity::Visitor(spec.clone()),
+                })),
+                CONTROL_SEND_TIMEOUT,
+            )
             .await;
     }
     ok(json!({"id": id, "revision": rev}))
@@ -1911,10 +1933,13 @@ async fn update_visitor(
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceUpdate, SyncEntity};
         let _ = sess
-            .send(ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
-                revision: rev,
-                entity: SyncEntity::Visitor(spec.clone()),
-            })))
+            .send_bounded(
+                ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
+                    revision: rev,
+                    entity: SyncEntity::Visitor(spec.clone()),
+                })),
+                CONTROL_SEND_TIMEOUT,
+            )
             .await;
     }
     ok(json!({"updated": true}))
@@ -1974,18 +1999,24 @@ async fn toggle_visitor(state: Arc<AppState>, id: i64, enabled: bool) -> Respons
         use rh_protocol::message::{ServerMessage, ServiceRemove, ServiceUpdate, SyncEntity};
         if enabled {
             let _ = sess
-                .send(ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
-                    revision: rev,
-                    entity: SyncEntity::Visitor(spec),
-                })))
+                .send_bounded(
+                    ServerMessage::ServiceUpdate(Box::new(ServiceUpdate {
+                        revision: rev,
+                        entity: SyncEntity::Visitor(spec),
+                    })),
+                    CONTROL_SEND_TIMEOUT,
+                )
                 .await;
         } else {
             let _ = sess
-                .send(ServerMessage::ServiceRemove(ServiceRemove {
-                    revision: rev,
-                    entity_type: "visitor".into(),
-                    entity_id: id as u64,
-                }))
+                .send_bounded(
+                    ServerMessage::ServiceRemove(ServiceRemove {
+                        revision: rev,
+                        entity_type: "visitor".into(),
+                        entity_id: id as u64,
+                    }),
+                    CONTROL_SEND_TIMEOUT,
+                )
                 .await;
         }
     }
@@ -2029,11 +2060,14 @@ async fn delete_visitor(
     if let Some(sess) = state.sessions.get(&client_id) {
         use rh_protocol::message::{ServerMessage, ServiceRemove};
         let _ = sess
-            .send(ServerMessage::ServiceRemove(ServiceRemove {
-                revision: rev,
-                entity_type: "visitor".into(),
-                entity_id: id as u64,
-            }))
+            .send_bounded(
+                ServerMessage::ServiceRemove(ServiceRemove {
+                    revision: rev,
+                    entity_type: "visitor".into(),
+                    entity_id: id as u64,
+                }),
+                CONTROL_SEND_TIMEOUT,
+            )
             .await;
     }
     ok(json!({"deleted": true}))
@@ -3671,6 +3705,154 @@ mod batch_services_tests {
         assert!(
             results.iter().all(|r| r["code"] == 0),
             "全部应成功: {results:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod admin_send_bounded_tests {
+    //! P2 回归:api.rs 的 admin handler 一律用 `send_bounded`,不得裸 `send`。
+    //!
+    //! 裸 `send` 是 `queue_tx.send(msg).await` —— 队列满时**永久 park**。
+    //! 这 11 处都在纯 HTTP handler 里(不在控制读循环内联路径上,所以
+    //! 不会自锁),真实后果是 HTTP 请求挂到 axum/反向代理超时,期间
+    //! `serial_lock(&id)` 一直被持有。
+    //!
+    //! 断言基于外部可观测行为:**队列满时,操作必须在有限时间内返回**。
+    use super::*;
+
+    const CID: &str = "bounded-send-client";
+
+    fn proxy_spec(name: &str, port: u16) -> ProxySpec {
+        serde_json::from_value(json!({
+            "name": name,
+            "kind": "stcp",
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": port,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": true,
+        }))
+        .unwrap()
+    }
+
+    /// 队列被填满且**无人消费**时,禁用一条规则必须仍然返回。
+    ///
+    /// 修前:`sess.send()` 在满队列上 park。测试用外层 timeout 把它变成
+    /// 可见失败(不是卡死整个测试套件)。修后:`send_bounded` 等 2s 后
+    /// 放弃,操作照常返回。
+    ///
+    /// ★能力边界:这条能区分新旧,因为旧实现是**永久** park(不是慢一点)。
+    /// 但它要等 2s 超时,所以测试本身耗时 ~2s。
+    #[tokio::test]
+    async fn disable_returns_even_when_queue_full() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        let id = db
+            .insert_proxy(CID, &proxy_spec("p", 24500), false, "console")
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+
+        // 注册一个"在线但不消费"的会话:capacity=1,填满即满。
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let sess = crate::session::Session::new(
+            CID.into(),
+            "sid".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx.clone(),
+        );
+        state.sessions.register(sess);
+        // 先把队列填满(第 1 条进队,第 2 条会 park —— 用 try_send 避免自己挂住)
+        let _ = tx.try_send(rh_protocol::message::ServerMessage::Pong(
+            rh_protocol::message::Pong {
+                ts_ms: 0,
+                probe: false,
+            },
+        ));
+
+        // 现在队列满。disable 必须仍能返回(最多等 CONTROL_SEND_TIMEOUT)。
+        let fut = disable_service_inner(&state, id);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("队列满时 disable 不得永久阻塞");
+        assert_eq!(r.0, 0, "disable 应成功: {r:?}");
+        // DB 状态已落
+        let (_, _, spec, _) = state.db.get_proxy(id).await.unwrap().unwrap();
+        assert!(!spec.enabled);
+    }
+
+    /// 删除同理(走 delete_service_inner)。
+    #[tokio::test]
+    async fn delete_returns_even_when_queue_full() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        let id = db
+            .insert_proxy(CID, &proxy_spec("p", 24501), false, "console")
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let sess = crate::session::Session::new(
+            CID.into(),
+            "sid".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx.clone(),
+        );
+        state.sessions.register(sess);
+        let _ = tx.try_send(rh_protocol::message::ServerMessage::Pong(
+            rh_protocol::message::Pong {
+                ts_ms: 0,
+                probe: false,
+            },
+        ));
+
+        let fut = delete_service_inner(&state, id);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("队列满时 delete 不得永久阻塞");
+        assert_eq!(r.0, 0, "delete 应成功: {r:?}");
+        assert!(state.db.get_proxy(id).await.unwrap().is_none());
+    }
+
+    /// 队列有空间时,操作必须成功且消息真的进队(不能因加了超时就误判)。
+    #[tokio::test]
+    async fn normal_send_still_delivers() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        let id = db
+            .insert_proxy(CID, &proxy_spec("p", 24502), false, "console")
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let sess = crate::session::Session::new(
+            CID.into(),
+            "sid".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        );
+        state.sessions.register(sess);
+
+        let r = disable_service_inner(&state, id).await;
+        assert_eq!(r.0, 0);
+        // 队列里应当有那条 ServiceRemove
+        let msg = rx.try_recv().expect("消息必须已入队");
+        assert!(
+            matches!(msg, rh_protocol::message::ServerMessage::ServiceRemove(_)),
+            "应收到 ServiceRemove,实际 {msg:?}"
         );
     }
 }

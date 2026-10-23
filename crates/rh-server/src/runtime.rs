@@ -13,7 +13,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// 控制面发送上限(与 state.rs 同名常量同义):超时按"对端不读"处理。
-const CONTROL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+///
+/// `pub(crate)` 供 api.rs 的 admin handler 复用 —— 那里 11 处裸 `send`
+/// 要从"队列满时永久 park"降级为"最多等 2s"。
+pub(crate) const CONTROL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 会话建立:重置确认、状态推进、预热。
 pub async fn on_session_up(state: &Arc<AppState>, sess: &Arc<Session>) {
