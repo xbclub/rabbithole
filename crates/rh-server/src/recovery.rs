@@ -13,7 +13,7 @@ use tracing::{info, warn};
 ///
 /// 注意这里只并发 **spawn** 阶段。端口重分配与 DB 查询仍串行(见
 /// [`recover_all`] 的分段说明)。
-const RECOVERY_CONCURRENCY: usize = 16;
+pub(crate) const RECOVERY_CONCURRENCY: usize = 16;
 
 pub async fn recover_all(state: &Arc<AppState>) {
     // ★DB 错误必须显式告警,不能静默当成"没有规则"。

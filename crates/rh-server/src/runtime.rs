@@ -526,17 +526,39 @@ pub async fn notify_client_recovery(state: &Arc<AppState>, client_id: &str) {
     let client = state.db.get_client(client_id).await.ok().flatten();
     let Some(c) = client else { return };
     let revision = c.config_revision.max(0) as u64;
-    for (_id, _cid, mut spec) in proxies {
-        if !spec.enabled {
-            continue;
-        }
-        {
-            let l = state.limits.read().unwrap_or_else(|e| e.into_inner());
-            crate::db::normalize_spec(&mut spec, l.default_pool_size, l.max_pool_size);
-        }
-        let _rt = spawn_runtime(state, client_id, &spec, revision).await;
-        info!(proxy = spec.name, "recovered after client enable");
-    }
+    // ★并发恢复:形态与 `recovery.rs` 的启动恢复完全同构(那里已经用
+    // `for_each_concurrent(RECOVERY_CONCURRENCY)`)。修前这里是 N 次串行
+    // `spawn_runtime` —— 每条含 1 次 `get_client` + bind + serve loop 启动
+    // + mpsc 发送,单客户端 N 条规则就是 N 倍单条延迟。
+    //
+    // ★为什么比 `recovery.rs` 更安全:那里要处理 `port_auto` 被外部占用时
+    // 的 `allocate_port` 重分配,所以必须把端口决策留在串行段;
+    // 本函数**完全没有** `allocate_port` 调用 —— 端口直接取 DB 里已有的
+    // `spec.bind_port`。DB 里同一客户端的端口本来就不重复,所以不存在
+    // 端口竞态,整个循环都可以并发。
+    //
+    // 自锁核查:调用点 `update_client` 持有 `serial_lock(&id)`,而
+    // `spawn_runtime` 内部不取 `serial_lock`(grep 结果为 0),不会自锁。
+    //
+    // 注:`state.limits.read()` 是 `std::sync::RwLock`,**不能跨 await 持有** ——
+    // 这里在块内取用完立即释放,与 `recovery.rs` 同写法。
+    use crate::recovery::RECOVERY_CONCURRENCY;
+    use futures::stream::StreamExt as _;
+    futures::stream::iter(proxies)
+        .filter(|(_, _, spec)| futures::future::ready(spec.enabled))
+        .for_each_concurrent(RECOVERY_CONCURRENCY, |(_id, _cid, mut spec)| {
+            let state = state.clone();
+            let client_id = client_id.to_string();
+            async move {
+                {
+                    let l = state.limits.read().unwrap_or_else(|e| e.into_inner());
+                    crate::db::normalize_spec(&mut spec, l.default_pool_size, l.max_pool_size);
+                }
+                let _rt = spawn_runtime(&state, &client_id, &spec, revision).await;
+                info!(proxy = spec.name, "recovered after client enable");
+            }
+        })
+        .await;
     // visitors 重发(全量 SYNC 更简单且正确)
     if let Some(sess) = state.sessions.get(client_id) {
         let entities = state.build_sync_entities(client_id).await;
@@ -595,4 +617,198 @@ pub async fn publish_spec_in_place(
     // 走合并窗口(单条更新也要重建,但同样可能落在批量路径里)。
     state.proxies.schedule_vhost_rebuild();
     true
+}
+
+#[cfg(test)]
+mod notify_client_recovery_tests {
+    //! P4 回归:`notify_client_recovery` 的批量恢复并发化后,
+    //! 结果必须与串行版本完全一致。
+    //!
+    //! ★能力边界(如实记录):这条**测不出并发收益**。理由与报告 §2 的
+    //! recovery 基准相同 —— `spawn_runtime` 的 await 点在内存 SQLite 且
+    //! 无在线背压时几乎不等待,并发只剩调度开销。真实收益依赖文件型
+    //! SQLite 与在线会话。所以这里只做**功能性回归**:全部启用规则被恢复、
+    //! 禁用规则被跳过、visitor SYNC 正常下发。
+    use super::*;
+
+    const CID: &str = "recovery-conc-client";
+
+    fn spec(name: &str, port: u16, enabled: bool) -> ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "kind": "stcp",
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": port,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": enabled,
+        }))
+        .unwrap()
+    }
+
+    /// 全部启用规则必须被恢复;禁用规则一条都不恢复。
+    #[tokio::test]
+    async fn recovers_all_enabled_and_skips_disabled() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        const ON: usize = 20;
+        const OFF: usize = 5;
+        for i in 0..ON {
+            db.insert_proxy(
+                CID,
+                &spec(&format!("on{i}"), 25000 + i as u16, true),
+                false,
+                "console",
+            )
+            .await
+            .unwrap();
+        }
+        for i in 0..OFF {
+            db.insert_proxy(
+                CID,
+                &spec(&format!("off{i}"), 25100 + i as u16, false),
+                false,
+                "console",
+            )
+            .await
+            .unwrap();
+        }
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+
+        notify_client_recovery(&state, CID).await;
+
+        assert_eq!(
+            state.proxies.runtimes.len(),
+            ON,
+            "必须恰好恢复 {ON} 条启用规则(禁用的一条都不该进来)"
+        );
+        // 每条都必须是启用状态
+        let rts: Vec<Arc<ProxyRuntime>> = state
+            .proxies
+            .runtimes
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+        for rt in rts {
+            let enabled = rt.spec.read().await.enabled;
+            assert!(enabled, "恢复出来的必须都是启用的");
+        }
+    }
+
+    /// `revision` 必须写入每条恢复出来的 runtime。
+    #[tokio::test]
+    async fn revision_propagated() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        for i in 0..8 {
+            db.insert_proxy(
+                CID,
+                &spec(&format!("p{i}"), 25200 + i as u16, true),
+                false,
+                "console",
+            )
+            .await
+            .unwrap();
+        }
+        // 推进 revision
+        let rev = db.bump_revision(CID).await.unwrap();
+        db.bump_revision(CID).await.unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+
+        notify_client_recovery(&state, CID).await;
+
+        let want = state
+            .db
+            .get_client(CID)
+            .await
+            .unwrap()
+            .unwrap()
+            .config_revision as u64;
+        assert!(want >= rev);
+        for e in state.proxies.runtimes.iter() {
+            assert_eq!(
+                e.value().latest_revision.load(Ordering::Relaxed),
+                want,
+                "并发恢复后每条规则的 revision 必须一致"
+            );
+        }
+    }
+
+    /// 客户端不存在:直接返回,不 panic、不残留。
+    #[tokio::test]
+    async fn missing_client_is_noop() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        notify_client_recovery(&state, "no-such-client").await;
+        assert!(state.proxies.runtimes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod notify_client_recovery_bench {
+    //! P4 基准(手动运行):批量恢复的耗时。
+    //!
+    //! ```text
+    //! cargo test -p rh-server --release notify_client_recovery_bench -- --ignored --nocapture
+    //! ```
+    //!
+    //! ★实测结论(如实记录):**本机测不出并发收益,串行甚至略快**。
+    //!
+    //! | N=1000 | 串行 | 并发(16) |
+    //! |---|---|---|
+    //! | 本机 `:memory:` | 30.14ms | 30.54ms |
+    //!
+    //! 原因与报告 §2 的 recovery 基准完全相同:`spawn_runtime` 的 await 点
+    //! (`get_client`、`send_bounded`、`mark_unconfirmed`)在内存 SQLite +
+    //! 无在线背压下几乎不等待,并发只剩调度开销。真实收益依赖文件型
+    //! SQLite 与在线会话 —— **未在部署环境验证,不为这条声称提升**。
+    //!
+    //! 保留这个基准是为了给出可复现的口径(后人可以自己复测),不是为了
+    //! 证明收益。
+    use super::*;
+
+    const CID: &str = "recovery-bench-client";
+
+    fn spec(name: &str, port: u16) -> ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "kind": "stcp",
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": port,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": true,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "耗时基准,手动运行(--ignored --nocapture)"]
+    async fn bench_notify_recovery() {
+        for n in [100usize, 500, 1000] {
+            let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+            db.create_client(CID, "c", &"0".repeat(64), "")
+                .await
+                .unwrap();
+            for i in 0..n {
+                db.insert_proxy(CID, &spec(&format!("p{i}"), 0), false, "console")
+                    .await
+                    .unwrap();
+            }
+            let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+            let t0 = std::time::Instant::now();
+            notify_client_recovery(&state, CID).await;
+            println!(
+                "N={n:>5}  notify_client_recovery={:>12?}  runtimes={}",
+                t0.elapsed(),
+                state.proxies.runtimes.len()
+            );
+        }
+    }
 }
