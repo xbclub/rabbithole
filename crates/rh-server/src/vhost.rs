@@ -678,9 +678,8 @@ fn ext_cached(path: &str, extensions: &[String]) -> bool {
         return false;
     }
     let ext = path[dot + 1..].to_lowercase();
-    extensions
-        .iter()
-        .any(|e| e.trim().trim_start_matches('.').to_lowercase() == ext)
+    // 白名单已在 route_from 构建时预规范化(R4),此处直接比较
+    extensions.iter().any(|e| e == &ext)
 }
 
 fn not_found_response(state: &Arc<AppState>) -> hyper::Response<BoxBody> {

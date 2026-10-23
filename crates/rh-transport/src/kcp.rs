@@ -1167,10 +1167,19 @@ struct RetiredTable {
 
 impl RetiredTable {
     fn insert(&mut self, conv: u32, until: std::time::Instant) {
-        if self.map.insert(conv, until).is_some() {
-            // 重复 conv:沿用原有序位置(避免同 conv 反复插入撑大 order)
+        // R4:重复 conv 取**较早**的截止 —— 满拒路径先落 200ms 短退避,
+        // 随后清理任务的 90s EXIT retire 会到达;修前无条件覆盖,短退避
+        // 恒失效,被满拒的 conv 要等 90s 才能靠重传重建(注释承诺的
+        // 「队列腾空后 ≥100ms RTO 重传可重建」永不成立)。min 语义下
+        // 洪泛防护不弱化(同 conv 仍在表内),恢复语义生效。
+        if let Some(prev) = self.map.get_mut(&conv) {
+            if until < *prev {
+                *prev = until;
+            }
+            // 沿用原有序位置(避免同 conv 反复插入撑大 order)
             return;
         }
+        self.map.insert(conv, until);
         self.order.push_back(conv);
         while self.order.len() > RETIRED_CAPACITY {
             if let Some(old) = self.order.pop_front() {
@@ -1219,6 +1228,11 @@ impl Default for SessionGateConfig {
 
 struct SessionGate {
     cfg: SessionGateConfig,
+    /// R4:上次全表淘汰扫描时刻 —— retain 限频(≥1s 一次)。修前只要
+    /// 表 >4096,每个成功 admit 都在 per_ip 锁 + sessions 锁双重持锁下
+    /// O(n) 全表扫描;伪造源洪泛(R≥1000/s)下 demux 单任务被扫描
+    /// 打满、存量会话收包停摆。限频后表上界 = 60s 窗口 + 1s 新到。
+    last_sweep: Mutex<std::time::Instant>,
     /// 全局在建会话计数(注册 +1,会话退出 -1)。
     live: std::sync::atomic::AtomicUsize,
     /// 每 IP 令牌桶(惰性创建,随 IP 数量增长;按最近使用淘汰到上限)。
@@ -1231,6 +1245,7 @@ impl SessionGate {
             cfg,
             live: std::sync::atomic::AtomicUsize::new(0),
             per_ip: Mutex::new(HashMap::new()),
+            last_sweep: Mutex::new(std::time::Instant::now()),
         }
     }
 
@@ -1261,7 +1276,12 @@ impl SessionGate {
         // 与"防随机源地址洪泛撑爆表"的目标正好相反:1M 伪造源 ≈70MB
         // 常驻,且表一旦超过 4096 此后每次 admit 都在锁内 O(n) 全表扫描。
         // 时间口径下洪泛表上限 = 60s 窗口内的唯一源数,自然有界。
-        if g.len() > 4096 {
+        // R4:retain 限频(≥1s 一次)—— 修前表超 4096 后每个成功 admit
+        // 都在 per_ip 锁 + sessions 锁双重持锁下 O(n) 全表扫描,伪造源
+        // 洪泛下 demux 单任务被扫描打满、存量会话收包停摆。
+        let mut sweep = self.last_sweep.lock().unwrap();
+        if g.len() > 4096 && sweep.elapsed() >= Duration::from_secs(1) {
+            *sweep = now;
             g.retain(|_, (_, last)| now.duration_since(*last) < Duration::from_secs(60));
         }
         self.live.fetch_add(1, Ordering::Relaxed);

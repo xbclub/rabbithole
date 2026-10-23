@@ -34,6 +34,12 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
             c.clone()
         }
         _ => {
+            // R4:seqlock 校验半边 —— 先捕获 gen,DB 读之后再复核;期间
+            // 任何 bump_cfg_gen(属主或目标客户端)都令本次放弃入缓存
+            //(结果照常返回,只是不缓存)。修前 gen 在 DB 读之后才读,
+            // 「读完旧数据 → 管理 bump → 读到新 gen」的交错会把旧数据
+            // 钉死在新 gen 上,直到下一次 bump 才自愈。
+            let gen0_owner = state.cfg_gen(&sess.client_id);
             let visitors = state
                 .db
                 .list_visitors(Some(&sess.client_id))
@@ -57,15 +63,19 @@ pub async fn on_user_connect(state: &Arc<AppState>, sess: &Arc<Session>, u: User
                 warn!(visitor = vspec.name, "target proxy not found/enabled");
                 return;
             };
+            let gen_owner = state.cfg_gen(&sess.client_id);
+            let gen_target = state.cfg_gen(&v_target_client);
             let entry = Arc::new(VisitorResolution {
-                gen: state.cfg_gen(&sess.client_id),
-                target_gen: state.cfg_gen(&v_target_client),
+                gen: gen_owner,
+                target_gen: gen_target,
                 visitor_id: vspec.id,
                 target_client: v_target_client,
                 vspec,
                 pspec,
             });
-            state.visitor_cache.insert(cache_key.clone(), entry.clone());
+            if gen_owner == gen0_owner {
+                state.visitor_cache.insert(cache_key.clone(), entry.clone());
+            }
             entry
         }
     };

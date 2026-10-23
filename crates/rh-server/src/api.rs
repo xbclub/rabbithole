@@ -651,7 +651,8 @@ async fn update_client(
             if let Some(sess) = state.sessions.get(&id) {
                 sess.cancel.cancel();
             }
-            let proxies = state.db.list_proxies(Some(&id)).await.unwrap_or_default();
+            // R4:一列投影(消费方只用 id;修前全量 spec 反序列化)
+            let proxies = state.db.list_proxy_ids(&id).await.unwrap_or_default();
             let visitors = state.db.list_visitors(Some(&id)).await.unwrap_or_default();
             let rev = state.db.bump_revision(&id).await.unwrap_or(0);
             state.bump_cfg_gen(&id);
@@ -687,7 +688,7 @@ async fn update_client(
             {
                 use futures::stream::StreamExt as _;
                 futures::stream::iter(proxies.iter())
-                    .for_each_concurrent(8, |(pid, _, _)| {
+                    .for_each_concurrent(8, |pid| {
                         let state = state.clone();
                         let pid = *pid as u64;
                         async move {
@@ -723,7 +724,7 @@ async fn update_client(
                 use futures::stream::StreamExt as _;
                 let payloads: Vec<(&'static str, u64)> = proxies
                     .iter()
-                    .map(|(pid, _, _)| ("proxy", *pid as u64))
+                    .map(|pid| ("proxy", *pid as u64))
                     .chain(
                         visitors
                             .iter()
@@ -801,7 +802,8 @@ async fn delete_client(
     }
     let lock = state.serial_lock(&id);
     let _g = lock.lock().await;
-    let proxies = state.db.list_proxies(Some(&id)).await.unwrap_or_default();
+    // R4:一列投影(teardown 只用 pid;修前全量 spec 反序列化)
+    let proxies = state.db.list_proxy_ids(&id).await.unwrap_or_default();
     // ★并发 teardown:单次 `teardown_runtime` 最坏等 `serve_handle` 收敛 2s,
     // 串行执行时 N 条规则 = N × 2s。删一个有 100 条规则、若干条 serve loop
     // 不收敛的客户端,这个 HTTP 请求会挂 200 秒。
@@ -821,7 +823,7 @@ async fn delete_client(
     {
         use futures::stream::StreamExt as _;
         futures::stream::iter(proxies.iter())
-            .for_each_concurrent(8, |(pid, _, _)| {
+            .for_each_concurrent(8, |pid| {
                 let state = state.clone();
                 let pid = *pid as u64;
                 async move {
@@ -1002,13 +1004,14 @@ async fn create_service_inner(
         state.hot.read().await.max_services_per_client
     };
     if per_client_max > 0 {
+        // R4:COUNT 走索引(修前全量取回 + 逐行 spec 反序列化只为 .len(),
+        // 且全程在 serial_lock 临界区内)
         let count = state
             .db
-            .list_proxies(Some(&client.id))
+            .count_proxies_for_client(&client.id)
             .await
-            .map_err(|e| (500, format!("{e}")))?
-            .len();
-        if count >= per_client_max {
+            .map_err(|e| (500, format!("{e}")))?;
+        if count as usize >= per_client_max {
             return Err((2003, "LIMIT_EXCEEDED:超出配额限制".into()));
         }
     }

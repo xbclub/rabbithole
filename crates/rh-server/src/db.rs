@@ -481,6 +481,26 @@ impl Db {
         Ok(())
     }
 
+    /// R4:按客户端数规则(create_service 的 per-client 上限检查;
+    /// idx_proxies_client 索引范围扫描,不做 spec 反序列化)。
+    pub async fn count_proxies_for_client(&self, client_id: &str) -> Result<i64> {
+        let r: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proxies WHERE client_id=?1")
+            .bind(client_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(r)
+    }
+
+    /// R4:客户端的全部规则 id(delete_client/update_client 禁用分支的
+    /// teardown/REMOVE 清单;一列投影,不做 spec 反序列化)。
+    pub async fn list_proxy_ids(&self, client_id: &str) -> Result<Vec<i64>> {
+        let rows = sqlx::query("SELECT id FROM proxies WHERE client_id=?1")
+            .bind(client_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get::<i64, _>(0)).collect())
+    }
+
     /// R3:全部规则的 (id, client_id) 轻量列表(batch_services 的属主
     /// 映射;不做 spec JSON 反序列化 —— 修前 list_proxies(None) 全表
     /// 解析只为取两列)。

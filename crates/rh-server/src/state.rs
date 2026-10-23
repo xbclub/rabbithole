@@ -259,41 +259,9 @@ impl ClientUsage {
     }
 }
 
-impl Clone for AppState {
-    fn clone(&self) -> Self {
-        Self {
-            cfg: self.cfg.clone(),
-            db: self.db.clone(),
-            events: self.events.clone(),
-            challenge: self.challenge.clone(),
-            sessions: self.sessions.clone(),
-            proxies: self.proxies.clone(),
-            client_locks: self.client_locks.clone(),
-            metrics: self.metrics.clone(),
-            shutdown: self.shutdown.clone(),
-            hot: self.hot.clone(),
-            limits: self.limits.clone(),
-            mux_streams: self.mux_streams.clone(),
-            relay_pairs: self.relay_pairs.clone(),
-            udp_relays: self.udp_relays.clone(),
-            nathole: self.nathole.clone(),
-            login_limiter: self.login_limiter.clone(),
-            login_limiter_user: self.login_limiter_user.clone(),
-            web_jwt_secret: self.web_jwt_secret.clone(),
-            unauth_conns: self.unauth_conns.clone(),
-            client_usage: self.client_usage.clone(),
-            certs: self.certs.clone(),
-            ssh_watch: (self.ssh_watch.0.clone(), self.ssh_watch.1.clone()),
-            metrics_task: self.metrics_task.clone(),
-            metrics_listen_addr: self.metrics_listen_addr.clone(),
-            visitor_cache: self.visitor_cache.clone(),
-            pwd_version_cache: self.pwd_version_cache.clone(),
-            pwd_version_epoch: std::sync::atomic::AtomicU64::new(0),
-            client_cfg_gen: self.client_cfg_gen.clone(),
-        }
-    }
-}
-
+// R4:AppState 的手写 Clone impl 已删 —— 全仓只以 Arc<AppState> 流转,
+// 该 impl 零调用且语义危险(深拷贝五张缓存 DashMap 使状态分叉;
+// pwd_version_epoch 归零会让克隆侧的已吊销令牌重新有效)。
 impl AppState {
     /// C1:推进客户端本地配置版本(规则/访问器任何变更后调用)。
     pub fn bump_cfg_gen(&self, client_id: &str) {
@@ -1555,7 +1523,14 @@ fn route_from(
         response_headers: c.response_headers.clone(),
         proxy_id: rt.id,
         not_found_html: c.not_found_html.clone(),
-        cache: c.cache.clone().map(std::sync::Arc::new),
+        cache: c.cache.clone().map(|mut cc| {
+            // R4:白名单预规范化(去空白/前导点 + 小写)—— 修前每个可缓存
+            // GET 都对每个扩展名重复 trim+to_lowercase(每项一次分配)。
+            for e in cc.extensions.iter_mut() {
+                *e = e.trim().trim_start_matches('.').to_lowercase();
+            }
+            std::sync::Arc::new(cc)
+        }),
     }
 }
 
