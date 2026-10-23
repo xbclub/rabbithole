@@ -1360,12 +1360,25 @@ pub async fn dispatch_frame(
                     ts_ms: 0,
                     probe: false,
                 });
-            let _ = sess
-                .send_msg(ClientMessage::Ping(rh_protocol::message::Ping {
-                    ts_ms: p.ts_ms,
-                    probe: false,
-                }))
-                .await;
+            // ★PING 应答必须 try_send,不能 await。
+            //
+            // 本函数由 `run_loop` 的 `select!` **读分支内联**调用,而那个
+            // select 的 `send_rx.recv()` 分支是 `send_tx` 的唯一消费者。
+            // 队列(256)满时 `send().await` 会 park 在"等自己消费"上 ——
+            // select 不再回顶,读帧 / 写帧 / 心跳 / cancel 全部失联。
+            // 与心跳(第四批 Q2)完全同源。
+            //
+            // 丢一拍 PING 应答是安全的:服务端心跳判死是 90s
+            // (`control.rs` 的 `hb.tick` 只看 `last_frame.elapsed() >= 90s`),
+            // 而 PING 间隔通常 30s,丢一两拍完全无感;服务端下一拍 PING
+            // 到达时,只要队列已排空就会正常回。
+            //
+            // 不需要按 Full/Closed 分叉:Closed 时后续分支(写/读)自然会
+            // 退出循环,这里丢消息不会掩盖问题。
+            let _ = sess.try_send_msg_err(ClientMessage::Ping(rh_protocol::message::Ping {
+                ts_ms: p.ts_ms,
+                probe: false,
+            }));
         }
         FrameType::PONG => {}
         other => {
@@ -3953,5 +3966,124 @@ mod run_loop_heartbeat_no_lockup_tests {
             })),
             "容量 1 填一条后必须已满"
         );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_frame_try_send_tests {
+    //! R1 回归:`dispatch_frame` 的 PING 应答不得在满队列上阻塞。
+    //!
+    //! `dispatch_frame` 由 `run_loop` 的 `select!` 读分支**内联**调用,
+    //! 而 `send_rx.recv()` 是 `send_tx` 的唯一消费者。队列满时
+    //! `send().await` 会 park 在"等自己消费"上 → select 不再回顶。
+    //!
+    //! ★与 Q2 不同,这条**能直接测到调用点**:`dispatch_frame` 是 pub 的
+    //! 纯函数式接口(只依赖 sess + control 流 + payload),不需要跑整个
+    //! run_loop。所以这里断言的是真实调用路径,不是原语。
+    use super::*;
+    use rh_protocol::message::Ping;
+
+    fn session_with_capacity(cap: usize) -> (Arc<ClientSession>, mpsc::Receiver<bytes::Bytes>) {
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(cap);
+        let sess = Arc::new(ClientSession {
+            cfg: Arc::new(ClientConfig::default()),
+            session_id: "s".into(),
+            heartbeat_s: 30,
+            send_tx: tx,
+            cancel: CancellationToken::new(),
+            proxies: Mutex::new(HashMap::new()),
+            visitors: Mutex::new(HashMap::new()),
+            visitor_cancels: Mutex::new(HashMap::new()),
+            health_cancels: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            punched: Mutex::new(HashMap::new()),
+            nat_socks: Mutex::new(HashMap::new()),
+            punched_auth: Mutex::new(HashMap::new()),
+            sudp_deliver: Mutex::new(HashMap::new()),
+            mux: rh_transport::mux::wrap_stream_as_client(
+                Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
+                true,
+                100,
+            ),
+            conn_counter: AtomicU64::new(0),
+        });
+        (sess, rx)
+    }
+
+    /// 队列满时,喂一个 PING 帧给 `dispatch_frame` 必须**立即返回**。
+    ///
+    /// 修前:内部 `send_msg().await` 在满队列上 park —— 这条会超时失败。
+    /// 修后:try_send 丢弃应答后立即返回。
+    #[tokio::test]
+    async fn ping_reply_does_not_block_on_full_queue() {
+        // 容量 1:填满后必然满
+        let (sess, _rx) = session_with_capacity(1);
+        assert!(
+            sess.try_send_msg(ClientMessage::Ping(Ping {
+                ts_ms: 0,
+                probe: false,
+            })),
+            "前置:先占掉唯一名额"
+        );
+
+        let (_c, _s) = tokio::io::duplex(64);
+        let mut control: rh_transport::BoxedIo = Box::new(_c);
+        let mut buf = bytes::BytesMut::new();
+        let sd = CancellationToken::new();
+        let payload = serde_json::to_vec(&Ping {
+            ts_ms: 12345,
+            probe: false,
+        })
+        .unwrap();
+
+        let t0 = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_millis(500),
+            dispatch_frame(
+                &sess,
+                &mut control,
+                &mut buf,
+                FrameType::PING,
+                &payload,
+                &sd,
+            ),
+        )
+        .await;
+        let elapsed = t0.elapsed();
+
+        assert!(r.is_ok(), "PING 应答在满队列上阻塞了超过 500ms");
+        assert!(r.unwrap().is_ok(), "dispatch_frame 应返回 Ok");
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "PING 应答耗时 {elapsed:?} —— 必须非阻塞"
+        );
+    }
+
+    /// 队列有空间时,PING 应答必须真的发出。
+    #[tokio::test]
+    async fn ping_reply_delivered_when_space() {
+        let (sess, mut rx) = session_with_capacity(8);
+        let (_c, _s) = tokio::io::duplex(64);
+        let mut control: rh_transport::BoxedIo = Box::new(_c);
+        let mut buf = bytes::BytesMut::new();
+        let sd = CancellationToken::new();
+        let payload = serde_json::to_vec(&Ping {
+            ts_ms: 999,
+            probe: false,
+        })
+        .unwrap();
+
+        dispatch_frame(
+            &sess,
+            &mut control,
+            &mut buf,
+            FrameType::PING,
+            &payload,
+            &sd,
+        )
+        .await
+        .unwrap();
+
+        assert!(rx.try_recv().is_ok(), "有空位时 PING 应答必须入队");
     }
 }
