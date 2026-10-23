@@ -211,7 +211,7 @@ gh api --allow-escape-sequences "repos/<owner>/<repo>/actions/jobs/$JOB/logs" \
 
 ```
 [test3: 压测端]        [test1: 服务端]           [test2: 客户端+目标]
-loadgen/iperf3 -c ──►  转发口 20001..  ──隧道──►  目标服务 19101..19104
+loadgen src ───────►  转发口 20001..  ──隧道──►  目标服务 19101..19104
                       控制面 17100 / API 18080
 ```
 
@@ -227,7 +227,8 @@ loadgen/iperf3 -c ──►  转发口 20001..  ──隧道──►  目标服
 | test2 客户端 | `Du9x3tHGGDhcZJNx` | 172.16.1.17 |
 | test3 压测端 | `tN76t9aSo3zaCwJJ` | 172.16.1.18 |
 
-三台均 8 核、10GbE、`sudo -n` 可用、`iperf3 3.9`+`python3` 就位。
+三台均 8 核、10GbE、`sudo -n` 可用、`python3` 就位;`/tmp/rh-bin/loadgen`
+(Go 压测器)必须提前放好 —— 三台没装 Go,只能本地交叉编译后上传。
 
 ### 流程
 
@@ -260,43 +261,60 @@ loadgen/iperf3 -c ──►  转发口 20001..  ──隧道──►  目标服
    /tmp/rh-bin/rh-server --version    # 必须核对版本,别拿旧二进制测
    ```
 
-3. **三台同步脚本**,然后按角色启动(每个角色一个 termark 会话,`setsid` 后台):
+3. **三台同步脚本**,然后按角色启动(每个角色一个 termark 会话,`setsid` 后台)。
+   **三个角色的环境变量必须完全一致**,尤其 `THP_TOOL=loadgen`:
 
    ```bash
    # test1
-   cd /tmp/rh-bench/benchmark && BENCH_BIN=/tmp/rh-bin \
+   cd /tmp/rh-bench/benchmark && BENCH_BIN=/tmp/rh-bin THP_TOOL=loadgen \
      PEER_RUN_ID=<id> PROTO=<proto> RELAY=splice MUX=1 PEER_DIR=/tmp/peer \
      setsid bash peer.sh server > /tmp/srv.out 2>&1 < /dev/null &
 
    # test2(凭据取 test1 输出)
-   ... setsid bash peer.sh client <A_IP>:17100 <cid> <secret> > /tmp/cli.out 2>&1 &
+   ... THP_TOOL=loadgen setsid bash peer.sh client <A_IP>:17100 <cid> <secret> \
+     > /tmp/cli.out 2>&1 &
 
    # test3(先登录拿 token)
    TOKEN=$(curl -s -X POST http://<A_IP>:18080/api/auth/login \
      -H 'Content-Type: application/json' \
      -d '{"username":"admin","password":"peer-Pass-1"}' | jq -r .data.accessToken)
-   ... setsid bash peer.sh drive <A_IP> <B_IP> 18080 $TOKEN <cid> <label>
+   ... THP_TOOL=loadgen setsid bash peer.sh drive <A_IP> <B_IP> 18080 \
+     $TOKEN <cid> <label>
    ```
 
-   `PROTO`/`RELAY`/`MUX`/`PEER_RUN_ID` **必须显式给**,脚本不再有隐式默认。
+   `PROTO`/`RELAY`/`MUX`/`PEER_RUN_ID`/`THP_TOOL` **必须显式给**,脚本的
+   隐式默认值(`iperf3`)不能依赖。test2 由脚本自己起 `loadgen sink`,
+   **不要手工起 `iperf3 -s`**。
 
 4. **等 drive 自己跑完**,别中途重跑。吞吐只是第一个场景,后面还有 UDP /
    延迟 / 并发 / 建连速率 / HTTP vhost。
 
-### 压测器:默认 iperf3,量大时切 loadgen
+### 压测器:一律用 loadgen,不用 iperf3
 
-`THP_TOOL=loadgen` 用仓库自带 Go 压测器(`benchmark/loadgen`),`THP_TOOL`
-默认为 `iperf3`。
+**所有吞吐压测都必须 `THP_TOOL=loadgen`**,用仓库自带 Go 压测器
+(`benchmark/loadgen`)。三个角色都要显式带上这个环境变量:
 
-**什么时候必须切**:被测吞吐接近 2 Gbps 量级时。系统 iperf3 3.9 单线程、
-`-P` 不扩展吞吐,与 Python loadgen 的天花板都在 2 Gbps 附近;用它测高吞吐
-会把两边都压到同一数字,测到的是压测器瓶颈而非产品差异(`loadgen/main.go`
-顶部记录了同一坑在明文场景的教训)。
+```bash
+THP_TOOL=loadgen PROTO=... RELAY=... MUX=1 PEER_RUN_ID=... ...
+```
 
-切换是**成对**的:drive 侧改用 loadgen src,**B 侧同时**把 `iperf3 -s` 换成
-`loadgen sink`(两者协议不兼容)。脚本已按 `THP_TOOL` 自动处理。
+脚本里 `THP_TOOL` 的默认值仍是 `iperf3`(`benchmark/peer.sh:95`,为兼容
+历史数据保留),**不要依赖这个默认值** —— 不显式给就等于在用过时的压测器。
 
-loadgen 只有单向发送,B 侧 sink 读空;`download` 档实际与 `upload` 同向。
+**为什么不再用 iperf3**:系统 iperf3 3.9 是单线程,`-P` 不扩展吞吐,天花板
+就在 2 Gbps 量级。本机三台是 10GbE,直连基线动辄 2.5~3 Gbps,用 iperf3
+测会把**压测器瓶颈当成产品瓶颈**,rh 与 frp 被压到同一数字而不可分辨。
+`loadgen/main.go` 顶部记录了 Python 版压测器踩过的同一个坑:曾据此得出
+「rh 与 frp 都卡在 2.0~2.2G、都不随并发扩展」——那个结论是压测器造成的。
+
+Go 版每连接一个 goroutine、收发走 `io.Copy` 大缓冲快路径,可稳定压满 10GbE。
+
+切换是**成对**的:drive 侧用 `loadgen src`,**B 侧同时**把 `iperf3 -s` 换成
+`loadgen sink`(两者协议不兼容,混用会让样本静默变 0)。脚本已按
+`THP_TOOL` 自动处理,B 侧不要手工起 `iperf3 -s`。
+
+loadgen 只有单向发送,B 侧 sink 读空;`download` 档实际与 `upload` 同向,
+这是工具的已知局限,**不要把它当成"双向都测过了"**。
 
 ### 结果在哪
 
