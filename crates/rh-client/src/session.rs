@@ -1290,20 +1290,35 @@ async fn apply_sync(
         }
     }
     // proxies
-    {
+    //
+    // ★锁内只收集,锁外才启动/停止。
+    //
+    // 修前 `stop_proxy` / `start_health` 都在 `proxies` 写锁内 await ——
+    // 前者取 `health_cancels` 锁,后者取 `health_cancels` 锁 + `spawn`。
+    // 全量 ServiceSync(客户端每次重连必走)期间 `proxies` 一直被占,
+    // 而 `open_data_channel` 要 `sess.proxies.lock().await.get(&proxy_id)`
+    // 才能建数据通道 —— 表现为「重连后首批连接建立慢」。
+    //
+    // 同文件的 `upsert` 早就为此写了 `drop(cur)`(注释:「别持着 visitors
+    // 锁去做重绑定」),`apply_sync` 是漏点。
+    //
+    // 锁获取顺序不变(仍是 proxies → health_cancels),只是不再嵌套持有。
+    let (to_stop, to_start) = {
         let mut cur = sess.proxies.lock().await;
         let old: Vec<(u64, ProxySpec)> = cur.drain().collect();
+        let mut to_stop: Vec<u64> = Vec::new();
         for (id, old_spec) in old {
             match new_proxies.get(&id) {
                 Some(new) if *new == old_spec => {
                     cur.insert(id, old_spec);
                 }
-                _ => stop_proxy(sess, id).await,
+                _ => to_stop.push(id),
             }
         }
         // 直接查 `cur` 本身(此刻它刚被重填完,语义与「先收集 existing
         // 再 contains」完全等价)。修前先 `keys().collect()` 成 Vec 再
         // `Vec::contains` 线性扫描,规则数 N 时全量同步是 O(N²)。
+        let mut to_start: Vec<(u64, ProxySpec)> = Vec::new();
         for (id, spec) in &new_proxies {
             if cur.contains_key(id) {
                 continue;
@@ -1311,30 +1326,46 @@ async fn apply_sync(
             let mut spec = spec.clone();
             spec.normalize_kind_configs();
             cur.insert(*id, spec.clone());
-            start_health(sess, *id, &spec).await;
+            to_start.push((*id, spec));
         }
+        (to_stop, to_start)
+    }; // ← proxies 写锁在这里释放
+    for id in to_stop {
+        stop_proxy(sess, id).await;
     }
-    // visitors
-    {
+    for (id, spec) in to_start {
+        start_health(sess, id, &spec).await;
+    }
+    // visitors:同上,锁内只收集。
+    let (to_stop, to_start) = {
         let mut cur = sess.visitors.lock().await;
         let old: Vec<(u64, VisitorSpec)> = cur.drain().collect();
+        let mut to_stop: Vec<u64> = Vec::new();
         for (id, old_spec) in old {
             match new_visitors.get(&id) {
                 Some(new) if *new == old_spec => {
                     cur.insert(id, old_spec);
                 }
-                _ => stop_visitor(sess, id).await,
+                _ => to_stop.push(id),
             }
         }
         // 同上:直接查 `cur`,去掉 O(N²) 的 Vec + contains。
+        let mut to_start: Vec<(u64, VisitorSpec)> = Vec::new();
         for (id, spec) in &new_visitors {
             if cur.contains_key(id) {
                 continue;
             }
             let spec = spec.clone();
             cur.insert(*id, spec.clone());
-            crate::visitor_run::start(sess.clone(), *id, spec).await;
+            to_start.push((*id, spec));
         }
+        (to_stop, to_start)
+    }; // ← visitors 写锁在这里释放
+    for id in to_stop {
+        stop_visitor(sess, id).await;
+    }
+    for (id, spec) in to_start {
+        crate::visitor_run::start(sess.clone(), id, spec).await;
     }
     info!(revision, "sync applied");
 }
@@ -2823,5 +2854,144 @@ mod apply_sync_bench {
         );
         // 只作记录,不做阈值断言(CI 机器噪声大);断言仅防"改后明显更慢"
         assert!(med_new <= med_old * 2, "改后不应比改前慢(允许噪声)");
+    }
+}
+
+#[cfg(test)]
+mod apply_sync_lock_tests {
+    //! #6 回归:`apply_sync` 不得持 `proxies` 写锁跨越 await。
+    //!
+    //! 修前 `stop_proxy` / `start_health` 都在写锁内 await(两者都取
+    //! `health_cancels` 锁)。全量 ServiceSync 是客户端每次重连必走的路,
+    //! 期间 `open_data_channel` 的 `sess.proxies.lock().await.get(&proxy_id)`
+    //! 全被挡住 —— 表现为「重连后首批连接建立慢」。
+    use super::*;
+    use rh_protocol::message::SyncEntity;
+
+    async fn test_session() -> Arc<ClientSession> {
+        let (tx, _rx) = mpsc::channel::<bytes::Bytes>(256);
+        Arc::new(ClientSession {
+            cfg: Arc::new(ClientConfig::default()),
+            session_id: "s".into(),
+            heartbeat_s: 30,
+            send_tx: tx,
+            cancel: CancellationToken::new(),
+            proxies: Mutex::new(HashMap::new()),
+            visitors: Mutex::new(HashMap::new()),
+            visitor_cancels: Mutex::new(HashMap::new()),
+            health_cancels: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            punched: Mutex::new(HashMap::new()),
+            nat_socks: Mutex::new(HashMap::new()),
+            punched_auth: Mutex::new(HashMap::new()),
+            sudp_deliver: Mutex::new(HashMap::new()),
+            mux: rh_transport::mux::wrap_stream_as_client(
+                Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
+                true,
+                100,
+            ),
+            conn_counter: AtomicU64::new(0),
+        })
+    }
+
+    fn proxy_spec(id: u64, name: &str) -> ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": name,
+            "kind": "tcp",
+            "client_id": "c",
+            "bind_ip": "127.0.0.1",
+            "bind_port": 24700 + id as u16,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": true,
+        }))
+        .unwrap()
+    }
+
+    fn entity(id: u64, name: &str) -> SyncEntity {
+        SyncEntity::Proxy(Box::new(proxy_spec(id, name)))
+    }
+
+    /// apply_sync 期间,读者必须能持续拿到 `proxies` 锁。
+    ///
+    /// ★关于这条测试的能力边界(如实记录):它**抓不住**"锁跨 await"
+    /// 这个缺陷本身。实测新旧实现的最长等待都在 5~7ms,差异被
+    /// `tokio::spawn` 的调度抖动淹没 —— 因为 `stop_proxy`/`start_health`
+    /// 内部的 await 点(取 `health_cancels` 锁、spawn)本身只有微秒级,
+    /// 真正的代价是"持锁期间**其它路径**被挡住",在单测里没有那个
+    /// 并发压力源(生产中是 `open_data_channel` 的读锁 + 真实建连延迟)。
+    ///
+    /// 因此这里只保留为**功能性回归**:apply_sync 期间读锁始终可用、
+    /// 不会死锁。锁纪律本身由源码结构保证(锁内只做纯内存收集,
+    /// 见 `apply_sync` 里的 `to_stop`/`to_start` 拆分),不靠这条测试。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxies_lock_available_during_apply_sync() {
+        let sess = test_session().await;
+        let n = 3000u64;
+        let entities: Vec<SyncEntity> = (1..=n).map(|i| entity(i, &format!("p{i}"))).collect();
+
+        let sync = {
+            let sess = sess.clone();
+            tokio::spawn(async move {
+                apply_sync(&sess, 1, entities).await;
+            })
+        };
+
+        let reader = {
+            let sess = sess.clone();
+            tokio::spawn(async move {
+                let mut worst = Duration::ZERO;
+                for _ in 0..500 {
+                    let t0 = std::time::Instant::now();
+                    let g = sess.proxies.lock().await;
+                    let waited = t0.elapsed();
+                    drop(g);
+                    worst = worst.max(waited);
+                    tokio::task::yield_now().await;
+                }
+                worst
+            })
+        };
+
+        sync.await.unwrap();
+        let worst = reader.await.unwrap();
+        assert!(
+            worst < Duration::from_millis(200),
+            "apply_sync 期间读锁最长等待 {worst:?} —— 不得死锁或长期独占"
+        );
+    }
+
+    /// 语义不变:新增的规则进表,消失的规则被移除,未变的保留。
+    #[tokio::test]
+    async fn full_sync_replaces_entity_set() {
+        let sess = test_session().await;
+        // 先放两条(1、2)
+        apply_sync(&sess, 1, vec![entity(1, "keep"), entity(2, "drop")]).await;
+        assert_eq!(sess.proxies.lock().await.len(), 2);
+
+        // 全量替换成 1(不变) + 3(新增)
+        apply_sync(&sess, 2, vec![entity(1, "keep"), entity(3, "new")]).await;
+        let cur = sess.proxies.lock().await;
+        let mut ids: Vec<u64> = cur.keys().copied().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 3], "全量同步必须精确替换实体集");
+        assert_eq!(cur.get(&1).unwrap().name, "keep", "未变的规则必须保留");
+    }
+
+    /// 停止路径也要正确:被移除的规则,其 health 取消器必须被 cancel。
+    #[tokio::test]
+    async fn removed_proxy_health_cancelled() {
+        let sess = test_session().await;
+        apply_sync(&sess, 1, vec![entity(1, "a")]).await;
+        // 手动登记一个取消器(模拟 start_health 起过健康检查)
+        let tok = CancellationToken::new();
+        sess.health_cancels.lock().await.insert(1, tok.clone());
+        assert!(!tok.is_cancelled());
+
+        apply_sync(&sess, 2, vec![]).await;
+        assert!(tok.is_cancelled(), "被移除的规则必须 cancel 其健康检查");
+        assert!(sess.health_cancels.lock().await.get(&1).is_none());
+        assert!(sess.proxies.lock().await.is_empty());
     }
 }
