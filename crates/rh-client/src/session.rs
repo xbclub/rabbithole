@@ -1537,11 +1537,20 @@ async fn start_health(sess: &Arc<ClientSession>, id: u64, spec: &ProxySpec) {
     let Some(hc) = spec.health_check.clone() else {
         return;
     };
-    if sess.health_cancels.lock().await.contains_key(&id) {
-        return;
-    }
-    let c = CancellationToken::new();
-    sess.health_cancels.lock().await.insert(id, c.clone());
+    // 单次 entry() 完成「查重 + 插入」,不再 contains_key 再 insert 两次加锁。
+    //
+    // 修前两次加锁之间存在 TOCTOU 窗口(当前调用方都在单线程路径上,实际
+    // 无竞态),但多取一次锁本身是白费,且这个形态容易被后来者当成
+    // "可以并发调用"的依据。entry 是原子的:已存在则直接返回,不重复 spawn。
+    let c = {
+        let mut g = sess.health_cancels.lock().await;
+        match g.entry(id) {
+            std::collections::hash_map::Entry::Occupied(_) => return,
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(CancellationToken::new()).clone()
+            }
+        }
+    };
     let s2 = sess.clone();
     let spec = spec.clone();
     tokio::spawn(async move {
