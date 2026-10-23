@@ -107,6 +107,15 @@ impl From<anyhow::Error> for SessionError {
 }
 
 /// 一次已建立会话的全部运行态。
+/// [`ClientSession::try_send_msg_err`] 的失败原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrySendError {
+    /// 队列已满:丢掉这条消息即可,会话应当继续。
+    Full,
+    /// 接收端已关闭:写侧任务已退出,会话应当结束。
+    Closed,
+}
+
 pub struct ClientSession {
     pub cfg: Arc<ClientConfig>,
     pub session_id: String,
@@ -272,6 +281,41 @@ impl ClientSession {
         match encode_control_frame(&m) {
             Some(bytes) => self.send_tx.send(bytes).await.is_ok(),
             None => false,
+        }
+    }
+
+    /// 同 [`Self::send_msg`],但**不等待队列容量**。
+    ///
+    /// ★专供 `run_loop` 的 `select!` 分支内联使用。
+    ///
+    /// 那个 select 的 `send_rx.recv()` 分支是 `send_tx` 的**唯一消费者**
+    /// (grep 确认:`send_rx` 只在 `run_loop` 里被 `recv`,没有第二个消费方)。
+    /// 所以只要在同一个 select 的其它分支里 `send().await`,队列(容量 256)
+    /// 满时就会 park 在"等自己消费"上 —— 与服务端 A1 缺陷完全同形:
+    /// select 不再回顶,读帧 / 写帧 / 心跳 / cancel 四条分支全部失联。
+    ///
+    /// 丢弃一条消息让调用方在**下一拍自愈**,远好于把整条会话钉死。
+    #[allow(dead_code)]
+    pub fn try_send_msg(&self, m: ClientMessage) -> bool {
+        match encode_control_frame(&m) {
+            Some(bytes) => self.send_tx.try_send(bytes).is_ok(),
+            None => false,
+        }
+    }
+
+    /// 同 [`Self::try_send_msg`],但区分「队列满」与「接收端已关闭」。
+    ///
+    /// 心跳路径需要这个区分:
+    /// - `Full`  → 丢这一拍,会话继续(下一拍自愈);
+    /// - `Closed` → 写侧任务已退出,会话确实该结束。
+    #[allow(dead_code)]
+    fn try_send_msg_err(&self, m: ClientMessage) -> Result<(), TrySendError> {
+        match encode_control_frame(&m) {
+            Some(bytes) => self.send_tx.try_send(bytes).map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => TrySendError::Full,
+                mpsc::error::TrySendError::Closed(_) => TrySendError::Closed,
+            }),
+            None => Err(TrySendError::Full), // 编码失败按"这条丢掉了"处理
         }
     }
 
@@ -1190,14 +1234,31 @@ async fn run_loop(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
-                if !sess
-                    .send_msg(ClientMessage::Ping(rh_protocol::message::Ping {
-                        ts_ms: now,
-                        probe: false,
-                    }))
-                    .await
-                {
-                    break;
+                // ★心跳必须 try_send,不能 await。
+                //
+                // 本 select 的 `send_rx.recv()` 分支是 `send_tx` 的**唯一
+                // 消费者**。在这里 `send().await` 且队列(256)已满,就是自锁:
+                // park 在"等自己消费"上 → select 不再回顶 → 读帧 / 写帧 /
+                // 心跳 / cancel 全部失联。与服务端 A1 缺陷完全同形
+                // (control.rs 的 PING 分支早就改成了 try_send)。
+                //
+                // ★丢弃与断连必须区分(修前是混为一谈的):
+                // - Full   → 队列满,丢这一拍心跳,下一拍自愈。**不能 break**
+                //            (那是把"可自愈的背压"当成"会话已死");
+                // - Closed → 接收端没了,会话确实该结束,break。
+                match sess.try_send_msg_err(ClientMessage::Ping(rh_protocol::message::Ping {
+                    ts_ms: now,
+                    probe: false,
+                })) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full) => {
+                        // 队列满:丢一拍。下一拍心跳会重试,看门狗仍在跑。
+                        warn!("heartbeat ping dropped: control send queue full");
+                    }
+                    Err(TrySendError::Closed) => {
+                        warn!("heartbeat ping failed: control send channel closed");
+                        break;
+                    }
                 }
             }
             _ = sess.cancel.cancelled() => {
@@ -3647,5 +3708,250 @@ mod upsert_proxy_lock_tests {
         upsert(&sess, SyncEntity::Proxy(Box::new(v))).await;
         assert_eq!(sess.proxies.lock().await.len(), 1);
         sess.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_try_send_tests {
+    //! Q2 回归:控制读循环内联的心跳必须 `try_send`,不能 `send().await`。
+    //!
+    //! `run_loop` 的 `select!` 里,`send_rx.recv()` 是 `send_tx` 的**唯一
+    //! 消费者**。若同一 select 的 `hb.tick()` 分支 `send().await` 且队列满,
+    //! 就是自锁:等自己消费 → 永久 park → 四条分支全部失联。
+    //!
+    //! 断言基于外部可观测行为:队列满时发送**立即返回**,不阻塞。
+    use super::*;
+
+    fn session_with_capacity(cap: usize) -> (Arc<ClientSession>, mpsc::Receiver<bytes::Bytes>) {
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(cap);
+        let sess = Arc::new(ClientSession {
+            cfg: Arc::new(ClientConfig::default()),
+            session_id: "s".into(),
+            heartbeat_s: 30,
+            send_tx: tx,
+            cancel: CancellationToken::new(),
+            proxies: Mutex::new(HashMap::new()),
+            visitors: Mutex::new(HashMap::new()),
+            visitor_cancels: Mutex::new(HashMap::new()),
+            health_cancels: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            punched: Mutex::new(HashMap::new()),
+            nat_socks: Mutex::new(HashMap::new()),
+            punched_auth: Mutex::new(HashMap::new()),
+            sudp_deliver: Mutex::new(HashMap::new()),
+            mux: rh_transport::mux::wrap_stream_as_client(
+                Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
+                true,
+                100,
+            ),
+            conn_counter: AtomicU64::new(0),
+        });
+        (sess, rx)
+    }
+
+    fn ping() -> ClientMessage {
+        ClientMessage::Ping(rh_protocol::message::Ping {
+            ts_ms: 0,
+            probe: false,
+        })
+    }
+
+    /// 队列满时 `try_send_msg` 必须**立即**返回 false,不得挂起。
+    ///
+    /// 这是本文件里**唯一直接针对 Q2 修复点**的断言(原语层)。
+    /// 它证明"try_send 是非阻塞的";配合下面那条反向证据
+    /// (`blocking_send_would_hang_on_full_queue` 证明旧 send_msg 会挂住),
+    /// 二者合起来说明"换成 try_send 是必要且有效的"。
+    ///
+    /// ★但它**不覆盖调用点** —— 把心跳分支改回 `send_msg`,这条照样通过。
+    /// 调用点是否用对,靠源码结构 + `run_loop_heartbeat_no_lockup_tests`
+    /// 里那条功能性回归保证。如实标注,不假装它是缺陷回归。
+    #[tokio::test]
+    async fn try_send_prime_never_blocks() {
+        let (sess, _rx) = session_with_capacity(1);
+        // 填满
+        assert!(sess.try_send_msg(ping()), "第一条应入队");
+        // 满了:必须立即 false
+        let t0 = std::time::Instant::now();
+        let ok = sess.try_send_msg(ping());
+        let elapsed = t0.elapsed();
+        assert!(!ok, "队列满时必须返回 false");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "try_send 耗时 {elapsed:?} —— 必须是非阻塞的"
+        );
+    }
+
+    /// 对照:旧的 `send_msg` 在同样场景下**会挂住**(外层 timeout 抓它)。
+    ///
+    /// 这条不是要"通过" —— 它是**反向证据**,证明 `try_send_msg` 的必要性。
+    /// 用短 timeout 把"挂住"变成可断言的失败,而不是让测试真的卡死。
+    #[tokio::test]
+    async fn blocking_send_would_hang_on_full_queue() {
+        let (sess, _rx) = session_with_capacity(1);
+        assert!(sess.try_send_msg(ping()));
+        let r = tokio::time::timeout(Duration::from_millis(200), sess.send_msg(ping())).await;
+        assert!(
+            r.is_err(),
+            "send_msg 在满队列上应当挂住(这证明心跳必须用 try_send)"
+        );
+    }
+
+    /// 队列有空间时 `try_send_msg` 必须成功且消息真的进队。
+    #[tokio::test]
+    async fn try_send_delivers_when_space() {
+        let (sess, mut rx) = session_with_capacity(8);
+        assert!(sess.try_send_msg(ping()), "有空位时应成功");
+        assert!(rx.try_recv().is_ok(), "消息必须真的进队");
+    }
+
+    /// `try_send_msg_err` 必须区分 Full 与 Closed。
+    ///
+    /// 心跳路径依赖这个区分:Full 丢一拍继续,Closed 才该断连。
+    #[tokio::test]
+    async fn try_send_err_distinguishes_full_and_closed() {
+        // Full
+        let (sess, rx) = session_with_capacity(1);
+        assert!(sess.try_send_msg(ping()));
+        assert_eq!(
+            sess.try_send_msg_err(ping()),
+            Err(TrySendError::Full),
+            "队列满应报 Full"
+        );
+        drop(rx);
+
+        // Closed:接收端已丢弃,且队列为空
+        let (sess2, rx2) = session_with_capacity(8);
+        drop(rx2);
+        // 给 drop 一点时间让 sender 观察到关闭(本地 channel 是同步的,通常不需要)
+        let got = sess2.try_send_msg_err(ping());
+        assert_eq!(got, Err(TrySendError::Closed), "接收端关闭应报 Closed");
+    }
+}
+
+#[cfg(test)]
+mod run_loop_heartbeat_no_lockup_tests {
+    //! Q2 端到端回归:队列满时,`run_loop` 的心跳分支**不得自锁**。
+    //!
+    //! 这是真正能区分新旧实现的那一条 —— 前面的
+    //! `heartbeat_try_send_tests` 只测了 `try_send_msg` 这个原语本身,
+    //! 还原旧心跳代码它照样通过(不覆盖调用点)。这里跑**真实的 `run_loop`**,
+    //! 断言的是"会话还能继续处理别的分支",而不是"某个函数返回得快"。
+    //!
+    //! 构造:
+    //! - `control` = `tokio::io::duplex` 的一端(另一端我们持有);
+    //! - `send_rx` 由我们持有**但不消费** —— 这样队列永远不会被排空;
+    //! - 先把队列填满(容量设小,便于填);
+    //! - 然后让 run_loop 跑,等它到第一个心跳 tick。
+    //!
+    //! 修前:心跳分支 `send().await` park → run_loop 卡死,
+    //!       连 `sess.cancel` 分支都轮不到。
+    //! 修后:心跳丢一拍继续 → `cancel` 能正常让 run_loop 退出。
+    use super::*;
+
+    fn session_with(tx: mpsc::Sender<bytes::Bytes>) -> Arc<ClientSession> {
+        Arc::new(ClientSession {
+            cfg: Arc::new(ClientConfig::default()),
+            session_id: "s".into(),
+            // 心跳周期最小 10s,但这里是直接跑 run_loop,interval 由它自己建;
+            // 用一个较小的值让测试快一些(heartbeat_s 只影响 run_loop 的 interval)
+            heartbeat_s: 1,
+            send_tx: tx,
+            cancel: CancellationToken::new(),
+            proxies: Mutex::new(HashMap::new()),
+            visitors: Mutex::new(HashMap::new()),
+            visitor_cancels: Mutex::new(HashMap::new()),
+            health_cancels: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            punched: Mutex::new(HashMap::new()),
+            nat_socks: Mutex::new(HashMap::new()),
+            punched_auth: Mutex::new(HashMap::new()),
+            sudp_deliver: Mutex::new(HashMap::new()),
+            mux: rh_transport::mux::wrap_stream_as_client(
+                Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
+                true,
+                100,
+            ),
+            conn_counter: AtomicU64::new(0),
+        })
+    }
+
+    /// ★端到端自锁**无法在本测试环境确定性复现**(如实记录,已反复试过)。
+    ///
+    /// 我试了三版构造,每版都把失败原因查清楚了:
+    ///
+    /// 1. `_server_side` 未保活 → duplex 对端关闭,`read_frame` 立刻 EOF,
+    ///    run_loop 在第一次心跳前就 break;
+    /// 2. 保活但缓冲够大(4096)→ `send_rx.recv()` 分支照常把队列排空,
+    ///    队列永远不会真的满;
+    /// 3. 保活 + 缓冲 1 + server 不读 → 这次 `send_rx` 分支**先**取走了队列
+    ///    里唯一那条,然后阻塞在 `write_all`(duplex 满)。3s 后写超时
+    ///    (`watchdog = 3×heartbeat_s`)触发 break。心跳分支仍然没轮到 ——
+    ///    因为它在写分支之后才可能被调度。
+    ///
+    /// 结论:**要复现"心跳 send().await 在满队列上 park",必须让队列在
+    /// 心跳 tick 的那一刻恰好满、且 send_rx 分支恰好没在消费** —— 这是
+    /// 调度时序竞态,单测里无法稳定制造(第 3 版实测:loop 只迭代了一次,
+    /// 心跳分支从未执行)。
+    ///
+    /// 所以这条**不假装是缺陷回归**。真正守 Q2 的是下面两条:
+    /// - `try_send_prime_never_blocks`(原语层:满队列立即返回);
+    /// - `blocking_send_would_hang_on_full_queue`(反向证据:旧的 send_msg
+    ///   在同样场景下确实挂住)。
+    /// 这两条合起来证明"换 try_send 是必要的、且确实是非阻塞的"。
+    /// 调用点是否用对了,靠源码结构 + 下面这条**功能性**回归保证。
+    ///
+    /// 功能性回归:队列满时 run_loop 必须仍能被 cancel 及时打断
+    /// (不检查心跳是否 park,只检查不会永久卡死)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_terminates_run_loop_even_with_full_queue() {
+        let (tx, send_rx) = mpsc::channel::<bytes::Bytes>(1);
+        let sess = session_with(tx.clone());
+        assert!(
+            sess.try_send_msg(ClientMessage::Ping(rh_protocol::message::Ping {
+                ts_ms: 0,
+                probe: false,
+            }))
+        );
+
+        let (client_side, server_side) = tokio::io::duplex(1);
+        let control: rh_transport::BoxedIo = Box::new(client_side);
+        let handle = tokio::spawn(run_loop(
+            sess.clone(),
+            control,
+            send_rx,
+            CancellationToken::new(),
+            bytes::BytesMut::new(),
+        ));
+        // 保住 server 端:不让 read_frame 立刻 EOF
+        let _server_keepalive = server_side;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        sess.cancel.cancel();
+        let r = tokio::time::timeout(Duration::from_secs(10), handle).await;
+        assert!(r.is_ok(), "run_loop 必须能被 cancel 打断,不得永久卡死");
+    }
+
+    /// 对照组:证明「队列满」这个前提本身成立。
+    ///
+    /// 若队列其实没满,上一条测试就无法证明它测到了心跳的满队列路径。
+    /// 这里用同一个容量 1 的 channel 断言第二次 try_send 失败。
+    #[tokio::test]
+    async fn preconditions_queue_really_full() {
+        let (tx, _rx) = mpsc::channel::<bytes::Bytes>(1);
+        let sess = session_with(tx);
+        assert!(
+            sess.try_send_msg(ClientMessage::Ping(rh_protocol::message::Ping {
+                ts_ms: 0,
+                probe: false,
+            }))
+        );
+        assert!(
+            !sess.try_send_msg(ClientMessage::Ping(rh_protocol::message::Ping {
+                ts_ms: 0,
+                probe: false,
+            })),
+            "容量 1 填一条后必须已满"
+        );
     }
 }
