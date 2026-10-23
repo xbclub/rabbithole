@@ -259,7 +259,8 @@ pub async fn spawn_runtime(
 
     if !spec.enabled || !enabled_client {
         rt.set_state(ProxyState::Disabled, "disabled").await;
-        state.proxies.rebuild_vhost_routes().await;
+        // 走合并窗口:批量禁用 N 条规则时,这里是 O(N²) 的主要来源之一。
+        state.proxies.schedule_vhost_rebuild();
         return rt;
     }
 
@@ -333,7 +334,7 @@ pub async fn spawn_runtime(
             rt.set_state(ProxyState::Offline, "created").await;
         }
     }
-    state.proxies.rebuild_vhost_routes().await;
+    state.proxies.schedule_vhost_rebuild();
     // 入队增量(在线时;bind_error 也入队,恢复绑定后按 confirmed 直达 running)
     if let Some(sess) = session {
         rt.latest_revision.store(revision, Ordering::Relaxed);
@@ -507,7 +508,9 @@ pub async fn teardown_runtime(state: &Arc<AppState>, proxy_id: u64) {
             sess.invalidate_proxy_requests(proxy_id).await;
         }
     }
-    state.proxies.rebuild_vhost_routes().await;
+    // 走合并窗口:`delete_client` / `update_client` 禁用分支 /
+    // `batch_services` 都是「循环内 teardown N 次」,这里每次重建就是 O(N²)。
+    state.proxies.schedule_vhost_rebuild();
 }
 
 pub async fn notify_client_recovery(state: &Arc<AppState>, client_id: &str) {
@@ -586,6 +589,7 @@ pub async fn publish_spec_in_place(
             rt.set_state(ProxyState::Pending, "updated").await;
         }
     }
-    state.proxies.rebuild_vhost_routes().await;
+    // 走合并窗口(单条更新也要重建,但同样可能落在批量路径里)。
+    state.proxies.schedule_vhost_rebuild();
     true
 }

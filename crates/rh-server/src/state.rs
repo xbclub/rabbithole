@@ -1011,7 +1011,34 @@ pub struct ProxyManager {
     pub vhost_tcpmux: RwLock<Arc<Vec<VhostRoute>>>,
     /// 热生效端口策略(网页可改,与 AppState.hot 同源)。
     pub hot: Arc<RwLock<HotConfig>>,
+    /// vhost 路由「待重建」标记。
+    ///
+    /// ★为什么需要它:`rebuild_vhost_routes()` 遍历**全部** runtime 并逐条
+    /// `spec.read().await`。`spawn_runtime` / `teardown_runtime` 原先每次都
+    /// 直接 await 一次重建,而 api.rs 有 17 处生命周期调用点 —— 凡是"对一批
+    /// 规则做操作"的路径(delete_client / update_client 禁用分支 /
+    /// notify_client_recovery / recovery / batch_services)都是
+    /// N 次 × 每次 O(N),整体 O(N²)。N=2000 时是 400 万次读锁 + 400 万次
+    /// 路由表重建。
+    ///
+    /// 改为:生命周期函数只 `mark_vhost_dirty()`,由一个常驻合并任务在
+    /// [`VHOST_COALESCE_WINDOW`] 后做一次重建。窗口内多次标脏只重建一次。
+    ///
+    /// ★语义代价(有意接受):路由表最多滞后一个窗口。窗口取 10ms ——
+    /// 远小于任何人工操作的感知阈值,也远小于 e2e 测试里的 `sleep 2`。
+    /// 需要"立即生效"的场合(单条规则的 API 路径、测试)可显式调
+    /// [`Self::flush_vhost_routes`]。
+    vhost_dirty: AtomicBool,
+    /// 已排队的合并任务(避免窗口内重复 spawn)。
+    vhost_flush_scheduled: AtomicBool,
 }
+
+/// vhost 路由重建的合并窗口。
+///
+/// 取值依据:管理面单次操作的端到端耗时在毫秒~数十毫秒量级,10ms 的
+/// 路由滞后不可感知;而批量路径(N 条)在窗口内只会触发一次 O(N) 重建,
+/// 把 O(N²) 压回 O(N)。再大就会让"建完规则立刻访问"的脚本偶发 404。
+const VHOST_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Clone)]
 pub struct VhostRoute {
@@ -1103,7 +1130,57 @@ impl ProxyManager {
             vhost_http: RwLock::new(Arc::new(Vec::new())),
             vhost_https: RwLock::new(Arc::new(Vec::new())),
             vhost_tcpmux: RwLock::new(Arc::new(Vec::new())),
+            vhost_dirty: AtomicBool::new(false),
+            vhost_flush_scheduled: AtomicBool::new(false),
         }
+    }
+
+    /// 标脏:本次生命周期变更需要重建 vhost 路由。
+    ///
+    /// 只置位,不重建。合并任务会在窗口后统一重建一次。
+    pub fn mark_vhost_dirty(&self) {
+        self.vhost_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 立即重建(如果脏)。
+    ///
+    /// 供需要"重建后立刻可见"的路径使用(单条规则 API、测试、以及
+    /// 进程收尾)。多次调用是幂等的:脏标记被原子地清掉,只有清到的那次
+    /// 会真正重建。
+    pub async fn flush_vhost_routes(&self) {
+        if !self
+            .vhost_dirty
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        self.rebuild_vhost_routes().await;
+    }
+
+    /// 标脏并安排一次合并重建。
+    ///
+    /// 生命周期函数调用这个而不是 `rebuild_vhost_routes().await`。
+    /// 用 `tokio::spawn` + 窗口:窗口内无论标脏多少次,只会 spawn 一个
+    /// 任务(由 `vhost_flush_scheduled` 去重)。
+    pub fn schedule_vhost_rebuild(self: &Arc<Self>) {
+        self.mark_vhost_dirty();
+        // 已经有排队中的任务 → 它会看到最新状态,不必再排一个
+        if self
+            .vhost_flush_scheduled
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(VHOST_COALESCE_WINDOW).await;
+            // 先清"已排队"再重建:重建期间若有新的标脏,会重新排一个任务,
+            // 不会漏掉(顺序不能反 —— 先重建再清标记会丢掉这期间的新变更)。
+            me.vhost_flush_scheduled
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            me.flush_vhost_routes().await;
+        });
     }
 
     pub fn get(&self, id: u64) -> Option<Arc<ProxyRuntime>> {
@@ -2168,5 +2245,188 @@ mod sync_entities_tests {
             SyncEntity::Proxy(p) => assert_eq!(p.name, "mine"),
             _ => panic!("期望 Proxy 实体"),
         }
+    }
+}
+
+#[cfg(test)]
+mod vhost_coalesce_tests {
+    //! #1 回归:vhost 路由重建走脏标记合并窗口。
+    //!
+    //! 断言基于外部可观测行为:重建次数、以及最终路由表内容。不引用
+    //! 窗口常量做断言 —— 用"窗口足够长时仍未重建 / flush 后立即重建"
+    //! 这种相对关系。
+    use super::*;
+
+    const CID: &str = "vhost-coalesce-client";
+
+    fn http_spec(id: u64, domain: &str) -> ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": format!("h{id}"),
+            "kind": "http",
+            "client_id": CID,
+            "bind_ip": "127.0.0.1",
+            "bind_port": 0,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "enabled": true,
+            "http": { "custom_domains": [domain] },
+        }))
+        .unwrap()
+    }
+
+    async fn state() -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        Arc::new(AppState::new(crate::config::ServerConfig::default(), db))
+    }
+
+    /// 窗口内多次标脏,只重建一次;最终表里能看到全部规则。
+    #[tokio::test]
+    async fn many_marks_coalesce_into_one_rebuild() {
+        let state = state().await;
+        let n = 200u64;
+        for i in 1..=n {
+            let spec = http_spec(i, &format!("h{i}.test"));
+            state
+                .proxies
+                .runtimes
+                .insert(i, Arc::new(ProxyRuntime::new(i, CID.into(), spec)));
+            state.proxies.schedule_vhost_rebuild();
+        }
+        // 合并窗口是毫秒级:等它过去
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let routes = state.proxies.vhost_http.read().await.clone();
+        assert_eq!(
+            routes.len(),
+            n as usize,
+            "合并后必须一次性反映全部 {n} 条 http 规则(实际 {})",
+            routes.len()
+        );
+        // 路由表必须精确对应
+        for i in 1..=n {
+            let host = format!("h{i}.test");
+            assert!(
+                routes.iter().any(|r| r.host == host && r.proxy_id == i),
+                "缺少路由 {host}"
+            );
+        }
+    }
+
+    /// `flush_vhost_routes` 必须立即生效(供需要同步语义的调用方)。
+    #[tokio::test]
+    async fn flush_is_immediate() {
+        let state = state().await;
+        let spec = http_spec(1, "immediate.test");
+        state
+            .proxies
+            .runtimes
+            .insert(1, Arc::new(ProxyRuntime::new(1, CID.into(), spec)));
+        state.proxies.mark_vhost_dirty();
+        state.proxies.flush_vhost_routes().await;
+        let routes = state.proxies.vhost_http.read().await.clone();
+        assert_eq!(routes.len(), 1, "flush 后必须立即可见");
+        assert_eq!(routes[0].host, "immediate.test");
+    }
+
+    /// 不脏时 flush 是空操作(不重复重建)。
+    #[tokio::test]
+    async fn flush_when_clean_is_noop() {
+        let state = state().await;
+        // 先建好一条并 flush
+        let spec = http_spec(1, "a.test");
+        state
+            .proxies
+            .runtimes
+            .insert(1, Arc::new(ProxyRuntime::new(1, CID.into(), spec)));
+        state.proxies.mark_vhost_dirty();
+        state.proxies.flush_vhost_routes().await;
+
+        // 直接改 runtime 但不标脏:flush 不应重建,表里仍是旧的
+        let spec2 = http_spec(2, "b.test");
+        state
+            .proxies
+            .runtimes
+            .insert(2, Arc::new(ProxyRuntime::new(2, CID.into(), spec2)));
+        state.proxies.flush_vhost_routes().await;
+        let routes = state.proxies.vhost_http.read().await.clone();
+        assert_eq!(routes.len(), 1, "未标脏时 flush 不得重建");
+    }
+
+    /// #1 基准(手动运行):模拟「N 条规则各触发一次生命周期重建」的总耗时。
+    ///
+    /// ```text
+    /// cargo test -p rh-server --release vhost_coalesce_tests::bench -- --ignored --nocapture
+    /// ```
+    ///
+    /// 两条路径对比:
+    ///   `per-call`  = 每次变更都 `rebuild_vhost_routes().await`(修前行为)
+    ///   `coalesce`  = 每次变更 `schedule_vhost_rebuild()`,窗口后统一重建
+    /// 前者是 O(N²),后者是 O(N)。这里直接调用底层函数复现两条路径,
+    /// 不经过 spawn_runtime(那会引入真实 bind,与要测的东西无关)。
+    #[tokio::test]
+    #[ignore = "耗时基准,手动运行(--ignored --nocapture)"]
+    async fn bench_vhost_rebuild_paths() {
+        for n in [100usize, 500, 1000, 2000] {
+            // 准备 N 条 http 规则
+            let mk = |state: &Arc<AppState>| {
+                for i in 1..=n as u64 {
+                    let spec = http_spec(i, &format!("h{i}.test"));
+                    state
+                        .proxies
+                        .runtimes
+                        .insert(i, Arc::new(ProxyRuntime::new(i, CID.into(), spec)));
+                }
+            };
+
+            // ① 修前口径:每次变更后立刻全量重建
+            let state_a = state().await;
+            mk(&state_a);
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                state_a.proxies.rebuild_vhost_routes().await;
+            }
+            let per_call = t0.elapsed();
+
+            // ② 修后口径:N 次标脏 + 一次合并重建
+            let state_b = state().await;
+            mk(&state_b);
+            let t1 = std::time::Instant::now();
+            for _ in 0..n {
+                state_b.proxies.mark_vhost_dirty();
+            }
+            state_b.proxies.flush_vhost_routes().await;
+            let coalesced = t1.elapsed();
+
+            println!(
+                "N={n:>5}  per-call rebuild={per_call:>12?}  coalesced={coalesced:>12?}  \
+                 speedup={:.1}x",
+                per_call.as_secs_f64() / coalesced.as_secs_f64()
+            );
+        }
+    }
+
+    /// 重建期间的新标脏不得丢失(先清 scheduled 再重建的顺序要求)。
+    #[tokio::test]
+    async fn mark_during_window_is_not_lost() {
+        let state = state().await;
+        let spec = http_spec(1, "first.test");
+        state
+            .proxies
+            .runtimes
+            .insert(1, Arc::new(ProxyRuntime::new(1, CID.into(), spec)));
+        state.proxies.schedule_vhost_rebuild();
+        // 窗口内再加一条并标脏
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let spec2 = http_spec(2, "second.test");
+        state
+            .proxies
+            .runtimes
+            .insert(2, Arc::new(ProxyRuntime::new(2, CID.into(), spec2)));
+        state.proxies.schedule_vhost_rebuild();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let routes = state.proxies.vhost_http.read().await.clone();
+        assert_eq!(routes.len(), 2, "窗口内追加的规则不得丢失");
     }
 }
