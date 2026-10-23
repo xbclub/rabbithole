@@ -1,7 +1,7 @@
 //! 管理 REST API(axum):vben 契约 + 客户端/规则/visitor/统计/事件/指标。
 
+use crate::config::CONTROL_SEND_TIMEOUT;
 use crate::db::normalize_spec;
-use crate::runtime::CONTROL_SEND_TIMEOUT;
 use crate::state::{AppState, ProxyState};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};

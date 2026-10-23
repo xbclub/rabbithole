@@ -1,7 +1,7 @@
 //! AppState:全局运行态(会话注册表、代理运行时、端口分配、组、vhost 路由)
 //! 与每客户端串行域。
 
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, CONTROL_SEND_TIMEOUT};
 use crate::db::Db;
 use crate::events::EventBus;
 use crate::session::{Session, SessionRegistry};
@@ -12,11 +12,6 @@ use rh_protocol::{
 };
 use rh_transport::BoxedIo;
 
-/// 控制面内联路径的发送上限。
-///
-/// 与 control.rs 的 `CONTROL_REPLY_TIMEOUT` 同量级:正常下发是微秒级,
-/// 卡满 2s 说明对端已不读控制流,继续等只会拖死控制读循环(自锁)。
-const CONTROL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};

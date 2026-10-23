@@ -1,5 +1,6 @@
 //! XTCP 打洞协调:双端 STUN 探测 → 候选交换 → 打洞指令;失败回退中继。
 
+use crate::config::CONTROL_SEND_TIMEOUT;
 use crate::session::Session;
 use crate::state::AppState;
 use rh_protocol::message::{NatHoleConnect, NatHolePrepare, NatHoleReport, ServerMessage};
@@ -10,13 +11,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::info;
 use uuid::Uuid;
-
-/// 控制面内联路径的发送上限(与 state.rs 同名常量同义)。
-///
-/// nathole 的 prepare/connect 由 `handle_client_message` 在**控制读循环里
-/// 内联** await(control.rs),队列满时 `send().await` 会 park 在等自己消费,
-/// 心跳与 cancel 全部失联 —— 与 A1/A2 同族的自锁。
-const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 struct NatSession {

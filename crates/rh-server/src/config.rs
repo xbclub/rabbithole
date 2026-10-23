@@ -357,6 +357,19 @@ impl ServerConfig {
     }
 }
 
+/// 控制面发送上限:超过这个时长仍发不出去,按"对端不读"处理。
+///
+/// 控制消息(ServiceSync / ServiceUpdate / ServiceRemove / Pong / CREATE)
+/// 走的是有界 mpsc 队列。正常下发是微秒级;卡满 2s 说明客户端零窗口黑洞
+/// (NAT 老化、进程挂起、恶意停读),继续等只会把调用方(admin API 请求、
+/// 控制读循环内联路径)一起拖死。
+///
+/// ★为什么定义在这里(而不是各业务模块):`runtime.rs` / `state.rs` /
+/// `nathole.rs` 原本各写了一份同值常量,三处漂移过一次的风险是实打实的。
+/// `config.rs` 不依赖任何业务模块(state/runtime/nathole 都依赖它),
+/// 放在这里不会引入循环依赖 —— 这是选它的唯一理由。
+pub(crate) const CONTROL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(test)]
 mod tests {
     use super::*;
