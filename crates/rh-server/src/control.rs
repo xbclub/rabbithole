@@ -94,7 +94,12 @@ impl ChallengeTable {
             let ChallengeInner { map, order } = &mut *g;
             let before = map.len();
             map.retain(|_, e| e.expires > now);
-            if map.len() != before {
+            // R9:修剪条件补「order 空洞超量」—— consume 只删 map 不删
+            // order,纯成功认证流(挑战全被应答、零过期)下过期清理永远
+            // 零产出,原条件永远为假,consume 空洞无界累积(每条 ~110B;
+            // R6 引入的回归:正常态 map 恒小,满表弹空路径永不触发)。
+            // 上界 = map.len() + 4096 空洞 + 1s 窗口内的 issue 量。
+            if map.len() != before || order.len() > map.len() + 4096 {
                 // 过期清理后同步修剪 order(被清条目的槽位在下次满表
                 // 淘汰时作为空弹跳过,摊还仍 O(1);这里只是尽快回收)
                 order.retain(|n| map.contains_key(n));
@@ -154,7 +159,9 @@ impl ChallengeTable {
                 let before = map.len();
                 map.retain(|_, e| e.expires > now);
                 let removed = before - map.len();
-                if removed > 0 {
+                // R9:同 issue() 的「order 空洞超量」分支(纯成功认证流
+                // 下 removed 恒 0,order 的 consume 空洞只能在这里收)。
+                if removed > 0 || order.len() > map.len() + 4096 {
                     order.retain(|n| map.contains_key(n));
                 }
                 removed
@@ -2511,6 +2518,36 @@ mod unauth_window_tests {
         assert!(
             state.enter_unauth_guard(ip).is_some(),
             "A3:早退路径(读失败/认证失败)必须由 Drop 归还名额"
+        );
+    }
+}
+
+#[cfg(test)]
+mod challenge_order_hole_tests {
+    use super::*;
+
+    /// R9 回归:纯成功认证流(挑战全被 consume、零过期)下,order 的
+    /// consume 空洞必须被「空洞超量」分支收住,不能无界累积。
+    /// 修前条件只看过期产出(`map.len() != before`),map 恒空时永远
+    /// 不修剪 —— 5001 条空洞直接穿透 4096 预算。
+    #[tokio::test]
+    async fn order_holes_stay_bounded_under_all_consume() {
+        let t = ChallengeTable::new();
+        for _ in 0..5000 {
+            let n = t.issue("client-a").await;
+            assert!(t.consume(&n).await.is_some());
+        }
+        // map 已空、零过期条目 → 过期清理分支不可能触发;
+        // 拨回限频计时器(真实等 1s 太慢),下一次 issue 必须走空洞修剪。
+        *t.last_sweep.lock().unwrap() -= Duration::from_secs(2);
+        let _ = t.issue("client-a").await;
+
+        let g = t.inner.lock().await;
+        assert!(
+            g.order.len() <= g.map.len() + 4096 + 1,
+            "order 空洞未收敛: order={} map={}",
+            g.order.len(),
+            g.map.len()
         );
     }
 }
