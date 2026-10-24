@@ -33,6 +33,9 @@
 | [not-supported.md](not-supported.md) | **明确不做**的能力及 frp 源码证据(SOCKS5 BIND 等),防止被反复当成遗漏 |
 | [fixed-plugin-proxy-semantics.md](fixed-plugin-proxy-semantics.md) | `http_proxy` / `socks5` 插件语义重写(已完成并验收) |
 | [deep-review-ffd49d3-remediation-plan.md](deep-review-ffd49d3-remediation-plan.md) | 七路深审 A/B/C 三批修复方案与逐项状态 |
+| [static-audit-2026-10-perf.md](static-audit-2026-10-perf.md) | **2026-10 全量静态审计**(5.5 万行):性能 / 死代码 / 并行串行 / 零拷贝,30 条发现。**已完成**,提交 `b84e7e1`;另有 12 轮后续扫描记在各自提交信息里 |
+| [task-concurrency-serialization.md](task-concurrency-serialization.md) | 任务书:「应并行/异步却串行」12 项。**已完成**,报告见 [concurrency-serialization-fixes.md](concurrency-serialization-fixes.md)。一次性任务书,基线 `1b8bfd6`,勿当现行指令 |
+| [task-fix-report-errors.md](task-fix-report-errors.md) | 任务书:更正上述报告的 2 处事实错误 + 1 处逻辑矛盾 + 1 处遗漏。**已完成**(`3a0d205` / `9a68def`) |
 
 ## 3. 专题:设计与决策
 
