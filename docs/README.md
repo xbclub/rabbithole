@@ -65,6 +65,7 @@
 | [pump-down-loop-gap-shadowing.md](pump-down-loop-gap-shadowing.md) | `pump_down` 变量遮蔽缺陷 | 已修 |
 | [mux-stream-limit-investigation.md](mux-stream-limit-investigation.md) | mux 并发流上限**不该**加到客户端 | 结论:不改 |
 | [single-carrier-bottleneck-summary.md](single-carrier-bottleneck-summary.md) | 单载体/多载体瓶颈实测结论:K 的最优值取决于 BDP,低延迟下 K=1 更快 | 参考 |
+| [../benchmark/README.md](../benchmark/README.md) 的「测量伪影」节 | **压测器自身的坑**:`loadgen sink` 的 `SetReadBuffer(4MiB)` 把单流直连腰斩到 1.6 Gbps,导致「保留率 > 100%」的反物理读数。**读任何单流吞吐结论前必看** | 现役 |
 
 ## 5. 历史:性能攻坚(2026-10-13 ~ 10-15,已被取代)
 
