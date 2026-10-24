@@ -50,8 +50,11 @@ pub async fn recover_all(state: &Arc<AppState>) {
         .filter(|c| c.enabled)
         .map(|c| c.id.clone())
         .collect();
-    // 预取 client 的 config_revision:一次全表,而不是每条规则一次
-    // `get_client`(修前是 N 次额外往返)。
+    // 预取 client 的 config_revision:一次全表,消掉每条规则一次的
+    // revision 半边往返。**enabled 半边没消**:`spawn_runtime` 内部仍对
+    // 每条规则做一次 `get_client` 单行查询(拿 client.enabled)——
+    // 启动期 N 次索引单行 SELECT(文件库合计 ~10-50ms),消除需改
+    // spawn_runtime 的 5+ 处调用点签名,收益不抵风险,在案接受。
     let revisions: std::collections::HashMap<String, u64> = clients
         .iter()
         .map(|c| (c.id.clone(), c.config_revision.max(0) as u64))
