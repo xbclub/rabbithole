@@ -247,10 +247,44 @@ loadgen src ───────►  转发口 20001..  ──隧道──►  
 
 2. **构建在 test1 上做**,不要本地交叉编译 rh:
 
+   > **⚠ 先问一句:被测版本有 Release 吗?**
+   >
+   > 只要被测版本**已经发过版**(`gh release view vX.Y.Z` 能查到),
+   > **直接下载 Release 产物,不要自己编译**:
+   >
+   > ```bash
+   > gh release download vX.Y.Z -R xbclub/rabbithole -D /tmp/rel-vX.Y.Z \
+   >   -p "*x86_64-unknown-linux-musl*"
+   > cd /tmp/rel-vX.Y.Z && shasum -a 256 -c *.sha256 && tar xzf *.tar.gz
+   > ```
+   >
+   > **为什么这是必须的**(2026-10-24 踩过):
+   > - **产物即事实**。用户拿到的是 Release 里那个二进制。自己编译出来的
+   >   即使 commit 相同,也可能因工具链/feature/依赖解析差异而不同 ——
+   >   测出来的数字不能代表用户实际跑的东西。
+   > - **能省一次构建**。`cargo build` 两套版本约 8-10 分钟,Release 下载
+   >   只要几秒,且带 `.sha256` 可校验完整性。
+   > - **省掉一类坑**。自己编译要 `sed` 关 `strip`、要处理 worktree、
+   >   要小心"版本号对得上但 commit 不对"(本次实测:test1 上那个
+   >   自报 `0.5.1` 的二进制其实是 `9fcce2f`,不是 v0.5.1 的 `a5d4276`)。
+   >   Release 产物由流水线从 tag 构建,产物与 commit 天然绑定。
+   >
+   > **只在下面两种情况下才自己编译**:
+   > - 被测的是**未发版的提交**(修完想立刻验证,还没打标签);
+   > - 需要**改代码做对照实验**(如临时关掉某个优化)。
+   >   这时才走下面的构建流程,并且要在结果里注明"非 Release 产物"。
+
+   构建流程(仅用于未发版的提交):
+
    ```bash
    cd /tmp/rh-bench && sed -i 's/^strip = true/strip = false/' Cargo.toml
    ~/.cargo/bin/cargo build --release -p rh-server -p rh-client   # 约 4-5 分钟
    ```
+
+   **`--version` 只能证明版本号,不能证明 commit**。要测某个 tag,用
+   `git worktree add /tmp/rh-vX.Y.Z vX.Y.Z` 检出该 tag 再构建,不要依赖
+   工作区当前状态(本次踩过:工作区在 `9fcce2f`,自报 `0.5.1`,与
+   `v0.5.1` 的 `a5d4276` 不是同一个东西)。
 
    编译产物放 `/tmp/rh-bin/`。**注意硬链接**:`/tmp/rh-bin/rh-server` 可能是
    多个历史版本的硬链接(count>1),`cp` 覆盖会改到同一 inode。换版本要先
@@ -389,5 +423,8 @@ loadgen 只有单向发送,B 侧 sink 读空;`download` 档实际与 `upload` �
   (CPU 采样、端点实况、nofile、无效样本留痕),事后无法复核。
 - 不要用 tar 传 rh 源码或 rh 二进制到测试机 —— 走 git,保证结果可绑定 commit。
   (loadgen 这类压测工具是例外,见流程第 1 步。)
+- **被测版本已发版时,不要自己 `cargo build`** —— 直接 `gh release download`
+  拉产物。产物即用户实际拿到的东西,且与 commit 天然绑定。详见流程第 2 步
+  的⚠ 框。
 - 不要在 `PROTO`/`RELAY`/`MUX` 不一致的两端之间比较结果。
 - 不要只跑一遍就下结论,也不要拿单向样本冒充双向。
