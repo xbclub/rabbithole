@@ -2167,8 +2167,11 @@ async fn stats_overview(State(state): State<Arc<AppState>>, headers: HeaderMap) 
     }
     // R1:COUNT 查询(修前全表取回 + 逐行 spec JSON 反序列化只为 .len();
     // 这是仪表盘轮询端点,管理面频率最高)。
-    let clients_total = state.db.count_clients().await.unwrap_or(0);
-    let services_total = state.db.count_proxies().await.unwrap_or(0);
+    // R7:两个 COUNT 无依赖,join! 并行(与 build_sync_entities 同型)。
+    let (clients_total, services_total) =
+        tokio::join!(state.db.count_clients(), state.db.count_proxies());
+    let clients_total = clients_total.unwrap_or(0);
+    let services_total = services_total.unwrap_or(0);
     let running = state
         .proxies
         .runtimes

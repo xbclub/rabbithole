@@ -195,6 +195,9 @@ pub struct ClientUsage {
     /// flow_limit 的原子缓存(配额写入时同步):数据面每块字节都要读,
     /// 避免 RwLock 热读;与 quota RwLock 由 set_quota 写侧保持一致。
     flow_limit_cache: AtomicI64,
+    /// max_conns 的原子缓存(同款理由):每连接准入路径读,修前为拿这
+    /// 两个标量整份 clone ClientQuota(含 rate_limit String 分配)。
+    max_conns_cache: AtomicI64,
     /// 服务端侧客户端级限速桶(随 rate_limit 重建)。
     pub rate_bucket: std::sync::RwLock<Option<Arc<rh_core::TokenBucket>>>,
 }
@@ -207,12 +210,25 @@ impl Default for ClientUsage {
             flow_cut: AtomicBool::new(false),
             quota: std::sync::RwLock::new(ClientQuota::default()),
             flow_limit_cache: AtomicI64::new(0),
+            max_conns_cache: AtomicI64::new(0),
             rate_bucket: std::sync::RwLock::new(None),
         }
     }
 }
 
 impl ClientUsage {
+    /// 原子缓存的流量上限(0 = 不限;与 quota 写侧由 set_quota 同步)。
+    pub fn flow_limit(&self) -> i64 {
+        self.flow_limit_cache
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 原子缓存的并发上限(0 = 不限)。
+    pub fn max_conns(&self) -> i64 {
+        self.max_conns_cache
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// 应用新配额;rate_limit 变化时重建限速桶。
     pub fn set_quota(&self, q: ClientQuota) {
         let mut cur = self.quota.write().unwrap();
@@ -235,6 +251,8 @@ impl ClientUsage {
         }
         self.flow_limit_cache
             .store(q.flow_limit, std::sync::atomic::Ordering::Relaxed);
+        self.max_conns_cache
+            .store(q.max_conns, std::sync::atomic::Ordering::Relaxed);
         *cur = q;
     }
 
@@ -942,6 +960,11 @@ pub struct ProxyRuntime {
     /// 全仓无 `remove_label_values`,IntGaugeVec 子项按 proxy_id 无界累积,
     /// 长跑 + 频繁建删规则时内存与 /metrics 输出持续增长(teardown 已回收)。
     pub metrics_label: String,
+    /// R7:所属客户端的用量条目缓存(OnceLock 惰性填充,不改 new() 签名)。
+    /// client_id 规则生命周期内不变;配额更新经 set_quota 原地改同一对象,
+    /// 缓存 Arc 不会读到旧值。修前每条 TCP 连接(vhost HTTP 为每请求)
+    /// 在准入/计量/限速三处各付一次 uuid `to_string` + DashMap entry。
+    usage_cache: std::sync::OnceLock<Arc<ClientUsage>>,
 }
 
 impl ProxyRuntime {
@@ -972,7 +995,15 @@ impl ProxyRuntime {
             pool: Mutex::new(None),
             udp_new_channel_tx: Mutex::new(None),
             metrics_label: id.to_string(),
+            usage_cache: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 取本规则所属客户端的用量条目(首次访问后缓存 Arc)。
+    pub fn usage(&self, state: &AppState) -> Arc<ClientUsage> {
+        self.usage_cache
+            .get_or_init(|| state.client_usage(&self.client_id))
+            .clone()
     }
 
     pub async fn set_state(&self, s: ProxyState, reason: &str) {

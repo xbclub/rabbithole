@@ -368,13 +368,6 @@ impl SessionRegistry {
         self.publish_online();
     }
 
-    /// 在线客户端 id 列表(控制台/诊断用)。C2 之后数据面不再走全表扫描,
-    /// 保留为观测接口。
-    #[allow(dead_code)]
-    pub fn online_clients(&self) -> Vec<String> {
-        self.map.iter().map(|e| e.key().clone()).collect()
-    }
-
     pub fn count_online(&self) -> usize {
         self.map.len()
     }

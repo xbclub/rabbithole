@@ -368,7 +368,7 @@ pub async fn assign_forward(
         None
     };
     // F2 客户端级限速(服务端侧,与规则级限速叠加)
-    let client_bucket = state.client_usage(&rt.client_id).bucket();
+    let client_bucket = rt.usage(state).bucket();
     // Y1 零拷贝 mux 中继:通道为 RhMuxStream(mux 模式常态;B1 修复后
     // QuotaIo/PrependedIo 壳已在上方剥开)时,数据以 Bytes 引用直达
     // 帧体/内核,消除两次中间拷贝。计量经 CountedUserIo 透明进行;
@@ -843,7 +843,7 @@ async fn splice_forward(
     let metrics_dn = state.metrics.clone();
     let rt_up = rt.clone();
     let rt_dn = rt.clone();
-    let usage_up = state.client_usage(&rt.client_id);
+    let usage_up = rt.usage(&state);
     let usage_dn = usage_up.clone();
     let usage_cut = usage_up.clone();
 
@@ -892,7 +892,7 @@ struct CountState {
 
 impl CountState {
     fn new(state: &AppState, proxy: Option<Arc<crate::state::ProxyRuntime>>) -> Self {
-        let usage = proxy.as_ref().map(|rt| state.client_usage(&rt.client_id));
+        let usage = proxy.as_ref().map(|rt| rt.usage(state));
         Self {
             metrics: state.metrics.clone(),
             proxy,
@@ -1331,17 +1331,18 @@ pub fn try_open_user_conn(
     state: &AppState,
     proxy: Option<&Arc<crate::state::ProxyRuntime>>,
 ) -> Option<ConnGuard> {
-    let usage = proxy.map(|rt| state.client_usage(&rt.client_id));
+    // R7:usage 经 ProxyRuntime 缓存;max_conns/flow_limit 走原子缓存
+    //(修前为两个标量整份 clone ClientQuota,rate_limit String 随之分配)。
+    let usage = proxy.map(|rt| rt.usage(state));
     if let Some(u) = &usage {
-        let q = u.quota.read().unwrap().clone();
+        let max = u.max_conns();
         // ★max_conns 用 CAS 闭环,不能 load 判完再 fetch_add。
         //
         // 修前是典型的 check-then-act:`load() >= max` 与随后的 `fetch_add`
         // 之间没有原子性,并发准入可同时看到未达上限、一起加,实际并发突破
         // max_conns(溢出量 = 并发度)。配额是硬闸,必须精确。
         // 用 `fetch_update`:在原子读-改-写里完成"判上限 + 自增"。
-        if q.max_conns > 0 {
-            let max = q.max_conns;
+        if max > 0 {
             let admitted = u
                 .conns
                 .fetch_update(
@@ -1359,9 +1360,8 @@ pub fn try_open_user_conn(
         }
         // 流量上限仍是"读快照"语义:bytes 是单调累计,超限即在下一块被切断,
         // 这里只做早退优化,不承担精确性(精确拦截在 add_bytes 置 flow_cut)。
-        if q.flow_limit > 0
-            && u.bytes.load(std::sync::atomic::Ordering::Relaxed) >= q.flow_limit as u64
-        {
+        let limit = u.flow_limit();
+        if limit > 0 && u.bytes.load(std::sync::atomic::Ordering::Relaxed) >= limit as u64 {
             // 回滚上面已经加的 conns
             u.conns.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return None;
@@ -1641,8 +1641,8 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
     let mut gc = tokio::time::interval(Duration::from_secs(15));
     // B1:客户端用量条目提到循环外一次获取(规则生命周期内 client_id
     // 不变)。修前每包 2-3 次 `client_usage(&id)` —— `entry(id.to_string())`
-    // 命中时也先构造 String,再 clone 一次 Arc。
-    let usage = state.client_usage(&rt.client_id);
+    // 命中时也先构造 String,再 clone 一次 Arc。R7 起走 ProxyRuntime 缓存。
+    let usage = rt.usage(&state);
     loop {
         // 等待第一条/重建通道
         let stream = tokio::select! {

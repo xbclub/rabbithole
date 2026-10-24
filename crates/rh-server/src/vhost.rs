@@ -959,7 +959,11 @@ async fn peek_sni(sock: &TcpStream) -> anyhow::Result<Option<String>> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut read = 0;
     loop {
-        let n = match sock.peek(&mut buf[read..]).await {
+        // peek 永远从接收队列**起始**拷贝(不消费),所以必须整只 buf 接:
+        // 修前 `&mut buf[read..]` 在 ClientHello 跨段到达时把流的**开头**
+        // 写进 buf[read..],累计缓冲错位,parse_sni 读到的是错位数据,
+        // SNI 解析失败 → serve_https 静默断连。
+        let n = match sock.peek(&mut buf).await {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if tokio::time::Instant::now() >= deadline {
