@@ -506,17 +506,12 @@ async fn handle_http_request(
             parts.headers.insert(hyper::header::HOST, v);
         }
     }
-    for h in &route.request_headers.set {
-        if let Ok(v) = hyper::header::HeaderValue::from_str(&h.value) {
-            if let Ok(n) = hyper::header::HeaderName::from_bytes(h.name.as_bytes()) {
-                parts.headers.insert(n, v);
-            }
-        }
+    // N9:预解析规则(route_from 构建时),免每请求 HeaderName/Value 解析
+    for (n, v) in &route.request_headers_set {
+        parts.headers.insert(n.clone(), v.clone());
     }
-    for d in &route.request_headers.del {
-        if let Ok(n) = hyper::header::HeaderName::from_bytes(d.as_bytes()) {
-            parts.headers.remove(n);
-        }
+    for n in &route.request_headers_del {
+        parts.headers.remove(n);
     }
     // X-Forwarded-For / X-Real-IP(HTTP 真实来源)
     if let Ok(v) = hyper::header::HeaderValue::from_str(&peer.ip().to_string()) {
@@ -619,17 +614,11 @@ async fn handle_http_request(
         .map(|b| b.boxed());
     // 响应头改写
     let (mut parts, body) = resp.into_parts();
-    for h in &route.response_headers.set {
-        if let Ok(v) = hyper::header::HeaderValue::from_str(&h.value) {
-            if let Ok(n) = hyper::header::HeaderName::from_bytes(h.name.as_bytes()) {
-                parts.headers.insert(n, v);
-            }
-        }
+    for (n, v) in &route.response_headers_set {
+        parts.headers.insert(n.clone(), v.clone());
     }
-    for d in &route.response_headers.del {
-        if let Ok(n) = hyper::header::HeaderName::from_bytes(d.as_bytes()) {
-            parts.headers.remove(n);
-        }
+    for n in &route.response_headers_del {
+        parts.headers.remove(n);
     }
     // ★归还:把 sender 挂到响应体上,等 body 真正读完再放回池。
     // 不能在函数返回时归还 —— 此时响应体还没被客户端读走,连接上仍挂着
@@ -677,9 +666,12 @@ fn ext_cached(path: &str, extensions: &[String]) -> bool {
     if path[dot..].contains('/') {
         return false;
     }
-    let ext = path[dot + 1..].to_lowercase();
-    // 白名单已在 route_from 构建时预规范化(R4),此处直接比较
-    extensions.iter().any(|e| e == &ext)
+    let ext = &path[dot + 1..];
+    // 白名单已在 route_from 构建时预规范化(R4),此处直接比较;
+    // N9:eq_ignore_ascii_case 免每请求 to_lowercase 分配
+    extensions
+        .iter()
+        .any(|e| e.as_str().eq_ignore_ascii_case(ext))
 }
 
 fn not_found_response(state: &Arc<AppState>) -> hyper::Response<BoxBody> {

@@ -247,7 +247,9 @@ async fn change_password(
         .pwd_version_epoch
         .fetch_add(1, std::sync::atomic::Ordering::Release);
     // 轮换会话密钥:旧令牌(含本请求所用)全部失效
-    *state.web_jwt_secret.lock().await = Some(uuid::Uuid::new_v4().simple().to_string());
+    *state.web_jwt_secret.lock().await = Some(std::sync::Arc::new(
+        uuid::Uuid::new_v4().simple().to_string(),
+    ));
     state
         .events
         .emit("info", "auth", &format!("密码已修改:{}", user))
@@ -299,7 +301,8 @@ async fn mint_jwt(
 }
 
 impl AppState {
-    pub async fn jwt_secret(&self) -> String {
+    pub async fn jwt_secret(&self) -> std::sync::Arc<String> {
+        // N19:Arc 引用计数替代整串 clone
         self.web_jwt_secret.lock().await.clone().unwrap_or_default()
     }
 }

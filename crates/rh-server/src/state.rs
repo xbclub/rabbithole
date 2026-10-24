@@ -45,7 +45,9 @@ pub struct AppState {
     /// C7:登录限速第二级 —— 每 IP+用户名。
     pub login_limiter_user: Arc<governor::DefaultKeyedRateLimiter<String>>,
     /// JWT 密钥(启动时定;空则启动生成随机值)。
-    pub web_jwt_secret: Arc<Mutex<Option<String>>>,
+    /// N19:按 Arc<String> 持有 —— require_auth 每请求都要取一次,
+    /// 修前整串 clone(随机 32 字节 secret 的一次堆分配)。
+    pub web_jwt_secret: Arc<Mutex<Option<std::sync::Arc<String>>>>,
     /// 每 IP 认证中并发连接数(控制面未认证窗口)。
     unauth_conns: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
     /// 热生效配置子集(网页可管:端口策略/日志级别/SSH 网关)。
@@ -430,7 +432,7 @@ impl AppState {
             login_limiter_user: Arc::new(governor::RateLimiter::keyed(
                 governor::Quota::per_minute(std::num::NonZeroU32::new(5).unwrap()),
             )),
-            web_jwt_secret: Arc::new(Mutex::new(Some(jwt_secret))),
+            web_jwt_secret: Arc::new(Mutex::new(Some(std::sync::Arc::new(jwt_secret)))),
             unauth_conns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             visitor_cache: dashmap::DashMap::new(),
             pwd_version_cache: dashmap::DashMap::new(),
@@ -1145,8 +1147,13 @@ pub struct VhostRoute {
     pub http_user: String,
     pub http_password: String,
     pub host_rewrite: String,
-    pub request_headers: rh_protocol::HeaderOp,
-    pub response_headers: rh_protocol::HeaderOp,
+    /// N9:头改写规则构建时预解析(修前每请求每条规则
+    /// `HeaderName::from_bytes` / `HeaderValue::from_str` 逐次分配+校验;
+    /// 解析失败的条目构建时丢弃,与修前每请求静默跳过等价)。
+    pub request_headers_set: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
+    pub request_headers_del: Vec<hyper::header::HeaderName>,
+    pub response_headers_set: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
+    pub response_headers_del: Vec<hyper::header::HeaderName>,
     pub proxy_id: u64,
     /// M2:域名命中但路径未命中 locations 时的自定义 404。
     pub not_found_html: String,
@@ -1518,8 +1525,10 @@ impl ProxyManager {
                             http_user: String::new(),
                             http_password: String::new(),
                             host_rewrite: String::new(),
-                            request_headers: Default::default(),
-                            response_headers: Default::default(),
+                            request_headers_set: Vec::new(),
+                            request_headers_del: Vec::new(),
+                            response_headers_set: Vec::new(),
+                            response_headers_del: Vec::new(),
                             proxy_id: rt.id,
                             not_found_html: String::new(),
                             cache: None,
@@ -1532,8 +1541,10 @@ impl ProxyManager {
                             http_user: String::new(),
                             http_password: String::new(),
                             host_rewrite: String::new(),
-                            request_headers: Default::default(),
-                            response_headers: Default::default(),
+                            request_headers_set: Vec::new(),
+                            request_headers_del: Vec::new(),
+                            response_headers_set: Vec::new(),
+                            response_headers_del: Vec::new(),
                             proxy_id: rt.id,
                             not_found_html: String::new(),
                             cache: None,
@@ -1549,8 +1560,10 @@ impl ProxyManager {
                             http_user: c.http_user.clone(),
                             http_password: c.http_password.clone(),
                             host_rewrite: String::new(),
-                            request_headers: Default::default(),
-                            response_headers: Default::default(),
+                            request_headers_set: Vec::new(),
+                            request_headers_del: Vec::new(),
+                            response_headers_set: Vec::new(),
+                            response_headers_del: Vec::new(),
                             proxy_id: rt.id,
                             not_found_html: String::new(),
                             cache: None,
@@ -1578,6 +1591,30 @@ impl ProxyManager {
     }
 }
 
+/// N9:HeaderOp 的 set 规则预解析(构建一次;解析失败条目丢弃,
+/// 与修前每请求 `if let Ok` 静默跳过语义一致)。
+fn parse_header_set(
+    op: &rh_protocol::HeaderOp,
+) -> Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> {
+    op.set
+        .iter()
+        .filter_map(|h| {
+            Some((
+                hyper::header::HeaderName::from_bytes(h.name.as_bytes()).ok()?,
+                hyper::header::HeaderValue::from_str(&h.value).ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// N9:HeaderOp 的 del 规则预解析。
+fn parse_header_del(op: &rh_protocol::HeaderOp) -> Vec<hyper::header::HeaderName> {
+    op.del
+        .iter()
+        .filter_map(|d| hyper::header::HeaderName::from_bytes(d.as_bytes()).ok())
+        .collect()
+}
+
 fn route_from(
     _spec: &ProxySpec,
     rt: &ProxyRuntime,
@@ -1593,8 +1630,10 @@ fn route_from(
         http_user: c.http_user.clone(),
         http_password: c.http_password.clone(),
         host_rewrite: c.host_rewrite.clone(),
-        request_headers: c.request_headers.clone(),
-        response_headers: c.response_headers.clone(),
+        request_headers_set: parse_header_set(&c.request_headers),
+        request_headers_del: parse_header_del(&c.request_headers),
+        response_headers_set: parse_header_set(&c.response_headers),
+        response_headers_del: parse_header_del(&c.response_headers),
         proxy_id: rt.id,
         not_found_html: c.not_found_html.clone(),
         cache: c.cache.clone().map(|mut cc| {

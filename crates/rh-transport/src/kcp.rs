@@ -998,35 +998,32 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
         // snd_queue,前端 256KiB 限额形同虚设,未 ACK 也可持续 accept。
         let mut user_wrote = false;
         {
+            // N6:锁内只做队列切分与记账,kcp.send(段化 + memcpy,单轮
+            // 循环可到数十段)移到锁外 —— 修前整个搬运持 OS 级互斥锁,
+            // 期间 KcpIo::poll_read/poll_write(yamux 收发任务)在同一把
+            // 锁上自旋。本任务是 kcp 的唯一喂入方(全仓唯一 send 调用点),
+            // 站立上界预算在锁内按进入时 wait_snd() 一次算定、逐片扣减,
+            // 与修前「每片 send 后重读 wait_snd」的算术等价:
+            // piece_len ≤ 余量×mss ⇒ 该片段数 ≤ 余量。
             let mut s = shared.guarded.lock().unwrap();
-            loop {
-                let headroom = MAX_KCP_PENDING_SEGS.checked_sub(kcp.wait_snd());
-                let Some(headroom) = headroom else {
-                    break;
-                };
-                // 余量为 0 必须直接停:任何喂入都会越过站立上界
-                if headroom == 0 {
-                    break;
-                }
+            let mut budget = MAX_KCP_PENDING_SEGS.saturating_sub(kcp.wait_snd());
+            let mut pieces: std::collections::VecDeque<Vec<u8>> = Default::default();
+            while budget > 0 {
                 let Some(front) = s.write_queue.front_mut() else {
                     break;
                 };
                 // 单次喂入 ≤ 余量×mss(≥mss,不产生微片),使
                 // wait_snd ≤ MAX_KCP_PENDING_SEGS 精确成立
-                let piece_len = front
-                    .len()
-                    .min(SEND_PIECE)
-                    .min(headroom.saturating_mul(mss));
+                let piece_len = front.len().min(SEND_PIECE).min(budget.saturating_mul(mss));
                 let tail = front.split_off(piece_len);
                 let piece = std::mem::replace(front, tail);
                 s.write_bytes = s.write_bytes.saturating_sub(piece_len);
                 if s.write_queue.front().is_some_and(|f| f.is_empty()) {
                     s.write_queue.pop_front();
                 }
-                if let Err(e) = kcp.send(&piece) {
-                    error = Some(format!("kcp send: {e}"));
-                    break;
-                }
+                // 该片将占用的段数(整 mss 切段、末段取余),从预算扣减
+                budget -= piece_len.div_ceil(mss);
+                pieces.push_back(piece);
                 user_wrote = true;
             }
             // 仅在真正腾出前端容量时唤醒等待写者:无条件唤醒会与
@@ -1034,6 +1031,13 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
             // 运行时永不空闲,暂停时钟不再推进、CPU 空转)。
             if user_wrote {
                 s.wake_write();
+            }
+            drop(s);
+            for piece in pieces {
+                if let Err(e) = kcp.send(&piece) {
+                    error = Some(format!("kcp send: {e}"));
+                    break;
+                }
             }
         }
         if error.is_some() {

@@ -17,27 +17,35 @@
 | N12 | 新增 `ProxyRuntime::state_kind()`;on_apply_result 不再为拿枚举 clone reason String |
 | N16 | visitor 用户侧 accept 补 TCP keepalive(socket2,60s 空闲起探;C10 整改当时只做了 nodelay 半边,注释却声称两者都开) |
 
+## 二批落地(同日,「能安全处理的」复评后)
+
+| 项 | 内容 |
+|---|---|
+| N6 | KCP `run_session` 搬运改锁内切分、锁外 `kcp.send`(唯一喂入方,站立上界预算逐片扣减,算术与修前等价) |
+| N9a | VhostRoute 头改写规则构建时预解析(`HeaderName/HeaderValue` 免每请求解析,四处应用点改预解析表) |
+| N9b | `ext_cached` 改 `eq_ignore_ascii_case`(免每请求 `to_lowercase` 分配) |
+| N14 | `RH_QUIC_CC` env 读 OnceLock 化(Endpoint 复用半边仍留档) |
+| N19 | web_jwt_secret 改 `Arc<String>`(require_auth 每请求整串 clone → 引用计数) |
+
 ## 留档缓修(需要基准或重设计,勿当遗漏反复重提)
 
 - **N3 客户端 UDP 上行每包 1 分配 + 2 拷贝**(`udpchan.rs`,`udp_packet::encode` 新 Vec → writer 再拷进 batch)。
   B-1 只修了服务端半边。根治需 Pending 携带已成帧 `Bytes` + writer 走 writev/chunk 路径
   (mux 载体可复用 `steal_mux_halves` 零拷贝),属 udpchan 写侧重设计,**必须配三机 UDP 基准**。
-- **N6 KCP `run_session` 持 std Mutex 做整个 write_queue→kcp 搬运**(`kcp.rs` run_session 内联段,
-  单次持锁 ≤256KiB memcpy)。锁内 `mem::take`、锁外 `kcp.send` 的重构动到
-  `MAX_KCP_PENDING_SEGS` 站立上界不变量(注释明确「精确成立」),需 KCP 协议三机基准验证后再动。
-- **N9 vhost 每请求常数分配簇**(path.to_string / HeaderName 逐请求解析 / basic-auth format! /
-  ext to_lowercase)。单项常数级,合计每请求 5-10 次小分配;先量化(直连 vs vhost 差距)再决定。
+- **N9 残余**:path.to_string(缓存键固有)、basic-auth 每请求 format!(仅配了认证的路由,µs 级)。
+  预解析与 ext 免分配已在二批落地。
+- ~~N6~~ 二批已修。
 - **N10 udpchan mux 载体下 `tokio::io::split` 同步锁**:锁内纯内存操作,量级远小于服务端 splice
   路径当年实测的 futex;与 N3 一起修最划算。
 - **N11 KCP 读路径逐字节多次 memcpy**(`read_buf` VecDeque):改 BytesMut 让 `kcp.recv` 直写,
   收益需 KCP 基准证明。
 - **N13 KCP drain 任务空闲 500ms 唤醒**:4096 会话 = 8192 唤醒/s;改法是生产者存活时不 arm sleep,
   属唤醒合并优化,基准观测到 CPU 占比再动。
-- **N14 quic::connect 每次新建 Endpoint + env 未缓存**:quic 非默认协议,低频;顺手项。
+- **N14 残余**:quic Endpoint 按 bind 族复用 —— 改变 socket 生命周期,quic 非默认协议,留档。
 - **N15 mux 泵预取 future 被 drop 时,已弹出缓冲绕过池释放**:稀释池命中率,非泄漏;
   修法(取消安全归还)复杂度高于收益。
-- **N17/N18/N19**(CONNECT head 拷贝 / 静态文件元数据 syscall / require_auth JWT secret clone):
-  低频或纳秒级,维持不动。
+- **N17/N18**(CONNECT head 拷贝 / 静态文件元数据 syscall):低频或纳秒级,维持不动。
+  (N19 已在二批落地。)
 - **服务端 UDP 泵单任务双向**(任一方向写阻塞拖停另一方向):B-1 当时已注明「写任务拆分单独评估」,
   仍开放,拆分时需基准验证半队列语义。
 

@@ -47,8 +47,11 @@ fn transport_config(keepalive: bool, max_streams: usize) -> quinn::TransportConf
     if keepalive {
         tc.keep_alive_interval(Some(QUIC_KEEPALIVE));
     }
-    // RH_QUIC_CC=bbr 时换 BBR 拥塞控制(默认 cubic;C1/C3 实验用)
-    if std::env::var("RH_QUIC_CC").as_deref() == Ok("bbr") {
+    // RH_QUIC_CC=bbr 时换 BBR 拥塞控制(默认 cubic;C1/C3 实验用)。
+    // N14:OnceLock 化 —— 修前每次 connect 读一次 env(分配 + 全局锁),
+    // 而该值进程内恒定。
+    static QUIC_CC_BBR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *QUIC_CC_BBR.get_or_init(|| std::env::var("RH_QUIC_CC").as_deref() == Ok("bbr")) {
         tc.congestion_controller_factory(std::sync::Arc::new(
             quinn::congestion::BbrConfig::default(),
         ));
