@@ -71,6 +71,10 @@ pub struct Session {
     /// 这里做 1s 最小间隔 —— 正常客户端只在收到未知 revision 时才请求,
     /// 秒级足够。
     pub last_sync_request: Mutex<Option<Instant>>,
+    /// N7:ApplyResult(!ok) 触发的全量 SYNC 重发限速(1s;与
+    /// last_sync_request 同款)。修前每个失败 ACK 都全量重建实体
+    /// + 全量序列化,N 条规则全失败 = O(N²) 压力,内联控制读循环。
+    pub last_failed_resync: Mutex<Option<Instant>>,
     /// 会话内单调 request_id。
     next_request_id: AtomicU64,
     /// 在途数据通道请求(request_id → 记录)。
@@ -105,6 +109,7 @@ impl Session {
             queue_tx,
             applied_revision: AtomicU64::new(0),
             last_sync_request: Mutex::new(None),
+            last_failed_resync: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             pending_requests: Mutex::new(BTreeMap::new()),
             started_at: Instant::now(),

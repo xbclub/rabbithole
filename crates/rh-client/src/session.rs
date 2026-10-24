@@ -129,7 +129,10 @@ pub struct ClientSession {
     pub send_tx: mpsc::Sender<bytes::Bytes>,
     pub cancel: CancellationToken,
     // 实体表
-    pub proxies: Mutex<HashMap<u64, ProxySpec>>,
+    /// N5:按 Arc 持有 —— open_data_channel 每条数据通道(TCP 池逐连接
+    /// 签发 CREATE)都要 get().cloned(),修前在 proxies 锁的 guard 内
+    /// 深克隆整份 ProxySpec(≈15+ 次分配)并拉长临界区。
+    pub proxies: Mutex<HashMap<u64, std::sync::Arc<ProxySpec>>>,
     pub visitors: Mutex<HashMap<u64, VisitorSpec>>,
     /// visitor 监听任务取消器。
     pub visitor_cancels: Mutex<HashMap<u64, CancellationToken>>,
@@ -1475,11 +1478,11 @@ async fn apply_sync(
     // 锁获取顺序不变(仍是 proxies → health_cancels),只是不再嵌套持有。
     let (to_stop, to_start) = {
         let mut cur = sess.proxies.lock().await;
-        let old: Vec<(u64, ProxySpec)> = cur.drain().collect();
+        let old: Vec<(u64, std::sync::Arc<ProxySpec>)> = cur.drain().collect();
         let mut to_stop: Vec<u64> = Vec::new();
         for (id, old_spec) in old {
             match new_proxies.get(&id) {
-                Some(new) if *new == old_spec => {
+                Some(new) if *new == *old_spec => {
                     cur.insert(id, old_spec);
                 }
                 _ => to_stop.push(id),
@@ -1488,13 +1491,14 @@ async fn apply_sync(
         // 直接查 `cur` 本身(此刻它刚被重填完,语义与「先收集 existing
         // 再 contains」完全等价)。修前先 `keys().collect()` 成 Vec 再
         // `Vec::contains` 线性扫描,规则数 N 时全量同步是 O(N²)。
-        let mut to_start: Vec<(u64, ProxySpec)> = Vec::new();
+        let mut to_start: Vec<(u64, std::sync::Arc<ProxySpec>)> = Vec::new();
         for (id, spec) in &new_proxies {
             if cur.contains_key(id) {
                 continue;
             }
             let mut spec = spec.clone();
             spec.normalize_kind_configs();
+            let spec = std::sync::Arc::new(spec);
             cur.insert(*id, spec.clone());
             to_start.push((*id, spec));
         }
@@ -1568,14 +1572,14 @@ async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) 
             // 再 insert 新 spec」,表内容一致。
             let to_start = {
                 let mut cur = sess.proxies.lock().await;
-                let changed = cur.get(&p.id).map(|o| *o != *p).unwrap_or(true);
+                let changed = cur.get(&p.id).map(|o| **o != *p).unwrap_or(true);
                 if !changed {
                     None
                 } else {
                     cur.remove(&p.id);
                     let mut p2 = (*p).clone();
                     p2.normalize_kind_configs();
-                    cur.insert(p2.id, p2.clone());
+                    cur.insert(p2.id, std::sync::Arc::new(p2.clone()));
                     Some(p2)
                 }
             }; // ← proxies 写锁在这里释放
@@ -1717,6 +1721,8 @@ async fn open_data_channel(sess: Arc<ClientSession>, m: CreateDataChannel) -> an
     .map_err(|e| anyhow::anyhow!("hello write: {e}"))?;
     match m.entity {
         ChannelEntity::Proxy { proxy_id } => {
+            // N5:实体表按 Arc 持有 —— 修前每条数据通道在锁 guard 内
+            // 深克隆整份 ProxySpec(≈15+ 次分配)。
             let spec = sess.proxies.lock().await.get(&proxy_id).cloned();
             let Some(spec) = spec else {
                 anyhow::bail!("unknown proxy {proxy_id}");
@@ -3670,11 +3676,17 @@ mod upsert_proxy_lock_tests {
         {
             let mut m = sess.proxies.lock().await;
             for i in 1000..1300u64 {
-                m.insert(i, proxy_with_health(i, 20000 + i as u16 % 1000));
+                m.insert(
+                    i,
+                    std::sync::Arc::new(proxy_with_health(i, 20000 + i as u16 % 1000)),
+                );
             }
         }
         let target = proxy_with_health(1, 24100);
-        sess.proxies.lock().await.insert(1, target.clone());
+        sess.proxies
+            .lock()
+            .await
+            .insert(1, std::sync::Arc::new(target.clone()));
 
         let up = {
             let sess = sess.clone();

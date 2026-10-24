@@ -336,6 +336,56 @@ impl AsyncWrite for KcpIo {
         self.shared.notify.notify_one();
         Poll::Ready(Ok(accept))
     }
+    /// N1(B-2 的 kcp 半边):向量写透传。修前落到 tokio 默认实现——
+    /// 只写第一个非空 slice,YamuxCarrier 的批量写(poll_writev,
+    /// ≤33 段)在 kcp 载体上整批退化:每段一次同步锁 + to_vec 分配
+    /// (12B 帧头也分配)+ notify,批聚合完全失效。与 WsIo 的 B-2
+    /// 修复对齐:多段拼成单条队列项,一次锁、一次分配、一次拷贝。
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let total: usize = bufs.iter().map(|b| b.len()).sum();
+        if total == 0 {
+            return Poll::Ready(Ok(0));
+        }
+        let mut s = self.shared.guarded.lock().unwrap();
+        if let Some(e) = s.error.clone() {
+            return Poll::Ready(Err(other_err(e)));
+        }
+        if s.closed {
+            return Poll::Ready(Err(other_err("kcp session closed")));
+        }
+        if s.closing || s.write_closed {
+            return Poll::Ready(Err(other_err("kcp session shutting down")));
+        }
+        if s.write_queue.len() >= MAX_WRITE_QUEUE || s.write_bytes >= MAX_WRITE_QUEUE_BYTES {
+            s.write_waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        let accept = total.min(MAX_WRITE_QUEUE_BYTES - s.write_bytes);
+        let mut combined = Vec::with_capacity(accept);
+        for b in bufs {
+            let remain = accept - combined.len();
+            if remain == 0 {
+                break;
+            }
+            let take = b.len().min(remain);
+            combined.extend_from_slice(&b[..take]);
+        }
+        s.write_bytes += accept;
+        s.write_seq += 1;
+        s.write_queue.push_back(combined);
+        // 与 poll_write 同因:入队即唤醒会话任务,不等 2ms tick
+        self.shared.notify.notify_one();
+        Poll::Ready(Ok(accept))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        // 多段拼成单条队列项,能力位如实上报
+        true
+    }
     /// flush 契约:成功返回 = 此前全部已接受写都已交给 kcp 输出
     /// (write_queue 排空且会话完成了一轮 flush)。修复前无条件
     /// Ready 是契约缺口(tokio AsyncWrite flush 成功隐含写出完成)。

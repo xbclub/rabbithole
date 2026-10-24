@@ -308,9 +308,9 @@ async fn serve_direct(
 }
 
 fn find_by_name(
-    proxies: &std::collections::HashMap<u64, ProxySpec>,
+    proxies: &std::collections::HashMap<u64, std::sync::Arc<ProxySpec>>,
     name: &str,
-) -> Option<ProxySpec> {
+) -> Option<std::sync::Arc<ProxySpec>> {
     proxies.values().find(|p| p.name == name).cloned()
 }
 

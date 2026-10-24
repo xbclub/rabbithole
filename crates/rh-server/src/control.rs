@@ -957,7 +957,20 @@ async fn run_session_loop(
                 match out {
                     Some(msg) => {
                         let payload = serde_json::to_vec(&msg)?;
-                        if write_frame(&mut stream, frame_type_of(&msg), &payload).await.is_err() {
+                        // N8:写臂有界超时。A1/A3 修的是队列侧背压,这里是
+                        // socket 写侧 —— 对端零窗口时该 await 内联挂起,
+                        // select 不再回顶,心跳/取消/队列消费全部失联,
+                        // 只能等 90s 死链检测兜底。超时视同链路死亡。
+                        let res = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            write_frame(&mut stream, frame_type_of(&msg), &payload),
+                        )
+                        .await
+                        .unwrap_or(Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "control write arm stalled 2s",
+                        )));
+                        if res.is_err() {
                             break Err(anyhow::anyhow!("control write failed"));
                         }
                     }

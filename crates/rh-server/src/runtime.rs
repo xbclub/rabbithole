@@ -124,6 +124,19 @@ pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &App
             }
         }
         sess.confirm_applied(r.revision, false).await;
+        // N7:全量重发限速(1s;与 SyncRequest 分支的 last_sync_request
+        // 同款)。修前每个失败 ACK 都全量重建实体 + 全量序列化,N 条
+        // 规则全失败 = O(N²) 序列化压力,内联在读循环里。
+        {
+            let mut last = sess.last_failed_resync.lock().await;
+            let now = std::time::Instant::now();
+            if let Some(prev) = *last {
+                if now.duration_since(prev) < std::time::Duration::from_secs(1) {
+                    return;
+                }
+            }
+            *last = Some(now);
+        }
         // 全量重发。
         //
         // ★try_send:本函数由控制读循环**内联** await(control.rs:966),
@@ -171,7 +184,9 @@ pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &App
     for rt in rts {
         rt.confirmed_revision.store(r.revision, Ordering::Relaxed);
         let latest = rt.latest_revision.load(Ordering::Relaxed);
-        let (st, _) = rt.snapshot_state().await;
+        // N12:state_kind() 只取枚举(snapshot_state 连带 clone reason
+        // String,本循环每 ACK × 每规则都在付)。
+        let st = rt.state_kind().await;
         let confirmed_enough = r.revision >= latest;
         let bound = rt.bound.load(Ordering::Relaxed);
         let new_state = match st {
@@ -182,14 +197,19 @@ pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &App
         if new_state != st {
             rt.set_state(new_state, "applied").await;
             if new_state == ProxyState::Running {
+                rt.mark_warm_session(sess);
                 let spec = rt.spec.read().await.clone();
                 warm_proxy(state, sess, &rt, &spec).await;
             }
         } else if st == ProxyState::Running {
-            // 已 running 的补充预热(如重连后);池满时 tcp_refill 为
-            // 无签发 no-op,重复调用的代价只是取一次池锁。
-            let spec = rt.spec.read().await.clone();
-            warm_proxy(state, sess, &rt, &spec).await;
+            // 已 running 的补充预热(重连后);N4:按会话实例去重 ——
+            // 客户端对每条 ServiceUpdate 各回一个 ACK,修前每个 ACK 都
+            // 深克隆 spec + warm_proxy,批量 N 条 = O(N²) 次克隆+预热。
+            // 池满时 tcp_refill 为无签发 no-op,但 spec 深克隆省不掉。
+            if rt.mark_warm_session(sess) {
+                let spec = rt.spec.read().await.clone();
+                warm_proxy(state, sess, &rt, &spec).await;
+            }
         }
     }
 }

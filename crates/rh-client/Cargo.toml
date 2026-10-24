@@ -17,6 +17,7 @@ rh-core = { workspace = true }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+socket2 = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

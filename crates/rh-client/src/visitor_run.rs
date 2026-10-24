@@ -86,7 +86,15 @@ async fn run_tcp(
                 // C10:用户侧连接必须关闭 Nagle 并开启 keepalive。
                 // 修前 visitor 用户侧是全仓唯一不设这两个选项的 accept 路径,
                 // stcp/xtcp 的小包交互会被 Nagle 合并出额外 RTT。
+                // N16:keepalive 半边当时只写进了注释、代码漏了 —— 用户
+                // 对端静默消失(拔线/NAT 回收)时 relay 双泵永挂,keepalive
+                // 让 OS 探测死链并出错,泵才收得了场。60s 空闲起探。
                 let _ = conn.set_nodelay(true);
+                // tokio TcpStream 无 keepalive API,走 socket2(与
+                // rh-transport 的 SockRef 用法一致);60s 空闲起探
+                let sref = socket2::SockRef::from(&conn);
+                let _ = sref.set_tcp_keepalive(&socket2::TcpKeepalive::new()
+                    .with_time(std::time::Duration::from_secs(60)));
                 let s2 = sess.clone();
                 let sp = spec.clone();
                 let vid = visitor_id;

@@ -111,7 +111,7 @@ where
 /// 代理侧:通道 ↔ 本地目标 UDP。按用户源地址各开一个本地 socket,
 /// 回写任务经唯一写任务写帧;主循环读帧 + 探活。
 /// 每 60s 清理 60s 无活动的用户会话(源端口轮换的客户端会持续产生新条目)。
-pub async fn run_proxy_side(channel: BoxedIo, spec: ProxySpec, prefix: Vec<u8>) {
+pub async fn run_proxy_side(channel: BoxedIo, spec: std::sync::Arc<ProxySpec>, prefix: Vec<u8>) {
     // ★目标解析支持**域名**(经 TTL 缓存,与 TCP 路径同一入口)。
     //
     // 修前只 `parse::<SocketAddr>()` —— 域名直接失败,而且只打 `debug`

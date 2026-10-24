@@ -965,6 +965,11 @@ pub struct ProxyRuntime {
     /// 缓存 Arc 不会读到旧值。修前每条 TCP 连接(vhost HTTP 为每请求)
     /// 在准入/计量/限速三处各付一次 uuid `to_string` + DashMap entry。
     usage_cache: std::sync::OnceLock<Arc<ClientUsage>>,
+    /// N4:最近一次对 Running 规则做过补充预热的会话实例(session_id)。
+    /// 客户端对每条 ServiceUpdate 各回一个 ApplyResult,修前每个 ACK
+    /// 都无条件深克隆 spec + warm_proxy —— 批量改 N 条 = O(N²) 次克隆
+    /// + 预热,全部内联在控制读循环里。预热本只需"会话(重连)后一次"。
+    warm_session: std::sync::Mutex<Option<String>>,
 }
 
 impl ProxyRuntime {
@@ -996,7 +1001,19 @@ impl ProxyRuntime {
             udp_new_channel_tx: Mutex::new(None),
             metrics_label: id.to_string(),
             usage_cache: std::sync::OnceLock::new(),
+            warm_session: std::sync::Mutex::new(None),
         }
+    }
+
+    /// N4:记录并去重"该会话实例已预热过本规则"。返回 false =
+    /// 同一会话已预热过(跳过);true = 本次是首次(或重连后首次)。
+    pub fn mark_warm_session(&self, sess: &crate::session::Session) -> bool {
+        let mut w = self.warm_session.lock().unwrap();
+        if w.as_deref() == Some(sess.session_id.as_str()) {
+            return false;
+        }
+        *w = Some(sess.session_id.clone());
+        true
     }
 
     /// 取本规则所属客户端的用量条目(首次访问后缓存 Arc)。
@@ -1012,6 +1029,13 @@ impl ProxyRuntime {
         tracing::debug!(proxy = self.id, state = s.as_str(), reason, "proxy state");
         *st = s;
         *r = reason.to_string();
+    }
+
+    /// N12:只取状态枚举。snapshot_state 会连带 clone state_reason
+    /// String,在 on_apply_result 的每 ACK × 每规则循环里放大;多数
+    /// 调用点只用枚举。
+    pub async fn state_kind(&self) -> ProxyState {
+        *self.state.read().await
     }
 
     pub async fn snapshot_state(&self) -> (ProxyState, String) {
@@ -1152,10 +1176,23 @@ pub struct HttpCacheEntry {
     pub body: bytes::Bytes,
 }
 
-#[derive(Default)]
 pub struct HttpCache {
     pub map: std::collections::HashMap<String, HttpCacheEntry>,
     pub bytes: usize,
+    /// N2:过期清扫限频时刻(≥1s 一次)。修前每次插入都无条件全表
+    /// retain —— 冷启动填充 K 条可缓存 MISS = O(K²) 扫描,且同步
+    /// Mutex 持锁期间同规则并发请求串行(ChallengeTable R5 同型)。
+    last_sweep: std::time::Instant,
+}
+
+impl Default for HttpCache {
+    fn default() -> Self {
+        Self {
+            map: Default::default(),
+            bytes: 0,
+            last_sweep: std::time::Instant::now(),
+        }
+    }
 }
 
 impl HttpCache {
@@ -1184,13 +1221,19 @@ impl HttpCache {
             return;
         }
         let now = std::time::Instant::now();
-        self.map.retain(|_, e| {
-            if e.expires < now {
-                self.bytes = self.bytes.saturating_sub(e.body.len());
-                return false;
-            }
-            true
-        });
+        // N2:retain 限频(≥1s)。过期条目晚 ≤1s 收走不影响正确性:
+        // get 命中前仍按 expires 判定并惰性摘除,容量压力由下方逐出
+        // 循环兜底。
+        if self.last_sweep.elapsed() >= std::time::Duration::from_secs(1) {
+            self.last_sweep = now;
+            self.map.retain(|_, e| {
+                if e.expires < now {
+                    self.bytes = self.bytes.saturating_sub(e.body.len());
+                    return false;
+                }
+                true
+            });
+        }
         while self.bytes + len > max_bytes {
             let k = self.map.keys().next().cloned();
             match k {
