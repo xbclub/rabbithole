@@ -34,19 +34,48 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-fn pong_bytes() -> Vec<u8> {
-    serde_json::to_vec(&rh_protocol::message::Pong {
-        ts_ms: 0,
-        probe: true,
+/// N3:PING/PONG 载荷恒定,成帧一次进程内缓存(修前每事件 serde 序列化
+/// + 每帧进批缓冲再拷)。
+fn framed_ping() -> bytes::Bytes {
+    static B: std::sync::OnceLock<bytes::Bytes> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        frame::encode_frame_bytes(
+            FrameType::PING,
+            &serde_json::to_vec(&rh_protocol::message::Ping {
+                ts_ms: 0,
+                probe: true,
+            })
+            .unwrap(),
+        )
     })
-    .unwrap()
+    .clone()
 }
-fn ping_bytes() -> Vec<u8> {
-    serde_json::to_vec(&rh_protocol::message::Ping {
-        ts_ms: 0,
-        probe: true,
+fn framed_pong() -> bytes::Bytes {
+    static B: std::sync::OnceLock<bytes::Bytes> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        frame::encode_frame_bytes(
+            FrameType::PONG,
+            &serde_json::to_vec(&rh_protocol::message::Pong {
+                ts_ms: 0,
+                probe: true,
+            })
+            .unwrap(),
+        )
     })
-    .unwrap()
+    .clone()
+}
+
+/// N3:UDP 数据帧一次成帧(帧头 + [addr_len][addr][data] 直写)——
+/// 1 分配 1 拷贝。修前 `udp_packet::encode` 新 Vec(拷贝 1)+ 写任务
+/// 批聚合再整包拷(拷贝 2)。
+fn frame_udp_packet(addr: &str, data: &[u8]) -> bytes::Bytes {
+    use bytes::BufMut as _;
+    let mut b = bytes::BytesMut::with_capacity(frame::HEADER_LEN + 1 + addr.len() + data.len());
+    frame::encode_frame_header(&mut b, FrameType::UDP_PACKET, 1 + addr.len() + data.len());
+    b.put_u8(addr.len() as u8);
+    b.put_slice(addr.as_bytes());
+    b.put_slice(data);
+    b.freeze()
 }
 
 /// 一次 `write_all` 最多聚合的帧数。
@@ -63,49 +92,170 @@ const WRITE_QUEUE: usize = 1024;
 /// UDP 单报文的物理上限(IPv4/IPv6 载荷最大 65507,取 64 KiB 缓冲足够)。
 const UDP_RECV_BUF: usize = 65536;
 
-/// 待写帧:帧类型 + 已编码的 payload。
-///
-/// 注意这是**一帧的 payload**,不是"多包合并";批聚合发生在写任务里,
-/// 由多个 [`Pending`] 拼成一次 `write_all`。
+/// 待写帧:**已成帧**的完整帧(帧头 + payload,N3)。
 struct Pending {
-    ty: FrameType,
-    payload: Vec<u8>,
+    framed: bytes::Bytes,
 }
 
-/// 唯一写任务:独占写半,从有界队列收帧并批聚合写出。
-///
-/// 返回即表示写半已关闭(对端断开或写错误),调用方据此终止整个通道。
-async fn writer_task<W>(mut w: W, mut rx: mpsc::Receiver<Pending>)
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    // 复用同一个缓冲:每批清空重用,避免每包分配。
-    let mut batch = bytes::BytesMut::with_capacity(BATCH_MAX * 128);
-    loop {
-        // 阻塞等第一帧(空队列时不空转;有界队列让 send 侧承担背压)。
-        let Some(first) = rx.recv().await else {
-            break; // 所有发送端已 drop = 通道结束
-        };
-        batch.clear();
-        frame::encode_frame(&mut batch, first.ty, &first.payload);
-        // 贪心多取:只在"队列里已经有货"时继续,绝不 sleep / 不额外等待,
-        // 保持"有就发"的低延迟语义。try_recv 为空即刻收手。
-        let mut n = 1;
-        while n < BATCH_MAX {
-            match rx.try_recv() {
-                Ok(next) => {
-                    frame::encode_frame(&mut batch, next.ty, &next.payload);
-                    n += 1;
+/// N10:通道读源。mux 偷出的读半无 AsyncRead 实现,走 chunk 组帧
+/// (chunk 边界 ≠ 帧边界,对端可能一批多帧/一帧跨界);其余载体保持
+/// 字节流 + `read_frame`。
+enum ChanReader {
+    Stream(Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+    Chunks {
+        r: rh_transport::mux::RhMuxStreamRead,
+        buf: bytes::BytesMut,
+    },
+}
+
+impl ChanReader {
+    async fn read_frame(
+        &mut self,
+        fbuf: &mut bytes::BytesMut,
+    ) -> std::io::Result<(FrameType, bytes::Bytes)> {
+        match self {
+            Self::Stream(r) => frame::read_frame(r, fbuf).await.map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("udp channel frame: {e}"),
+                )
+            }),
+            Self::Chunks { r, buf } => loop {
+                match frame::decode_frame(buf) {
+                    Ok(Some(f)) => return Ok(f),
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("udp channel frame: {e}"),
+                        ))
+                    }
                 }
-                Err(_) => break,
-            }
-        }
-        // 一次 write_all 写出 n 个**独立**帧(线格式与逐帧写完全一致)。
-        if w.write_all(&batch).await.is_err() {
-            break;
+                match r.read_chunk().await? {
+                    Some(c) => buf.extend_from_slice(&c),
+                    None => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "udp channel eof",
+                        ))
+                    }
+                }
+            },
         }
     }
-    let _ = w.shutdown().await;
+}
+
+/// N10:通道写侧。mux 载体偷半后 `write_chunk(Bytes)` 引用直达 yamux
+/// 帧(零拷贝);其余载体批量 writev。
+enum ChanWriter {
+    Stream(Box<dyn tokio::io::AsyncWrite + Send + Unpin>),
+    Chunks(rh_transport::mux::RhMuxStreamWrite),
+}
+
+/// N3:全量向量写(本 tokio 版本无 `write_all_vectored`,自实现):
+/// 逐次 `poll_write_vectored` 消费切片。载体不支持向量写时 tokio 默认
+/// 实现只写首个非空段 —— 这里按返回值推进已写字节,剩余段后续轮次
+/// 继续,线格式与逐帧写完全一致。
+async fn writev_all<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    mut slices: &mut [std::io::IoSlice<'_>],
+) -> std::io::Result<()> {
+    use std::future::poll_fn;
+    while !slices.is_empty() && slices[0].is_empty() {
+        slices = &mut slices[1..];
+    }
+    while !slices.is_empty() {
+        let n = poll_fn(|cx| std::pin::Pin::new(&mut *w).poll_write_vectored(cx, slices)).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "writev_all: zero-length write",
+            ));
+        }
+        let mut rem = n;
+        while let Some(first) = slices.first_mut() {
+            if first.len() <= rem {
+                rem -= first.len();
+                slices = &mut slices[1..];
+            } else {
+                first.advance(rem);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 唯一写任务:独占写半,从有界队列收帧写出。
+///
+/// - mux 载体(N10 偷半):每帧 `write_chunk`,Bytes 引用直达 yamux 帧
+///   —— 零拷贝,且消掉 mux 流 `tokio::io::split` 的同步锁;
+/// - 其余载体:贪心多取 ≤BATCH_MAX 帧,`write_all_vectored` 单次下发
+///   (N3:修前把每帧 payload 再拷进批缓冲,每包一次整包拷贝;载体
+///   不支持向量写时由 write_all_vectored 内部逐段推进,线格式不变)。
+///
+/// 返回即表示写半已关闭(对端断开或写错误),调用方据此终止整个通道。
+async fn writer_task(mut w: ChanWriter, mut rx: mpsc::Receiver<Pending>) {
+    match &mut w {
+        ChanWriter::Chunks(hw) => {
+            'outer: loop {
+                // 阻塞等第一帧(空队列时不空转;有界队列让 send 侧承担背压)。
+                let Some(first) = rx.recv().await else {
+                    break; // 所有发送端已 drop = 通道结束
+                };
+                if hw.write_chunk(first.framed).await.is_err() {
+                    break;
+                }
+                // 贪心多取同前:队列里已经有货才继续,绝不额外等待。
+                while let Ok(next) = rx.try_recv() {
+                    if hw.write_chunk(next.framed).await.is_err() {
+                        // 排空剩余帧(仅丢弃),让 rx 尽快关闭
+                        while rx.try_recv().is_ok() {}
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        ChanWriter::Stream(sw) => {
+            // 帧持有缓冲复用;IoSlice 按自然借用每批构造(一个小 Vec,
+            // ≤32 项,可忽略——不值得为它引入 unsafe 生命周期延长)。
+            let mut frames: Vec<bytes::Bytes> = Vec::with_capacity(BATCH_MAX);
+            loop {
+                let Some(first) = rx.recv().await else {
+                    break;
+                };
+                frames.clear();
+                frames.push(first.framed);
+                let mut n = 1;
+                while n < BATCH_MAX {
+                    match rx.try_recv() {
+                        Ok(next) => {
+                            frames.push(next.framed);
+                            n += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // 一次 writev 写出 n 个**独立**帧(线格式与逐帧写完全一致)。
+                let mut slices: Vec<std::io::IoSlice<'_>> = frames
+                    .iter()
+                    .map(|f| std::io::IoSlice::new(f.as_ref()))
+                    .collect();
+                if writev_all(sw, &mut slices).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    // 关闭写半:Chunks 有序关闭(yamux FIN);Stream 常规 shutdown。
+    match &mut w {
+        ChanWriter::Chunks(hw) => {
+            let _ = hw.close().await;
+        }
+        ChanWriter::Stream(sw) => {
+            let _ = sw.shutdown().await;
+        }
+    }
 }
 
 /// 代理侧:通道 ↔ 本地目标 UDP。按用户源地址各开一个本地 socket,
@@ -131,27 +281,40 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: std::sync::Arc<ProxySpec>, p
             return;
         }
     };
-    // R1:读主循环与写任务分属两个 task,先试无锁拆半(非 mux 载体下
-    // channel 是裸 TcpStream,into_split 两个独立 fd);mux 流回落
-    // 同步锁拆分(与修前一致)。
-    let (mut r, w): (
-        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-        Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-    ) = match rh_transport::split_boxed_io(channel) {
-        Ok((r, w)) => (r, w),
-        Err(io) => {
-            let (r, w) = tokio::io::split(io);
-            (Box::new(r), Box::new(w))
-        }
-    };
+    // N10:优先偷 mux 半 —— 写侧 chunk 零拷贝(Bytes 引用直达 yamux 帧),
+    // 读侧 chunk 组帧,并消掉 mux 载体下 tokio::io::split 的同步锁;
+    // 非 mux 载体先试无锁 into_split(裸 TcpStream 两个独立 fd),
+    // 不行再回落同步锁拆分。
+    let mut channel = channel;
+    let (mut r, w): (ChanReader, ChanWriter) =
+        match rh_transport::mux::steal_mux_halves(&mut channel) {
+            Some((mr, mw)) => (
+                ChanReader::Chunks {
+                    r: mr,
+                    buf: bytes::BytesMut::from(&prefix[..]),
+                },
+                ChanWriter::Chunks(mw),
+            ),
+            None => match rh_transport::split_boxed_io(channel) {
+                Ok((r, w)) => (ChanReader::Stream(r), ChanWriter::Stream(w)),
+                Err(io) => {
+                    let (r, w) = tokio::io::split(io);
+                    (
+                        ChanReader::Stream(Box::new(r)),
+                        ChanWriter::Stream(Box::new(w)),
+                    )
+                }
+            },
+        };
     let (tx, rx) = mpsc::channel::<Pending>(WRITE_QUEUE);
     // 写任务独占写半:此后主循环与各回写任务都不再持有它,
     // 也就不存在"跨 await 持锁"和"全部会话等同一把锁"。
     let writer = tokio::spawn(writer_task(w, rx));
 
     let mut sessions: HashMap<std::net::SocketAddr, Session> = HashMap::new();
-    // hello 后已抵达的帧数据预置进缓冲
-    let mut fbuf = bytes::BytesMut::from(&prefix[..]);
+    // hello 后已抵达的帧数据预置进读缓冲(Stream 路径用 fbuf;
+    // Chunks 路径已在上方并入 chunk 组帧缓冲)
+    let mut fbuf = bytes::BytesMut::with_capacity(2048);
     let mut last_alive = Instant::now();
     let mut last_ping = Instant::now();
     let mut gc = tokio::time::interval(Duration::from_secs(60));
@@ -165,7 +328,7 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: std::sync::Arc<ProxySpec>, p
     let _ = probe.tick().await;
     loop {
         tokio::select! {
-            rr = frame::read_frame(&mut r, &mut fbuf) => {
+            rr = r.read_frame(&mut fbuf) => {
                 match rr {
                     Ok((FrameType::UDP_PACKET, p)) => {
                         if let Some((src, data)) = udp_packet::decode(&p) {
@@ -179,7 +342,7 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: std::sync::Arc<ProxySpec>, p
                     }
                     Ok((FrameType::PING, _)) => {
                         // 只投递,不等待:写任务会按序写出(帧序由单队列保证)。
-                        if tx.send(Pending { ty: FrameType::PONG, payload: pong_bytes() }).await.is_err() {
+                        if tx.send(Pending { framed: framed_pong() }).await.is_err() {
                             break;
                         }
                         last_alive = Instant::now();
@@ -206,7 +369,7 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: std::sync::Arc<ProxySpec>, p
             }
             _ = probe.tick() => {
                 if last_ping.elapsed() >= Duration::from_secs(30) {
-                    if tx.send(Pending { ty: FrameType::PING, payload: ping_bytes() }).await.is_err() {
+                    if tx.send(Pending { framed: framed_ping() }).await.is_err() {
                         break;
                     }
                     last_ping = Instant::now();
@@ -292,16 +455,14 @@ async fn get_session(
                 _ = cancel.cancelled() => break,
             };
             // 地址字符串复用会话里那份,不再每包格式化。
-            let payload = udp_packet::encode(&addr_str, &buf[..n]);
+            // N3:一次成帧(1 分配 1 拷贝;修前 encode 新 Vec + 批聚合再拷)。
+            let framed = frame_udp_packet(&addr_str, &buf[..n]);
             // ★send 必须与 cancel 同一个 select:A4 修好了 recv 侧的退出,
             // 但 send 一旦因队列满而阻塞,就再也观察不到 cancel ——
             // 任务永久持有 sock2/tx2,`writer.await` 永挂,每次重连泄漏
             // 整套通道。
             let sent = tokio::select! {
-                r = tx2.send(Pending {
-                    ty: FrameType::UDP_PACKET,
-                    payload,
-                }) => r.is_ok(),
+                r = tx2.send(Pending { framed }) => r.is_ok(),
                 _ = cancel.cancelled() => false,
             };
             if !sent {
@@ -363,32 +524,35 @@ pub async fn run_visitor_side(
     cancel: tokio_util::sync::CancellationToken,
     pending: std::collections::VecDeque<(std::net::SocketAddr, Vec<u8>)>,
 ) {
-    // R1:读主循环与写任务分属两个 task,先试无锁拆半(非 mux 载体下
-    // channel 是裸 TcpStream,into_split 两个独立 fd);mux 流回落
-    // 同步锁拆分(与修前一致)。
-    let (mut r, w): (
-        Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-        Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-    ) = match rh_transport::split_boxed_io(channel) {
-        Ok((r, w)) => (r, w),
-        Err(io) => {
-            let (r, w) = tokio::io::split(io);
-            (Box::new(r), Box::new(w))
-        }
-    };
+    // N10:与 run_proxy_side 同款 —— 优先偷 mux 半(写侧 chunk 零拷贝,
+    // 读侧 chunk 组帧,消掉同步锁);非 mux 先试无锁 into_split。
+    let mut channel = channel;
+    let (mut r, w): (ChanReader, ChanWriter) =
+        match rh_transport::mux::steal_mux_halves(&mut channel) {
+            Some((mr, mw)) => (
+                ChanReader::Chunks {
+                    r: mr,
+                    buf: bytes::BytesMut::with_capacity(2048),
+                },
+                ChanWriter::Chunks(mw),
+            ),
+            None => match rh_transport::split_boxed_io(channel) {
+                Ok((r, w)) => (ChanReader::Stream(r), ChanWriter::Stream(w)),
+                Err(io) => {
+                    let (r, w) = tokio::io::split(io);
+                    (
+                        ChanReader::Stream(Box::new(r)),
+                        ChanWriter::Stream(Box::new(w)),
+                    )
+                }
+            },
+        };
     let (tx, rx) = mpsc::channel::<Pending>(WRITE_QUEUE);
     let writer = tokio::spawn(writer_task(w, rx));
     // 先冲通道到位前缓冲的本地包(仍在写任务里按序写出)
     for (peer, data) in pending {
-        let payload = udp_packet::encode(&peer.to_string(), &data);
-        if tx
-            .send(Pending {
-                ty: FrameType::UDP_PACKET,
-                payload,
-            })
-            .await
-            .is_err()
-        {
+        let framed = frame_udp_packet(&peer.to_string(), &data);
+        if tx.send(Pending { framed }).await.is_err() {
             drop(tx);
             let _ = writer.await;
             return;
@@ -417,12 +581,13 @@ pub async fn run_visitor_side(
                     addr_cache[slot] = Some((peer, peer.to_string()));
                 }
                 let addr_str = addr_cache[slot].as_ref().map(|(_, s)| s.as_str()).unwrap_or("");
-                let payload = udp_packet::encode(addr_str, &buf[..n]);
-                if tx.send(Pending { ty: FrameType::UDP_PACKET, payload }).await.is_err() {
+                // N3:一次成帧(修前 encode 新 Vec + 批聚合再整包拷)
+                let framed = frame_udp_packet(addr_str, &buf[..n]);
+                if tx.send(Pending { framed }).await.is_err() {
                     break;
                 }
             }
-            rr = frame::read_frame(&mut r, &mut fbuf) => {
+            rr = r.read_frame(&mut fbuf) => {
                 match rr {
                     Ok((FrameType::UDP_PACKET, p)) => {
                         if let Some((src, data)) = udp_packet::decode(&p) {
@@ -433,7 +598,7 @@ pub async fn run_visitor_side(
                         }
                     }
                     Ok((FrameType::PING, _)) => {
-                        if tx.send(Pending { ty: FrameType::PONG, payload: pong_bytes() }).await.is_err() {
+                        if tx.send(Pending { framed: framed_pong() }).await.is_err() {
                             break;
                         }
                         last_alive = Instant::now();
@@ -444,7 +609,7 @@ pub async fn run_visitor_side(
             }
             _ = probe.tick() => {
                 if last_ping.elapsed() >= Duration::from_secs(30) {
-                    if tx.send(Pending { ty: FrameType::PING, payload: ping_bytes() }).await.is_err() {
+                    if tx.send(Pending { framed: framed_ping() }).await.is_err() {
                         break;
                     }
                     last_ping = Instant::now();
@@ -475,7 +640,7 @@ mod tests {
     ) {
         let (a, b) = tokio::io::duplex(1 << 20);
         let (tx, rx) = mpsc::channel::<Pending>(cap);
-        let h = tokio::spawn(writer_task(b, rx));
+        let h = tokio::spawn(writer_task(ChanWriter::Stream(Box::new(b)), rx));
         (tx, a, h)
     }
 
@@ -490,8 +655,7 @@ mod tests {
 
     fn pkt(addr: &str, data: &[u8]) -> Pending {
         Pending {
-            ty: FrameType::UDP_PACKET,
-            payload: udp_packet::encode(addr, data),
+            framed: frame_udp_packet(addr, data),
         }
     }
 
@@ -570,15 +734,13 @@ mod tests {
         let seq = ["d0", "d1", "d2"];
         tx.send(pkt("1.2.3.4:5", seq[0].as_bytes())).await.unwrap();
         tx.send(Pending {
-            ty: FrameType::PING,
-            payload: ping_bytes(),
+            framed: framed_ping(),
         })
         .await
         .unwrap();
         tx.send(pkt("1.2.3.4:5", seq[1].as_bytes())).await.unwrap();
         tx.send(Pending {
-            ty: FrameType::PONG,
-            payload: pong_bytes(),
+            framed: framed_pong(),
         })
         .await
         .unwrap();
@@ -660,7 +822,7 @@ mod tests {
         const CAP: usize = 4;
         let (_a, b) = tokio::io::duplex(64); // 读端缓冲极小且永不读
         let (tx, rx) = mpsc::channel::<Pending>(CAP);
-        let h = tokio::spawn(writer_task(b, rx));
+        let h = tokio::spawn(writer_task(ChanWriter::Stream(Box::new(b)), rx));
 
         // 第一轮:把写任务喂到"卡在 write_all"的状态(它取走 1 帧后不动了)
         let padded = format!("{:0>2000}", "x"); // 超过 duplex 缓冲,保证写阻塞
@@ -754,15 +916,8 @@ mod session_leak_tests {
                     },
                     _ = c.cancelled() => break,
                 };
-                let payload = udp_packet::encode(&addr_str, &buf[..n]);
-                if tx2
-                    .send(Pending {
-                        ty: FrameType::UDP_PACKET,
-                        payload,
-                    })
-                    .await
-                    .is_err()
-                {
+                let framed = frame_udp_packet(&addr_str, &buf[..n]);
+                if tx2.send(Pending { framed }).await.is_err() {
                     break;
                 }
             }
@@ -811,7 +966,7 @@ mod session_leak_tests {
     async fn writer_converges_only_after_session_tasks_cancelled() {
         let (tx, rx) = mpsc::channel::<Pending>(8);
         let (_a, b) = tokio::io::duplex(1 << 16);
-        let writer = tokio::spawn(writer_task(b, rx));
+        let writer = tokio::spawn(writer_task(ChanWriter::Stream(Box::new(b)), rx));
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());

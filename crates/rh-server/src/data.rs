@@ -4,7 +4,6 @@
 use crate::session::{RequestPurpose, Session};
 use crate::state::{AppState, ProxyRuntime, TcpPool};
 use rh_core::ratelimit::TokenBucket;
-use rh_protocol::message::udp_packet;
 use rh_protocol::message::{ChannelEntity, StartForward};
 use rh_protocol::{forward_flags, FrameType, ProxySpec};
 use rh_transport::{compress_stream, BoxedIo};
@@ -1636,19 +1635,88 @@ fn udp_session_admit(
     true
 }
 
+/// B-1:通道读源/写侧(mux 偷半 → chunk 组帧/零拷贝 chunk 写;非 mux
+/// 先试无锁 into_split,再回落同步锁拆分)。与 rh-client::udpchan 的
+/// ChanReader/ChanWriter 同型(该侧私有,不跨 crate 抽公共)。
+enum UdpChanReader {
+    Stream(Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+    Chunks {
+        r: rh_transport::mux::RhMuxStreamRead,
+        buf: bytes::BytesMut,
+    },
+}
+
+impl UdpChanReader {
+    async fn read_frame(
+        &mut self,
+        fbuf: &mut bytes::BytesMut,
+    ) -> std::io::Result<(rh_protocol::FrameType, bytes::Bytes)> {
+        match self {
+            Self::Stream(r) => rh_protocol::frame::read_frame(r, fbuf)
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}"))),
+            Self::Chunks { r, buf } => loop {
+                match rh_protocol::frame::decode_frame(buf) {
+                    Ok(Some(f)) => return Ok(f),
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("udp channel frame: {e}"),
+                        ))
+                    }
+                }
+                match r.read_chunk().await? {
+                    Some(c) => buf.extend_from_slice(&c),
+                    None => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "udp channel eof",
+                        ))
+                    }
+                }
+            },
+        }
+    }
+}
+
+enum UdpChanWriter {
+    Stream(Box<dyn tokio::io::AsyncWrite + Send + Unpin>),
+    Chunks(rh_transport::mux::RhMuxStreamWrite),
+}
+
+impl UdpChanWriter {
+    /// 写一帧;false = 通道死。chunk 路径经 copy_from_slice 进 Bytes
+    /// (复用缓冲换一次拷贝,与修前 poll_write 的内部拷贝同量级)。
+    async fn write_frame(&mut self, f: &[u8]) -> bool {
+        match self {
+            Self::Stream(w) => w.write_all(f).await.is_ok(),
+            Self::Chunks(w) => w
+                .write_chunk(bytes::Bytes::copy_from_slice(f))
+                .await
+                .is_ok(),
+        }
+    }
+}
+
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: Arc<UdpSocket>) {
     let (new_tx, mut new_rx) = mpsc::channel::<BoxedIo>(4);
     *rt.udp_new_channel_tx.lock().await = Some(new_tx);
-    let mut sessions: std::collections::HashMap<SocketAddr, Instant> =
-        std::collections::HashMap::new();
-    let mut gc = tokio::time::interval(Duration::from_secs(15));
-    // B1:客户端用量条目提到循环外一次获取(规则生命周期内 client_id
-    // 不变)。修前每包 2-3 次 `client_usage(&id)` —— `entry(id.to_string())`
-    // 命中时也先构造 String,再 clone 一次 Arc。R7 起走 ProxyRuntime 缓存。
+    // B-1:会话表双任务共享(上/下行都要准入);短临界区,锁内无 await。
+    let sessions: Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, Instant>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // B1/R7:客户端用量条目提到循环外一次获取(规则生命周期内 client_id 不变)。
     let usage = rt.usage(&state);
     loop {
         // 等待第一条/重建通道
-        let stream = tokio::select! {
+        let mut stream = tokio::select! {
             s = new_rx.recv() => match s {
                 Some(s) => s,
                 None => {
@@ -1668,144 +1736,312 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
             _ = rt.rule_cancel.cancelled() => return,
             _ = state.shutdown.cancelled() => return,
         };
-        let (mut ch_r, mut ch_w) = tokio::io::split(stream);
-        let mut frame_buf = bytes::BytesMut::with_capacity(2048);
-        // B1:上行一次成帧缓冲 + 地址字符串复用缓冲。
-        let mut up_frame = bytes::BytesMut::new();
-        let mut addr_buf = String::with_capacity(24);
-        let mut pkt_buf = vec![
-            0u8;
-            state
-                .limits
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .udp_packet_size
-                .max(1500)
-        ];
-        let mut last_ping_sent = Instant::now();
-        let mut last_alive = Instant::now();
-        let dead = loop {
-            tokio::select! {
-                r = sock.recv_from(&mut pkt_buf) => {
-                    match r {
-                        Ok((n, peer)) => {
-                            // ★配额击穿后上行也必须停。
-                            //
-                            // 下行(通道 → 用户)早已检查 flow_cut,但上行
-                            // (用户 → 通道)此前照常计费转发 —— 配额击穿后
-                            // UDP 只有单边被切:客户端仍能持续把数据打进隧道,
-                            // 表现是"限流生效了但只限一半"。
-                            if usage
-                                .flow_cut
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                            {
-                                last_alive = Instant::now();
-                                continue;
-                            }
-                            // 会话准入:超上限的新源地址直接丢包(既有会话不受影响)
-                            if !udp_session_admit(&state, &mut sessions, peer) {
-                                continue;
-                            }
-                            state.metrics.count_user_in(n);
-                            rt.bytes_in.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-                            usage.add_bytes(n as u64);
-                            // B1:一次成帧(帧头 + [addr_len][addr][data] 直接写进
-                            // 复用缓冲),消除 encode 的中间 Vec 与 write_frame 的
-                            // 二次整包拷贝;地址字符串复用缓冲,不再每包分配。
-                            addr_buf.clear();
-                            use bytes::BufMut as _;
-                            use std::fmt::Write as _;
-                            let _ = write!(addr_buf, "{peer}");
-                            let payload_len = 1 + addr_buf.len() + n;
-                            up_frame.clear();
-                            rh_protocol::encode_frame_header(&mut up_frame, FrameType::UDP_PACKET, payload_len);
-                            up_frame.put_u8(addr_buf.len() as u8);
-                            up_frame.put_slice(addr_buf.as_bytes());
-                            up_frame.put_slice(&pkt_buf[..n]);
-                            if ch_w.write_all(&up_frame).await.is_err() {
-                                break true;
-                            }
-                            sessions.insert(peer, Instant::now());
-                        }
-                        Err(_) => break false, // 监听 socket 失效:整个规则退出
-                    }
+        // B-1:拆双任务。修前单 select 循环里,上行 `ch_w.write_all` 在
+        // 分支体内联 await —— 隧道拥塞(零窗口)时整个循环停摆:下行读、
+        // socket 收包(内核丢包)、PING 保活、90s 探活全部失联。拆分后:
+        // - 上行任务(用户→隧道)独占写半,阻塞只影响自身;
+        // - 下行任务(隧道→用户)独占读半,持会话 GC、保活与探活节奏;
+        // - 会话表(Mutex)与存活时钟(原子 epoch ms)共享;
+        // - 通道死亡(任一方向 IO 错误)经 dead 令牌互相收敛。
+        let (reader, writer) = match rh_transport::mux::steal_mux_halves(&mut stream) {
+            Some((mr, mw)) => (
+                UdpChanReader::Chunks {
+                    r: mr,
+                    buf: bytes::BytesMut::with_capacity(2048),
+                },
+                UdpChanWriter::Chunks(mw),
+            ),
+            None => match rh_transport::split_boxed_io(stream) {
+                Ok((r, w)) => (UdpChanReader::Stream(r), UdpChanWriter::Stream(w)),
+                Err(io) => {
+                    let (r, w) = tokio::io::split(io);
+                    (
+                        UdpChanReader::Stream(Box::new(r)),
+                        UdpChanWriter::Stream(Box::new(w)),
+                    )
                 }
-                r = rh_protocol::read_frame(&mut ch_r, &mut frame_buf) => {
-                    match r {
-                        Ok((FrameType::UDP_PACKET, p)) => {
-                            if let Some((src, data)) = udp_packet::decode(&p) {
-                                if let Ok(addr) = src.parse::<SocketAddr>() {
-                                    if usage
-                                        .flow_cut
-                                        .load(std::sync::atomic::Ordering::Relaxed)
-                                    {
-                                        last_alive = Instant::now();
-                                        continue;
-                                    }
-                                    if !udp_session_admit(&state, &mut sessions, addr) {
-                                        last_alive = Instant::now();
-                                        continue;
-                                    }
-                                    let _ = sock.send_to(data, addr).await;
-                                    state.metrics.count_user_out(data.len());
-                                    rt.bytes_out
-                                        .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                                    usage.add_bytes(data.len() as u64);
-                                    sessions.insert(addr, Instant::now());
-                                }
-                                last_alive = Instant::now();
-                            }
-                        }
-                        Ok((FrameType::PING, _)) => {
-                            let pong = serde_json::to_vec(&rh_protocol::message::Pong { ts_ms: 0, probe: true }).unwrap();
-                            if rh_protocol::write_frame(&mut ch_w, FrameType::PONG, &pong).await.is_err() {
-                                break true;
-                            }
-                            last_alive = Instant::now();
-                        }
-                        Ok(_) => { last_alive = Instant::now(); }
-                        Err(_) => break true, // EOF/错误:通道死亡
-                    }
-                }
-                _ = gc.tick() => {
-                    // 会话表淘汰必须在通道存活期间执行(不能只等通道死亡),
-                    // 否则源地址轮换的 UDP 对端会无界积累
-                    let now = Instant::now();
-                    sessions.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
-
-                    // ★保活与探活超时也挂在这个 **interval** 上。
-                    //
-                    // 修前这里另有一个 `_ = tokio::time::sleep(30s)` 分支:
-                    // `sleep` 在每次 select 迭代都重新创建,timer 从"本轮开始"
-                    // 计时,所以只要通道上有任何事件(socket 可读、帧到达)先就绪,
-                    // 这个分支就永远轮不到 —— 持续流量下 PING 保活与 90s 探活
-                    // 超时**双双失效**,死通道永不回收。
-                    // `gc` 是 `interval`(15s 固定节拍,与流量无关),合并进来即修复;
-                    // 保活判断仍按 >=30s 自己控节奏,gc 更快只是更及时。
-                    if now.duration_since(last_ping_sent) >= Duration::from_secs(30) {
-                        let ping = serde_json::to_vec(&rh_protocol::message::Ping { ts_ms: 0, probe: true }).unwrap();
-                        if rh_protocol::write_frame(&mut ch_w, FrameType::PING, &ping).await.is_err() {
-                            break true;
-                        }
-                        last_ping_sent = now;
-                    }
-                    if now.duration_since(last_alive) > Duration::from_secs(90) {
-                        break true; // 探活超时
-                    }
-                }
-                _ = rt.rule_cancel.cancelled() => return,
-                _ = state.shutdown.cancelled() => return,
-            }
+            },
         };
-        if dead {
+        let dead = tokio_util::sync::CancellationToken::new();
+        // 控制帧通道:下行收 PING 回 PONG / 保活发 PING,写半独占于
+        // 上行任务,经此转发(PING/PONG 与上行数据帧在同一写半按序发出)。
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<bytes::Bytes>(4);
+        let last_alive = Arc::new(std::sync::atomic::AtomicI64::new(epoch_ms()));
+        let up = {
+            let state = state.clone();
+            let rt = rt.clone();
+            let sock = sock.clone();
+            let sessions = sessions.clone();
+            let last_alive = last_alive.clone();
+            let usage = usage.clone();
+            let dead = dead.clone();
+            let rule_cancel = rt.rule_cancel.clone();
+            let shutdown = state.shutdown.clone();
+            tokio::spawn(async move {
+                udp_pump_up(
+                    &state,
+                    &rt,
+                    &sock,
+                    writer,
+                    ctrl_rx,
+                    &sessions,
+                    &last_alive,
+                    &usage,
+                    &dead,
+                    &rule_cancel,
+                    &shutdown,
+                )
+                .await
+            })
+        };
+        let down = {
+            let state = state.clone();
+            let rt = rt.clone();
+            let sock = sock.clone();
+            let sessions = sessions.clone();
+            let last_alive = last_alive.clone();
+            let usage = usage.clone();
+            let dead = dead.clone();
+            let rule_cancel = rt.rule_cancel.clone();
+            let shutdown = state.shutdown.clone();
+            tokio::spawn(async move {
+                udp_pump_down(
+                    &state,
+                    &rt,
+                    &sock,
+                    reader,
+                    ctrl_tx,
+                    &sessions,
+                    &last_alive,
+                    &usage,
+                    &dead,
+                    &rule_cancel,
+                    &shutdown,
+                )
+                .await
+            })
+        };
+        let _ = tokio::join!(up, down);
+        if dead.is_cancelled() {
+            // 通道死亡:固定退避后重建(修前同义)。
             debug!(proxy = rt.id, "udp channel dead");
             if let Some(sess) = state.sessions.get(&rt.client_id) {
-                // 每次通道重建固定退避 1s(原指数值在下次通道到达即被重置,等效恒为 1)
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 udp_ensure_channel(&state, &sess, &rt).await;
             }
-            // 清用户会话映射(代次隔离)
-            sessions.clear();
+            sessions.lock().unwrap().clear();
+        } else {
+            // rule_cancel / shutdown / 监听 socket 失效:规则退出。
+            // (修前 socket 失效会停在"等下一条通道"上;直接退出更诚实,
+            // 行为差异记录于此。)
+            return;
+        }
+    }
+}
+
+/// 上行:用户 socket → 隧道写半(独占)。任一 await 都可被 dead/rule 打断。
+#[allow(clippy::too_many_arguments)]
+async fn udp_pump_up(
+    state: &Arc<AppState>,
+    rt: &Arc<ProxyRuntime>,
+    sock: &Arc<UdpSocket>,
+    mut ch_w: UdpChanWriter,
+    mut ctrl_rx: mpsc::Receiver<bytes::Bytes>,
+    sessions: &Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, Instant>>>,
+    last_alive: &Arc<std::sync::atomic::AtomicI64>,
+    usage: &Arc<crate::state::ClientUsage>,
+    dead: &tokio_util::sync::CancellationToken,
+    rule_cancel: &tokio_util::sync::CancellationToken,
+    shutdown: &tokio_util::sync::CancellationToken,
+) {
+    use std::fmt::Write as _;
+    let mut up_frame = bytes::BytesMut::new();
+    let mut addr_buf = String::with_capacity(24);
+    let mut pkt_buf = vec![
+        0u8;
+        state
+            .limits
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .udp_packet_size
+            .max(1500)
+    ];
+    loop {
+        let (n, peer) = tokio::select! {
+            r = sock.recv_from(&mut pkt_buf) => match r {
+                Ok(v) => v,
+                Err(_) => {
+                    // 监听 socket 失效:规则级退出(不 cancel dead ——
+                    // 外层据此直接返回而非等待重建)。
+                    tracing::warn!(proxy = rt.id, "udp pump: listen socket failed");
+                    return;
+                }
+            },
+            // PING/PONG 控制帧:与数据帧共用写半,经单队列保序
+            c = ctrl_rx.recv() => {
+                match c {
+                    Some(f) => {
+                        let ok = tokio::select! {
+                            r = ch_w.write_frame(&f) => r,
+                            _ = dead.cancelled() => false,
+                        };
+                        if !ok {
+                            dead.cancel();
+                            return;
+                        }
+                        last_alive.store(epoch_ms(), std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    None => return, // 下行已退出(它自己处理了自己的死因)
+                }
+            }
+            _ = dead.cancelled() => return,
+            _ = rule_cancel.cancelled() => return,
+            _ = shutdown.cancelled() => return,
+        };
+        // ★配额击穿后上行也必须停(修前同义:下行早已切,上行此前照常计费转发)。
+        if usage.flow_cut.load(std::sync::atomic::Ordering::Relaxed) {
+            last_alive.store(epoch_ms(), std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        {
+            let mut s = sessions.lock().unwrap();
+            if !udp_session_admit(state, &mut s, peer) {
+                continue;
+            }
+        }
+        state.metrics.count_user_in(n);
+        rt.bytes_in
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        usage.add_bytes(n as u64);
+        // B1:一次成帧(帧头 + [addr_len][addr][data] 直接写进复用缓冲)。
+        addr_buf.clear();
+        use bytes::BufMut as _;
+        let _ = write!(addr_buf, "{peer}");
+        let payload_len = 1 + addr_buf.len() + n;
+        up_frame.clear();
+        rh_protocol::encode_frame_header(
+            &mut up_frame,
+            rh_protocol::FrameType::UDP_PACKET,
+            payload_len,
+        );
+        up_frame.put_u8(addr_buf.len() as u8);
+        up_frame.put_slice(addr_buf.as_bytes());
+        up_frame.put_slice(&pkt_buf[..n]);
+        // B-1:写阻塞必须可被打断 —— 死链 90s 后下行任务 cancel dead,
+        // 本任务不能仍钉在 write 上(修前正是这个内联 await 拖停全局)。
+        let ok = tokio::select! {
+            r = ch_w.write_frame(&up_frame) => r,
+            _ = dead.cancelled() => false,
+        };
+        if !ok {
+            dead.cancel();
+            return;
+        }
+        sessions.lock().unwrap().insert(peer, Instant::now());
+        last_alive.store(epoch_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 下行:隧道读半(独占)→ 用户 socket;持会话 GC、PING 保活与 90s 探活。
+#[allow(clippy::too_many_arguments)]
+async fn udp_pump_down(
+    state: &Arc<AppState>,
+    rt: &Arc<ProxyRuntime>,
+    sock: &Arc<UdpSocket>,
+    mut ch_r: UdpChanReader,
+    ctrl_tx: mpsc::Sender<bytes::Bytes>,
+    sessions: &Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, Instant>>>,
+    last_alive: &Arc<std::sync::atomic::AtomicI64>,
+    usage: &Arc<crate::state::ClientUsage>,
+    dead: &tokio_util::sync::CancellationToken,
+    rule_cancel: &tokio_util::sync::CancellationToken,
+    shutdown: &tokio_util::sync::CancellationToken,
+) {
+    use std::sync::atomic::Ordering;
+    let mut fbuf = bytes::BytesMut::with_capacity(2048);
+    let mut gc = tokio::time::interval(Duration::from_secs(15));
+    let mut last_ping_sent = Instant::now();
+    let alive = || last_alive.load(Ordering::Relaxed);
+    let touch = || last_alive.store(epoch_ms(), Ordering::Relaxed);
+    // PING/PONG 载荷恒定,成帧一次缓存
+    let framed_ping = std::sync::OnceLock::new();
+    let framed_pong = std::sync::OnceLock::new();
+    loop {
+        tokio::select! {
+            r = ch_r.read_frame(&mut fbuf) => {
+                match r {
+                    Ok((rh_protocol::FrameType::UDP_PACKET, p)) => {
+                        if let Some((src, data)) = rh_protocol::message::udp_packet::decode(&p) {
+                            if let Ok(addr) = src.parse::<SocketAddr>() {
+                                if usage.flow_cut.load(Ordering::Relaxed) {
+                                    touch();
+                                    continue;
+                                }
+                                {
+                                    let mut s = sessions.lock().unwrap();
+                                    if !udp_session_admit(state, &mut s, addr) {
+                                        touch();
+                                        continue;
+                                    }
+                                }
+                                let _ = sock.send_to(data, addr).await;
+                                state.metrics.count_user_out(data.len());
+                                rt.bytes_out.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                usage.add_bytes(data.len() as u64);
+                                sessions.lock().unwrap().insert(addr, Instant::now());
+                            }
+                            touch();
+                        }
+                    }
+                    Ok((rh_protocol::FrameType::PING, _)) => {
+                        let pong = framed_pong.get_or_init(|| {
+                            rh_protocol::frame::encode_frame_bytes(
+                                rh_protocol::FrameType::PONG,
+                                &serde_json::to_vec(&rh_protocol::message::Pong { ts_ms: 0, probe: true }).unwrap(),
+                            )
+                        });
+                        if ctrl_tx.send(pong.clone()).await.is_err() {
+                            dead.cancel();
+                            break;
+                        }
+                        touch();
+                    }
+                    Ok(_) => { touch(); }
+                    Err(_) => {
+                        // EOF/错误:通道死亡
+                        dead.cancel();
+                        break;
+                    }
+                }
+            }
+            _ = gc.tick() => {
+                // 会话表淘汰必须在通道存活期间执行(源地址轮换的对端会无界积累)
+                let now = Instant::now();
+                sessions.lock().unwrap().retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
+                // ★保活与探活挂在固定 interval 上(流量无关);修前曾有
+                // sleep 分支被高频事件饿死的缺陷,此结构保持 interval 版本。
+                if now.duration_since(last_ping_sent) >= Duration::from_secs(30) {
+                    let ping = framed_ping.get_or_init(|| {
+                        rh_protocol::frame::encode_frame_bytes(
+                            rh_protocol::FrameType::PING,
+                            &serde_json::to_vec(&rh_protocol::message::Ping { ts_ms: 0, probe: true }).unwrap(),
+                        )
+                    });
+                    if ctrl_tx.send(ping.clone()).await.is_err() {
+                        dead.cancel();
+                        break;
+                    }
+                    last_ping_sent = now;
+                }
+                if epoch_ms() - alive() > 90_000 {
+                    dead.cancel(); // 探活超时:通道死亡
+                    break;
+                }
+            }
+            _ = dead.cancelled() => break,
+            _ = rule_cancel.cancelled() => break,
+            _ = shutdown.cancelled() => break,
         }
     }
 }
