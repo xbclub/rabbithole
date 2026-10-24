@@ -35,6 +35,12 @@ pub struct NatCoordinator {
     /// 等待连接在 10s TTL 内耗尽)。以 session_id 为键:user_conn_id 是客户端进程内
     /// 计数器,客户端重启后会重新从 1 开始,按 client_id 键会跨重启误判。
     attempted: Mutex<HashMap<(String, u64), Instant>>,
+    /// R8:两张表的 retain 限频时刻(≥1s 一次)。修前 mark_attempted
+    /// 每条 xtcp 用户连接都对 attempted 做锁内全表扫描,表大小 ≈
+    /// 连接建立速率 × 60s TTL 且无硬上限 —— 扫描成本对事件速率是
+    /// 二次的(ChallengeTable R5 修过的同型,当时范围只圈了那张表)。
+    attempted_last_sweep: std::sync::Mutex<Instant>,
+    txs_last_sweep: std::sync::Mutex<Instant>,
 }
 
 impl NatCoordinator {
@@ -42,6 +48,8 @@ impl NatCoordinator {
         Self {
             txs: Mutex::new(HashMap::new()),
             attempted: Mutex::new(HashMap::new()),
+            attempted_last_sweep: std::sync::Mutex::new(Instant::now()),
+            txs_last_sweep: std::sync::Mutex::new(Instant::now()),
         }
     }
 
@@ -49,8 +57,18 @@ impl NatCoordinator {
     pub async fn mark_attempted(&self, visitor_session_id: &str, user_conn_id: u64) -> bool {
         let key = (visitor_session_id.to_string(), user_conn_id);
         let mut m = self.attempted.lock().await;
-        m.retain(|_, t| t.elapsed() < Duration::from_secs(60));
-        m.insert(key, Instant::now()).is_some()
+        let now = Instant::now();
+        // R8:retain 限频(≥1s)。语义无损:返回值只依赖 insert().is_some(),
+        // 与 retain 时机无关;过期条目晚 ≤1s 收走只影响 60s 重试边界的
+        // 毫秒级抖动。
+        {
+            let mut sweep = self.attempted_last_sweep.lock().unwrap();
+            if sweep.elapsed() >= Duration::from_secs(1) {
+                *sweep = now;
+                m.retain(|_, t| t.elapsed() < Duration::from_secs(60));
+            }
+        }
+        m.insert(key, now).is_some()
     }
 }
 
@@ -80,7 +98,15 @@ pub async fn start(
     let timeout = state.cfg.nathole.prepare_timeout_s.max(3);
     {
         let mut txs = state.nathole.txs.lock().await;
-        txs.retain(|_, s| s.created.elapsed() < Duration::from_secs(timeout + 10));
+        // R8:同款 retain 限频。txs 主清理路径是 decide 的 remove,
+        // 这里只是超时兜底,放宽到 ≥1s 一次无风险。
+        {
+            let mut sweep = state.nathole.txs_last_sweep.lock().unwrap();
+            if sweep.elapsed() >= Duration::from_secs(1) {
+                *sweep = Instant::now();
+                txs.retain(|_, s| s.created.elapsed() < Duration::from_secs(timeout + 10));
+            }
+        }
         txs.insert(
             txid.clone(),
             NatSession {
