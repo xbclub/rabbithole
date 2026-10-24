@@ -325,7 +325,9 @@ async fn handle_http_request(
         .next()
         .unwrap_or("")
         .to_lowercase();
-    let path = req.uri().path().to_string();
+    // N9:借用 &str(修前每请求 to_string 一次分配;path 仅参与前缀
+    // 匹配 / 扩展名判定 / 缓存键拼接,无一需要持有所有权)
+    let path = req.uri().path();
 
     // 路由:域名 + locations 前缀(最长匹配)。
     // B6:按 host 索引取候选(修前 O(全部域名) String== 扫描;索引与
@@ -382,13 +384,17 @@ async fn handle_http_request(
         return Ok(not_found_response(&state));
     };
     // Basic 认证
-    if !route.http_user.is_empty() {
+    if route.http_credentials.is_some() {
         let got = req
             .headers()
             .get(hyper::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        if !check_basic_auth(got.as_deref(), &route.http_user, &route.http_password) {
+        // N9:预拼接凭据(route_from 构建时),免每请求 format! 分配
+        if !check_basic_auth(
+            got.as_deref(),
+            route.http_credentials.as_deref().unwrap_or(""),
+        ) {
             let mut resp = hyper::Response::builder()
                 .status(401)
                 .body(full_body(b"Unauthorized"))?;
@@ -404,7 +410,7 @@ async fn handle_http_request(
     let cacheable = method == hyper::Method::GET
         && cache_cfg
             .as_ref()
-            .map(|c| ext_cached(&path, &c.extensions))
+            .map(|c| ext_cached(path, &c.extensions))
             .unwrap_or(false);
     // M2 静态缓存键:**含 query**。修前只用 path,`?id=1` 与 `?id=2` 命中
     // 同一条缓存 —— 第二个用户会拿到第一个人的数据。扩展名判定仍用 path
@@ -413,7 +419,7 @@ async fn handle_http_request(
     // 绝大多数规则没配缓存,纯白付)。非可缓存时为空串,下游全部走
     // cacheable/cache_cfg 门控,不会误用。
     let cache_key = if cacheable {
-        http_cache_key(&host, &path, req.uri().query())
+        http_cache_key(&host, path, req.uri().query())
     } else {
         String::new()
     };
@@ -632,13 +638,12 @@ async fn handle_http_request(
     Ok(hyper::Response::from_parts(parts, body))
 }
 
-fn check_basic_auth(header: Option<&str>, user: &str, pass: &str) -> bool {
+fn check_basic_auth(header: Option<&str>, expect: &str) -> bool {
     let Some(h) = header else { return false };
     let Some(b64) = h.strip_prefix("Basic ") else {
         return false;
     };
     let decoded = base64_decode(b64).unwrap_or_default();
-    let expect = format!("{user}:{pass}");
     rh_transport::constant_time_eq(&decoded, expect.as_bytes())
 }
 
@@ -1133,7 +1138,7 @@ async fn serve_tcpmux(
         .map(|&i| &table.routes[i]);
     // Basic 认证
     if let Some(r) = route {
-        if !r.http_user.is_empty() {
+        if r.http_credentials.is_some() {
             let got = head.lines().find_map(|l| {
                 let (k, v) = l.split_once(':')?;
                 if k.trim().eq_ignore_ascii_case("proxy-authorization") {
@@ -1142,7 +1147,7 @@ async fn serve_tcpmux(
                     None
                 }
             });
-            if !check_basic_auth(got.as_deref(), &r.http_user, &r.http_password) {
+            if !check_basic_auth(got.as_deref(), r.http_credentials.as_deref().unwrap_or("")) {
                 sock.write_all(
                     b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"rabbithole\"\r\n\r\n",
                 )

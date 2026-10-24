@@ -1144,8 +1144,10 @@ const VHOST_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_mil
 pub struct VhostRoute {
     pub host: String,
     pub locations: Vec<String>,
-    pub http_user: String,
-    pub http_password: String,
+    /// N9:`user:pass` 预拼接(构建一次;修前每请求 format! 一次分配)。
+    /// None = 未启用 Basic 认证(与 http_user 为空同义)——启用判定
+    /// 直接看它,不再单独存 user/password 两份。
+    pub http_credentials: Option<String>,
     pub host_rewrite: String,
     /// N9:头改写规则构建时预解析(修前每请求每条规则
     /// `HeaderName::from_bytes` / `HeaderValue::from_str` 逐次分配+校验;
@@ -1522,8 +1524,7 @@ impl ProxyManager {
                         https.push(VhostRoute {
                             host: d.trim().to_lowercase(),
                             locations: vec![],
-                            http_user: String::new(),
-                            http_password: String::new(),
+                            http_credentials: None,
                             host_rewrite: String::new(),
                             request_headers_set: Vec::new(),
                             request_headers_del: Vec::new(),
@@ -1538,8 +1539,7 @@ impl ProxyManager {
                         https.push(VhostRoute {
                             host: format!("{}.{}", c.subdomain, subdomain_host).to_lowercase(),
                             locations: vec![],
-                            http_user: String::new(),
-                            http_password: String::new(),
+                            http_credentials: None,
                             host_rewrite: String::new(),
                             request_headers_set: Vec::new(),
                             request_headers_del: Vec::new(),
@@ -1557,8 +1557,11 @@ impl ProxyManager {
                         tcpmux.push(VhostRoute {
                             host: d.trim().to_lowercase(),
                             locations: vec![],
-                            http_user: c.http_user.clone(),
-                            http_password: c.http_password.clone(),
+                            http_credentials: if c.http_user.is_empty() {
+                                None
+                            } else {
+                                Some(format!("{}:{}", c.http_user, c.http_password))
+                            },
                             host_rewrite: String::new(),
                             request_headers_set: Vec::new(),
                             request_headers_del: Vec::new(),
@@ -1627,8 +1630,11 @@ fn route_from(
     VhostRoute {
         host,
         locations: c.locations.clone(),
-        http_user: c.http_user.clone(),
-        http_password: c.http_password.clone(),
+        http_credentials: if c.http_user.is_empty() {
+            None
+        } else {
+            Some(format!("{}:{}", c.http_user, c.http_password))
+        },
         host_rewrite: c.host_rewrite.clone(),
         request_headers_set: parse_header_set(&c.request_headers),
         request_headers_del: parse_header_del(&c.request_headers),

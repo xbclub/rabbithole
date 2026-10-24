@@ -193,6 +193,40 @@ pub async fn accept(listener: &mut QuicListener) -> io::Result<Incoming> {
         .ok_or_else(|| other_err("quic listener closed"))
 }
 
+/// N14:按 (bind 族, runtime Id) 缓存的客户端 Endpoint。
+/// 键必须含 runtime Id:Endpoint 的 driver 任务绑定**创建它的** runtime,
+/// runtime 退出后 driver 即死 —— 按进程全局缓存时,测试环境(每个
+/// #[tokio::test] 一个独立 runtime)首个测试结束后共享 Endpoint 的
+/// 握手全部 "closed"。按 runtime 键控后:生产单 runtime 恰好一份/族,
+/// 测试各 runtime 各自一份。
+fn client_endpoint(is_v4: bool) -> io::Result<quinn::Endpoint> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(bool, tokio::runtime::Id), quinn::Endpoint>>,
+    > = std::sync::OnceLock::new();
+    let cell = CACHE.get_or_init(Default::default);
+    let mut g = cell.lock().unwrap();
+    let key = (is_v4, tokio::runtime::Handle::current().id());
+    if let Some(e) = g.get(&key) {
+        return Ok(e.clone());
+    }
+    // 本地绑定地址必须与**服务端地址同族**:写死 0.0.0.0 时连 IPv6 服务端
+    // 会因 address family 不匹配直接失败(与 kcp.rs 的同款分支对齐)。
+    let bind_local: std::net::SocketAddr = if is_v4 {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        bind_tuned_udp(bind_local)?,
+        quinn::default_runtime().ok_or_else(|| other_err("quic: no async runtime"))?,
+    )
+    .map_err(|e| other_err(format!("quic client bind: {e}")))?;
+    g.insert(key, endpoint.clone());
+    Ok(endpoint)
+}
+
 pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>> {
     // R2:同 dial_io 走按配置键缓存(B5;QUIC 的 rustls 侧同样带
     // 会话恢复票据缓存,重连每次重建会让它永远空转)
@@ -202,21 +236,11 @@ pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>
             .map_err(|e| other_err(format!("quic client config: {e}")))?,
     ));
     qcfg.transport_config(Arc::new(transport_config(true, MUX_STREAMS_UNLIMITED)));
-    // 本地绑定地址必须与**服务端地址同族**:写死 0.0.0.0 时连 IPv6 服务端
-    // 会因 address family 不匹配直接失败(与 kcp.rs 的同款分支对齐)。
-    let bind_local: std::net::SocketAddr = if cfg.server_addr.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
-    } else {
-        "[::]:0".parse().unwrap()
-    };
-    let mut endpoint = quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        None,
-        bind_tuned_udp(bind_local)?,
-        quinn::default_runtime().ok_or_else(|| other_err("quic: no async runtime"))?,
-    )
-    .map_err(|e| other_err(format!("quic client bind: {e}")))?;
-    endpoint.set_default_client_config(qcfg);
+    // N14:Endpoint 按服务端地址族缓存复用(修前每次 connect 新绑一个
+    // UDP socket + 起 driver;quinn 客户端形态本就支持单 Endpoint 多
+    // 连接,CID 区分)。配置经 connect_with 每次携带,不同 tls 配置的
+    // 调用共享 Endpoint 不互相覆盖。
+    let endpoint = client_endpoint(cfg.server_addr.is_ipv4())?;
     let name = cfg
         .tls
         .server_name
@@ -230,7 +254,7 @@ pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>
     // io::Error,让外层只需处理超时。
     let conn = tokio::time::timeout(cfg.connect_timeout, async {
         let connecting = endpoint
-            .connect(cfg.server_addr, &name)
+            .connect_with(qcfg, cfg.server_addr, &name)
             .map_err(|e| other_err(format!("quic connect: {e}")))?;
         connecting
             .await

@@ -393,7 +393,9 @@ async fn read_proxy_request(
         .unwrap_or(buf.len());
     let head = buf[..head_len].to_vec();
     let leftover = buf[head_len..].to_vec();
-    let text = String::from_utf8_lossy(&head).into_owned();
+    // N17:from_utf8_lossy 借用 head 切片(合法 UTF-8 时零分配;修前
+    // into_owned 再整块拷一次成 String,纯为 parse 用的白拷)
+    let text = String::from_utf8_lossy(&head);
 
     let mut lines = text.split("\r\n");
     let req_line = lines.next().unwrap_or("");
