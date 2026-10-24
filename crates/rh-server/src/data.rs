@@ -843,7 +843,10 @@ async fn splice_forward(
     let metrics_dn = state.metrics.clone();
     let rt_up = rt.clone();
     let rt_dn = rt.clone();
-    let usage_up = rt.usage(&state);
+    // `state` 在本函数已是 `&Arc<AppState>`,直接传即可;多一层 `&` 是
+    // clippy::needless_borrow。★注意这段在 `#[cfg(target_os = "linux")]`
+    // 内,开发机(macOS)的 clippy 根本不编译它 —— 只有 CI 的 linux job 能发现。
+    let usage_up = rt.usage(state);
     let usage_dn = usage_up.clone();
     let usage_cut = usage_up.clone();
 
