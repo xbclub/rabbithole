@@ -1734,4 +1734,53 @@ mod tests {
         );
         upstream.abort();
     }
+
+    /// peek_sni 必须正确处理 **ClientHello 跨段到达**。
+    ///
+    /// 这是 R7 修复的缺陷所在层,此前测试只覆盖纯函数 `parse_sni`
+    /// (一次给全量字节),完全没碰 `peek` 的累计语义 —— 所以那个
+    /// 「`&mut buf[read..]` 把流头写进错位位置」的缺陷能一直存活。
+    ///
+    /// 构造:先发 ClientHello 前 10 字节,等 peek_sni 有机会 peek 到
+    /// 该前缀,再发剩余部分。修前第二段 peek 会把**流头**写进
+    /// `buf[10..]`,parse_sni 读到错位数据 → 返回 None → serve_https
+    /// 静默断连。修后应稳定取到 SNI。
+    #[tokio::test]
+    async fn peek_sni_handles_client_hello_split_across_segments() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let hello = client_hello(Some("split.test"));
+        assert!(hello.len() > 20, "用例前提:ClientHello 足够长以切段");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server_side, _) = listener.accept().await.unwrap();
+
+        let writer = tokio::spawn({
+            let hello = hello.clone();
+            async move {
+                // 第一段:record header + handshake 头的前半部分
+                client.write_all(&hello[..10]).await.unwrap();
+                client.flush().await.unwrap();
+                // 给 peek_sni 一次 peek 到「不完整前缀」的机会 ——
+                // 这正是修前触发错位写的那一拍。
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // 第二段:剩余全部
+                client.write_all(&hello[10..]).await.unwrap();
+                client.flush().await.unwrap();
+                // 保持连接不关,让 peek 侧能读满(peek 不消费)
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        });
+
+        let got = peek_sni(&server_side).await.unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some("split.test"),
+            "ClientHello 跨段到达时 peek_sni 必须仍能解析出 SNI\
+             (修前 &mut buf[read..] 会把流头写进错位位置导致返回 None)"
+        );
+        writer.abort();
+    }
 }
