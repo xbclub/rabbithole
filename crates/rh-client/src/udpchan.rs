@@ -97,6 +97,20 @@ struct Pending {
     framed: bytes::Bytes,
 }
 
+/// 构造读缓冲:hello 之后已抵达的字节(`prefix`)必须预置其中。
+///
+/// **两条载体路径共用这一个入口**,是修"prefix 静默丢失"的关键:
+/// 修前 Chunks 路径在构造时并入 prefix、Stream 路径却另起一个空缓冲,
+/// 而注释还写着"Stream 路径用 fbuf" —— 注释与代码不符,且一旦有调用方
+/// 传非空 prefix,非 mux 载体就会**静默丢掉**隧道建立后最先到达的字节
+/// (常是帧头),表现为偶发解析失败。
+///
+/// 抽成函数既统一了两条路径,也让"是否预置"这件事可被单测直接锁住
+/// (直接测 `run_proxy_side` 需要真 mux/真 socket,构造成本高)。
+fn read_buf_with_prefix(prefix: &[u8]) -> bytes::BytesMut {
+    bytes::BytesMut::from(prefix)
+}
+
 /// N10:通道读源。mux 偷出的读半无 AsyncRead 实现,走 chunk 组帧
 /// (chunk 边界 ≠ 帧边界,对端可能一批多帧/一帧跨界);其余载体保持
 /// 字节流 + `read_frame`。
@@ -291,7 +305,7 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: std::sync::Arc<ProxySpec>, p
             Some((mr, mw)) => (
                 ChanReader::Chunks {
                     r: mr,
-                    buf: bytes::BytesMut::from(&prefix[..]),
+                    buf: read_buf_with_prefix(&prefix),
                 },
                 ChanWriter::Chunks(mw),
             ),
@@ -312,9 +326,20 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: std::sync::Arc<ProxySpec>, p
     let writer = tokio::spawn(writer_task(w, rx));
 
     let mut sessions: HashMap<std::net::SocketAddr, Session> = HashMap::new();
-    // hello 后已抵达的帧数据预置进读缓冲(Stream 路径用 fbuf;
-    // Chunks 路径已在上方并入 chunk 组帧缓冲)
-    let mut fbuf = bytes::BytesMut::with_capacity(2048);
+    // hello 之后已抵达的字节必须预置进读缓冲,**两条载体路径都要**。
+    //
+    // 修前只有 Chunks 路径做了(见上方 `ChanReader::Chunks { buf: prefix }`),
+    // Stream 路径的 fbuf 是空 `with_capacity(2048)` —— 而紧邻的注释却写着
+    // "Stream 路径用 fbuf",与代码不符。当时没有行为差异,因为唯一调用方
+    // (`session.rs::open_data_channel`)传入的 `buf.to_vec()` 恒为空
+    // (buf 只分配、未读)。但这是个陷阱:一旦将来有调用方传非空 prefix,
+    // mux 载体正常、非 mux 载体**静默丢数据**,丢的还是隧道建立后最先
+    // 到达的那几字节(往往是用户数据帧的帧头),表现为偶发解析失败,
+    // 极难归因。
+    //
+    // 修法取最小等价:Stream 路径的 fbuf 直接以 prefix 起头,与 Chunks
+    // 路径、以及拆分双任务之前的旧实现(两条路径都预置)一致。
+    let mut fbuf = read_buf_with_prefix(&prefix);
     let mut last_alive = Instant::now();
     let mut last_ping = Instant::now();
     let mut gc = tokio::time::interval(Duration::from_secs(60));
@@ -659,7 +684,76 @@ mod tests {
         }
     }
 
-    /// **核心回归(串源)**:多个用户源地址并发写帧,每个源的包不得串到别的源。
+    /// **回归(prefix 静默丢失)**:读缓冲构造必须预置 hello 后已抵达的字节。
+    ///
+    /// 修前 Chunks 路径在构造时并入 prefix、Stream 路径却另起一个空
+    /// `with_capacity(2048)`,而紧邻注释写着"Stream 路径用 fbuf" ——
+    /// 注释与代码不符。当时无行为差异(唯一调用方传的 prefix 恒空),
+    /// 但一旦有调用方传非空 prefix,mux 载体正常、非 mux 载体**静默丢数据**,
+    /// 丢的是隧道建立后最先到达的字节(常是帧头),表现为偶发解析失败。
+    ///
+    /// 这条直接测 `read_buf_with_prefix`(两条路径共用的唯一入口),
+    /// 所以改坏实现**必然**变红 —— 不像"自己造 fbuf"那种写法会绕过被测代码。
+    #[test]
+    fn read_buf_prepends_prefix() {
+        // 用一帧完整的 UDP_PACKET 当 prefix:若实现丢弃它,首帧就解不出来
+        let first = frame_udp_packet("1.1.1.1:1000", b"first");
+        let mut fbuf = read_buf_with_prefix(&first);
+        let decoded = frame::decode_frame(&mut fbuf)
+            .expect("prefix 必须是合法帧字节")
+            .expect("prefix 中的完整帧必须能立刻被解出");
+        assert_eq!(decoded.0, FrameType::UDP_PACKET);
+        let (src, data) = udp_packet::decode(&decoded.1).expect("首帧必须可解码");
+        assert_eq!(src, "1.1.1.1:1000", "解出的必须是 prefix 里那一帧");
+        assert_eq!(data, b"first");
+    }
+
+    /// 反向对照:空 prefix 时缓冲为空、后续字节照常解析(现有调用方的真实情形)。
+    #[test]
+    fn read_buf_with_empty_prefix_is_empty() {
+        let mut fbuf = read_buf_with_prefix(&[]);
+        assert!(fbuf.is_empty(), "空 prefix 不得凭空产生字节");
+        let f = frame_udp_packet("3.3.3.3:3000", b"only");
+        fbuf.extend_from_slice(&f);
+        let decoded = frame::decode_frame(&mut fbuf).unwrap().unwrap();
+        assert_eq!(decoded.0, FrameType::UDP_PACKET);
+        let (src, data) = udp_packet::decode(&decoded.1).unwrap();
+        assert_eq!(src, "3.3.3.3:3000");
+        assert_eq!(data, b"only");
+    }
+
+    /// prefix 之后紧跟真实通道字节时,两段必须被拼成连续帧流
+    /// (这正是"hello 后的残留字节 + 后续帧"的真实形态)。
+    #[tokio::test]
+    async fn stream_path_parses_prefix_then_channel_bytes() {
+        let first = frame_udp_packet("1.1.1.1:1000", b"first");
+        let second = frame_udp_packet("2.2.2.2:2000", b"second");
+
+        // 通道里只放第二帧:第一帧完全来自 prefix
+        let (mut w, r) = tokio::io::duplex(4096);
+        w.write_all(&second).await.unwrap();
+        drop(w);
+
+        let mut r = ChanReader::Stream(Box::new(r));
+        let mut fbuf = read_buf_with_prefix(&first);
+
+        let (ty, payload) = r
+            .read_frame(&mut fbuf)
+            .await
+            .expect("prefix 中的完整帧必须能被解出(修前 Stream 路径会丢掉它)");
+        assert_eq!(ty, FrameType::UDP_PACKET);
+        let (src, data) = udp_packet::decode(&payload).expect("首帧必须可解码");
+        assert_eq!(src, "1.1.1.1:1000");
+        assert_eq!(data, b"first");
+
+        let (ty2, payload2) = r.read_frame(&mut fbuf).await.expect("后续帧必须可读");
+        assert_eq!(ty2, FrameType::UDP_PACKET);
+        let (src2, data2) = udp_packet::decode(&payload2).unwrap();
+        assert_eq!(src2, "2.2.2.2:2000");
+        assert_eq!(data2, b"second");
+    }
+
+    /// **核心回归(串源)**:多个用户源地址并发写帧,每个源的包不得串到别的源。    /// **核心回归(串源)**:多个用户源地址并发写帧,每个源的包不得串到别的源。
     ///
     /// 修前是各回写任务共享 `Arc<Mutex<Option<W>>>` 逐帧写;现在改为单队列
     /// 批聚合。批聚合最容易出的错就是"批次里帧边界算错",让某个 src 的
