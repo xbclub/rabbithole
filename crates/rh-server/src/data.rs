@@ -1767,6 +1767,8 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
         // 上行任务,经此转发(PING/PONG 与上行数据帧在同一写半按序发出)。
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<bytes::Bytes>(4);
         let last_alive = Arc::new(std::sync::atomic::AtomicI64::new(epoch_ms()));
+        // 监听 socket 失效的独立信号(见 join 之后的判定)。
+        let sock_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let up = {
             let state = state.clone();
             let rt = rt.clone();
@@ -1775,6 +1777,7 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
             let last_alive = last_alive.clone();
             let usage = usage.clone();
             let dead = dead.clone();
+            let sock_failed = sock_failed.clone();
             let rule_cancel = rt.rule_cancel.clone();
             let shutdown = state.shutdown.clone();
             tokio::spawn(async move {
@@ -1788,6 +1791,7 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
                     &last_alive,
                     &usage,
                     &dead,
+                    &sock_failed,
                     &rule_cancel,
                     &shutdown,
                 )
@@ -1822,35 +1826,71 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
             })
         };
         let _ = tokio::join!(up, down);
-        if dead.is_cancelled() {
-            // 通道死亡:固定退避后重建(修前同义)。
-            debug!(proxy = rt.id, "udp channel dead");
-            if let Some(sess) = state.sessions.get(&rt.client_id) {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                udp_ensure_channel(&state, &sess, &rt).await;
+        // ★先查 sock_failed,再查 dead —— 顺序是语义,不是风格。
+        //
+        // 监听 socket 失效(recv_from 持续报错,如 fd 被外部关闭、网卡
+        // 消失)与"通道死亡"是**两件不同的事**,但修前它们共用一个判据:
+        // 上行任务按注释意图"不 cancel dead 直接 return",可下行任务仍
+        // 持有 ctrl_tx,最迟下一个 PING 时机(≤30s)走到 `ctrl_tx.send`
+        // 失败分支 → 那里执行 `dead.cancel()` → 外层误判为通道死亡 →
+        // sleep 1s + udp_ensure_channel 重建。新通道的上行任务在**同一个
+        // 坏 socket** 上立刻再失败,于是形成"每 ~30s 重建一次"的死循环:
+        // 控制面被无谓流量刷、会话表反复清空,而规则永远不会自愈。
+        //
+        // 独立信号让两种情况彻底分开:上行任务在 socket 失效时自行置位,
+        // 外层优先采信它,走"规则退出"分支(return),不再请求新通道。
+        match udp_pump_verdict(&sock_failed, &dead) {
+            UdpPumpVerdict::SocketFailed => {
+                warn!(
+                    proxy = rt.id,
+                    "udp pump: listen socket failed, rule loop exiting (no channel rebuild)"
+                );
+                return;
             }
-            sessions.lock().unwrap().clear();
-        } else {
-            // rule_cancel / shutdown / 监听 socket 失效:规则退出。
-            // (修前 socket 失效会停在"等下一条通道"上;直接退出更诚实,
-            // 行为差异记录于此。)
-            return;
+            UdpPumpVerdict::RuleExit => return,
+            UdpPumpVerdict::Rebuild => {
+                // 通道死亡:固定退避后重建(修前同义)。
+                debug!(proxy = rt.id, "udp channel dead");
+                if let Some(sess) = state.sessions.get(&rt.client_id) {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    udp_ensure_channel(&state, &sess, &rt).await;
+                }
+                sessions.lock().unwrap().clear();
+            }
         }
+    }
+}
+
+/// 上行收包源。
+///
+/// 抽成 trait 只为让"socket 失效"这条**错误路径**可测:真实
+/// `UdpSocket::recv_from` 在 fd 被关闭时不会返回错误,而是永久 Pending
+/// (epoll 不会因 close 唤醒),所以无法用它构造"持续报错"的现场 ——
+/// 而真实世界的失效形态(ENETDOWN / ENXIO / 驱动层 EIO)恰恰是**返回错误**。
+/// 测试实现直接返回 `Err`,生产实现原样转发,不改变任何行为。
+trait UdpRecv {
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+}
+
+impl UdpRecv for Arc<UdpSocket> {
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        UdpSocket::recv_from(self, buf).await
     }
 }
 
 /// 上行:用户 socket → 隧道写半(独占)。任一 await 都可被 dead/rule 打断。
 #[allow(clippy::too_many_arguments)]
-async fn udp_pump_up(
+async fn udp_pump_up<S: UdpRecv>(
     state: &Arc<AppState>,
     rt: &Arc<ProxyRuntime>,
-    sock: &Arc<UdpSocket>,
+    sock: &S,
     mut ch_w: UdpChanWriter,
     mut ctrl_rx: mpsc::Receiver<bytes::Bytes>,
     sessions: &Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, Instant>>>,
     last_alive: &Arc<std::sync::atomic::AtomicI64>,
     usage: &Arc<crate::state::ClientUsage>,
     dead: &tokio_util::sync::CancellationToken,
+    sock_failed: &Arc<std::sync::atomic::AtomicBool>,
     rule_cancel: &tokio_util::sync::CancellationToken,
     shutdown: &tokio_util::sync::CancellationToken,
 ) {
@@ -1871,8 +1911,17 @@ async fn udp_pump_up(
             r = sock.recv_from(&mut pkt_buf) => match r {
                 Ok(v) => v,
                 Err(_) => {
-                    // 监听 socket 失效:规则级退出(不 cancel dead ——
-                    // 外层据此直接返回而非等待重建)。
+                    // 监听 socket 失效:规则级退出。
+                    //
+                    // ★必须**置位 sock_failed** 再返回,不能只 return。
+                    //
+                    // 本任务"不 cancel dead"的意图是对的(那不是通道死亡),
+                    // 但下行任务仍持有 ctrl_tx:它会最迟在下一个 PING 时机
+                    // (≤30s)对已死的写半 send 失败,那里执行 dead.cancel(),
+                    // 外层就会误判成通道死亡并重建 —— 而重建出来的新通道在
+                    // 同一个坏 socket 上必然立刻再失败,形成永久重建死循环。
+                    // 独立信号让外层能把"socket 坏"与"通道坏"分开处理。
+                    sock_failed.store(true, Ordering::Relaxed);
                     tracing::warn!(proxy = rt.id, "udp pump: listen socket failed");
                     return;
                 }
@@ -1943,9 +1992,184 @@ async fn udp_pump_up(
     }
 }
 
+/// 控制帧入队(PONG 回执 / PING 保活),**永不无限阻塞**。
+///
+/// # 为什么不能直接 `ctrl_tx.send(..).await`
+///
+/// ctrl 通道容量 4,唯一的消费者是上行任务。上行任务在隧道写半上可能被
+/// 零窗口**长期卡住**(它对 `write_frame` 只挂了 `dead.cancelled()`,而
+/// `dead` 只能由本任务 cancel)。一旦队列被填满,本任务就 park 在
+/// `send().await` 上:
+///
+///   - 不再读隧道帧(`ch_r.read_frame` 轮不到);
+///   - `gc.tick()` 轮不到 → **90s 探活判定失效**;
+///   - 而 90s 探活正是唯一能在服务端侧判定死链的机制,且只有本任务能
+///     cancel `dead` —— 服务端自身的闭环在这里断掉。
+///
+/// 这正是 B-1 要根治的"分支体内联 await 拖停整个 select 循环",只是换了
+/// 位置重现(从 up 的写半换到了 down 的 ctrl 队列)。
+///
+/// # 语义:丢弃是可接受的
+///
+/// - PONG 丢:客户端会重新 PING;
+/// - PING 丢:下一个 gc 周期(15s)会重发。
+///
+/// 两者都不影响 90s 探活判定(`last_alive` 由上行任务的真实流量与成功
+/// 控制帧刷新,不靠这两个帧保命)。
+///
+/// # 返回值
+///
+/// - `true`:已入队,或队列暂时满(丢弃,继续循环);
+/// - `false`:**通道已关闭**(上行任务已退出、接收端没了)—— 此时通道确实
+///   死了,cancel `dead` 让外层走重建路径。
+fn ctrl_send_behavior(err: &mpsc::error::TrySendError<bytes::Bytes>) -> bool {
+    match err {
+        // 队列满:丢弃,继续。消费者活着,只是暂时跟不上。
+        mpsc::error::TrySendError::Full(_) => true,
+        // 接收端已 drop:上行任务已退出,写半没了,通道确已死。
+        mpsc::error::TrySendError::Closed(_) => false,
+    }
+}
+
+/// 非阻塞发送一帧控制帧;`false` = 通道已关闭(调用方应 cancel dead 并退出)。
+async fn ctrl_send(
+    ctrl_tx: &mpsc::Sender<bytes::Bytes>,
+    f: bytes::Bytes,
+    dead: &tokio_util::sync::CancellationToken,
+) -> bool {
+    // 先试非阻塞路径(绝大多数情况走这里,零 await)。
+    match ctrl_tx.try_send(f) {
+        Ok(()) => true,
+        Err(e) => {
+            if !ctrl_send_behavior(&e) {
+                dead.cancel();
+                return false;
+            }
+            // 队列满:下面走有界等待,拿到 PING/PONG 的"尽力送达"机会,
+            // 但绝不无限期 park。
+            let mpsc::error::TrySendError::Full(f) = e else {
+                unreachable!("Closed 已在上面返回");
+            };
+            // 有界等待:远小于 15s gc 周期,保证探活节奏不被拖坏。
+            match tokio::time::timeout(CTRL_SEND_BUDGET, ctrl_tx.send(f)).await {
+                Ok(Ok(())) => true,
+                Ok(Err(_)) => {
+                    dead.cancel();
+                    false
+                }
+                // 超时:队列仍满 → 丢弃该帧,继续循环(不 cancel dead)。
+                Err(_) => true,
+            }
+        }
+    }
+}
+
+/// 双任务 join 之后外层的走向。
+///
+/// 抽成纯函数是为了让"哪种失败该重建、哪种该退出"这条**语义**可被
+/// 单测锁住,而不必每次都搭真 UDP 通道。
+#[derive(Debug, PartialEq, Eq)]
+enum UdpPumpVerdict {
+    /// 两个任务都因 rule_cancel / shutdown 退出:规则结束。
+    RuleExit,
+    /// 监听 socket 失效:规则级退出,**不重建通道**。
+    SocketFailed,
+    /// 通道死亡:退避后重建。
+    Rebuild,
+}
+
+/// 判定顺序是语义:`sock_failed` 必须先于 `dead` 检查。
+///
+/// 两者可能同时成立 —— 上行任务因 socket 失效退出后,下行任务最迟在下一个
+/// PING 时机对已死的写半 send 失败,那里会 cancel `dead`。若先看 `dead`,
+/// 就会把"socket 坏"误判成"通道坏"并重建,而重建出的新通道在同一个坏
+/// socket 上必然立刻再失败 —— 这正是"每 ~30s 重建一次"的死循环。
+fn udp_pump_verdict(
+    sock_failed: &std::sync::atomic::AtomicBool,
+    dead: &tokio_util::sync::CancellationToken,
+) -> UdpPumpVerdict {
+    if sock_failed.load(Ordering::Relaxed) {
+        return UdpPumpVerdict::SocketFailed;
+    }
+    if dead.is_cancelled() {
+        return UdpPumpVerdict::Rebuild;
+    }
+    UdpPumpVerdict::RuleExit
+}
+
+/// UDP 泵的周期参数(生产恒用 [`PumpTiming::PROD`])。
+///
+/// 抽成结构体只为**可测**:探活闭环的正确性要在"90s 内必须收敛"上验证,
+/// 而真实阈值让测试至少跑 90s。参数化后测试用毫秒级窗口复现同一条
+/// 时序逻辑,生产取值一字未改(见 [`PumpTiming::PROD`])。
+#[derive(Clone, Copy, Debug)]
+struct PumpTiming {
+    /// gc / 保活 / 探活检查的节拍。
+    gc_every: Duration,
+    /// 距上次发 PING 超过该值就再发一次。
+    ping_every: Duration,
+    /// 存活时钟超过该值即判定死链(cancel dead)。
+    probe_timeout: Duration,
+    /// 会话表条目闲置淘汰阈值。
+    session_idle: Duration,
+}
+
+impl PumpTiming {
+    /// 生产取值:15s 节拍 / 30s 保活 / 90s 探活 / 60s 会话淘汰。
+    ///
+    /// 三个阈值的关系是语义的一部分:探活(90s)必须显著大于保活(30s),
+    /// 否则一次 PING 丢失就误杀;节拍(15s)必须整除前两者,否则判定
+    /// 粒度漂移。
+    const PROD: Self = Self {
+        gc_every: Duration::from_secs(15),
+        ping_every: Duration::from_secs(30),
+        probe_timeout: Duration::from_secs(90),
+        session_idle: Duration::from_secs(60),
+    };
+}
+
+/// 控制帧入队的有界等待上限(见 [`ctrl_send`])。
+///
+/// 取 100ms:远小于 15s gc 周期(探活节奏不受影响),又足以吃掉"上行
+/// 任务恰好在写一帧、队列瞬时满"的抖动 —— 那正是 PING/PONG 值得等一等
+/// 的唯一场景。
+const CTRL_SEND_BUDGET: Duration = Duration::from_millis(100);
+
 /// 下行:隧道读半(独占)→ 用户 socket;持会话 GC、PING 保活与 90s 探活。
 #[allow(clippy::too_many_arguments)]
 async fn udp_pump_down(
+    state: &Arc<AppState>,
+    rt: &Arc<ProxyRuntime>,
+    sock: &Arc<UdpSocket>,
+    ch_r: UdpChanReader,
+    ctrl_tx: mpsc::Sender<bytes::Bytes>,
+    sessions: &Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, Instant>>>,
+    last_alive: &Arc<std::sync::atomic::AtomicI64>,
+    usage: &Arc<crate::state::ClientUsage>,
+    dead: &tokio_util::sync::CancellationToken,
+    rule_cancel: &tokio_util::sync::CancellationToken,
+    shutdown: &tokio_util::sync::CancellationToken,
+) {
+    udp_pump_down_with(
+        state,
+        rt,
+        sock,
+        ch_r,
+        ctrl_tx,
+        sessions,
+        last_alive,
+        usage,
+        dead,
+        rule_cancel,
+        shutdown,
+        PumpTiming::PROD,
+    )
+    .await
+}
+
+/// [`udp_pump_down`] 的本体,周期参数可注入(生产恒 `PumpTiming::PROD`)。
+#[allow(clippy::too_many_arguments)]
+async fn udp_pump_down_with(
     state: &Arc<AppState>,
     rt: &Arc<ProxyRuntime>,
     sock: &Arc<UdpSocket>,
@@ -1957,11 +2181,15 @@ async fn udp_pump_down(
     dead: &tokio_util::sync::CancellationToken,
     rule_cancel: &tokio_util::sync::CancellationToken,
     shutdown: &tokio_util::sync::CancellationToken,
+    timing: PumpTiming,
 ) {
     use std::sync::atomic::Ordering;
     let mut fbuf = bytes::BytesMut::with_capacity(2048);
-    let mut gc = tokio::time::interval(Duration::from_secs(15));
-    let mut last_ping_sent = Instant::now();
+    let mut gc = tokio::time::interval(timing.gc_every);
+    // interval 的第一次 tick 立刻返回(时间 0),此时距 last_ping_sent 为 0,
+    // 不会触发保活。显式把"上次发 PING 的时刻"回拨一个周期,让**首个**
+    // gc 就走到保活分支 —— 这正是"拥塞下 PING 卡住"的现场。
+    let mut last_ping_sent = Instant::now() - timing.ping_every;
     let alive = || last_alive.load(Ordering::Relaxed);
     let touch = || last_alive.store(epoch_ms(), Ordering::Relaxed);
     // PING/PONG 载荷恒定,成帧一次缓存
@@ -2001,8 +2229,7 @@ async fn udp_pump_down(
                                 &serde_json::to_vec(&rh_protocol::message::Pong { ts_ms: 0, probe: true }).unwrap(),
                             )
                         });
-                        if ctrl_tx.send(pong.clone()).await.is_err() {
-                            dead.cancel();
+                        if !ctrl_send(&ctrl_tx, pong.clone(), dead).await {
                             break;
                         }
                         touch();
@@ -2018,23 +2245,22 @@ async fn udp_pump_down(
             _ = gc.tick() => {
                 // 会话表淘汰必须在通道存活期间执行(源地址轮换的对端会无界积累)
                 let now = Instant::now();
-                sessions.lock().unwrap().retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
+                sessions.lock().unwrap().retain(|_, t| now.duration_since(*t) < timing.session_idle);
                 // ★保活与探活挂在固定 interval 上(流量无关);修前曾有
                 // sleep 分支被高频事件饿死的缺陷,此结构保持 interval 版本。
-                if now.duration_since(last_ping_sent) >= Duration::from_secs(30) {
+                if now.duration_since(last_ping_sent) >= timing.ping_every {
                     let ping = framed_ping.get_or_init(|| {
                         rh_protocol::frame::encode_frame_bytes(
                             rh_protocol::FrameType::PING,
                             &serde_json::to_vec(&rh_protocol::message::Ping { ts_ms: 0, probe: true }).unwrap(),
                         )
                     });
-                    if ctrl_tx.send(ping.clone()).await.is_err() {
-                        dead.cancel();
+                    if !ctrl_send(&ctrl_tx, ping.clone(), dead).await {
                         break;
                     }
                     last_ping_sent = now;
                 }
-                if epoch_ms() - alive() > 90_000 {
+                if epoch_ms() - alive() > timing.probe_timeout.as_millis() as i64 {
                     dead.cancel(); // 探活超时:通道死亡
                     break;
                 }
@@ -3197,6 +3423,308 @@ mod tests {
             .await
             .expect("数据送达后 relay 必须收敛")
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod udp_pump_failure_tests {
+    //! v0.5.3 B-1 拆双任务后的两个遗留缺陷回归。
+    //!
+    //! **问题 1**:监听 socket 失效被误判成"通道死亡" → 每 ~30s 重建死循环。
+    //! **问题 2**:下行任务的 ctrl 发送内联 `await` → 拥塞时 90s 探活失效。
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::state::{ClientUsage, ProxyRuntime};
+    use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
+
+    fn udp_spec() -> rh_protocol::ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": "udp-fail",
+            "kind": "udp",
+            "client_id": "cid",
+            "bind_ip": "127.0.0.1",
+            "bind_port": 0,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+        }))
+        .unwrap()
+    }
+
+    async fn state() -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        Arc::new(AppState::new(ServerConfig::default(), db))
+    }
+
+    fn make_rt() -> Arc<ProxyRuntime> {
+        Arc::new(ProxyRuntime::new(2001, "cid".to_string(), udp_spec()))
+    }
+
+    fn sessions() -> Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, Instant>>> {
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    // ---------------- 问题 2:ctrl 发送不得无限阻塞 ----------------
+
+    /// 队列满时 `ctrl_send` 必须有界返回 `true`(丢弃该帧),而不是永久 park。
+    ///
+    /// 这是问题 2 的最小判定:容量 4 的通道塞满、接收端**不消费**,修前
+    /// `ctrl_tx.send().await` 会永久挂起;修后必须在 `CTRL_SEND_BUDGET`
+    /// 附近返回,让调用方继续跑 gc/探活。
+    #[tokio::test]
+    async fn ctrl_send_returns_when_queue_full_instead_of_blocking_forever() {
+        let (tx, _rx) = mpsc::channel::<bytes::Bytes>(4);
+        // 填满
+        for _ in 0..4 {
+            tx.try_send(bytes::Bytes::from_static(b"x")).unwrap();
+        }
+        let dead = tokio_util::sync::CancellationToken::new();
+
+        let t0 = Instant::now();
+        let ok = tokio::time::timeout(
+            Duration::from_secs(5),
+            ctrl_send(&tx, bytes::Bytes::from_static(b"ping"), &dead),
+        )
+        .await
+        .expect("队列满时 ctrl_send 不得永久阻塞(修前会 park 在 send().await 上)");
+        let elapsed = t0.elapsed();
+
+        assert!(ok, "队列满只应丢弃该帧(返回 true),不得判定通道死亡");
+        assert!(
+            !dead.is_cancelled(),
+            "队列满不等于通道死亡,不得 cancel dead"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "必须按 CTRL_SEND_BUDGET 有界返回,实际 {elapsed:?}"
+        );
+    }
+
+    /// 接收端已 drop(`Closed`)才代表通道真的死了:必须 cancel dead 并返回 false。
+    #[tokio::test]
+    async fn ctrl_send_cancels_dead_only_when_channel_closed() {
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(4);
+        drop(rx);
+        let dead = tokio_util::sync::CancellationToken::new();
+        let ok = ctrl_send(&tx, bytes::Bytes::from_static(b"ping"), &dead).await;
+        assert!(!ok, "接收端已关闭时必须返回 false");
+        assert!(dead.is_cancelled(), "通道关闭才允许 cancel dead");
+    }
+
+    /// 空队列正常入队(快路径不应引入额外延迟)。
+    #[tokio::test]
+    async fn ctrl_send_fast_path_enqueues_without_delay() {
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(4);
+        let dead = tokio_util::sync::CancellationToken::new();
+        let t0 = Instant::now();
+        assert!(ctrl_send(&tx, bytes::Bytes::from_static(b"pong"), &dead).await);
+        assert!(
+            t0.elapsed() < Duration::from_millis(50),
+            "空队列必须走零 await 的 try_send 快路径"
+        );
+        assert_eq!(rx.recv().await.unwrap(), bytes::Bytes::from_static(b"pong"));
+    }
+
+    // ---------------- 问题 2:ctrl 拥塞时 90s 探活仍生效 ----------------
+
+    /// 假读源:立刻返回 `PENDING` 永不就绪(模拟"隧道无帧可读"的死链),
+    /// 让 select 只剩 gc 分支可推进。
+    struct IdleReader;
+
+    impl tokio::io::AsyncRead for IdleReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// **问题 2 的闭环验收**:ctrl 队列被填满且**永不消费**时,
+    /// 下行任务仍必须按 `probe_timeout` 判定死链并 cancel `dead`。
+    ///
+    /// 修前:队列满 → `ctrl_tx.send().await` 永久 park → `gc.tick()` 轮不到
+    /// → 探活永不触发 → `dead` 永不被 cancel,服务端自身闭环断掉
+    /// (只能等客户端 90s 或 yamux 报错)。
+    ///
+    /// 用 `PumpTiming` 把 90s 压到毫秒级:被测的是**时序结构**,不是常量。
+    #[tokio::test]
+    async fn down_probe_fires_even_when_ctrl_queue_is_full() {
+        let st = state().await;
+        let rt = make_rt();
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sess_map = sessions();
+        // 存活时钟停在很久以前 → 第一个 gc 周期就该判死链
+        let last_alive = Arc::new(AtomicI64::new(epoch_ms() - 60_000));
+        let usage: Arc<ClientUsage> = Arc::new(ClientUsage::default());
+        let dead = tokio_util::sync::CancellationToken::new();
+
+        // ctrl 通道:容量 4 且接收端**不消费**(最坏拥塞)
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<bytes::Bytes>(4);
+        for _ in 0..4 {
+            ctrl_tx
+                .try_send(bytes::Bytes::from_static(b"filler"))
+                .unwrap();
+        }
+        // 接收端保持存活但不读 —— 让 send 一直"满"而不是 Closed
+        let _hold = ctrl_rx;
+
+        let timing = PumpTiming {
+            gc_every: Duration::from_millis(20),
+            ping_every: Duration::from_millis(10),
+            probe_timeout: Duration::from_millis(50),
+            session_idle: Duration::from_secs(60),
+        };
+
+        let h = tokio::spawn({
+            let st = st.clone();
+            let rt = rt.clone();
+            let sock = sock.clone();
+            let sess_map = sess_map.clone();
+            let last_alive = last_alive.clone();
+            let usage = usage.clone();
+            let dead = dead.clone();
+            async move {
+                udp_pump_down_with(
+                    &st,
+                    &rt,
+                    &sock,
+                    UdpChanReader::Stream(Box::new(IdleReader)),
+                    ctrl_tx,
+                    &sess_map,
+                    &last_alive,
+                    &usage,
+                    &dead,
+                    &tokio_util::sync::CancellationToken::new(),
+                    &tokio_util::sync::CancellationToken::new(),
+                    timing,
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), h)
+            .await
+            .expect(
+                "ctrl 队列满时下行任务必须仍能跑 gc 并按时收敛;                 永久阻塞说明探活闭环断了(修前的行为)",
+            )
+            .unwrap();
+        assert!(
+            dead.is_cancelled(),
+            "探活超时必须 cancel dead,否则外层永远不知道该重建通道"
+        );
+    }
+
+    // ---------------- 问题 1:socket 失效 ≠ 通道死亡 ----------------
+
+    /// `sock_failed` 置位后,外层判定必须走"规则退出",**不得**请求新通道。
+    ///
+    /// 这里直接锁住判定语义(`udp_pump_verdict`),因为完整
+    /// `udp_serve_loop` 需要真 UDP 通道 + 会话,构造成本高且判定逻辑本身
+    /// 是纯函数。完整链路由 `socket_failure_exits_loop_without_rebuild`
+    /// 覆盖。
+    #[test]
+    fn socket_failure_verdict_is_rule_exit_not_channel_dead() {
+        let dead = tokio_util::sync::CancellationToken::new();
+        let sock_failed = std::sync::atomic::AtomicBool::new(false);
+
+        // 常态:未失效、通道也未死 → 规则退出(join 已返回,无事可做)
+        assert_eq!(
+            udp_pump_verdict(&sock_failed, &dead),
+            UdpPumpVerdict::RuleExit
+        );
+
+        // 通道死亡(无 socket 故障)→ 重建
+        dead.cancel();
+        assert_eq!(
+            udp_pump_verdict(&sock_failed, &dead),
+            UdpPumpVerdict::Rebuild
+        );
+
+        // ★核心:两者同时成立时,socket 故障必须**优先**被判出。
+        // 若这里返回 Rebuild,外层就会去重建通道,而新通道在同一个坏
+        // socket 上立刻再失败 —— 每 ~30s 重建一次的死循环。
+        sock_failed.store(true, AtomicOrdering::Relaxed);
+        assert_eq!(
+            udp_pump_verdict(&sock_failed, &dead),
+            UdpPumpVerdict::SocketFailed,
+            "socket 失效必须优先于通道死亡被判出(否则外层会去重建)"
+        );
+    }
+
+    /// 收包源始终报错(模拟监听 socket 失效)。
+    struct FailingRecv;
+
+    impl UdpRecv for FailingRecv {
+        async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            Err(std::io::Error::from(std::io::ErrorKind::Other))
+        }
+    }
+
+    /// **问题 1 的闭环验收**:`recv_from` 持续报错时,上行任务必须
+    /// **置位 `sock_failed`** 并退出,且**不得** cancel `dead`。
+    ///
+    /// 这两个断言合起来就是"规则退出 vs 通道死亡"的区分:
+    /// - 置位 `sock_failed` → 外层走规则退出(不重建);
+    /// - 不 cancel `dead` → 外层不会被误导成"通道死亡"。
+    ///
+    /// 修前只 `return`(不置位),下行任务随后对已死写半 send 失败 →
+    /// cancel `dead` → 外层重建 → 新通道在同一个坏 socket 上再失败 →
+    /// 每 ~30s 重建一次的死循环。
+    #[tokio::test]
+    async fn up_sets_sock_failed_and_does_not_cancel_dead_on_recv_error() {
+        let st = state().await;
+        let rt = make_rt();
+        let sess_map = sessions();
+        let last_alive = Arc::new(AtomicI64::new(epoch_ms()));
+        let usage: Arc<ClientUsage> = Arc::new(ClientUsage::default());
+        let dead = tokio_util::sync::CancellationToken::new();
+        let sock_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel::<bytes::Bytes>(4);
+        // 写半:duplex 的一端;测试不关心内容
+        let (w, _w_peer) = tokio::io::duplex(4096);
+
+        let h = tokio::spawn({
+            let st = st.clone();
+            let rt = rt.clone();
+            let sess_map = sess_map.clone();
+            let last_alive = last_alive.clone();
+            let usage = usage.clone();
+            let dead = dead.clone();
+            let sock_failed = sock_failed.clone();
+            async move {
+                udp_pump_up(
+                    &st,
+                    &rt,
+                    &FailingRecv,
+                    UdpChanWriter::Stream(Box::new(w)),
+                    ctrl_rx,
+                    &sess_map,
+                    &last_alive,
+                    &usage,
+                    &dead,
+                    &sock_failed,
+                    &tokio_util::sync::CancellationToken::new(),
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), h)
+            .await
+            .expect("recv_from 持续报错时上行任务必须立刻退出,不得卡住")
+            .unwrap();
+
+        assert!(
+            sock_failed.load(AtomicOrdering::Relaxed),
+            "socket 失效必须置位 sock_failed —— 否则外层无从区分\"socket 坏\"\
+             与\"通道坏\",会去重建通道(死循环)"
+        );
+        assert!(
+            !dead.is_cancelled(),
+            "socket 失效**不是**通道死亡,不得 cancel dead"
+        );
     }
 }
 
