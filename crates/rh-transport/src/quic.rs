@@ -196,31 +196,54 @@ pub async fn accept(listener: &mut QuicListener) -> io::Result<Incoming> {
 /// Endpoint 缓存键:本地绑定地址族 + 创建它的 runtime。
 type EndpointKey = (bool, tokio::runtime::Id);
 
+/// 缓存值:身份令牌 + Endpoint。令牌与 Endpoint 在同一次插入中产生、
+/// 之后不再变化,`Arc::ptr_eq` 即**结构性**的实例同一性判别。
+struct CachedEndpoint {
+    token: Arc<()>,
+    endpoint: quinn::Endpoint,
+}
+
+impl Clone for CachedEndpoint {
+    fn clone(&self) -> Self {
+        // token 走 Arc clone:指针不变,克隆前后仍是同一身份。
+        Self {
+            token: self.token.clone(),
+            endpoint: self.endpoint.clone(),
+        }
+    }
+}
+
 fn endpoint_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<EndpointKey, quinn::Endpoint>> {
+) -> &'static std::sync::Mutex<std::collections::HashMap<EndpointKey, CachedEndpoint>> {
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<EndpointKey, quinn::Endpoint>>,
+        std::sync::Mutex<std::collections::HashMap<EndpointKey, CachedEndpoint>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
-/// 从缓存中驱逐一个 Endpoint(仅当仍是**同一个**实例)。
+/// 从缓存中驱逐一个 Endpoint(仅当它仍是调用方实际用过的**同一实例**)。
 ///
-/// 只驱逐"调用方实际用过的那一个":并发场景下另一个任务可能已经因为
-/// 同样的原因驱逐并重建过,用 `same_instance` 比对避免误删新鲜实例。
-fn evict_endpoint(key: EndpointKey, same_instance: &quinn::Endpoint) {
+/// 实例判别用与 Endpoint 同一次插入产生的身份令牌(`Arc::ptr_eq`):
+/// 令牌相等 ⟺ 同一次 `client_endpoint` 插入,无 IO、无 Err 路径、
+/// 无端口撞车。并发下另一任务驱逐重建后,本任务持旧令牌再来驱逐时
+/// 比对不中,新鲜实例安然留在缓存里被复用。
+///
+/// 为什么不用 quinn 自己的接口判身份(查证 quinn 0.11.12 endpoint.rs):
+/// - `Endpoint` 仅 derive `Debug, Clone`(L50),无 `PartialEq`;
+/// - 内部 `EndpointRef(Arc<EndpointInner>)` 为 `pub(crate)`(L678),
+///   外部拿不到指针做比较;
+/// - `driver_lost` 是私有字段(L483),无公开存活查询。
+///
+/// 前一版用 `local_addr` 比对,已废弃,三个理由:
+/// 1. 任一方 `local_addr()` 返回 Err(socket 被内核回收等)即放弃驱逐,
+///    本次 attempt 已耗尽,自愈多绕一整次 connect;
+/// 2. 端口撞车(死实例与并发重建的新实例恰好同端口)只能靠
+///    "0.0.0.0:0 重绑几乎不可能撞上"的概率论证排除,不是结构性保证;
+/// 3. local_addr 是 socket 属性而非实例身份,相等不蕴含同一实例。
+fn evict_endpoint(key: EndpointKey, token: &Arc<()>) {
     let mut g = endpoint_cache().lock().unwrap();
-    if let Some(cur) = g.get(&key) {
-        // quinn::Endpoint 未实现 PartialEq;用 driver 侧唯一可观测的稳定量
-        // (本地地址)判同一实例。同 key 同族 + 同端口几乎不可能撞车,
-        // 而即便误判,代价也只是多重绑一个 UDP socket。
-        let same = match (cur.local_addr(), same_instance.local_addr()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        };
-        if same {
-            g.remove(&key);
-        }
+    if matches!(g.get(&key), Some(cur) if Arc::ptr_eq(&cur.token, token)) {
+        g.remove(&key);
     }
 }
 
@@ -242,7 +265,8 @@ fn is_endpoint_level_error(e: &quinn::ConnectError) -> bool {
     matches!(e, quinn::ConnectError::EndpointStopping)
 }
 
-/// N14:按 (bind 族, runtime Id) 缓存的客户端 Endpoint。
+/// N14:按 (bind 族, runtime Id) 缓存的客户端 Endpoint,连同身份令牌一起
+/// 返回(令牌供 [`evict_endpoint`] 做实例同一性判别)。
 /// 键必须含 runtime Id:Endpoint 的 driver 任务绑定**创建它的** runtime,
 /// runtime 退出后 driver 即死 —— 按进程全局缓存时,测试环境(每个
 /// #[tokio::test] 一个独立 runtime)首个测试结束后共享 Endpoint 的
@@ -250,13 +274,13 @@ fn is_endpoint_level_error(e: &quinn::ConnectError) -> bool {
 /// 测试各 runtime 各自一份。
 ///
 /// **失效路径**:缓存本身没有主动驱逐(quinn 的 Endpoint 没有"是否还活着"
-/// 的查询接口),因此死 Endpoint 会被 `connect` 在失败时按需驱逐 ——
-/// 见 [`is_endpoint_level_error`] 与 `connect` 里的重试。
-fn client_endpoint(is_v4: bool) -> io::Result<quinn::Endpoint> {
+/// 的公开查询接口,见 `evict_endpoint` 注释的查证),死 Endpoint 由
+/// `connect` 在失败时按需驱逐 —— 见 [`is_endpoint_level_error`]。
+fn client_endpoint(is_v4: bool) -> io::Result<(Arc<()>, quinn::Endpoint)> {
     let key = (is_v4, tokio::runtime::Handle::current().id());
     let mut g = endpoint_cache().lock().unwrap();
-    if let Some(e) = g.get(&key) {
-        return Ok(e.clone());
+    if let Some(c) = g.get(&key) {
+        return Ok((c.token.clone(), c.endpoint.clone()));
     }
     // 本地绑定地址必须与**服务端地址同族**:写死 0.0.0.0 时连 IPv6 服务端
     // 会因 address family 不匹配直接失败(与 kcp.rs 的同款分支对齐)。
@@ -272,8 +296,13 @@ fn client_endpoint(is_v4: bool) -> io::Result<quinn::Endpoint> {
         quinn::default_runtime().ok_or_else(|| other_err("quic: no async runtime"))?,
     )
     .map_err(|e| other_err(format!("quic client bind: {e}")))?;
-    g.insert(key, endpoint.clone());
-    Ok(endpoint)
+    let cached = CachedEndpoint {
+        token: Arc::new(()),
+        endpoint: endpoint.clone(),
+    };
+    let token = cached.token.clone();
+    g.insert(key, cached);
+    Ok((token, endpoint))
 }
 
 pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>> {
@@ -305,7 +334,7 @@ pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>
     // 否则只会白丢 Endpoint 复用。
     let mut attempt = 0;
     let conn = loop {
-        let endpoint = client_endpoint(is_v4)?;
+        let (token, endpoint) = client_endpoint(is_v4)?;
         // 一次超时覆盖"建连接对象 + 握手"两段:修前两段各包一次
         // connect_timeout,最坏要等 2× 超时才失败(上层按 connect_timeout
         // 做重连退避,双倍延迟会让退避节奏整体错位)。endpoint.connect
@@ -329,8 +358,9 @@ pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>
             // connect_with 失败:只有 EndpointStopping 才值得驱逐重试
             Ok(Err(e)) => {
                 if attempt == 0 && is_endpoint_level_error(&e) {
-                    // 死 Endpoint:驱逐后重试一次(下一次 loop 会重建)
-                    evict_endpoint(key, &endpoint);
+                    // 死 Endpoint:驱逐(token 判同一实例,见 evict_endpoint)
+                    // 后重试一次(下一次 loop 会重建)
+                    evict_endpoint(key, &token);
                     attempt += 1;
                     continue;
                 }
@@ -624,7 +654,8 @@ mod tests {
                 .get(&key)
                 .cloned()
                 .expect("首次连接后缓存里必须有 Endpoint");
-            ep.close(quinn::VarInt::from_u32(0), b"test: kill endpoint");
+            ep.endpoint
+                .close(quinn::VarInt::from_u32(0), b"test: kill endpoint");
         }
         // 给 driver 一点时间收敛到"停止服务"
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -673,6 +704,45 @@ mod tests {
         assert!(
             super::endpoint_cache().lock().unwrap().contains_key(&key),
             "握手超时属于服务端侧错误,不得驱逐 Endpoint(否则白丢复用)"
+        );
+    }
+
+    /// 身份判别契约:驱逐只认**同一次插入**的令牌(token)。
+    ///
+    /// 并发场景下,另一任务可能已因同样原因驱逐并重建过;此时本任务持
+    /// **旧令牌**再来驱逐,必须比对不中、留下新鲜实例 —— 否则重连风暴中
+    /// N 个并发任务会连环误删彼此刚重建的 Endpoint,每次都多绑一个
+    /// UDP socket + driver。修前(local_addr 比对)除此之外还有
+    /// Err 即放弃、端口撞车两个瑕疵,token 判别一并消除。
+    ///
+    /// 反向验证(2026-10-25 实测):把 `evict_endpoint` 的 `Arc::ptr_eq`
+    /// 条件去掉改成无条件 remove,本测试的"旧令牌不得驱逐"断言立刻变红。
+    /// `client_endpoint` 无网络依赖(只绑本地 UDP socket),可直连直测。
+    #[tokio::test]
+    async fn evict_matches_token_identity() {
+        let key = (true, tokio::runtime::Handle::current().id());
+
+        // 首建 (T1, E1);T1 驱逐 → 缓存清空、下轮重建
+        let (t1, _e1) = super::client_endpoint(true).unwrap();
+        super::evict_endpoint(key, &t1);
+        assert!(
+            !super::endpoint_cache().lock().unwrap().contains_key(&key),
+            "匹配令牌必须驱逐"
+        );
+
+        // 重建得到 (T2, E2);持旧令牌 T1 再驱逐 → 不得动 E2
+        let (t2, _e2) = super::client_endpoint(true).unwrap();
+        super::evict_endpoint(key, &t1);
+        assert!(
+            super::endpoint_cache().lock().unwrap().contains_key(&key),
+            "旧令牌不得驱逐并发重建的新鲜实例"
+        );
+
+        // 现任令牌 T2 驱逐 → 生效
+        super::evict_endpoint(key, &t2);
+        assert!(
+            !super::endpoint_cache().lock().unwrap().contains_key(&key),
+            "现任令牌必须驱逐"
         );
     }
 
