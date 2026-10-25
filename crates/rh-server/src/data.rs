@@ -2135,6 +2135,32 @@ impl PumpTiming {
 /// 的唯一场景。
 const CTRL_SEND_BUDGET: Duration = Duration::from_millis(100);
 
+/// 计算"上次发 PING 的时刻"初值:把 `now` 回拨一个 `ping_every`。
+///
+/// # 为什么需要回拨
+///
+/// `tokio::time::interval` 的**第一次** tick 立刻返回,此刻距刚初始化的
+/// `last_ping_sent` 为 0,首个 gc 走不到保活分支。回拨一个周期后,首个 gc
+/// 就会发 PING —— 拥塞场景的回归测试正是靠这一点进入"PING 卡住"的现场。
+///
+/// # 为什么用 `checked_sub` 而不是直接减
+///
+/// `Instant - Duration` 在下溢时 **panic**(内部 `expect`,与
+/// `checked_sub` 返回 `None` 是同一条件)。`Instant` 的锚点是开机时刻,
+/// 所以机器 uptime 小于 `ping_every`(生产 30s)时任务启动就会触发 ——
+/// 概率趋近于零(嵌入式 / 快启动 / 容器内时钟异常),但确实是真实可触发的
+/// panic,而这条路径完全没有理由让进程崩掉。
+///
+/// 下溢时以 `now` 为锚:首个 gc tick **不**发 PING,与回拨之前的原始行为
+/// 一致,只是保活起点晚一个周期,无害。
+///
+/// 注:下溢分支无法用真实 `Instant` 构造(`Instant` 无公开构造接口,
+/// 也无法在安全 Rust 里伪造"刚开机"的时钟),故只对常规路径做断言,
+/// 下溢分支由本注释说明,不引入非移植的时钟 hack。
+fn ping_sent_anchor(now: Instant, ping_every: Duration) -> Instant {
+    now.checked_sub(ping_every).unwrap_or(now)
+}
+
 /// 下行:隧道读半(独占)→ 用户 socket;持会话 GC、PING 保活与 90s 探活。
 #[allow(clippy::too_many_arguments)]
 async fn udp_pump_down(
@@ -2186,10 +2212,7 @@ async fn udp_pump_down_with(
     use std::sync::atomic::Ordering;
     let mut fbuf = bytes::BytesMut::with_capacity(2048);
     let mut gc = tokio::time::interval(timing.gc_every);
-    // interval 的第一次 tick 立刻返回(时间 0),此时距 last_ping_sent 为 0,
-    // 不会触发保活。显式把"上次发 PING 的时刻"回拨一个周期,让**首个**
-    // gc 就走到保活分支 —— 这正是"拥塞下 PING 卡住"的现场。
-    let mut last_ping_sent = Instant::now() - timing.ping_every;
+    let mut last_ping_sent = ping_sent_anchor(Instant::now(), timing.ping_every);
     let alive = || last_alive.load(Ordering::Relaxed);
     let touch = || last_alive.store(epoch_ms(), Ordering::Relaxed);
     // PING/PONG 载荷恒定,成帧一次缓存
@@ -3522,6 +3545,39 @@ mod udp_pump_failure_tests {
             "空队列必须走零 await 的 try_send 快路径"
         );
         assert_eq!(rx.recv().await.unwrap(), bytes::Bytes::from_static(b"pong"));
+    }
+
+    /// 保活起点锚:常规路径必须回拨恰好一个 `ping_every`。
+    ///
+    /// 这个回拨是"首个 gc 就发 PING"的前提(interval 首次 tick 立刻返回,
+    /// 不回拨则距上次为 0,永远进不了保活分支)。
+    ///
+    /// 下溢分支(uptime < ping_every)无法用真实 `Instant` 构造 ——
+    /// `Instant` 没有公开构造接口,也不能在安全 Rust 里伪造"刚开机"的时钟。
+    /// 该分支的语义(下溢时以 now 为锚、不 panic)见 [`ping_sent_anchor`]
+    /// 的文档,此处不引入非移植的时钟 hack 去覆盖它。
+    #[test]
+    fn ping_sent_anchor_rewinds_by_ping_every() {
+        let now = Instant::now();
+        let every = Duration::from_secs(30);
+        let anchor = ping_sent_anchor(now, every);
+        assert_eq!(
+            now.duration_since(anchor),
+            every,
+            "常规路径必须恰好回拨一个 ping_every(否则首个 gc 的保活判定会漂移)"
+        );
+        // 回拨后首个 gc(远小于 ping_every)必定满足"该发 PING"的条件
+        assert!(
+            now.duration_since(anchor) >= every,
+            "回拨量必须足以让首个 gc tick 走进保活分支"
+        );
+    }
+
+    /// 零间隔是退化输入:回拨 0 等于不回拨,不得 panic。
+    #[test]
+    fn ping_sent_anchor_handles_zero_interval() {
+        let now = Instant::now();
+        assert_eq!(ping_sent_anchor(now, Duration::ZERO), now);
     }
 
     // ---------------- 问题 2:ctrl 拥塞时 90s 探活仍生效 ----------------
