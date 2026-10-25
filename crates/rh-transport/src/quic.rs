@@ -198,19 +198,12 @@ type EndpointKey = (bool, tokio::runtime::Id);
 
 /// 缓存值:身份令牌 + Endpoint。令牌与 Endpoint 在同一次插入中产生、
 /// 之后不再变化,`Arc::ptr_eq` 即**结构性**的实例同一性判别。
+/// Clone 对 token 是 Arc 克隆(指针不变),克隆体仍是同一身份 —— 这是
+/// `evict_endpoint` 用缓存值里的 token 比对的前提。
+#[derive(Clone)]
 struct CachedEndpoint {
     token: Arc<()>,
     endpoint: quinn::Endpoint,
-}
-
-impl Clone for CachedEndpoint {
-    fn clone(&self) -> Self {
-        // token 走 Arc clone:指针不变,克隆前后仍是同一身份。
-        Self {
-            token: self.token.clone(),
-            endpoint: self.endpoint.clone(),
-        }
-    }
 }
 
 fn endpoint_cache(
@@ -228,8 +221,9 @@ fn endpoint_cache(
 /// 无端口撞车。并发下另一任务驱逐重建后,本任务持旧令牌再来驱逐时
 /// 比对不中,新鲜实例安然留在缓存里被复用。
 ///
-/// 为什么不用 quinn 自己的接口判身份(查证 quinn 0.11.12 endpoint.rs):
-/// - `Endpoint` 仅 derive `Debug, Clone`(L50),无 `PartialEq`;
+/// 为什么不用 quinn 自己的接口判身份(查证 quinn 0.11.12 endpoint.rs,
+/// 行号系该版本快照,升级 quinn 后以结构描述为准):
+/// - `Endpoint` 仅 derive `Debug, Clone`(L49-50),无 `PartialEq`;
 /// - 内部 `EndpointRef(Arc<EndpointInner>)` 为 `pub(crate)`(L678),
 ///   外部拿不到指针做比较;
 /// - `driver_lost` 是私有字段(L483),无公开存活查询。
