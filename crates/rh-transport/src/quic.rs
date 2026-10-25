@@ -193,19 +193,68 @@ pub async fn accept(listener: &mut QuicListener) -> io::Result<Incoming> {
         .ok_or_else(|| other_err("quic listener closed"))
 }
 
+/// Endpoint 缓存键:本地绑定地址族 + 创建它的 runtime。
+type EndpointKey = (bool, tokio::runtime::Id);
+
+fn endpoint_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<EndpointKey, quinn::Endpoint>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<EndpointKey, quinn::Endpoint>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// 从缓存中驱逐一个 Endpoint(仅当仍是**同一个**实例)。
+///
+/// 只驱逐"调用方实际用过的那一个":并发场景下另一个任务可能已经因为
+/// 同样的原因驱逐并重建过,用 `same_instance` 比对避免误删新鲜实例。
+fn evict_endpoint(key: EndpointKey, same_instance: &quinn::Endpoint) {
+    let mut g = endpoint_cache().lock().unwrap();
+    if let Some(cur) = g.get(&key) {
+        // quinn::Endpoint 未实现 PartialEq;用 driver 侧唯一可观测的稳定量
+        // (本地地址)判同一实例。同 key 同族 + 同端口几乎不可能撞车,
+        // 而即便误判,代价也只是多重绑一个 UDP socket。
+        let same = match (cur.local_addr(), same_instance.local_addr()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if same {
+            g.remove(&key);
+        }
+    }
+}
+
+/// 判断错误是否指向 **Endpoint 自身**已不可用(而非服务端侧问题)。
+///
+/// 只认 `ConnectError::EndpointStopping` —— quinn 在 driver 任务死亡
+/// (`EndpointDriver` 的 future 结束,例如 UDP socket IO 错误)或
+/// `Endpoint::close()` 之后,`connect_with` 会立刻返回它,且**不发出任何
+/// 网络包**。这是唯一可靠的"endpoint 级"判据:
+///
+/// - 握手超时 / 连接被拒 / 证书错误 → 都在 `connecting.await` 之后才出现,
+///   属于**服务端侧或路径**问题,驱逐 Endpoint 只会白白丢掉复用(还要
+///   重建 UDP socket + driver),下次照样失败;
+/// - `CidsExhausted` / `InvalidRemoteAddress` / `InvalidServerName` 等是
+///   **配置**问题,驱逐同样无用。
+///
+/// 因此只对 EndpointStopping 驱逐,其余错误原样上抛。
+fn is_endpoint_level_error(e: &quinn::ConnectError) -> bool {
+    matches!(e, quinn::ConnectError::EndpointStopping)
+}
+
 /// N14:按 (bind 族, runtime Id) 缓存的客户端 Endpoint。
 /// 键必须含 runtime Id:Endpoint 的 driver 任务绑定**创建它的** runtime,
 /// runtime 退出后 driver 即死 —— 按进程全局缓存时,测试环境(每个
 /// #[tokio::test] 一个独立 runtime)首个测试结束后共享 Endpoint 的
 /// 握手全部 "closed"。按 runtime 键控后:生产单 runtime 恰好一份/族,
 /// 测试各 runtime 各自一份。
+///
+/// **失效路径**:缓存本身没有主动驱逐(quinn 的 Endpoint 没有"是否还活着"
+/// 的查询接口),因此死 Endpoint 会被 `connect` 在失败时按需驱逐 ——
+/// 见 [`is_endpoint_level_error`] 与 `connect` 里的重试。
 fn client_endpoint(is_v4: bool) -> io::Result<quinn::Endpoint> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(bool, tokio::runtime::Id), quinn::Endpoint>>,
-    > = std::sync::OnceLock::new();
-    let cell = CACHE.get_or_init(Default::default);
-    let mut g = cell.lock().unwrap();
     let key = (is_v4, tokio::runtime::Handle::current().id());
+    let mut g = endpoint_cache().lock().unwrap();
     if let Some(e) = g.get(&key) {
         return Ok(e.clone());
     }
@@ -236,32 +285,60 @@ pub async fn connect(cfg: &ClientTransportConfig) -> io::Result<Arc<Multiplexer>
             .map_err(|e| other_err(format!("quic client config: {e}")))?,
     ));
     qcfg.transport_config(Arc::new(transport_config(true, MUX_STREAMS_UNLIMITED)));
-    // N14:Endpoint 按服务端地址族缓存复用(修前每次 connect 新绑一个
-    // UDP socket + 起 driver;quinn 客户端形态本就支持单 Endpoint 多
-    // 连接,CID 区分)。配置经 connect_with 每次携带,不同 tls 配置的
-    // 调用共享 Endpoint 不互相覆盖。
-    let endpoint = client_endpoint(cfg.server_addr.is_ipv4())?;
+    let is_v4 = cfg.server_addr.is_ipv4();
+    let key = (is_v4, tokio::runtime::Handle::current().id());
     let name = cfg
         .tls
         .server_name
         .clone()
         .unwrap_or_else(|| cfg.server_addr.ip().to_string());
-    // 一次超时覆盖"建连接对象 + 握手"两段:修前两段各包一次 connect_timeout,
-    // 最坏情况要等 2× 超时才失败(上层按 connect_timeout 做重连退避,双倍延迟
-    // 会让退避节奏整体错位)。endpoint.connect 本身只构造状态机不阻塞,真正
-    // 耗时的握手在 awaiting `connecting` 时发生,故合并为单个 deadline 即可。
-    // 两段错误类型不同(ConnectError / ConnectionError),在闭包内就地转成
-    // io::Error,让外层只需处理超时。
-    let conn = tokio::time::timeout(cfg.connect_timeout, async {
-        let connecting = endpoint
-            .connect_with(qcfg, cfg.server_addr, &name)
-            .map_err(|e| other_err(format!("quic connect: {e}")))?;
-        connecting
-            .await
-            .map_err(|e| other_err(format!("quic handshake: {e}")))
-    })
-    .await
-    .map_err(|_| other_err("quic connect/handshake timeout"))??;
+    // N14:Endpoint 按服务端地址族缓存复用(修前每次 connect 新绑一个
+    // UDP socket + 起 driver;quinn 客户端形态本就支持单 Endpoint 多
+    // 连接,CID 区分)。配置经 connect_with 每次携带,不同 tls 配置的
+    // 调用共享 Endpoint 不互相覆盖。
+    //
+    // ★失效自愈(修前是"永久 brick"):缓存的 Endpoint 一旦 driver 死亡
+    // (UDP socket IO 错误等),后续所有 connect 都会立刻返回
+    // `EndpointStopping` 且**不发任何包**,只能重启进程恢复 —— N14 之前
+    // 每次新建 Endpoint 天然自愈。这里在**确认是 endpoint 级错误**时
+    // 驱逐缓存并重试一次;服务端侧错误(超时/拒绝/证书)绝不驱逐,
+    // 否则只会白丢 Endpoint 复用。
+    let mut attempt = 0;
+    let conn = loop {
+        let endpoint = client_endpoint(is_v4)?;
+        // 一次超时覆盖"建连接对象 + 握手"两段:修前两段各包一次
+        // connect_timeout,最坏要等 2× 超时才失败(上层按 connect_timeout
+        // 做重连退避,双倍延迟会让退避节奏整体错位)。endpoint.connect
+        // 本身只构造状态机不阻塞,真正耗时的握手在 awaiting `connecting`
+        // 时发生,故合并为单个 deadline 即可。
+        //
+        // 两段错误类型不同,在闭包内就地转成 io::Error;但 **ConnectError
+        // 要单独带出来** —— 只有它能区分"endpoint 级"与"参数级"错误。
+        let r = tokio::time::timeout(cfg.connect_timeout, async {
+            let connecting = endpoint.connect_with(qcfg.clone(), cfg.server_addr, &name)?;
+            Ok::<_, quinn::ConnectError>(connecting.await)
+        })
+        .await;
+        match r {
+            // 握手成功
+            Ok(Ok(Ok(c))) => break c,
+            // 握手失败(服务端侧/路径/证书):原样上抛,**不驱逐**
+            Ok(Ok(Err(e))) => {
+                return Err(other_err(format!("quic handshake: {e}")));
+            }
+            // connect_with 失败:只有 EndpointStopping 才值得驱逐重试
+            Ok(Err(e)) => {
+                if attempt == 0 && is_endpoint_level_error(&e) {
+                    // 死 Endpoint:驱逐后重试一次(下一次 loop 会重建)
+                    evict_endpoint(key, &endpoint);
+                    attempt += 1;
+                    continue;
+                }
+                return Err(other_err(format!("quic connect: {e}")));
+            }
+            Err(_) => return Err(other_err("quic connect/handshake timeout")),
+        }
+    };
     // 记录对端叶子证书:上层(rh-client)用它比对服务端用 secret 加密下发的
     // 证书,不一致即说明中间有人在转发。与 tcp/tls 路径(sink 在握手后立刻
     // 写入)对齐——不写 sink 时上层 `peer_cert.get()` 恒为 None,而
@@ -477,6 +554,128 @@ mod tests {
     /// 而不是能区分 bug 的断言 —— 负向验证(把 `shutdown.send(())` 删掉)
     /// 实测**不会变红**,已如实记录,避免后人误以为它有区分力。
     ///
+    /// **回归(N14 缓存无失效路径)**:缓存中的 Endpoint 一旦失效,下一次
+    /// connect 必须自愈,而不是永久 brick。
+    ///
+    /// 构造:正常建一次连接(把 Endpoint 写进缓存),然后对**缓存里那个**
+    /// Endpoint 调 `close()` —— 这是 quinn 提供的"让 endpoint 停止服务"
+    /// 的公开手段,之后 `connect_with` 立刻返回 `EndpointStopping`
+    /// (与 driver 死亡后的表现完全一致,是同一判据)。
+    ///
+    /// 修前:缓存的死 Endpoint 被一直返回 → 后续 connect 全部
+    /// `quic connect: endpoint stopping`,只能重启进程。
+    /// 修后:识别为 endpoint 级错误 → 驱逐 + 重试一次 → 成功。
+    #[tokio::test]
+    async fn dead_cached_endpoint_is_evicted_and_next_connect_heals() {
+        let (cert, key) = crate::tls::auto_cert(&Default::default()).unwrap();
+        let server_cfg = ServerTransportConfig {
+            protocol: Protocol::Quic,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            multiplex: true,
+            tls: crate::TlsServerOptions {
+                cert_pem: Some(cert),
+                key_pem: Some(key),
+                ..Default::default()
+            },
+            alpn: vec![crate::DEFAULT_ALPN.into()],
+        };
+        let mut listener = listen(
+            &server_cfg,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr;
+        // 服务端持续 accept(两次连接)
+        let srv = tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Ok(_inc) = listener.accept().await {
+                    // 保持连接存活
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    });
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        });
+
+        let client = ClientTransportConfig {
+            protocol: Protocol::Quic,
+            server_addr: addr,
+            multiplex: true,
+            connect_timeout: std::time::Duration::from_secs(5),
+            tls: crate::TlsClientOptions {
+                insecure_skip_verify: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // 第一次:把 Endpoint 建进缓存
+        let mux1 = super::connect(&client).await.expect("首次连接必须成功");
+        drop(mux1);
+
+        // 让缓存里的 Endpoint 失效(等价于 driver 死亡后的状态)
+        {
+            let key = (addr.is_ipv4(), tokio::runtime::Handle::current().id());
+            let ep = super::endpoint_cache()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .expect("首次连接后缓存里必须有 Endpoint");
+            ep.close(quinn::VarInt::from_u32(0), b"test: kill endpoint");
+        }
+        // 给 driver 一点时间收敛到"停止服务"
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 第二次:**必须自愈**(修前会一直拿到死 Endpoint 而永久失败)
+        let mux2 =
+            tokio::time::timeout(std::time::Duration::from_secs(10), super::connect(&client))
+                .await
+                .expect("死 Endpoint 不得让 connect 卡住")
+                .expect(
+                    "缓存中的 Endpoint 失效后,下一次 connect 必须驱逐并重建;\
+             永久失败说明缓存没有失效路径(N14 遗留)",
+                );
+        drop(mux2);
+        srv.abort();
+    }
+
+    /// 反向契约:**服务端侧**错误不得驱逐 Endpoint。
+    ///
+    /// 对端不可达时错误是握手超时(ConnectionError),不是 EndpointStopping。
+    /// 若在这里也驱逐,每次超时都要重建 UDP socket + driver,纯属浪费 ——
+    /// 而且下次照样失败,驱逐没有任何收益。
+    #[tokio::test]
+    async fn server_side_error_does_not_evict_endpoint() {
+        // 找一个必然无人监听的本地端口
+        let dead_addr = {
+            let l = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let client = ClientTransportConfig {
+            protocol: Protocol::Quic,
+            server_addr: dead_addr,
+            multiplex: true,
+            connect_timeout: std::time::Duration::from_millis(300),
+            tls: crate::TlsClientOptions {
+                insecure_skip_verify: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let r = super::connect(&client).await;
+        assert!(r.is_err(), "对端不可达时连接必须失败");
+
+        // Endpoint 仍应留在缓存里(握手超时不等于 endpoint 坏了)
+        let key = (dead_addr.is_ipv4(), tokio::runtime::Handle::current().id());
+        assert!(
+            super::endpoint_cache().lock().unwrap().contains_key(&key),
+            "握手超时属于服务端侧错误,不得驱逐 Endpoint(否则白丢复用)"
+        );
+    }
+
     /// 反向契约:drop **不得**杀死已建立连接 —— 第一版实现用
     /// `Endpoint::close()` 收敛,实测把在途连接一起打死
     /// (`ConnectionLost(ApplicationClosed{reason:"listener dropped"})`,
