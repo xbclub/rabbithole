@@ -3068,26 +3068,11 @@ mod kcp_regress {
         }
         assert!(backlog.is_empty(), "空闲冲刷不得残留 backlog");
 
-        // 满载回落实测仅 Linux:loopback UDP 记 sender wmem,收紧 sndbuf
-        // 后必然 EAGAIN;macOS loopback 满载在接收侧静默丢包、不回压
-        // 发送者,无法在本机构造(回落路径的顺序性由下方
-        // a03_send_agg_transfer_keeps_order 确定性钉住)。
-        #[cfg(target_os = "linux")]
-        {
-            let _ = socket2::SockRef::from(&*tx_sock).set_send_buffer_size(2048);
-            let payload = vec![0xABu8; 1400];
-            for _ in 0..4096 {
-                agg.push(&payload);
-                agg.flush_now().ok();
-                if backlog.queued_packets() > 0 {
-                    break;
-                }
-            }
-            assert!(
-                backlog.queued_packets() > 0,
-                "持续满载必须触发 EAGAIN 余段回落 backlog"
-            );
-        }
+        // 满载回落(EAGAIN 余段转 backlog)不做真实 socket 洪泛断言:
+        // loopback UDP 在 macOS 与 Linux(test1/CI ubuntu 实测 4096×1400B
+        // 收紧 sndbuf 后全部发送成功)都是接收满即静默丢包、不回压发送
+        // 端,断言依赖内核调参必假绿或必红。回落路径的行为与顺序性由
+        // a03_send_agg_transfer_keeps_order 直接调用内部路径确定性钉住。
     }
 
     /// A-3:余段转移的 FIFO —— transfer_to_backlog 必须把聚合缓冲内
