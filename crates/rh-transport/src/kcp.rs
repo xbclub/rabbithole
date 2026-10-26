@@ -1915,117 +1915,53 @@ async fn demux_loop(
     sessions: SessionMap,
 ) {
     loop {
-        // A-5:Linux 用 recvmmsg 批收(单 syscall ≤64 报,高聚合 pps 下的
-        // 收包扩展上限);其余平台保持逐包 recv_from。MacOS 无 recvmmsg,
-        // libc 依赖也只声明在 linux target(与 A-3 sendmmsg 同款门控)。
-        #[cfg(target_os = "linux")]
-        {
-            tokio::select! {
-                r = udp.readable() => {
-                    if let Err(e) = r {
-                        // 持续性 socket 错误(如 fd 失效)不退避会忙转烧 CPU
-                        tracing::warn!(error = %e, "kcp recv error");
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        continue;
-                    }
+        // A-4:每迭代取池槽收包,随包整槽移交消费端(drop 路径由
+        // demux_route_one 统一归还)。
+        //
+        // A-5 回退(2026-10-26 基准):Linux 曾用「readable() + raw
+        // recvmmsg 批收 + try 探测清缓存」替代本逐包 recv_from,实测
+        // 对回显窗口型 UDP 载荷(1200B×window32)每程加 ~110µs 固定
+        // 延迟(RTT p50 3.16→3.82ms,吞吐 -19%),而对 TCP 吞吐零贡献
+        // (agg 关闭对照轮与基线持平)。批收的 syscall 摊薄在该负载
+        // 下买不回这个延迟代价,统一回到 tokio 原生 recv_from 的等待
+        // 语义 —— 唤醒点就是收包点,无就绪缓存簿记。
+        let mut buf = pkt_pool_get();
+        let (n, peer) = tokio::select! {
+            r = udp.recv_from(&mut buf) => match r {
+                Ok(x) => {
+                    bump_counter!(recvfrom_calls);
+                    x
                 }
-                // listener drop / 最后会话退出通知:已 closing 且无会话
-                // → 退出释放 socket;仍有会话则继续服务存量。
-                _ = ctl.wake.notified() => {
-                    if ctl.closing.load(Ordering::Acquire)
-                        && sessions.lock().unwrap().is_empty()
-                    {
-                        tracing::debug!("kcp demux exit: listener dropped, no sessions");
-                        break;
-                    }
-                    continue;
-                }
-            }
-            // 就绪后排空:批收(recvmmsg ≤64 报/次)为主,末尾用一次
-            // tokio 原生 try 探测收尾 —— raw recvmmsg 打到 EAGAIN **不会**
-            // 清 tokio 的就绪缓存,直接回到 select 会让 readable() 永远
-            // 立即就绪 → 忙转(Linux CI 实测 27 万次 EAGAIN 空转,current_thread
-            // 测试运行时下饿死会话任务)。try_recv_buf_from 经 try_io,遇
-            // WouldBlock 清缓存,select 才能真正挂起;偶得包则照常路由后
-            // 回批路径续收,不丢序。
-            loop {
-                let batch = recv_mmsg_batch(&udp);
-                for (pkt, peer) in batch {
-                    demux_route_one(&udp, &accept_tx, &mux_streams, &ctl, &sessions, peer, pkt);
-                }
-                let mut probe = pkt_pool_get();
-                match udp.try_recv_buf_from(&mut probe) {
-                    Ok((n, peer)) if n > 0 => {
-                        demux_route_one(
-                            &udp,
-                            &accept_tx,
-                            &mux_streams,
-                            &ctl,
-                            &sessions,
-                            peer,
-                            PooledPkt { buf: probe, len: n },
-                        );
-                        continue;
-                    }
-                    Ok(_) => {
-                        pkt_pool_put(probe);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // 缓存已清:回到 select 等新事件
-                        pkt_pool_put(probe);
-                        break;
-                    }
-                    Err(e) => {
-                        pkt_pool_put(probe);
-                        tracing::warn!(error = %e, "kcp recv error");
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        break;
-                    }
-                }
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // A-4:每迭代取池槽收包,随包整槽移交消费端(drop 路径由
-            // demux_route_one 统一归还)
-            let mut buf = pkt_pool_get();
-            let (n, peer) = tokio::select! {
-                r = udp.recv_from(&mut buf) => match r {
-                    Ok(x) => {
-                        bump_counter!(recvfrom_calls);
-                        x
-                    }
-                    Err(e) => {
-                        // 持续性 socket 错误(如 fd 失效)不退避会忙转烧 CPU
-                        tracing::warn!(error = %e, "kcp recv error");
-                        pkt_pool_put(buf);
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        continue;
-                    }
-                },
-                // listener drop / 最后会话退出通知:已 closing 且无会话
-                // → 退出释放 socket;仍有会话则继续服务存量。
-                _ = ctl.wake.notified() => {
-                    if ctl.closing.load(Ordering::Acquire)
-                        && sessions.lock().unwrap().is_empty()
-                    {
-                        tracing::debug!("kcp demux exit: listener dropped, no sessions");
-                        break;
-                    }
+                Err(e) => {
+                    // 持续性 socket 错误(如 fd 失效)不退避会忙转烧 CPU
+                    tracing::warn!(error = %e, "kcp recv error");
                     pkt_pool_put(buf);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 }
-            };
-            demux_route_one(
-                &udp,
-                &accept_tx,
-                &mux_streams,
-                &ctl,
-                &sessions,
-                peer,
-                PooledPkt { buf, len: n },
-            );
-        }
+            },
+            // listener drop / 最后会话退出通知:已 closing 且无会话
+            // → 退出释放 socket;仍有会话则继续服务存量。
+            _ = ctl.wake.notified() => {
+                if ctl.closing.load(Ordering::Acquire)
+                    && sessions.lock().unwrap().is_empty()
+                {
+                    tracing::debug!("kcp demux exit: listener dropped, no sessions");
+                    break;
+                }
+                pkt_pool_put(buf);
+                continue;
+            }
+        };
+        demux_route_one(
+            &udp,
+            &accept_tx,
+            &mux_streams,
+            &ctl,
+            &sessions,
+            peer,
+            PooledPkt { buf, len: n },
+        );
     }
 }
 
@@ -2116,88 +2052,6 @@ fn demux_route_one(
             let SessionCmd::Packet(PooledPkt { buf, .. }) = p;
             pkt_pool_put(buf);
         }
-    }
-}
-
-/// Linux recvmmsg 批收(A-5):一次系统调用收 ≤[`RECV_BATCH`] 个数据报
-/// (MSG_DONTWAIT,配合 `readable().await` 的标准批收形态),返回
-/// (池化包, 来源) 列表;空 = EAGAIN/无数据。未用槽归还池。
-#[cfg(target_os = "linux")]
-const RECV_BATCH: usize = 64;
-
-#[cfg(target_os = "linux")]
-fn recv_mmsg_batch(udp: &UdpSocket) -> Vec<(PooledPkt, SocketAddr)> {
-    use std::os::fd::AsRawFd as _;
-    let mut slots: Vec<Vec<u8>> = (0..RECV_BATCH).map(|_| pkt_pool_get()).collect();
-    let mut iovs: [libc::iovec; RECV_BATCH] = unsafe { std::mem::zeroed() };
-    let mut hdrs: [libc::mmsghdr; RECV_BATCH] = unsafe { std::mem::zeroed() };
-    let mut addrs: [libc::sockaddr_storage; RECV_BATCH] = unsafe { std::mem::zeroed() };
-    for i in 0..RECV_BATCH {
-        iovs[i].iov_base = slots[i].as_mut_ptr() as *mut libc::c_void;
-        iovs[i].iov_len = slots[i].len();
-        hdrs[i].msg_hdr.msg_name = &mut addrs[i] as *mut _ as *mut libc::c_void;
-        hdrs[i].msg_hdr.msg_namelen =
-            std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        hdrs[i].msg_hdr.msg_iov = &mut iovs[i];
-        hdrs[i].msg_hdr.msg_iovlen = 1;
-    }
-    let rc = unsafe {
-        libc::recvmmsg(
-            udp.as_raw_fd(),
-            hdrs.as_mut_ptr(),
-            RECV_BATCH as libc::c_uint,
-            libc::MSG_DONTWAIT,
-            std::ptr::null_mut(),
-        )
-    };
-    if rc <= 0 {
-        for s in slots {
-            pkt_pool_put(s);
-        }
-        return Vec::new();
-    }
-    let got = rc as usize;
-    bump_counter!(recvfrom_calls);
-    for s in slots.drain(got..) {
-        pkt_pool_put(s);
-    }
-    slots
-        .into_iter()
-        .zip(0..got)
-        .filter_map(|(buf, i)| {
-            let len = hdrs[i].msg_len as usize;
-            match sockaddr_to_std(&addrs[i]) {
-                Some(peer) if len > 0 => Some((PooledPkt { buf, len }, peer)),
-                _ => {
-                    pkt_pool_put(buf);
-                    None
-                }
-            }
-        })
-        .collect()
-}
-
-/// libc sockaddr → std SocketAddr(A-5 recvmmsg 批收用)。
-#[cfg(target_os = "linux")]
-fn sockaddr_to_std(ss: &libc::sockaddr_storage) -> Option<SocketAddr> {
-    match ss.ss_family as libc::c_int {
-        libc::AF_INET => {
-            let a: &libc::sockaddr_in = unsafe { &*(ss as *const _ as *const libc::sockaddr_in) };
-            Some(SocketAddr::V4(std::net::SocketAddrV4::new(
-                std::net::Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr)),
-                u16::from_be(a.sin_port),
-            )))
-        }
-        libc::AF_INET6 => {
-            let a: &libc::sockaddr_in6 = unsafe { &*(ss as *const _ as *const libc::sockaddr_in6) };
-            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
-                std::net::Ipv6Addr::from(a.sin6_addr.s6_addr),
-                u16::from_be(a.sin6_port),
-                a.sin6_flowinfo,
-                a.sin6_scope_id,
-            )))
-        }
-        _ => None,
     }
 }
 
