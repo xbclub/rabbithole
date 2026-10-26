@@ -988,7 +988,9 @@ impl SendAgg {
         }
     }
 
-    /// 逐包回退(非 Linux;生产不启用,仅供跨平台测试走通 flush_now)。
+    /// 逐包回退(非 Linux 平台的 send_batch 实现;Linux 只走 mmsg,
+    /// 此函数在 Linux 目标下不编译 —— 否则无调用点触发 dead_code)。
+    #[cfg(not(target_os = "linux"))]
     fn send_batch_per_packet(&self, q: &AggQueue) -> std::io::Result<usize> {
         let mut off = 0usize;
         let mut sent = 0usize;
