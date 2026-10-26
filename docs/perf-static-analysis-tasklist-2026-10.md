@@ -24,7 +24,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 ## 包 E:客户端(rh-client)
 
 ### E-1 [P1] 静态文件/tls2raw 搬运缓冲 8KiB → 64KiB —— 来源 clientMisc-1
-- [x] 状态:完成 @ 8ee8672
+- [x] 状态:完成 @ c9f5591
 > 核查:✅ 问题在,行号无漂移(plugins.rs:124 / :965);tokio 锁定 1.53.2,`copy_bidirectional_with_sizes`(1.35+)可用;修法可行。
 - 位置:`crates/rh-client/src/plugins.rs:965`(serve_static_file 成功分支)、`plugins.rs:124`(tls2raw 的 copy_bidirectional)
 - 问题:落在 tokio `io::copy` / `copy_bidirectional` 默认 8KiB 缓冲,是同文件其余搬运路径刻意用的 64KiB 口径(plugins.rs:1270 注释已论证)的 1/8,大响应/大流量 syscall 与 await 轮次放大 8 倍。
@@ -76,7 +76,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 ## 包 A:KCP 载体(rh-transport/kcp.rs)
 
 ### A-1 [P1] 进程级 COUNTERS 每包 5-7 次原子 RMW —— 来源 kcp-1
-- [x] 状态:完成 @ a417712
+- [x] 状态:完成 @ 6214abb
 > 核查:✅ 问题在(11 处 fetch_add 行号全对上:766/830/962/971/974/1049/1097/1511/1747/1834/2057,全在会话循环/输出回调/收包循环热路径);读者仅 examples/kcp_loopback_bench.rs,kcp.rs 内测试用独立 shared.stats 不受影响。采用 feature 开关方案:`perf-counters`(默认关,宏封装编译期移除;example 无条件可编译,未启用时启动提示计数恒 0)。
 - 位置:`crates/rh-transport/src/kcp.rs:962/971/974/1049/1097/830/766/1511/1747/1834/2057`
 - 问题:生产每包路径对 static COUNTERS(7 个 AtomicU64 同 struct)做 fetch_add,跨核多会话时缓存行乒乓;生产二进制无任何读者(唯一读者是 examples/kcp_loopback_bench.rs)。B3 注释声称成本已移走,实际经 COUNTERS 原样保留。
@@ -146,7 +146,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 ## 包 B:mux / splice / ws(rh-transport)
 
 ### B-1 [P1] UpReader Empty 路径丢弃 256KiB 池缓冲 —— 来源 mux-1
-- [x] 状态:完成 @ 9083a21
+- [x] 状态:完成 @ 6602991
 > 核查:✅ 问题在(mux.rs:342-367 先 pool_get(up_chunk_cap()=默认 256KiB) 再 poll,Pending 即整只 drop;:750-753 自证抢收常态为 Empty);修法可行,另把阻塞 read_chunk 一并接入同一 stash(只取不存,不改变 pool_borrows 测试语义)。
 - 位置:`crates/rh-transport/src/mux.rs:342-367`
 - 问题:try_read_chunk 在数据未就绪(Empty)时,已取出的 256KiB 池缓冲未消费即 drop(不归池);仓库自证典型中继"几乎总是返回 Empty"(mux.rs:750-753),即上行每批一次 256KiB 分配/释放或池条目永久流失。
@@ -278,7 +278,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 ## 包 D:服务端(rh-server)
 
 ### D-1 [P1] API 响应双序列化(Value 树 → 再序列化) —— 来源 serverApi-1
-- [x] 状态:完成 @ 1bdd599
+- [x] 状态:完成 @ fc0e92f
 > 核查:✅ 问题在(ok() 信封 api.rs:80-82 经 json! 深拷贝 data 再二次序列化;list_services/list_clients 每行 20 字段 json! 建树)。serde_json 未开 preserve_order(现状键序本为字母序,改结构体后为声明序——语义等价,对比测试按解析后 Value 断言)。ProxySpec 含 flatten,直接序列化与 to_value 输出等价。实施:信封 struct + list_services/list_clients/stats_overview 强类型行;list_events 本就传 db 行类型,信封改造即覆盖。
 - 位置:`crates/rh-server/src/api.rs:80-82`(ok() 信封);最重的消费方 :925-947(list_services 每行 20 字段 + 内嵌整份 spec)、:446-468(list_clients)
 - 问题:所有响应先经 `json!` 构造完整 serde_json::Value 树,axum Json 再把树二次序列化——同一数据两遍,分配量数倍于响应体积;api.rs:884 注释"json! 按引用序列化"低估了 to_value 成本。
@@ -286,7 +286,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 验收:三道门绿;**新增对比测试:改造前后同一数据的 JSON 结构逐字段一致**(这是行为红线);前端 console 各页正常(list 依赖的字段名不能变)。
 
 ### D-2 [P1] UDP 上/下行泵每包对同一会话表加锁两次 —— 来源 serverData-1
-- [x] 状态:完成 @ 665ba1a
+- [x] 状态:完成 @ 9e6fb31
 > 核查:✅ 问题在,行号无漂移(1957/1990、2233/2243);up 泵 insert 提前到写之前,写失败残留 entry 由通道死亡路径 data.rs:1858 的 clear() 与 retain GC 兜底;down 泵 send_to 错误本就被忽略、insert 照做,行为等价。修法可行。
 - 位置:`crates/rh-server/src/data.rs:1957/1990`(up 泵)、:2233/2243(down 泵)
 - 问题:admit 一次 + 发送后刷新时间戳一次,双向高 pps 时两任务在同一 std Mutex 上互抢。
@@ -295,7 +295,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 备注:peer.sh UDP 档验证。
 
 ### D-3 [P1] 每 ACK 全量遍历客户端规则,O(N²) 内联在控制读循环 —— 来源 serverMisc-1
-- [x] 状态:完成 @ 752d4b7
+- [x] 状态:完成 @ ba3a350
 > 核查:✅ 问题在但已被部分修过:B9/R2 已把 DB 全量读改为内存 by-client 索引,残余成本 = 每 ACK O(N) 次 `state_kind()` 异步锁读 + 原子写,批量改 N 条(每条独立 bump revision,db.rs:692)= N 个 ACK × O(N)。采用①协议方案:ApplyResult.ok 增加 service_id(serde default + skip,双向兼容——旧服务端忽略未知字段,新服务端 None 回落全量扫;ApplyError.service_id 同语义先例),仅 proxy 实体的 ServiceUpdate ACK 携带。**放弃②**:核实全仓唯一的同 revision 重复全量 ACK 来源是失败重发 SYNC 后的补 ACK,而全量扫正是失败规则(ApplyError/Pending)的自愈机制,短路会让它卡死——②不仅无收益反而有害。行为变化(提交信息已注明):单条 ok ACK 丢失的自愈窗口从"该客户端任一后续 ACK"收窄为"该规则的下一次变更/任一 sync·remove ACK/重连"。
 - 位置:`crates/rh-server/src/runtime.rs:170-214`;调用链 control.rs:951→1056;协议 `crates/rh-protocol/src/message.rs:112-127`(ApplyResult ok 无 service_id)
 - 问题:批量改 N 条规则 = N 个 ACK × O(N) 收集遍历 + N 次 Vec 分配,全在该客户端控制读循环内,挤占 PONG/取消处理。
