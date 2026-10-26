@@ -1241,7 +1241,60 @@ impl Drop for UdpOutput {
 // ---------------- 会话任务 ----------------
 
 enum SessionCmd {
-    Packet(Vec<u8>),
+    Packet(PooledPkt),
+}
+
+// ---------------- A-4:入站包池 ----------------
+
+/// 入站包缓冲大小(单包上限;与修前收包缓冲一致)。
+const PKT_BUF: usize = 65536;
+/// 池槽上限:在途槽 ≈ 收包任务数 + 通道容量;256 槽 = 16MiB 硬上界。
+const PKT_POOL_CAP: usize = 256;
+
+/// 进程级入站包池(64KiB 槽复用)。1 Gbps ≈ 85k pps,修前每报文
+/// `pkt.to_vec()` 一次 ~1200B 堆分配,且通道 Full 时参数先求值、分配
+/// 照做再丢弃;池化后收包直接读进槽内、整槽移交、消费端 kcp.input
+/// 后归还,稳态零分配。std Mutex 临界区仅 Vec push/pop,争用弱。
+static PKT_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+fn pkt_pool_get() -> Vec<u8> {
+    PKT_POOL
+        .lock()
+        .unwrap()
+        .pop()
+        .unwrap_or_else(|| vec![0u8; PKT_BUF])
+}
+
+fn pkt_pool_put(buf: Vec<u8>) {
+    let mut p = PKT_POOL.lock().unwrap();
+    if p.len() < PKT_POOL_CAP && buf.len() == PKT_BUF {
+        p.push(buf);
+    }
+}
+
+/// 池化入站包:槽 + 有效长度(kcp.input 只看 [..len])。
+struct PooledPkt {
+    buf: Vec<u8>,
+    len: usize,
+}
+
+impl std::ops::Deref for PooledPkt {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl PooledPkt {
+    /// 从切片拷入新槽(首包投喂与测试;热路径直接读进槽再移交)。
+    fn copy_of(src: &[u8]) -> Self {
+        let mut buf = pkt_pool_get();
+        buf[..src.len()].copy_from_slice(src);
+        Self {
+            buf,
+            len: src.len(),
+        }
+    }
 }
 
 async fn run_session<O: std::io::Write>(
@@ -1325,6 +1378,9 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
             // input 错误(段格式/conv 不一致)由 demux 前置过滤,
             // 此处按可丢弃网络杂音处理,不终止会话。
             let _ = kcp.input(&pkt);
+            // A-4:槽归还池(稳态零分配的关键:消费端闭环)
+            let PooledPkt { buf, .. } = pkt;
+            pkt_pool_put(buf);
         }
         // D 守护观测:批缓冲容量高水位(复用不增长;仅测试读)
         #[cfg(test)]
@@ -1844,8 +1900,9 @@ async fn demux_loop(
     ctl: Arc<DemuxCtl>,
     sessions: SessionMap,
 ) {
-    let mut buf = vec![0u8; 65536];
     loop {
+        // A-4:每迭代取池槽收包,随包整槽移交消费端(空转/drop 路径归还)
+        let mut buf = pkt_pool_get();
         let (n, peer) = tokio::select! {
             r = udp.recv_from(&mut buf) => match r {
                 Ok(x) => {
@@ -1855,6 +1912,7 @@ async fn demux_loop(
                 Err(e) => {
                     // 持续性 socket 错误(如 fd 失效)不退避会忙转烧 CPU
                     tracing::warn!(error = %e, "kcp recv error");
+                    pkt_pool_put(buf);
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 }
@@ -1868,16 +1926,19 @@ async fn demux_loop(
                     tracing::debug!("kcp demux exit: listener dropped, no sessions");
                     break;
                 }
+                pkt_pool_put(buf);
                 continue;
             }
         };
         if n < KCP_OVERHEAD {
+            pkt_pool_put(buf);
             continue;
         }
         let pkt = &buf[..n];
         let conv = kcp::get_conv(pkt);
         // cmd 合法性:81(PUSH) 82(ACK) 83(WASK) 84(WINS)
         if !(81..=84).contains(&pkt[4]) {
+            pkt_pool_put(buf);
             continue;
         }
         // 会话表锁只做查表/注册:锁内绝不 spawn/投递/清理 ——
@@ -1917,7 +1978,10 @@ async fn demux_loop(
             }
         };
         let route = match route {
-            Route::Skip => continue,
+            Route::Skip => {
+                pkt_pool_put(buf);
+                continue;
+            }
             // 锁已释放后再 spawn:helper 内部(含满队列/关闭失败分支、
             // 清理回调)的任何锁获取都不会与调用方嵌套
             Route::New((tx, rx)) => {
@@ -1936,7 +2000,14 @@ async fn demux_loop(
             }
             Route::Existing(tx) => tx,
         };
-        let _ = route.try_send(SessionCmd::Packet(pkt.to_vec()));
+        // 满丢包:kcp 重传兜底;两种失败都回收槽(Full = 丢包,Closed = 会话已亡)
+        match route.try_send(SessionCmd::Packet(PooledPkt { buf, len: n })) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(p)) | Err(mpsc::error::TrySendError::Closed(p)) => {
+                let SessionCmd::Packet(PooledPkt { buf, .. }) = p;
+                pkt_pool_put(buf);
+            }
+        }
     }
 }
 
@@ -2090,14 +2161,15 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
         let pkt_tx = pkt_tx;
         let shared = shared.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
             loop {
+                // A-4:池槽收包,随包整槽移交(修前每包 to_vec 分配)
+                let mut buf = pkt_pool_get();
                 tokio::select! {
                     r = recv_sock.recv_from(&mut buf) => {
                         let Ok((n, _)) = r else { break };
                         bump_counter!(recvfrom_calls);
                         if pkt_tx
-                            .send(SessionCmd::Packet(buf[..n].to_vec()))
+                            .send(SessionCmd::Packet(PooledPkt { buf, len: n }))
                             .await
                             .is_err()
                         {
@@ -2179,23 +2251,29 @@ pub async fn punch_listen(
         let shared = shared.clone();
         let pinned = peer;
         tokio::spawn(async move {
-            let mut b = vec![0u8; 65536];
             loop {
+                // A-4:池槽收包,随包整槽移交
+                let mut b = pkt_pool_get();
                 tokio::select! {
                     r = udp.recv_from(&mut b) => {
                         let Ok((n, from)) = r else { break };
                         bump_counter!(recvfrom_calls);
                         if from != pinned {
+                            pkt_pool_put(b);
                             continue;
                         }
                         if n >= KCP_OVERHEAD && (81..=84).contains(&b[4]) {
-                            match pkt_tx.try_send(SessionCmd::Packet(b[..n].to_vec())) {
+                            match pkt_tx.try_send(SessionCmd::Packet(PooledPkt { buf: b, len: n })) {
                                 Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    // 满丢包:kcp 重传兜底,不断流
+                                Err(mpsc::error::TrySendError::Full(p)) => {
+                                    // 满丢包:kcp 重传兜底,不断流;槽回收
+                                    let SessionCmd::Packet(PooledPkt { buf, .. }) = p;
+                                    pkt_pool_put(buf);
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => break,
                             }
+                        } else {
+                            pkt_pool_put(b);
                         }
                     }
                     _ = shared.shutdown.notified() => break,
@@ -2203,7 +2281,7 @@ pub async fn punch_listen(
             }
         });
     }
-    let _ = pkt_tx.try_send(SessionCmd::Packet(buf[..n].to_vec()));
+    let _ = pkt_tx.try_send(SessionCmd::Packet(PooledPkt::copy_of(&buf[..n])));
     tokio::spawn(run_session(kcp, pkt_rx, shared.clone()));
     // 3. 等首条消息落地:哨兵则剥离
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -2402,31 +2480,36 @@ pub async fn punch_dial(
         let abort = abort_inbound.clone();
         let shared = shared.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
             loop {
+                // A-4:池槽收包,随包整槽移交
+                let mut buf = pkt_pool_get();
                 tokio::select! {
                     r = udp.recv_from(&mut buf) => {
                         let Ok((n, from)) = r else { break };
                         bump_counter!(recvfrom_calls);
-                        let pkt = &buf[..n];
-                        if n >= KCP_OVERHEAD && (81..=84).contains(&pkt[4]) {
+                        if n >= KCP_OVERHEAD && (81..=84).contains(&buf[4]) {
                             // A7:只接受服务端下发的候选来源,拒绝打洞窗口内
                             // 第三方注入(否则首个合法包即可劫持 dial 侧)。
                             if !cands_for_inbound.iter().any(|c| c == &from) {
                                 tracing::debug!(%from, "punch dial: drop non-candidate source");
+                                pkt_pool_put(buf);
                                 continue;
                             }
                             if peer.learn(from) {
                                 learned.store(true, Ordering::Relaxed);
                                 inbound.notify_one();
                             }
-                            match pkt_tx.try_send(SessionCmd::Packet(pkt.to_vec())) {
+                            match pkt_tx.try_send(SessionCmd::Packet(PooledPkt { buf, len: n })) {
                                 Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    // 满丢包:kcp 重传兜底,不断流
+                                Err(mpsc::error::TrySendError::Full(p)) => {
+                                    // 满丢包:kcp 重传兜底,不断流;槽回收
+                                    let SessionCmd::Packet(PooledPkt { buf, .. }) = p;
+                                    pkt_pool_put(buf);
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => break,
                             }
+                        } else {
+                            pkt_pool_put(buf);
                         }
                     }
                     _ = abort.notified() => break,
@@ -3748,7 +3831,7 @@ mod boundary_tests {
                     tokio::select! {
                         r = recv_sock.recv_from(&mut buf) => {
                             let Ok((n, _)) = r else { break };
-                            if pkt_tx.send(SessionCmd::Packet(buf[..n].to_vec())).await.is_err() {
+                            if pkt_tx.send(SessionCmd::Packet(PooledPkt::copy_of(&buf[..n]))).await.is_err() {
                                 break;
                             }
                         }
@@ -3847,7 +3930,7 @@ mod boundary_tests {
                     tokio::select! {
                         r = recv_sock.recv_from(&mut buf) => {
                             let Ok((n, _)) = r else { break };
-                            if pkt_tx.send(SessionCmd::Packet(buf[..n].to_vec())).await.is_err() {
+                            if pkt_tx.send(SessionCmd::Packet(PooledPkt::copy_of(&buf[..n]))).await.is_err() {
                                 break;
                             }
                         }
@@ -3892,7 +3975,7 @@ mod boundary_tests {
                                 && n >= KCP_OVERHEAD
                                 && kcp::get_conv(&buf[..n]) == conv
                                 && pkt_tx2
-                                    .send(SessionCmd::Packet(buf[..n].to_vec()))
+                                    .send(SessionCmd::Packet(PooledPkt::copy_of(&buf[..n])))
                                     .await
                                     .is_err()
                             {
@@ -4124,7 +4207,7 @@ mod boundary_tests {
                     tokio::select! {
                         r = recv_sock.recv_from(&mut buf) => {
                             let Ok((n, _)) = r else { break };
-                            if pkt_tx.send(SessionCmd::Packet(buf[..n].to_vec())).await.is_err() {
+                            if pkt_tx.send(SessionCmd::Packet(PooledPkt::copy_of(&buf[..n]))).await.is_err() {
                                 break;
                             }
                         }
@@ -4163,7 +4246,7 @@ mod boundary_tests {
                                 && n >= KCP_OVERHEAD
                                 && kcp::get_conv(&buf[..n]) == conv
                                 && pkt_tx2
-                                    .send(SessionCmd::Packet(buf[..n].to_vec()))
+                                    .send(SessionCmd::Packet(PooledPkt::copy_of(&buf[..n])))
                                     .await
                                     .is_err()
                             {
@@ -4539,7 +4622,7 @@ mod stronger_tests {
                     tokio::select! {
                         r = recv_sock.recv_from(&mut buf) => {
                             let Ok((n, _)) = r else { break };
-                            if pkt_tx.send(SessionCmd::Packet(buf[..n].to_vec())).await.is_err() {
+                            if pkt_tx.send(SessionCmd::Packet(PooledPkt::copy_of(&buf[..n]))).await.is_err() {
                                 break;
                             }
                         }
@@ -4581,7 +4664,7 @@ mod stronger_tests {
                                 && n >= KCP_OVERHEAD
                                 && kcp::get_conv(&buf[..n]) == conv
                                 && pkt_tx2
-                                    .send(SessionCmd::Packet(buf[..n].to_vec()))
+                                    .send(SessionCmd::Packet(PooledPkt::copy_of(&buf[..n])))
                                     .await
                                     .is_err()
                             {
@@ -4785,7 +4868,7 @@ mod unaccepted_tests {
                     tokio::select! {
                         r = recv_sock.recv_from(&mut buf) => {
                             let Ok((n, _)) = r else { break };
-                            if pkt_tx.send(SessionCmd::Packet(buf[..n].to_vec())).await.is_err() {
+                            if pkt_tx.send(SessionCmd::Packet(PooledPkt::copy_of(&buf[..n]))).await.is_err() {
                                 break;
                             }
                         }
@@ -5353,7 +5436,7 @@ mod c84_closure_tests {
     impl Write for WireOut {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
             self.0
-                .try_send(SessionCmd::Packet(b.to_vec()))
+                .try_send(SessionCmd::Packet(PooledPkt::copy_of(b)))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(b.len())
         }
@@ -5530,7 +5613,7 @@ mod c84_closure_tests {
                         r = recv_sock.recv_from(&mut buf) => {
                             let Ok((n, _)) = r else { break };
                             if pkt_tx
-                                .send(SessionCmd::Packet(buf[..n].to_vec()))
+                                .send(SessionCmd::Packet(PooledPkt::copy_of(&buf[..n])))
                                 .await
                                 .is_err()
                             {
@@ -5575,7 +5658,7 @@ mod c84_closure_tests {
                                 && n >= KCP_OVERHEAD
                                 && kcp::get_conv(&buf[..n]) == conv
                                 && pkt_tx2
-                                    .send(SessionCmd::Packet(buf[..n].to_vec()))
+                                    .send(SessionCmd::Packet(PooledPkt::copy_of(&buf[..n])))
                                     .await
                                     .is_err()
                             {
@@ -6108,8 +6191,10 @@ mod c84_closure_tests {
             .collect();
         let base = sess(&shared);
         for (sn, ts) in sns {
-            tx.try_send(SessionCmd::Packet(ack_for(conv, sn, ts)))
-                .unwrap();
+            tx.try_send(SessionCmd::Packet(PooledPkt::copy_of(&ack_for(
+                conv, sn, ts,
+            ))))
+            .unwrap();
         }
         spin_until(&shared, |c| {
             c.packets_consumed - base.packets_consumed >= K as u64
@@ -6149,8 +6234,10 @@ mod c84_closure_tests {
             )
         };
         let base = sess(&shared);
-        tx.try_send(SessionCmd::Packet(ack_for(conv, sn, ts)))
-            .unwrap();
+        tx.try_send(SessionCmd::Packet(PooledPkt::copy_of(&ack_for(
+            conv, sn, ts,
+        ))))
+        .unwrap();
         spin_until(&shared, |c| c.packets_consumed - base.packets_consumed >= 1).await;
         wait_stable(&shared, 100).await;
         let after = sess(&shared);
@@ -6192,7 +6279,8 @@ mod c84_closure_tests {
         // 通道预置 200 个入站(conv 全 0,kcp.input 容错丢弃,只驱动轮次)
         let filler = vec![0u8; 24];
         for _ in 0..200 {
-            tx.try_send(SessionCmd::Packet(filler.clone())).unwrap();
+            tx.try_send(SessionCmd::Packet(PooledPkt::copy_of(&filler)))
+                .unwrap();
         }
         // 满批未清空时用户写到达:有界轮内必须被服务(输出可观察)
         io.write_all(b"FAIRNESS-USER-WRITE").await.unwrap();
@@ -6221,11 +6309,13 @@ mod c84_closure_tests {
         let (_io, shared, _rec, tx, task) = setup_ack_session(0xB15C).await;
         let filler = vec![0u8; 24];
         for _ in 0..200 {
-            tx.try_send(SessionCmd::Packet(filler.clone())).unwrap();
+            tx.try_send(SessionCmd::Packet(PooledPkt::copy_of(&filler)))
+                .unwrap();
         }
         spin_until(&shared, |c| c.packets_consumed >= 200).await;
         for _ in 0..100 {
-            tx.try_send(SessionCmd::Packet(filler.clone())).unwrap();
+            tx.try_send(SessionCmd::Packet(PooledPkt::copy_of(&filler)))
+                .unwrap();
         }
         spin_until(&shared, |c| c.packets_consumed >= 300).await;
         assert!(
