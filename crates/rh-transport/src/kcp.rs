@@ -1024,24 +1024,19 @@ impl SendAgg {
         for i in 0..n {
             iovs[i].iov_base = q.buf[off..].as_ptr() as *mut libc::c_void;
             iovs[i].iov_len = q.lens[i];
-            let dest_ptr: *mut libc::c_void = match &self.dest {
-                Dest::Connected => std::ptr::null_mut(),
-                Dest::Peer(p) | Dest::Punch(pc) => {
-                    let a: &mut libc::sockaddr_storage = &mut addrs[i];
-                    let len = fill_sockaddr(
-                        a,
-                        if let Dest::Punch(pc) = &self.dest {
-                            pc.current()
-                        } else {
-                            *p
-                        },
-                    );
-                    hdrs[i].msg_hdr.msg_namelen = len;
-                    a as *mut libc::sockaddr_storage as *mut libc::c_void
-                }
+            // 目的地址先取值再填 sockaddr(或-pattern 绑定不同类型变量
+            // 编不过;Punch 按 per-packet 语义在此取 current(),与逐包
+            // try_send 的轮换一致)
+            let dest_addr: Option<SocketAddr> = match &self.dest {
+                Dest::Connected => None,
+                Dest::Peer(p) => Some(*p),
+                Dest::Punch(pc) => Some(pc.current()),
             };
-            if !dest_ptr.is_null() {
-                hdrs[i].msg_hdr.msg_name = dest_ptr;
+            if let Some(addr) = dest_addr {
+                let a: &mut libc::sockaddr_storage = &mut addrs[i];
+                let len = fill_sockaddr(a, addr);
+                hdrs[i].msg_hdr.msg_namelen = len;
+                hdrs[i].msg_hdr.msg_name = a as *mut libc::sockaddr_storage as *mut libc::c_void;
             }
             hdrs[i].msg_hdr.msg_iov = &mut iovs[i];
             hdrs[i].msg_hdr.msg_iovlen = 1;
