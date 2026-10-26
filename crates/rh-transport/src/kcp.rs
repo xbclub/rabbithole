@@ -183,10 +183,32 @@ fn backlog_bytes(q: &VecDeque<Vec<u8>>) -> usize {
 
 // ---------------- 会话 IO(用户侧字节流) ----------------
 
+/// write_queue 条目:缓冲 + 消费游标(A-2)。
+///
+/// 修前每片 `split_off(piece_len)` 切尾:一次新分配 + 尾段整块 memcpy。
+/// 预算受限(慢 ACK/丢包链路使 wait_snd 居高)时对同一 64KiB 项按每轮
+/// 1 段消费,尾拷贝总量按片数平方放大(实测口径 ≈28×),恰发生在拥塞
+/// 恢复最不想烧 CPU 的时刻。游标只前移,零额外分配/拷贝。
+#[derive(Default)]
+struct WriteChunk {
+    buf: Vec<u8>,
+    off: usize,
+}
+
+impl WriteChunk {
+    fn new(buf: Vec<u8>) -> Self {
+        Self { buf, off: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.off
+    }
+}
+
 struct Guarded {
     read_buf: VecDeque<u8>,
     read_waker: Option<Waker>,
-    write_queue: VecDeque<Vec<u8>>,
+    write_queue: VecDeque<WriteChunk>,
     /// write_queue 中排队字节总数(与条数上限共同做回压)
     write_bytes: usize,
     write_waker: Option<Waker>,
@@ -224,6 +246,40 @@ impl Guarded {
         if let Some(w) = self.write_waker.take() {
             w.wake();
         }
+    }
+
+    /// A-2:按段预算从 write_queue 切出下一批 piece(锁内调用;
+    /// kcp.send 由调用方在锁外执行,N6)。游标前移消费、消费尽才弹
+    /// 条目 —— 取代修前的 split_off 切尾(每片一次新分配 + 尾段
+    /// memcpy,预算受限时对同一大项按每轮 1 段消费,尾拷贝平方放大)。
+    fn take_send_pieces(
+        &mut self,
+        budget_segs: usize,
+        mss: usize,
+        piece_cap: usize,
+    ) -> std::collections::VecDeque<Vec<u8>> {
+        let mut pieces = std::collections::VecDeque::new();
+        let mut budget = budget_segs;
+        while budget > 0 {
+            let Some(front) = self.write_queue.front_mut() else {
+                break;
+            };
+            // 单片 ≤ 余量×mss(≥mss,不产生微片),使段预算算术成立
+            let piece_len = front
+                .remaining()
+                .min(piece_cap)
+                .min(budget.saturating_mul(mss));
+            let piece = front.buf[front.off..front.off + piece_len].to_vec();
+            front.off += piece_len;
+            self.write_bytes = self.write_bytes.saturating_sub(piece_len);
+            if front.remaining() == 0 {
+                self.write_queue.pop_front();
+            }
+            // 该片将占用的段数(整 mss 切段、末段取余),从预算扣减
+            budget -= piece_len.div_ceil(mss);
+            pieces.push_back(piece);
+        }
+        pieces
     }
 }
 
@@ -338,7 +394,8 @@ impl AsyncWrite for KcpIo {
         let accept = buf.len().min(MAX_WRITE_QUEUE_BYTES - s.write_bytes);
         s.write_bytes += accept;
         s.write_seq += 1;
-        s.write_queue.push_back(buf[..accept].to_vec());
+        s.write_queue
+            .push_back(WriteChunk::new(buf[..accept].to_vec()));
         // 入队即唤醒会话任务:不等 2ms tick。kcp 0.6.0 的 flush 受
         // ts_flush(interval 下限 10ms)门控,写若只靠 tick 拾取 +
         // interval flush,单次写延迟可被放大到 10ms 级(RTT/吞吐同受
@@ -386,7 +443,7 @@ impl AsyncWrite for KcpIo {
         }
         s.write_bytes += accept;
         s.write_seq += 1;
-        s.write_queue.push_back(combined);
+        s.write_queue.push_back(WriteChunk::new(combined));
         // 与 poll_write 同因:入队即唤醒会话任务,不等 2ms tick
         self.shared.notify.notify_one();
         Poll::Ready(Ok(accept))
@@ -1006,8 +1063,7 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
         // 下降后才会继续搬运;单次喂入 ≤ SEND_PIECE(kcp.send 的
         // UserBufTooBig 上限)。修复前:每轮无条件全部搬入无界
         // snd_queue,前端 256KiB 限额形同虚设,未 ACK 也可持续 accept。
-        let mut user_wrote = false;
-        {
+        let user_wrote = {
             // N6:锁内只做队列切分与记账,kcp.send(段化 + memcpy,单轮
             // 循环可到数十段)移到锁外 —— 修前整个搬运持 OS 级互斥锁,
             // 期间 KcpIo::poll_read/poll_write(yamux 收发任务)在同一把
@@ -1016,30 +1072,13 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
             // 与修前「每片 send 后重读 wait_snd」的算术等价:
             // piece_len ≤ 余量×mss ⇒ 该片段数 ≤ 余量。
             let mut s = shared.guarded.lock().unwrap();
-            let mut budget = MAX_KCP_PENDING_SEGS.saturating_sub(kcp.wait_snd());
-            let mut pieces: std::collections::VecDeque<Vec<u8>> = Default::default();
-            while budget > 0 {
-                let Some(front) = s.write_queue.front_mut() else {
-                    break;
-                };
-                // 单次喂入 ≤ 余量×mss(≥mss,不产生微片),使
-                // wait_snd ≤ MAX_KCP_PENDING_SEGS 精确成立
-                let piece_len = front.len().min(SEND_PIECE).min(budget.saturating_mul(mss));
-                let tail = front.split_off(piece_len);
-                let piece = std::mem::replace(front, tail);
-                s.write_bytes = s.write_bytes.saturating_sub(piece_len);
-                if s.write_queue.front().is_some_and(|f| f.is_empty()) {
-                    s.write_queue.pop_front();
-                }
-                // 该片将占用的段数(整 mss 切段、末段取余),从预算扣减
-                budget -= piece_len.div_ceil(mss);
-                pieces.push_back(piece);
-                user_wrote = true;
-            }
+            let budget = MAX_KCP_PENDING_SEGS.saturating_sub(kcp.wait_snd());
+            let pieces = s.take_send_pieces(budget, mss, SEND_PIECE);
+            let wrote = !pieces.is_empty();
             // 仅在真正腾出前端容量时唤醒等待写者:无条件唤醒会与
             // flush/shutdown 等待者的重注册形成忙环(两者互相唤醒,
             // 运行时永不空闲,暂停时钟不再推进、CPU 空转)。
-            if user_wrote {
+            if wrote {
                 s.wake_write();
             }
             drop(s);
@@ -1049,7 +1088,8 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
                     break;
                 }
             }
-        }
+            wrote
+        };
         if error.is_some() {
             break;
         }
@@ -2130,7 +2170,8 @@ pub async fn punch_dial(
         let mut s = shared.guarded.lock().unwrap();
         s.write_bytes += b"RHTP-PUNCH!".len();
         s.write_seq += 1;
-        s.write_queue.push_back(b"RHTP-PUNCH!".to_vec());
+        s.write_queue
+            .push_back(WriteChunk::new(b"RHTP-PUNCH!".to_vec()));
         drop(s);
         shared.notify.notify_one();
     }
@@ -2408,6 +2449,45 @@ mod kcp_regress {
 
     // ---------- C:写队列按字节上限回压(修复前失败) ----------
 
+    /// A-2(任务书):大项 + 受限预算(每轮 1 段,模拟慢 ACK 链路)分多轮
+    /// 消费,数据逐字节完整、记账同步清零、消费尽才弹条目 —— 钉住
+    /// 游标化的正确性(修前 split_off 语义等价但每片切尾重分配)。
+    #[test]
+    fn a02_write_queue_piecemeal_budget_integrity() {
+        let (_io, shared) = new_io();
+        let payload: Vec<u8> = (0..48 * 1024u32).map(|i| (i % 251) as u8).collect();
+        {
+            let mut s = shared.guarded.lock().unwrap();
+            s.write_bytes = payload.len();
+            s.write_seq = 1;
+            s.write_queue.push_back(WriteChunk::new(payload.clone()));
+        }
+        const MSS: usize = 1200;
+        let mut rebuilt = Vec::with_capacity(payload.len());
+        let mut rounds = 0usize;
+        loop {
+            let (pieces, drained) = {
+                let mut s = shared.guarded.lock().unwrap();
+                let p = s.take_send_pieces(1, MSS, SEND_PIECE);
+                let d = s.write_queue.is_empty() && s.write_bytes == 0;
+                (p, d)
+            };
+            if pieces.is_empty() {
+                assert!(drained, "无片可取时队列与记账必须已清空");
+                break;
+            }
+            for p in pieces {
+                rebuilt.extend_from_slice(&p);
+            }
+            rounds += 1;
+        }
+        assert_eq!(rebuilt, payload, "分片消费必须逐字节还原");
+        assert!(
+            rounds >= payload.len() / MSS,
+            "确需多轮受限消费才消费完(实际 {rounds} 轮)"
+        );
+    }
+
     /// 条数远未到 256 时,字节上限(256KiB)必须先触发 Pending。
     #[test]
     fn t04_write_queue_byte_cap_applies_backpressure() {
@@ -2427,7 +2507,7 @@ mod kcp_regress {
         {
             let mut s = shared.guarded.lock().unwrap();
             while let Some(chunk) = s.write_queue.pop_front() {
-                s.write_bytes = s.write_bytes.saturating_sub(chunk.len());
+                s.write_bytes = s.write_bytes.saturating_sub(chunk.remaining());
             }
             s.wake_write();
         }
@@ -2517,7 +2597,7 @@ mod kcp_regress {
             let mut s = shared.guarded.lock().unwrap();
             for _ in 0..4 {
                 s.write_bytes += big.len();
-                s.write_queue.push_back(big.clone());
+                s.write_queue.push_back(WriteChunk::new(big.clone()));
             }
         }
         assert!(matches!(
@@ -2528,7 +2608,7 @@ mod kcp_regress {
         {
             let mut s = shared.guarded.lock().unwrap();
             while let Some(chunk) = s.write_queue.pop_front() {
-                s.write_bytes = s.write_bytes.saturating_sub(chunk.len());
+                s.write_bytes = s.write_bytes.saturating_sub(chunk.remaining());
             }
             s.wake_write();
         }
@@ -3132,7 +3212,7 @@ mod boundary_tests {
         {
             let mut s = shared.guarded.lock().unwrap();
             s.write_bytes = MAX_WRITE_QUEUE_BYTES - 1024;
-            s.write_queue.push_back(vec![0u8; 1024]);
+            s.write_queue.push_back(WriteChunk::new(vec![0u8; 1024]));
         }
         let big = vec![1u8; 64 * 1024];
         let r = poll_w(&mut io, &big);

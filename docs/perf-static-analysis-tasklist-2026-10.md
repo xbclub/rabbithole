@@ -79,7 +79,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 验收:三道门绿 + `cargo build --examples` 通过(bench example 仍能编译运行);生产路径零计数。
 
 ### A-2 [P1] write_queue 搬运用 split_off 反复切尾 —— 来源 kcp-2
-- [ ] 状态:
+- [x] 状态:
+> 核查:✅ 问题在(kcp.rs:1027-1029 split_off+mem::replace,每片一次新分配 + 尾段 memcpy);修法可行,条目改 `WriteChunk { buf, off }` 游标结构(类型系统强制一致性,优于在 Guarded 加 front_off 隐式不变量)。触点 9 处(声明/两个 push/消费循环/punch/3 处测试)全部核过;kcp.send 收 &[u8],锁内 to_vec 出片(≤64KiB,通常 ≤mss×budget)即可。
 - 位置:`crates/rh-transport/src/kcp.rs:1017-1019`
 - 问题:每片为"尾部剩余"重新分配 + 整段 memcpy;预算受限(慢 ACK/丢包链路)时对同一 64KiB 项按每轮 1 段消费,尾拷贝总量 ≈1.8MB(放大 ~28 倍),恰发生在拥塞恢复最不想烧 CPU 的时刻。
 - 修法:前端项加消费游标(Vec, offset):piece 以 `&front[off..off+len]` 视角记账,锁外只对 piece 本身 to_vec(≤64KiB,通常 ≤mss),消费到尾部才弹出项。
@@ -191,7 +192,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 备注:peer.sh mux 档看 CPU。
 
 ### C-2 [P1] ShardWorker poll 循环无消费预算 —— 来源 yamuxShard-1
-- [x] 状态:
+- [x] 状态:完成 @ 45e4ee9
 > 核查:✅ 问题在(shard.rs:860 poll 主循环 progress→continue 无界;SendWorker :112 SEND_CMDS_PER_POLL=64 且注释明言防独占,接收侧缺失);修法可行,预算取 64(与 SendWorker 同款;且 < 分片通道容量 128,单轮 drain 即可观察预算生效,测试确定性)。终结排空(:880)与 send_dropped 排空(:933)保持全量语义不受预算约束。
 - 位置:`vendor/yamux/src/connection/halves/shard.rs:939-957`
 - 问题:持续满载下单次 poll 可无限延续、不让出 tokio worker(SendWorker 有预算 shard.rs:112 `SEND_CMDS_PER_POLL=64` 且注释明言"防单 Worker 独占线程",接收侧恰好缺失)。影响公平性/尾延迟,吞吐不受损。
