@@ -254,7 +254,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 验收:三道门绿;**新增对比测试:改造前后同一数据的 JSON 结构逐字段一致**(这是行为红线);前端 console 各页正常(list 依赖的字段名不能变)。
 
 ### D-2 [P1] UDP 上/下行泵每包对同一会话表加锁两次 —— 来源 serverData-1
-- [ ] 状态:
+- [x] 状态:完成 @ 665ba1a
+> 核查:✅ 问题在,行号无漂移(1957/1990、2233/2243);up 泵 insert 提前到写之前,写失败残留 entry 由通道死亡路径 data.rs:1858 的 clear() 与 retain GC 兜底;down 泵 send_to 错误本就被忽略、insert 照做,行为等价。修法可行。
 - 位置:`crates/rh-server/src/data.rs:1957/1990`(up 泵)、:2233/2243(down 泵)
 - 问题:admit 一次 + 发送后刷新时间戳一次,双向高 pps 时两任务在同一 std Mutex 上互抢。
 - 修法:"admit + 时间戳刷新"合并进一次 lock()(insert 提前到 send 之前),每包每方向 2 次降 1 次,不改数据结构。复核确认语义差异仅为 µs 级 idle 窗口偏移,通道死亡路径外层有 clear() 兜底。

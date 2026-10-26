@@ -1954,10 +1954,14 @@ async fn udp_pump_up<S: UdpRecv>(
             continue;
         }
         {
+            // 准入判定与时间戳刷新合并进同一次加锁:up/down 两任务在高 pps
+            // 下互抢这把锁,拆成两次取锁纯付争抢成本。insert 提前到写之前,
+            // 写失败残留的 entry 由通道死亡路径的 clear() 与 retain GC 兜底。
             let mut s = sessions.lock().unwrap();
             if !udp_session_admit(state, &mut s, peer) {
                 continue;
             }
+            s.insert(peer, Instant::now());
         }
         state.metrics.count_user_in(n);
         rt.bytes_in
@@ -1987,7 +1991,6 @@ async fn udp_pump_up<S: UdpRecv>(
             dead.cancel();
             return;
         }
-        sessions.lock().unwrap().insert(peer, Instant::now());
         last_alive.store(epoch_ms(), std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -2229,18 +2232,21 @@ async fn udp_pump_down_with(
                                     touch();
                                     continue;
                                 }
+                                // 与上行泵同款:准入 + 时间戳刷新一次加锁完成。
+                                // send_to 的错误本就被忽略(丢包语义),insert
+                                // 提前后行为等价。
                                 {
                                     let mut s = sessions.lock().unwrap();
                                     if !udp_session_admit(state, &mut s, addr) {
                                         touch();
                                         continue;
                                     }
+                                    s.insert(addr, Instant::now());
                                 }
                                 let _ = sock.send_to(data, addr).await;
                                 state.metrics.count_user_out(data.len());
                                 rt.bytes_out.fetch_add(data.len() as u64, Ordering::Relaxed);
                                 usage.add_bytes(data.len() as u64);
-                                sessions.lock().unwrap().insert(addr, Instant::now());
                             }
                             touch();
                         }
