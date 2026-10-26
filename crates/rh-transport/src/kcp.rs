@@ -403,6 +403,9 @@ impl AsyncWrite for KcpIo {
         // ts_flush(interval 下限 10ms)门控,写若只靠 tick 拾取 +
         // interval flush,单次写延迟可被放大到 10ms 级(RTT/吞吐同受
         // 其害)。Notify 许可合并,多次写只触发一轮拾取,不会忙等。
+        // A-8:先 drop 锁再唤醒(与 poll_flush 同款纪律)——被唤醒的
+        // 会话任务立刻取同一把锁,持锁 notify 只让它空等一次。
+        drop(s);
         self.shared.notify.notify_one();
         Poll::Ready(Ok(accept))
     }
@@ -447,7 +450,9 @@ impl AsyncWrite for KcpIo {
         s.write_bytes += accept;
         s.write_seq += 1;
         s.write_queue.push_back(WriteChunk::new(combined));
-        // 与 poll_write 同因:入队即唤醒会话任务,不等 2ms tick
+        // 与 poll_write 同因:入队即唤醒会话任务,不等 2ms tick;
+        // 先 drop 锁再唤醒(A-8,同 poll_write)
+        drop(s);
         self.shared.notify.notify_one();
         Poll::Ready(Ok(accept))
     }
@@ -555,6 +560,9 @@ struct UdpBacklog {
     inflight_bytes: AtomicUsize,
     inflight_packets: AtomicUsize,
     fatal_error: Mutex<Option<String>>,
+    /// A-6:fatal 一次性置位永不清除,热路径(每输出一次的输出回调)先读
+    /// 原子再决定是否取锁拿错误串。
+    fatal_flag: std::sync::atomic::AtomicBool,
     /// 会话错误桥:drain 遇真实输出错误时,直接把错误写进会话 IO 并
     /// 唤醒会话/接收循环 —— idle 会话(无后续写/待发数据)不必等下一
     /// 次 UdpOutput::write 才感知。Weak:不延长会话生命周期。
@@ -576,6 +584,7 @@ impl UdpBacklog {
             inflight_bytes: AtomicUsize::new(0),
             inflight_packets: AtomicUsize::new(0),
             fatal_error: Mutex::new(None),
+            fatal_flag: std::sync::atomic::AtomicBool::new(false),
             session: Mutex::new(None),
             agg_slot: std::sync::OnceLock::new(),
         }
@@ -651,8 +660,10 @@ impl UdpBacklog {
         self.is_empty() && self.inflight_bytes.load(Ordering::Relaxed) == 0
     }
 
+    /// A-6:快路径读一次性置位的原子标志(置位点见 note_fatal;
+    /// 永不清除,Acquire 与 store Release 配对)。
     fn is_fatal(&self) -> bool {
-        self.fatal_error.lock().unwrap().is_some()
+        self.fatal_flag.load(Ordering::Acquire)
     }
 
     fn fatal_error(&self) -> Option<String> {
@@ -662,6 +673,7 @@ impl UdpBacklog {
     /// 记录致命错误(首个记 warn 日志,后续幂等);唤醒 drain 收敛;
     /// 经错误桥立即送达会话(idle 会话不等待下一次输出)。
     fn note_fatal(&self, msg: String, pkt_len: usize) {
+        self.fatal_flag.store(true, Ordering::Release);
         {
             let mut g = self.fatal_error.lock().unwrap();
             if g.is_none() {
@@ -1156,8 +1168,11 @@ fn output_write_via_backlog(
     buf: &[u8],
 ) -> std::io::Result<usize> {
     // 致命错误:向 kcp 报错,经 flush 传播终止会话(不吞)。
-    if let Some(e) = backlog.fatal_error() {
-        return Err(other_err(e));
+    // A-6:一次性置位标志先做原子快路径,置位才取锁拿错误串。
+    if backlog.is_fatal() {
+        if let Some(e) = backlog.fatal_error() {
+            return Err(other_err(e));
+        }
     }
     if backlog.is_idle() {
         bump_counter!(send_attempts);
@@ -1199,8 +1214,10 @@ impl Write for UdpOutput {
         // (生产 wiring;测试与 PunchOutput 未注册 → 修前逐包路径)。
         // 顺带免去每数据报的 Arc clone 闭包(A-7 同款收益)。
         if let Some(agg) = self.backlog.agg() {
-            if let Some(e) = self.backlog.fatal_error() {
-                return Err(other_err(e));
+            if self.backlog.is_fatal() {
+                if let Some(e) = self.backlog.fatal_error() {
+                    return Err(other_err(e));
+                }
             }
             if self.backlog.is_idle() {
                 bump_counter!(send_attempts);
@@ -1210,16 +1227,16 @@ impl Write for UdpOutput {
             let _ = self.backlog.push(buf);
             return Ok(buf.len());
         }
-        let sock = self.sock.clone();
-        let peer = self.peer;
-        let connected = self.connected;
+        // 非 Linux/未启用聚合:修前逐包直发路径。direct 是 FnOnce 局部
+        // 闭包,借用即可(A-7:修前每数据报 clone Arc + 搬移标量)。
+        let this = &*self;
         output_write_via_backlog(
             &self.backlog,
             move |b| {
-                if connected {
-                    sock.try_send(b)
+                if this.connected {
+                    this.sock.try_send(b)
                 } else {
-                    sock.try_send_to(b, peer)
+                    this.sock.try_send_to(b, this.peer)
                 }
             },
             buf,
@@ -1901,113 +1918,257 @@ async fn demux_loop(
     sessions: SessionMap,
 ) {
     loop {
-        // A-4:每迭代取池槽收包,随包整槽移交消费端(空转/drop 路径归还)
-        let mut buf = pkt_pool_get();
-        let (n, peer) = tokio::select! {
-            r = udp.recv_from(&mut buf) => match r {
-                Ok(x) => {
-                    bump_counter!(recvfrom_calls);
-                    x
+        // A-5:Linux 用 recvmmsg 批收(单 syscall ≤64 报,高聚合 pps 下的
+        // 收包扩展上限);其余平台保持逐包 recv_from。MacOS 无 recvmmsg,
+        // libc 依赖也只声明在 linux target(与 A-3 sendmmsg 同款门控)。
+        #[cfg(target_os = "linux")]
+        {
+            tokio::select! {
+                r = udp.readable() => {
+                    if let Err(e) = r {
+                        // 持续性 socket 错误(如 fd 失效)不退避会忙转烧 CPU
+                        tracing::warn!(error = %e, "kcp recv error");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
                 }
-                Err(e) => {
-                    // 持续性 socket 错误(如 fd 失效)不退避会忙转烧 CPU
-                    tracing::warn!(error = %e, "kcp recv error");
-                    pkt_pool_put(buf);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                // listener drop / 最后会话退出通知:已 closing 且无会话
+                // → 退出释放 socket;仍有会话则继续服务存量。
+                _ = ctl.wake.notified() => {
+                    if ctl.closing.load(Ordering::Acquire)
+                        && sessions.lock().unwrap().is_empty()
+                    {
+                        tracing::debug!("kcp demux exit: listener dropped, no sessions");
+                        break;
+                    }
                     continue;
                 }
-            },
-            // listener drop / 最后会话退出通知:已 closing 且无会话
-            // → 退出释放 socket;仍有会话则继续服务存量。
-            _ = ctl.wake.notified() => {
-                if ctl.closing.load(Ordering::Acquire)
-                    && sessions.lock().unwrap().is_empty()
-                {
-                    tracing::debug!("kcp demux exit: listener dropped, no sessions");
+            }
+            // 就绪后收至 EAGAIN(每次 recvmmsg ≤64 报),逐包独立路由
+            loop {
+                let batch = recv_mmsg_batch(&udp);
+                if batch.is_empty() {
                     break;
                 }
-                pkt_pool_put(buf);
-                continue;
+                for (pkt, peer) in batch {
+                    demux_route_one(&udp, &accept_tx, &mux_streams, &ctl, &sessions, peer, pkt);
+                }
             }
-        };
-        if n < KCP_OVERHEAD {
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // A-4:每迭代取池槽收包,随包整槽移交消费端(drop 路径由
+            // demux_route_one 统一归还)
+            let mut buf = pkt_pool_get();
+            let (n, peer) = tokio::select! {
+                r = udp.recv_from(&mut buf) => match r {
+                    Ok(x) => {
+                        bump_counter!(recvfrom_calls);
+                        x
+                    }
+                    Err(e) => {
+                        // 持续性 socket 错误(如 fd 失效)不退避会忙转烧 CPU
+                        tracing::warn!(error = %e, "kcp recv error");
+                        pkt_pool_put(buf);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                },
+                // listener drop / 最后会话退出通知:已 closing 且无会话
+                // → 退出释放 socket;仍有会话则继续服务存量。
+                _ = ctl.wake.notified() => {
+                    if ctl.closing.load(Ordering::Acquire)
+                        && sessions.lock().unwrap().is_empty()
+                    {
+                        tracing::debug!("kcp demux exit: listener dropped, no sessions");
+                        break;
+                    }
+                    pkt_pool_put(buf);
+                    continue;
+                }
+            };
+            demux_route_one(
+                &udp,
+                &accept_tx,
+                &mux_streams,
+                &ctl,
+                &sessions,
+                peer,
+                PooledPkt { buf, len: n },
+            );
+        }
+    }
+}
+
+/// demux 单包路由(逐包与 recvmmsg 批收共用)。Skip/满/关闭路径在
+/// 内部归还池槽。
+#[allow(clippy::too_many_arguments)]
+fn demux_route_one(
+    udp: &Arc<UdpSocket>,
+    accept_tx: &mpsc::Sender<ReadyItem>,
+    mux_streams: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ctl: &Arc<DemuxCtl>,
+    sessions: &SessionMap,
+    peer: SocketAddr,
+    pkt: PooledPkt,
+) {
+    let PooledPkt { buf, len } = pkt;
+    if len < KCP_OVERHEAD {
+        pkt_pool_put(buf);
+        return;
+    }
+    let conv = kcp::get_conv(&buf[..len]);
+    // cmd 合法性:81(PUSH) 82(ACK) 83(WASK) 84(WINS)
+    if !(81..=84).contains(&buf[4]) {
+        pkt_pool_put(buf);
+        return;
+    }
+    // 会话表锁只做查表/注册:锁内绝不 spawn/投递/清理 ——
+    // spawn_server_session 在 ready 满队列/关闭分支会再次锁同一
+    // 非重入 Mutex(旧实现在此自锁,demux 与全部会话清理一起卡死,
+    // 见 DEMUX-FULL-DEADLOCK)。注册竞态由清理路径的 channel 身份
+    // 比较(same_channel)防旧会话误删重建同 conv 的新注册。
+    enum Route {
+        Existing(mpsc::Sender<SessionCmd>),
+        New((mpsc::Sender<SessionCmd>, mpsc::Receiver<SessionCmd>)),
+        Skip,
+    }
+    let route = {
+        let mut g = sessions.lock().unwrap();
+        match g.get(&conv) {
+            // 会话锁定首见对端:第三方伪造同 conv 报文不得注入既有会话
+            Some((tx, pinned)) if !tx.is_closed() && *pinned == peer => Route::Existing(tx.clone()),
+            Some(_) => Route::Skip,
+            // listener 已关闭:不再接入新会话(存量继续服务)
+            None if ctl.closing.load(Ordering::Acquire) => Route::Skip,
+            // 已退休 conv(刚退出/刚被满队列拒绝):不重建
+            None if ctl.is_retired(conv) => Route::Skip,
+            // A8:预认证闸 —— 只对**新**会话生效(存量会话已在上面的
+            // Existing 分支放行)。全局上限与每 IP 速率都在此判定,避免
+            // 随机源地址把会话表/任务数放大成无界。
+            None if !ctl.gate.admit(peer.ip()) => {
+                tracing::debug!(%peer, conv, "kcp session gate: rejected new session");
+                Route::Skip
+            }
+            None => {
+                let (tx, rx) = mpsc::channel::<SessionCmd>(256);
+                g.insert(conv, (tx.clone(), peer));
+                Route::New((tx, rx))
+            }
+        }
+    };
+    let route = match route {
+        Route::Skip => {
             pkt_pool_put(buf);
-            continue;
+            return;
         }
-        let pkt = &buf[..n];
-        let conv = kcp::get_conv(pkt);
-        // cmd 合法性:81(PUSH) 82(ACK) 83(WASK) 84(WINS)
-        if !(81..=84).contains(&pkt[4]) {
+        // 锁已释放后再 spawn:helper 内部(含满队列/关闭失败分支、
+        // 清理回调)的任何锁获取都不会与调用方嵌套
+        Route::New((tx, rx)) => {
+            spawn_server_session(
+                conv,
+                tx.clone(),
+                rx,
+                sessions.clone(),
+                udp.clone(),
+                peer,
+                accept_tx,
+                mux_streams.load(std::sync::atomic::Ordering::Relaxed),
+                ctl.clone(),
+            );
+            tx
+        }
+        Route::Existing(tx) => tx,
+    };
+    // 满丢包:kcp 重传兜底;两种失败都回收槽(Full = 丢包,Closed = 会话已亡)
+    match route.try_send(SessionCmd::Packet(PooledPkt { buf, len })) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(p)) | Err(mpsc::error::TrySendError::Closed(p)) => {
+            let SessionCmd::Packet(PooledPkt { buf, .. }) = p;
             pkt_pool_put(buf);
-            continue;
         }
-        // 会话表锁只做查表/注册:锁内绝不 spawn/投递/清理 ——
-        // spawn_server_session 在 ready 满队列/关闭分支会再次锁同一
-        // 非重入 Mutex(旧实现在此自锁,demux 与全部会话清理一起卡死,
-        // 见 DEMUX-FULL-DEADLOCK)。注册竞态由清理路径的 channel 身份
-        // 比较(same_channel)防旧会话误删重建同 conv 的新注册。
-        enum Route {
-            Existing(mpsc::Sender<SessionCmd>),
-            New((mpsc::Sender<SessionCmd>, mpsc::Receiver<SessionCmd>)),
-            Skip,
+    }
+}
+
+/// Linux recvmmsg 批收(A-5):一次系统调用收 ≤[`RECV_BATCH`] 个数据报
+/// (MSG_DONTWAIT,配合 `readable().await` 的标准批收形态),返回
+/// (池化包, 来源) 列表;空 = EAGAIN/无数据。未用槽归还池。
+#[cfg(target_os = "linux")]
+const RECV_BATCH: usize = 64;
+
+#[cfg(target_os = "linux")]
+fn recv_mmsg_batch(udp: &UdpSocket) -> Vec<(PooledPkt, SocketAddr)> {
+    use std::os::fd::AsRawFd as _;
+    let mut slots: Vec<Vec<u8>> = (0..RECV_BATCH).map(|_| pkt_pool_get()).collect();
+    let mut iovs: [libc::iovec; RECV_BATCH] = unsafe { std::mem::zeroed() };
+    let mut hdrs: [libc::mmsghdr; RECV_BATCH] = unsafe { std::mem::zeroed() };
+    let mut addrs: [libc::sockaddr_storage; RECV_BATCH] = unsafe { std::mem::zeroed() };
+    for i in 0..RECV_BATCH {
+        iovs[i].iov_base = slots[i].as_mut_ptr() as *mut libc::c_void;
+        iovs[i].iov_len = slots[i].len();
+        hdrs[i].msg_hdr.msg_name = &mut addrs[i] as *mut _ as *mut libc::c_void;
+        hdrs[i].msg_hdr.msg_namelen =
+            std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        hdrs[i].msg_hdr.msg_iov = &mut iovs[i];
+        hdrs[i].msg_hdr.msg_iovlen = 1;
+    }
+    let rc = unsafe {
+        libc::recvmmsg(
+            udp.as_raw_fd(),
+            hdrs.as_mut_ptr(),
+            RECV_BATCH as libc::c_uint,
+            libc::MSG_DONTWAIT,
+            std::ptr::null_mut(),
+        )
+    };
+    if rc <= 0 {
+        for s in slots {
+            pkt_pool_put(s);
         }
-        let route = {
-            let mut g = sessions.lock().unwrap();
-            match g.get(&conv) {
-                // 会话锁定首见对端:第三方伪造同 conv 报文不得注入既有会话
-                Some((tx, pinned)) if !tx.is_closed() && *pinned == peer => {
-                    Route::Existing(tx.clone())
-                }
-                Some(_) => Route::Skip,
-                // listener 已关闭:不再接入新会话(存量继续服务)
-                None if ctl.closing.load(Ordering::Acquire) => Route::Skip,
-                // 已退休 conv(刚退出/刚被满队列拒绝):不重建
-                None if ctl.is_retired(conv) => Route::Skip,
-                // A8:预认证闸 —— 只对**新**会话生效(存量会话已在上面的
-                // Existing 分支放行)。全局上限与每 IP 速率都在此判定,避免
-                // 随机源地址把会话表/任务数放大成无界。
-                None if !ctl.gate.admit(peer.ip()) => {
-                    tracing::debug!(%peer, conv, "kcp session gate: rejected new session");
-                    Route::Skip
-                }
-                None => {
-                    let (tx, rx) = mpsc::channel::<SessionCmd>(256);
-                    g.insert(conv, (tx.clone(), peer));
-                    Route::New((tx, rx))
+        return Vec::new();
+    }
+    let got = rc as usize;
+    bump_counter!(recvfrom_calls);
+    for s in slots.drain(got..) {
+        pkt_pool_put(s);
+    }
+    slots
+        .into_iter()
+        .zip(0..got)
+        .filter_map(|(buf, i)| {
+            let len = hdrs[i].msg_len as usize;
+            match sockaddr_to_std(&addrs[i]) {
+                Some(peer) if len > 0 => Some((PooledPkt { buf, len }, peer)),
+                _ => {
+                    pkt_pool_put(buf);
+                    None
                 }
             }
-        };
-        let route = match route {
-            Route::Skip => {
-                pkt_pool_put(buf);
-                continue;
-            }
-            // 锁已释放后再 spawn:helper 内部(含满队列/关闭失败分支、
-            // 清理回调)的任何锁获取都不会与调用方嵌套
-            Route::New((tx, rx)) => {
-                spawn_server_session(
-                    conv,
-                    tx.clone(),
-                    rx,
-                    sessions.clone(),
-                    udp.clone(),
-                    peer,
-                    &accept_tx,
-                    mux_streams.load(std::sync::atomic::Ordering::Relaxed),
-                    ctl.clone(),
-                );
-                tx
-            }
-            Route::Existing(tx) => tx,
-        };
-        // 满丢包:kcp 重传兜底;两种失败都回收槽(Full = 丢包,Closed = 会话已亡)
-        match route.try_send(SessionCmd::Packet(PooledPkt { buf, len: n })) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(p)) | Err(mpsc::error::TrySendError::Closed(p)) => {
-                let SessionCmd::Packet(PooledPkt { buf, .. }) = p;
-                pkt_pool_put(buf);
-            }
+        })
+        .collect()
+}
+
+/// libc sockaddr → std SocketAddr(A-5 recvmmsg 批收用)。
+#[cfg(target_os = "linux")]
+fn sockaddr_to_std(ss: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    match ss.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let a: &libc::sockaddr_in = unsafe { &*(ss as *const _ as *const libc::sockaddr_in) };
+            Some(SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr)),
+                u16::from_be(a.sin_port),
+            )))
         }
+        libc::AF_INET6 => {
+            let a: &libc::sockaddr_in6 = unsafe { &*(ss as *const _ as *const libc::sockaddr_in6) };
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(a.sin6_addr.s6_addr),
+                u16::from_be(a.sin6_port),
+                a.sin6_flowinfo,
+                a.sin6_scope_id,
+            )))
+        }
+        _ => None,
     }
 }
 
@@ -2386,11 +2547,11 @@ impl PunchOutput {
 
 impl Write for PunchOutput {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let sock = self.sock.clone();
-        let peer = self.peer.clone();
+        // A-7:direct 闭包借用 self(FnOnce,无需每数据报 clone 两个 Arc)
+        let this = &*self;
         output_write_via_backlog(
             &self.backlog,
-            move |b| sock.try_send_to(b, peer.current()),
+            move |b| this.sock.try_send_to(b, this.peer.current()),
             buf,
         )
     }

@@ -96,7 +96,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 备注:收益用 benchmark/peer.sh 的 kcp 档实测(PROTO=kcp),看保留率与 CPU(cpu.jsonl)。
 
 ### A-4 [P1] 入站每报文 pkt.to_vec() 一次堆分配 —— 来源 kcp-5(合并 transports-2)
-- [ ] 状态:
+- [x] 状态:完成 @ 880cca7
+> 核查:✅ 问题在(四个收包循环每包 to_vec:demux/客户端 connect/punch pinned/punch dial;测试另有 8 处构造);TX 侧积压 push(output_write_via_backlog 的 WouldBlock 回落)经 A-3 聚合改造后仅在拥塞回落路径发生、量级骤减,不再单独处理(在 A-3 条目注明)。实施:进程级 64KiB 槽池(上限 256 槽=16MiB),SessionCmd::Packet 携 (槽, len),收包读进槽内整槽移交、消费端 kcp.input 后归还,全部 drop/失败路径归还防槽流失。
 - 位置:`crates/rh-transport/src/kcp.rs:1598`(demux,服务端全部会话唯一入站通道)、同型 :1749/:1839/:1853/:2070/:620/:331
 - 项目自述 1 Gbps ≈ 85k pps,即每秒 ~8.5 万次 ~1200B 小分配;1598 参数先求值,通道 Full 时分配照做再丢弃。
 - 修法:SessionCmd::Packet 改携池化载体(参照 mux.rs:230 既有 BytesMut 池风格,或用已有 bytes 依赖的引用计数),recv_from 直接读进池缓冲移交,消费端 kcp.input 后归还;发送积压 push(620)同理。
@@ -104,28 +105,32 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 备注:同 A-3 用 peer.sh kcp 档验证。
 
 ### A-5 [P2] demux 单任务逐包 recv_from,无 recvmmsg —— 来源 kcp-4
-- [ ] 状态:
+- [x] 状态:完成 @ 待填
+> 核查:✅ 问题在(demux_loop 每 select 一包一 syscall);采用 recvmmsg 批收(readable().await → recvmmsg(MSG_DONTWAIT)×N 至 EAGAIN 的标准批收形态),仅服务端 demux(客户端/打洞为单会话流量,pps 低一档,不动)。**门控 cfg(target_os="linux") 而非 cfg(unix)**:recvmmsg 同为 Linux-only(与 A-3 同因);单包路由抽 demux_route_one 供两平台共用,行为逐语句等价。libc 用法经 x86_64-unknown-linux-gnu scratch crate 编译验证(ring 交叉构建受阻,本地无法整 crate 交叉检查),余下由 CI linux job 兜底。
 - 位置:`crates/rh-transport/src/kcp.rs:1506-1532`(服务端)、:1741-1759(客户端)
 - 问题:高聚合 pps 下 syscall 频率与单任务调度是收包扩展上限;4MiB SO_RCVBUF 只是兜底。
 - 修法:Linux 下 `recvmmsg` 一次取一批(≤64)再按 conv 分发;或按 conv 哈希分片到多收包任务(需 SO_REUSEPORT 多 socket)。cfg(unix)/cfg(target_os) 门控。
 - 验收:三道门绿;与 A-3/A-4 合并为一次基准对照。
 
 ### A-6 [P2] 每输出数据报先锁 fatal_error 再锁 state —— 来源 kcp-6
-- [ ] 状态:
+- [x] 状态:完成 @ 待填
+> 核查:✅ 问题在(output_write_via_backlog 每输出一次 `fatal_error()` 取 Mutex;drain 的 is_fatal 每轮取锁);修法可行:fatal_flag AtomicBool 一次性置位(note_fatal 内 store Release),is_fatal 读原子,置位才取锁拿错误串。
 - 位置:`crates/rh-transport/src/kcp.rs:826`(检查)、:579-581(实现)
 - 问题:fatal_error 是一次性置位永不清除的状态,却用 Mutex 每包读;is_idle 的 state 锁有 FIFO 正确性依据应保留。
 - 修法:fatal_error 改 AtomicBool 快路径;错误串仅在首个致命错误时写入一次供诊断/桥接读取。
 - 验收:三道门绿;致命错误传播测试(kcp.rs 内 drain_once fatal 分支)通过。
 
 ### A-7 [P2] 每次 write 克隆 Arc 再立即 drop —— 来源 kcp-7
-- [ ] 状态:
+- [x] 状态:完成 @ 待填
+> 核查:✅ 问题在(PunchOutput 每数据报 clone sock+peer 两个 Arc;UdpOutput 回落路径 clone sock);A-3 聚合分支已顺带消掉(Linux 主路径不走闭包),本条补齐回落路径与 PunchOutput:direct 闭包改借用 self。
 - 位置:`crates/rh-transport/src/kcp.rs:863`(UdpOutput)、:1958-1959(PunchOutput)
 - 问题:每数据报 2-4 次纯多余原子 RMW;direct 闭包是 FnOnce 局部闭包,借用即可。
 - 修法:闭包改借用形式(`|b| self.sock.try_send(b)`),或把 output_write_via_backlog 的 direct 参数改为显式引用。
 - 验收:三道门绿。
 
 ### A-8 [P2] poll_write 持锁 notify_one —— 来源 kcp-8
-- [ ] 状态:
+- [x] 状态:完成 @ 待填
+> 核查:✅ 问题在(poll_write 与 poll_write_vectored 均 guard 存活期间 notify_one;poll_flush 已是先 drop 再 notify);两处补 drop(s) 后再唤醒,与 poll_flush 纪律对齐。
 - 位置:`crates/rh-transport/src/kcp.rs:336`、`:381`
 - 问题:guard 存活期间 notify_one,被唤醒的会话任务立刻在同一把锁上空等;poll_flush(:408→412)已按"先 drop 再 notify"实现,写路径未对齐。
 - 修法:两处各改成 drop(s) 后再 notify_one。一致性清理,零风险。
