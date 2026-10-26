@@ -182,7 +182,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 ## 包 C:yamux(vendor/yamux)
 
 ### C-1 [P1] 接收 staging 的 zeroed 水位被 reclaim 误重置 —— 来源 yamuxRest-1(合并 yamuxCore-1)
-- [x] 状态:完成 @ e27c8ef
+- [x] 状态:完成 @ e2c0b41
 > 核查:✅ 机理确认但成因修正:读 bytes-1.12.1 `reserve_inner` 源码,KIND_VEC/ARC-unique 的 "no copy necessary" 分支仅抬高 cap 不动任何字节(空闲区仍零),而 capacity 变化触发现有代码 `zeroed=min(zeroed,len)` 误重置——这才是误重置来源;copy-back reclaim 与 fresh-alloc 的重置则是正确必需。红线核实成立:ptr/cap 观测均无法区分三分支(realloc 可原地同 ptr、fresh alloc 可落在更低地址),故不采用水位判别法,改**自管扩容**:容量不足时不调 `buf.reserve`(杜绝内部搬移被观察到),自建新缓冲整块预零填一次、水位=新容量;`advance`/`split_to` 同步递减 cap 与水位(bytes 源码 advance_unchecked 证实 cap-=k),不变量 `zeroed==capacity` 永久保持,读路径零 memset,零填总量从"随流量线性"降为"每连接 ≈2× 峰值容量(几何增长有界)"。代价:staging 驻留高水位最多翻倍(不再回收已消费前缀),仅 1MiB 级大帧流场景可感。
 - 位置:`vendor/yamux/src/frame/io.rs:232-239`(重置条件)、:264-288(消费)、:593(零填)
 - 问题:水位在任何 capacity 变化时重置为 buf.len(),而 bytes 1.12.1 的 reclaim(无新分配、指针复位)也改变 capacity → 稳态每收 1 字节约做 1 字节 memset,写脏的 cacheline 随即被内核拷贝覆盖。
@@ -191,7 +191,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 备注:peer.sh mux 档看 CPU。
 
 ### C-2 [P1] ShardWorker poll 循环无消费预算 —— 来源 yamuxShard-1
-- [ ] 状态:
+- [x] 状态:
+> 核查:✅ 问题在(shard.rs:860 poll 主循环 progress→continue 无界;SendWorker :112 SEND_CMDS_PER_POLL=64 且注释明言防独占,接收侧缺失);修法可行,预算取 64(与 SendWorker 同款;且 < 分片通道容量 128,单轮 drain 即可观察预算生效,测试确定性)。终结排空(:880)与 send_dropped 排空(:933)保持全量语义不受预算约束。
 - 位置:`vendor/yamux/src/connection/halves/shard.rs:939-957`
 - 问题:持续满载下单次 poll 可无限延续、不让出 tokio worker(SendWorker 有预算 shard.rs:112 `SEND_CMDS_PER_POLL=64` 且注释明言"防单 Worker 独占线程",接收侧恰好缺失)。影响公平性/尾延迟,吞吐不受损。
 - 修法:仿 SendWorker 加 poll 级预算(如每 poll ≤256 帧),耗尽后 `cx.waker().wake_by_ref()` + Pending 让出;帧仍在分片通道/缓冲中,不丢不重。

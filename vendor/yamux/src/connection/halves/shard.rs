@@ -111,6 +111,13 @@ pub(super) const SEND_OUT_CAP: usize = 128;
 /// 线程;命令已在通道内,break 后下轮继续,不丢)。
 const SEND_CMDS_PER_POLL: usize = 64;
 
+/// ShardWorker 单轮 poll 的消息消费预算(与 SEND_CMDS_PER_POLL 同款纪律,
+/// 接收侧此前缺失):持续满载下 Framer 并发补货,`progress → continue`
+/// 可无限延续、不让出 tokio worker。预算 < 分片通道容量,单轮排空即可
+/// 触发;耗尽后自唤醒 + Pending 让出,剩余消息留在 msg_buf 下轮继续,
+/// 不丢不重。终结/弃置排空走全量语义,不受预算约束。
+const RECV_MSGS_PER_POLL: usize = 64;
+
 /// Worker→Framer 建流交付通道容量(D6:accept 背压链的一环)。
 pub(super) const NEW_STREAMS_CAP: usize = 16;
 
@@ -532,15 +539,26 @@ impl ShardWorker {
     }
 
     /// 热路径:ring 排空(单轮 ≤ 通道容量,天然有界)+ 逐条 §2.3 处理。
+    /// 全量版:终结排空/弃置排空专用(必须处理完在途数据,不受预算约束)。
     fn drain_msgs(&mut self) -> bool {
+        let mut unbounded = usize::MAX;
+        self.drain_msgs_budgeted(&mut unbounded)
+    }
+
+    /// 预算版:热路径单次 poll 消费 ≤ *budget 条,剩余留在 msg_buf
+    /// (与下一轮 drain_into 追加的内容保持先来先到顺序),不丢。
+    fn drain_msgs_budgeted(&mut self, budget: &mut usize) -> bool {
         self.msg_rx.drain_into(&mut self.msg_buf);
-        if self.msg_buf.is_empty() {
-            return false;
-        }
-        while let Some(msg) = self.msg_buf.pop_front() {
+        let mut progressed = false;
+        while *budget > 0 {
+            let Some(msg) = self.msg_buf.pop_front() else {
+                break;
+            };
             self.process_msg(msg);
+            *budget -= 1;
+            progressed = true;
         }
-        true
+        progressed
     }
 
     /// new_streams 交付重试(§2.2 步骤 3:try_send 成功一条清一条)。
@@ -859,6 +877,9 @@ impl Future for ShardWorker {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = &mut *self;
+        // 消息消费预算(loop 外声明,跨轮次递减;park 复查不是消息消费,
+        // 不受预算约束——与 SendWorker 的 SEND_CMDS_PER_POLL 同型)。
+        let mut budget = RECV_MSGS_PER_POLL;
         loop {
             if this.finished {
                 return Poll::Ready(());
@@ -946,7 +967,9 @@ impl Future for ShardWorker {
             //    不再消费分片通道——通道随之填满 → Framer 停读 → TCP
             //    背压,端到端有界;修前无条件排空把建流句柄无限堆进
             //    无界暂存,背压链在此断裂。
-            if this.pending_new.is_empty() && this.drain_msgs() {
+            //    预算在 loop 外声明,`progress → continue` 不重置;持续
+            //    满载下并发补货会让单次 poll 无限延续,预算是 poll 级的。
+            if this.pending_new.is_empty() && this.drain_msgs_budgeted(&mut budget) {
                 progress = true;
             }
             // 3) new_streams 交付重试(try_send 成功一条清一条)
@@ -954,6 +977,14 @@ impl Future for ShardWorker {
                 progress = true;
             }
             if progress {
+                if budget == 0 {
+                    // 预算耗尽:此刻分片通道/msg_buf 可能仍有剩余,消费者
+                    // waker 未必登记过——直接 park 会滞留到无关事件。
+                    // 自唤醒 + Pending:任务重新排队、其他任务插队
+                    // (防独占),剩余消息下次 poll 继续,不丢。
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
                 continue;
             }
             // park:new_streams 满 → 发送侧 poll_ready 登记(futures mpsc
@@ -1933,6 +1964,53 @@ mod tests {
             expect.extend_from_slice(&[0xA0 + i; 100]);
         }
         assert_eq!(data, expect, "流内顺序必须逐字节一致(FIFO)");
+    }
+
+    /// T-C2(任务书 C-2):接收侧消息预算——单轮 poll 消费恰
+    /// RECV_MSGS_PER_POLL 条(自唤醒 + Pending 让出),剩余保留下轮、
+    /// 零丢失且顺序逐字节一致。与 T-S7(SendWorker 64 命令预算)对偶。
+    #[test]
+    fn recv_worker_msg_budget_splits_rounds() {
+        let mut f = Fixture::client(1, Config::default());
+        // 建流(N=1,入站 sid 2 归 worker0)
+        f.feed(syn_data_block(2, &[0xA0]));
+        let mut stream = match f.drive_recv() {
+            Poll::Ready(Some(Ok(s))) => s,
+            other => panic!("worker must deliver the inbound stream, got {other:?}"),
+        };
+        // 100 帧数据(> 预算 64,< 通道容量 128,一次 recv.poll 全部路由)
+        const FRAMES: usize = 100;
+        let mut expect = vec![0xA0u8];
+        for i in 0..FRAMES {
+            f.feed(data_block(2, &[0x10 + i as u8; 64]));
+            expect.extend_from_slice(&[0x10 + i as u8; 64]);
+        }
+        match f.recv.poll(&mut f.cx) {
+            Poll::Pending => {}
+            other => panic!("recv half must park after routing, got {other:?}"),
+        }
+        // 第一轮:预算耗尽,恰消费 64 条,剩余 36 条滞留 msg_buf
+        match f.workers[0].poll_unpin(&mut f.cx) {
+            Poll::Pending => {}
+            other => panic!("worker must yield via self-wake + Pending, got {other:?}"),
+        }
+        assert_eq!(
+            f.workers[0].msg_buf.len(),
+            FRAMES - RECV_MSGS_PER_POLL,
+            "a single ShardWorker poll must consume exactly the budget"
+        );
+        // 第二轮:预算刷新,消费余量,排空后正常 park
+        match f.workers[0].poll_unpin(&mut f.cx) {
+            Poll::Pending => {}
+            other => panic!("worker must park after draining the remainder, got {other:?}"),
+        }
+        assert!(
+            f.workers[0].msg_buf.is_empty(),
+            "all messages must be consumed across rounds"
+        );
+        // 零丢失 + 顺序(流缓冲逐字节比对)
+        let data = drain_stream(&mut stream, &mut f.cx).expect("ordered read");
+        assert_eq!(data, expect, "budget split must not lose or reorder frames");
     }
 
     /// T-W2:SYN 建流交付 + wire 侧恰一个 ACK|WU 建流授信帧(对齐现行
