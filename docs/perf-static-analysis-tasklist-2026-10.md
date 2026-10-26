@@ -110,7 +110,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 备注:同 A-3 用 peer.sh kcp 档验证。
 
 ### A-5 [P2] demux 单任务逐包 recv_from,无 recvmmsg —— 来源 kcp-4
-- [x] 状态:完成 @ 645a88e
+- [x] 状态:已回退 @ 0801505(实施 @ 645a88e,基准后撤销)
+> 回退核查(2026-10-26 三机基准):recvmmsg 批收使 KCP 隧道 UDP(1200B×window32 回显)每程加 ~110µs 固定延迟 —— RTT p50 3.16→3.82ms、吞吐 96.9→77.4 Mbps(-19%),且回退后实测对 TCP 吞吐零贡献(agg 关闭对照轮与基线持平)。二分矩阵:V0 自建 v0.5.3(96.3,排除构建)、V1 关 agg(78.4,排除 A-3)、V2 demux 翻回逐包(93.1,锁定 A-5 结构)、tcp 轮延迟仅 +65µs(排除 yamux 层)。回退后 demux 统一为 tokio 原生 recv_from 逐包收,保留 demux_route_one 抽取与 A-4 池化;删除 recv_mmsg_batch/sockaddr_to_std 与 demux 内 std::os::fd 用法(该路径从此跨平台同构,可本地验证)。证据:/tmp/ev-udp-base、/tmp/ev-udp-cand、/tmp/ev-v2-demux-flip(见下方基准结论节)。
 > 核查:✅ 问题在(demux_loop 每 select 一包一 syscall);采用 recvmmsg 批收(readable().await → recvmmsg(MSG_DONTWAIT)×N 至 EAGAIN 的标准批收形态),仅服务端 demux(客户端/打洞为单会话流量,pps 低一档,不动)。**门控 cfg(target_os="linux") 而非 cfg(unix)**:recvmmsg 同为 Linux-only(与 A-3 同因);单包路由抽 demux_route_one 供两平台共用,行为逐语句等价。libc 用法经 x86_64-unknown-linux-gnu scratch crate 编译验证(ring 交叉构建受阻,本地无法整 crate 交叉检查),余下由 CI linux job 兜底。
 - 位置:`crates/rh-transport/src/kcp.rs:1506-1532`(服务端)、:1741-1759(客户端)
 - 问题:高聚合 pps 下 syscall 频率与单任务调度是收包扩展上限;4MiB SO_RCVBUF 只是兜底。
@@ -433,7 +434,18 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 
 **C-9 判定(依据本轮数据)**:yamux 路径(tcp+MUX=1)吞吐/延迟/CPU 全持平 —— 帧路径微开销在 10GbE 端到端里不可见,C-3~C-8 的收益也不体现为端到端数字。C-9(take_error 锁 + workers_gone 遍历)量级更小,**归档不修**;判据:C 包已优化项尚且测不出端到端差异,C-9 不可能单独可见。
 
-**待查项(需下轮处理)**:KCP 隧道 UDP 吞吐 -19%(0% 丢包、直连基线一致、AGG 批大小无关、两次独立轮次复现)。候选机制:UDP 代理每报文小写在聚合批路径下的迭代节奏劣化,或 demux 探测收尾的每排空一次额外 syscall(8-10k pps 量级敏感)。**未修,不盲改**;定位时优先 perf 对比 base/cand 的 rh-server/rh-client 在 UDP 档的热点。
+**待查项已闭环(2026-10-26 第二轮)**:KCP 隧道 UDP -19% 根因 = A-5 服务端 demux 的「readable()+raw recvmmsg 批收+try 探测清缓存」结构,对回显窗口型载荷每程加 ~110µs 固定延迟(分布整体平移,min 也 +220µs = 两程)。二分归因矩阵(每轮 REPEAT=5×15s,PROTO=kcp/splice/mux):
+
+| 轮次 | 构成 | UDP 隧道 Mbps / RTT p50 | 裁决 |
+|---|---|---|---|
+| ev-udp-base | Release v0.5.3 | 93.1 / 3.16ms | 基线复现(前日 96.9/2.92) |
+| ev-udp-cand | main@67e1038 | 76.2 / 3.82ms | 回归今日复现 |
+| (V0) | **自建** v0.5.3(同工具链) | 96.3 / 2.99ms | 构建差异排除 |
+| (V1) | 候选、A-3 agg 关闭 | 78.4 / 3.63ms | A-3 排除;agg 对吞吐零贡献 |
+| (V2) | 候选、demux 翻回逐包 | 93.1 / 3.14ms | **锁定 A-5**;TCP 1流 562/16流 779 最高 |
+| ev-fix-kcp | 修复 @ 0801505 | **95.0 / 3.08ms** | 修复验证 ✅ |
+
+修复后终态(main@0801505,ev-fix-kcp):UDP 95.0 Mbps 恢复基线;KCP TCP 隧道 1/4/16流 = 560/598/775 Mbps,较基线 +5~8% 增益保留且不低于回退前;tcp 主路径未触(本轮未改其代码);并发/丢包全绿。任务书候选机制两条(聚合批迭代节奏 / 探测 syscall)均未命中 —— 实际根因是批收结构与 tokio 就绪缓存簿记的等待语义差异,靠二分变体而非推理定位(教训:延迟型回归 CPU 火焰图不敏感,变体二分 + RTT 分布是有效仪器)。
 
 ## 已确认优化到位、不要重复优化的热点
 
