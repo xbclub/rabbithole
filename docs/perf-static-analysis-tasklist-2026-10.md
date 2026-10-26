@@ -133,7 +133,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 ## 包 B:mux / splice / ws(rh-transport)
 
 ### B-1 [P1] UpReader Empty 路径丢弃 256KiB 池缓冲 —— 来源 mux-1
-- [ ] 状态:
+- [x] 状态:完成 @ 9083a21
+> 核查:✅ 问题在(mux.rs:342-367 先 pool_get(up_chunk_cap()=默认 256KiB) 再 poll,Pending 即整只 drop;:750-753 自证抢收常态为 Empty);修法可行,另把阻塞 read_chunk 一并接入同一 stash(只取不存,不改变 pool_borrows 测试语义)。
 - 位置:`crates/rh-transport/src/mux.rs:342-367`
 - 问题:try_read_chunk 在数据未就绪(Empty)时,已取出的 256KiB 池缓冲未消费即 drop(不归池);仓库自证典型中继"几乎总是返回 Empty"(mux.rs:750-753),即上行每批一次 256KiB 分配/释放或池条目永久流失。
 - 修法:UpReader 加 `spare: Option<BytesMut>` 字段,Empty 时暂存供下次复用(容量不符再丢弃);初始相 12KiB 本地缓冲同理。

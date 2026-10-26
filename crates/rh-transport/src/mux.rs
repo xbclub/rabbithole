@@ -297,12 +297,39 @@ enum TryChunk {
 #[derive(Default)]
 struct UpReader {
     upgraded: bool,
+    /// 非阻塞读未就绪(Empty)时暂存的缓冲,下次调用直接复用。
+    ///
+    /// 修前每批收集的第一次 `try_read_chunk` 几乎总是 Empty(数据尚未
+    /// 抵达,round-55 注释自证),取出的池相 256KiB/初始相 12KiB 缓冲
+    /// 未消费即整个丢弃 —— 每批白付一次分配,池相缓冲流失后永不归池。
+    /// 容量不足(升级导致 cap 变化)时丢弃重取。
+    spare: Option<bytes::BytesMut>,
     /// 本读取器经池相取缓冲的次数(cfg(test) 探针:C4 断言滴流阶段 == 0)。
     #[cfg(test)]
     pool_borrows: usize,
 }
 
 impl UpReader {
+    /// 取一块容量 ≥ cap 的缓冲:优先复用暂存的 spare,否则按当前相
+    /// 从池取或本地分配。读入量仍由调用方以 cap 收口(A4 红线不受影响)。
+    fn acquire(&mut self, cap: usize) -> bytes::BytesMut {
+        if let Some(b) = self.spare.take() {
+            if b.capacity() >= cap {
+                return b;
+            }
+        }
+        if self.upgraded {
+            #[cfg(test)]
+            {
+                self.pool_borrows += 1;
+            }
+            pool_get(cap)
+        } else {
+            // 本地缓冲:不经池,冻结后写穿直接释放
+            bytes::BytesMut::with_capacity(cap)
+        }
+    }
+
     /// 非阻塞读:数据未就绪立即返回 [`TryChunk::Empty`],**不挂起**。
     ///
     /// 用于上行批量收集:当前块已收下后,把"此刻已就绪"的后续块一并收进
@@ -339,16 +366,7 @@ impl UpReader {
         } else {
             INIT_BUF_CAP
         };
-        let mut bm = if self.upgraded {
-            #[cfg(test)]
-            {
-                self.pool_borrows += 1;
-            }
-            pool_get(cap)
-        } else {
-            // 本地缓冲:不经池,冻结后写穿直接释放
-            bytes::BytesMut::with_capacity(cap)
-        };
+        let mut bm = self.acquire(cap);
         let n = std::future::poll_fn(|cx| {
             let spare = bm.spare_capacity_mut();
             let limit = spare.len().min(cap);
@@ -363,6 +381,8 @@ impl UpReader {
         })
         .await?;
         if n == usize::MAX {
+            // 未就绪:缓冲零消费,暂存供下次复用(见 spare 字段注释)
+            self.spare = Some(bm);
             return Ok(TryChunk::Empty);
         }
         if n == 0 {
@@ -379,15 +399,12 @@ impl UpReader {
         &mut self,
         r: &mut R,
     ) -> io::Result<Option<Bytes>> {
-        if self.upgraded {
-            #[cfg(test)]
-            {
-                self.pool_borrows += 1;
-            }
-            return read_chunk_from(r, up_chunk_cap()).await;
-        }
-        let local = bytes::BytesMut::with_capacity(INIT_BUF_CAP);
-        let chunk = read_chunk_into(r, INIT_BUF_CAP, local).await?;
+        let cap = if self.upgraded {
+            up_chunk_cap()
+        } else {
+            INIT_BUF_CAP
+        };
+        let chunk = read_chunk_into(r, cap, self.acquire(cap)).await?;
         if chunk.as_ref().is_some_and(|c| c.len() >= INIT_BUF_CAP) {
             self.upgraded = true;
         }
