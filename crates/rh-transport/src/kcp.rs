@@ -1941,14 +1941,46 @@ async fn demux_loop(
                     continue;
                 }
             }
-            // 就绪后收至 EAGAIN(每次 recvmmsg ≤64 报),逐包独立路由
+            // 就绪后排空:批收(recvmmsg ≤64 报/次)为主,末尾用一次
+            // tokio 原生 try 探测收尾 —— raw recvmmsg 打到 EAGAIN **不会**
+            // 清 tokio 的就绪缓存,直接回到 select 会让 readable() 永远
+            // 立即就绪 → 忙转(Linux CI 实测 27 万次 EAGAIN 空转,current_thread
+            // 测试运行时下饿死会话任务)。try_recv_buf_from 经 try_io,遇
+            // WouldBlock 清缓存,select 才能真正挂起;偶得包则照常路由后
+            // 回批路径续收,不丢序。
             loop {
                 let batch = recv_mmsg_batch(&udp);
-                if batch.is_empty() {
-                    break;
-                }
                 for (pkt, peer) in batch {
                     demux_route_one(&udp, &accept_tx, &mux_streams, &ctl, &sessions, peer, pkt);
+                }
+                let mut probe = pkt_pool_get();
+                match udp.try_recv_buf_from(&mut probe) {
+                    Ok((n, peer)) if n > 0 => {
+                        demux_route_one(
+                            &udp,
+                            &accept_tx,
+                            &mux_streams,
+                            &ctl,
+                            &sessions,
+                            peer,
+                            PooledPkt { buf: probe, len: n },
+                        );
+                        continue;
+                    }
+                    Ok(_) => {
+                        pkt_pool_put(probe);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // 缓存已清:回到 select 等新事件
+                        pkt_pool_put(probe);
+                        break;
+                    }
+                    Err(e) => {
+                        pkt_pool_put(probe);
+                        tracing::warn!(error = %e, "kcp recv error");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        break;
+                    }
                 }
             }
         }
