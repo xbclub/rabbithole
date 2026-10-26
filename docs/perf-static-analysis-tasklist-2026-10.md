@@ -249,7 +249,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 ## 包 D:服务端(rh-server)
 
 ### D-1 [P1] API 响应双序列化(Value 树 → 再序列化) —— 来源 serverApi-1
-- [ ] 状态:
+- [x] 状态:完成 @ 1bdd599
+> 核查:✅ 问题在(ok() 信封 api.rs:80-82 经 json! 深拷贝 data 再二次序列化;list_services/list_clients 每行 20 字段 json! 建树)。serde_json 未开 preserve_order(现状键序本为字母序,改结构体后为声明序——语义等价,对比测试按解析后 Value 断言)。ProxySpec 含 flatten,直接序列化与 to_value 输出等价。实施:信封 struct + list_services/list_clients/stats_overview 强类型行;list_events 本就传 db 行类型,信封改造即覆盖。
 - 位置:`crates/rh-server/src/api.rs:80-82`(ok() 信封);最重的消费方 :925-947(list_services 每行 20 字段 + 内嵌整份 spec)、:446-468(list_clients)
 - 问题:所有响应先经 `json!` 构造完整 serde_json::Value 树,axum Json 再把树二次序列化——同一数据两遍,分配量数倍于响应体积;api.rs:884 注释"json! 按引用序列化"低估了 to_value 成本。
 - 修法:列表端点改 `#[derive(Serialize)]` 强类型行结构体直接交 axum::Json;envelope 用包一层 Serialize 的包装 struct 实现。先改最重的 list_services/list_clients/stats_overview/list_events,再逐步铺开。

@@ -77,8 +77,24 @@ async fn menu_all(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
 
 // ---------------- envelope ----------------
 
+/// 统一成功信封。D-1:修前 `json!` 把 data 经 to_value 深拷贝进 Value 树,
+/// axum 再把整棵树序列化 —— 同一数据两遍、分配量数倍于响应体积。包装
+/// struct 让 serde 直接把 data 写进输出缓冲,不再建中间树(data 本身是
+/// Value 时省掉的是第二次建树;是强类型行时连第一次都没有)。
+#[derive(Serialize)]
+struct OkEnvelope<T> {
+    code: i32,
+    data: T,
+    message: &'static str,
+}
+
 pub fn ok<T: Serialize>(data: T) -> Response {
-    Json(json!({"code": 0, "data": data, "message": "ok"})).into_response()
+    Json(OkEnvelope {
+        code: 0,
+        data,
+        message: "ok",
+    })
+    .into_response()
 }
 
 pub fn err(code: i32, message: &str) -> Response {
@@ -410,6 +426,34 @@ async fn auth_codes(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 
 // ---------------- clients ----------------
 
+/// D-1:list_clients 行结构(修前逐行 `json!` 建 Value 树)。
+/// 字段集与修前 json! 构造完全一致(对比测试 `d1_rows_match_legacy_json`
+/// 逐字段钉住;null 语义靠 Option 无 skip_serializing_if 保持)。
+#[derive(Serialize)]
+struct ClientListRow {
+    id: String,
+    name: String,
+    enabled: bool,
+    remark: String,
+    online: bool,
+    online_since: Option<u64>,
+    reported_revision: Option<u64>,
+    expected_revision: i64,
+    client_version: String,
+    hostname: String,
+    os: String,
+    last_online_at: Option<i64>,
+    created_at: i64,
+    bytes_in: u64,
+    bytes_out: u64,
+    conns_current: i64,
+    // F2 配额(0/空 = 不限)
+    rate_limit: String,
+    max_conns: i64,
+    max_services: i64,
+    flow_limit: i64,
+}
+
 async fn list_clients(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
@@ -443,29 +487,29 @@ async fn list_clients(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
         .map(|c| {
             let sess = state.sessions.get(&c.id);
             let meter = per_client.get(&c.id).copied().unwrap_or((0, 0, 0));
-            json!({
-                "id": c.id,
-                "name": c.name,
-                "enabled": c.enabled,
-                "remark": c.remark,
-                "online": sess.is_some(),
-                "online_since": sess.as_ref().map(|s| s.started_at.elapsed().as_secs()),
-                "reported_revision": sess.as_ref().map(|s| s.applied()),
-                "expected_revision": c.config_revision,
-                "client_version": c.client_version,
-                "hostname": c.hostname,
-                "os": c.os,
-                "last_online_at": c.last_online_at,
-                "created_at": c.created_at,
-                "bytes_in": meter.0,
-                "bytes_out": meter.1,
-                "conns_current": meter.2,
+            ClientListRow {
+                id: c.id,
+                name: c.name,
+                enabled: c.enabled,
+                remark: c.remark,
+                online: sess.is_some(),
+                online_since: sess.as_ref().map(|s| s.started_at.elapsed().as_secs()),
+                reported_revision: sess.as_ref().map(|s| s.applied()),
+                expected_revision: c.config_revision,
+                client_version: c.client_version,
+                hostname: c.hostname,
+                os: c.os,
+                last_online_at: c.last_online_at,
+                created_at: c.created_at,
+                bytes_in: meter.0,
+                bytes_out: meter.1,
+                conns_current: meter.2,
                 // F2 配额(0/空 = 不限)
-                "rate_limit": c.rate_limit,
-                "max_conns": c.max_conns,
-                "max_services": c.max_services,
-                "flow_limit": c.flow_limit,
-            })
+                rate_limit: c.rate_limit,
+                max_conns: c.max_conns,
+                max_services: c.max_services,
+                flow_limit: c.flow_limit,
+            }
         })
         .collect();
     ok(out)
@@ -853,6 +897,34 @@ struct ListQuery {
     client_id: Option<String>,
 }
 
+/// D-1:list_services 行结构(修前逐行 `json!` 建 Value 树;每行 20 字段
+/// 且内嵌整份 spec,是最重的消费方)。字段集与修前 json! 构造完全一致
+/// (对比测试 `d1_rows_match_legacy_json` 逐字段钉住)。
+#[derive(Serialize)]
+struct ServiceListRow {
+    id: i64,
+    client_id: String,
+    name: String,
+    kind: &'static str,
+    enabled: bool,
+    bind_ip: String,
+    bind_port: u16,
+    target: String,
+    target_host: String,
+    target_port: u16,
+    plugin: Option<String>,
+    group: Option<String>,
+    status: String,
+    status_reason: String,
+    healthy: bool,
+    pool_ready: usize,
+    spec: ProxySpec,
+    // F1 分规则计量(用户侧口径;运行时不在(已禁用)则为 0)
+    bytes_in: u64,
+    bytes_out: u64,
+    conns_current: i64,
+}
+
 async fn list_services(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -881,7 +953,7 @@ async fn list_services(
         // 前端不需要该值:编辑时留空即表示"不修改"(update 路径按空值保留原密钥,
         // 见 api.rs 里 `old...filter(|c| !c.secret_key.is_empty())`)。
         // R1:spec 是本行独占所有权,直接原地抹除(修前先整份深克隆)。
-        // json! 按引用序列化,下方字段读取都发生在构造时。
+        // 强类型行按声明序直接序列化,下方字段读取都发生在构造时。
         if let Some(secret_cfg) = spec.stcp.as_mut() {
             secret_cfg.secret_key.clear();
         }
@@ -922,29 +994,34 @@ async fn list_services(
                     .max(0),
             )
         });
-        out.push(json!({
-            "id": id,
-            "client_id": client_id,
-            "name": spec.name,
-            "kind": spec.kind.as_str(),
-            "enabled": spec.enabled,
-            "bind_ip": spec.bind_ip,
-            "bind_port": spec.bind_port,
-            "target": format!("{}:{}", spec.target_host, spec.target_port),
-            "target_host": spec.target_host,
-            "target_port": spec.target_port,
-            "plugin": spec.plugin.as_ref().map(|p| p.kind().as_str().to_string()),
-            "group": spec.group,
-            "status": status,
-            "status_reason": reason,
-            "healthy": rt.as_ref().map(|rt| rt.healthy.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(true),
-            "pool_ready": pool_ready,
-            "spec": spec,
+        // spec 整份移入行结构(放最后构造);被引用的标量字段先 clone,
+        // 相对修前的整树深拷贝仍是净省。
+        out.push(ServiceListRow {
+            id,
+            client_id,
+            name: spec.name.clone(),
+            kind: spec.kind.as_str(),
+            enabled: spec.enabled,
+            bind_ip: spec.bind_ip.clone(),
+            bind_port: spec.bind_port,
+            target: format!("{}:{}", spec.target_host, spec.target_port),
+            target_host: spec.target_host.clone(),
+            target_port: spec.target_port,
+            plugin: spec.plugin.as_ref().map(|p| p.kind().as_str().to_string()),
+            group: spec.group.clone(),
+            status,
+            status_reason: reason,
+            healthy: rt
+                .as_ref()
+                .map(|rt| rt.healthy.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(true),
+            pool_ready,
+            spec,
             // F1 分规则计量(用户侧口径;运行时不在(已禁用)则为 0)
-            "bytes_in": rt_meter.map(|(i, _, _)| i).unwrap_or(0),
-            "bytes_out": rt_meter.map(|(_, o, _)| o).unwrap_or(0),
-            "conns_current": rt_meter.map(|(_, _, c)| c).unwrap_or(0),
-        }));
+            bytes_in: rt_meter.map(|(i, _, _)| i).unwrap_or(0),
+            bytes_out: rt_meter.map(|(_, o, _)| o).unwrap_or(0),
+            conns_current: rt_meter.map(|(_, _, c)| c).unwrap_or(0),
+        });
     }
     ok(out)
 }
@@ -2164,6 +2241,19 @@ async fn delete_visitor(
 
 // ---------------- stats / events / metrics ----------------
 
+/// D-1:stats_overview 响应体(修前 `json!` 建树;仪表盘轮询端点,
+/// 管理面频率最高)。字段集与修前 json! 构造一致(对比测试钉住)。
+#[derive(Serialize)]
+struct StatsOverview {
+    clients_total: i64,
+    clients_online: usize,
+    services_total: i64,
+    services_running: usize,
+    conns_current: i64,
+    bytes_in: u64,
+    bytes_out: u64,
+}
+
 async fn stats_overview(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
@@ -2188,15 +2278,15 @@ async fn stats_overview(State(state): State<Arc<AppState>>, headers: HeaderMap) 
         })
         .count();
     let totals = state.metrics.totals_snapshot();
-    ok(json!({
-        "clients_total": clients_total,
-        "clients_online": state.sessions.count_online(),
-        "services_total": services_total,
-        "services_running": running,
-        "conns_current": totals.conns_current,
-        "bytes_in": totals.bytes_in,
-        "bytes_out": totals.bytes_out,
-    }))
+    ok(StatsOverview {
+        clients_total,
+        clients_online: state.sessions.count_online(),
+        services_total,
+        services_running: running,
+        conns_current: totals.conns_current,
+        bytes_in: totals.bytes_in,
+        bytes_out: totals.bytes_out,
+    })
 }
 
 #[derive(Deserialize)]
@@ -3016,6 +3106,136 @@ mod tests {
     async fn disable(state: &Arc<AppState>, id: i64) -> serde_json::Value {
         let h = auth_headers(state).await;
         body_json(disable_service(State(state.clone()), h, Path(id)).await).await
+    }
+
+    /// D-1 红线:信封与强类型行结构必须与修前 json! 构造逐字段一致
+    /// (右侧 legacy 就是修前代码原样;JSON 对象键序无语义,serde_json
+    /// Value 相等 = 字段/类型/值全等,Option::None 两侧都序列化为 null)。
+    #[tokio::test]
+    async fn d1_envelope_and_rows_match_legacy_json() {
+        // --- 信封 ---
+        let v = body_json(ok(json!({"a": 1}))).await;
+        assert_eq!(v, json!({"code": 0, "data": {"a": 1}, "message": "ok"}));
+
+        // --- stats_overview ---
+        let s = StatsOverview {
+            clients_total: 3,
+            clients_online: 2,
+            services_total: 10,
+            services_running: 7,
+            conns_current: 5,
+            bytes_in: 111,
+            bytes_out: 222,
+        };
+        assert_eq!(
+            serde_json::to_value(&s).unwrap(),
+            json!({
+                "clients_total": 3,
+                "clients_online": 2,
+                "services_total": 10,
+                "services_running": 7,
+                "conns_current": 5,
+                "bytes_in": 111,
+                "bytes_out": 222,
+            })
+        );
+
+        // --- list_clients 行(含 Option 两侧的 Some/None) ---
+        let row = ClientListRow {
+            id: "c1".into(),
+            name: "n".into(),
+            enabled: true,
+            remark: "r".into(),
+            online: true,
+            online_since: Some(12),
+            reported_revision: None,
+            expected_revision: 5,
+            client_version: "0.5.1".into(),
+            hostname: "h".into(),
+            os: "linux".into(),
+            last_online_at: None,
+            created_at: 1700000000,
+            bytes_in: 1,
+            bytes_out: 2,
+            conns_current: 3,
+            rate_limit: "1MB".into(),
+            max_conns: 9,
+            max_services: 8,
+            flow_limit: 7,
+        };
+        assert_eq!(
+            serde_json::to_value(&row).unwrap(),
+            json!({
+                "id": "c1",
+                "name": "n",
+                "enabled": true,
+                "remark": "r",
+                "online": true,
+                "online_since": 12,
+                "reported_revision": null,
+                "expected_revision": 5,
+                "client_version": "0.5.1",
+                "hostname": "h",
+                "os": "linux",
+                "last_online_at": null,
+                "created_at": 1700000000,
+                "bytes_in": 1,
+                "bytes_out": 2,
+                "conns_current": 3,
+                "rate_limit": "1MB",
+                "max_conns": 9,
+                "max_services": 8,
+                "flow_limit": 7,
+            })
+        );
+
+        // --- list_services 行(含整份 spec 与两个 Option 字段) ---
+        let sp = spec("tcp", "svc", 20001);
+        let legacy = json!({
+            "id": 42,
+            "client_id": "c1",
+            "name": sp.name,
+            "kind": sp.kind.as_str(),
+            "enabled": sp.enabled,
+            "bind_ip": sp.bind_ip,
+            "bind_port": sp.bind_port,
+            "target": format!("{}:{}", sp.target_host, sp.target_port),
+            "target_host": sp.target_host,
+            "target_port": sp.target_port,
+            "plugin": sp.plugin.as_ref().map(|p| p.kind().as_str().to_string()),
+            "group": sp.group,
+            "status": "running",
+            "status_reason": "",
+            "healthy": true,
+            "pool_ready": 2,
+            "spec": &sp,
+            "bytes_in": 10,
+            "bytes_out": 20,
+            "conns_current": 30,
+        });
+        let row = ServiceListRow {
+            id: 42,
+            client_id: "c1".into(),
+            name: sp.name.clone(),
+            kind: sp.kind.as_str(),
+            enabled: sp.enabled,
+            bind_ip: sp.bind_ip.clone(),
+            bind_port: sp.bind_port,
+            target: format!("{}:{}", sp.target_host, sp.target_port),
+            target_host: sp.target_host.clone(),
+            target_port: sp.target_port,
+            plugin: sp.plugin.as_ref().map(|p| p.kind().as_str().to_string()),
+            group: sp.group.clone(),
+            status: "running".into(),
+            status_reason: String::new(),
+            healthy: true,
+            pool_ready: 2,
+            spec: sp,
+            bytes_in: 10,
+            bytes_out: 20,
+            conns_current: 30,
+        };
+        assert_eq!(serde_json::to_value(&row).unwrap(), legacy);
     }
 
     /// 在指定端口拉起真实 metrics 监听(teardown 后监听释放是异步的,短暂重试)。
