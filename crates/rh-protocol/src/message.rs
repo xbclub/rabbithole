@@ -113,6 +113,14 @@ pub struct ApplyResult {
     /// 确认语义:客户端当前已应用到的 revision。
     pub revision: u64,
     pub ok: bool,
+    /// ok 路径定点推进的实体 id:仅 proxy 实体的 ServiceUpdate ACK 携带
+    /// (服务端据此 O(1) 推进该规则,不再全量扫本客户端全部规则);
+    /// ServiceSync/ServiceRemove/visitor 实体的 ACK 为 None → 服务端走
+    /// 全量推进。与 ApplyError.service_id 同语义。
+    /// 兼容性:字段缺省即 None,旧客户端报文无需迁移;旧服务端 serde
+    /// 默认忽略未知字段,双向混布安全。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ApplyError>,
 }

@@ -1318,15 +1318,22 @@ pub async fn dispatch_frame(
         match m {
             ServerMessage::ServiceSync(s) => {
                 apply_sync(sess, s.revision, s.entities).await;
-                ack(sess, s.revision).await;
+                ack(sess, s.revision, None).await;
             }
             ServerMessage::ServiceUpdate(u) => {
+                // 定点 ACK:proxy 实体携带 id(visitor 实体服务端无运行时,
+                // 全量推进只覆盖 proxy,携带 None 走全量)。id 须在 upsert
+                // 消费 entity 前取出。
+                let sid = match &u.entity {
+                    rh_protocol::message::SyncEntity::Proxy(p) => Some(p.id),
+                    rh_protocol::message::SyncEntity::Visitor(_) => None,
+                };
                 upsert(sess, u.entity).await;
-                ack(sess, u.revision).await;
+                ack(sess, u.revision, sid).await;
             }
             ServerMessage::ServiceRemove(r) => {
                 remove_entity(sess, &r.entity_type, r.entity_id).await;
-                ack(sess, r.revision).await;
+                ack(sess, r.revision, None).await;
             }
             ServerMessage::CreateDataChannel(c) => {
                 tracing::debug!(request_id = c.request_id, entity = ?c.entity, "create data channel received");
@@ -1429,13 +1436,16 @@ pub async fn dispatch_frame(
 /// 此时放弃这一条,等下次配置变更重发。
 const ACK_SEND_TIMEOUT: Duration = Duration::from_millis(50);
 
-async fn ack(sess: &Arc<ClientSession>, revision: u64) {
+async fn ack(sess: &Arc<ClientSession>, revision: u64, service_id: Option<u64>) {
     // 有界发送:队列满时最多阻塞 [`ACK_SEND_TIMEOUT`],不 park select。
+    // service_id:proxy 实体的增量 ACK 定点指回该规则,服务端免全量扫
+    // (D-3);sync/remove/visitor 为 None,服务端保持全量推进语义。
     let _ = tokio::time::timeout(
         ACK_SEND_TIMEOUT,
         sess.send_msg(ClientMessage::ApplyResult(ApplyResult {
             revision,
             ok: true,
+            service_id,
             error: None,
         })),
     )
@@ -2636,6 +2646,7 @@ mod control_frame_tests {
                 ClientMessage::ApplyResult(ApplyResult {
                     revision: 1,
                     ok: true,
+                    service_id: None,
                     error: None,
                 }),
                 FrameType::APPLY_RESULT,
@@ -4218,7 +4229,7 @@ mod ack_bounded_send_tests {
     #[tokio::test]
     async fn ack_delivered_when_space() {
         let (sess, mut rx) = session_with_capacity(8);
-        ack(&sess, 42).await;
+        ack(&sess, 42, None).await;
         let bytes = rx.try_recv().expect("ACL 必须已入队");
         // 解出来确认是 ApplyResult
         let mut cur = std::io::Cursor::new(bytes.to_vec());
@@ -4251,7 +4262,7 @@ mod ack_bounded_send_tests {
             }))
         );
         let before = sess.proxies.lock().await.len();
-        ack(&sess, 7).await;
+        ack(&sess, 7, None).await;
         let after = sess.proxies.lock().await.len();
         assert_eq!(before, after, "丢 ACK 不得影响客户端配置状态");
     }

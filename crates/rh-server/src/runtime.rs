@@ -160,6 +160,26 @@ pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &App
     sess.confirm_applied(r.revision, true).await;
     // 规则状态推进:confirmed ≥ latest → running。
     //
+    // D-3:带 service_id 的定点 ACK(客户端对 proxy 实体的 ServiceUpdate
+    // 逐条回 ACK,批量改 N 条 = N 个)只推进该规则 —— 修前每个 ACK 都
+    // 全量扫本客户端全部 N 条规则(每条一次 state_kind 异步锁读),O(N²)
+    // 内联在控制读循环里,挤占 PONG/取消处理。不带 id 的(sync 全量确认 /
+    // remove / visitor / 旧版客户端)保持全量推进,失败重发 SYNC 后的补
+    // ACK 也走这里 —— 全量扫正是 ApplyError/Pending 规则的自愈路径,
+    // 不得短路。
+    if let Some(pid) = r.service_id {
+        // 属主校验同下方 ApplyError 分支:客户端只能推进自己名下规则。
+        if let Some(rt) = state.proxies.get(pid) {
+            if rt.client_id == sess.client_id {
+                advance_confirmed(state, sess, &rt, r.revision).await;
+            } else {
+                warn!(proxy = pid, client = %sess.client_id, owner = %rt.client_id,
+                    "apply ack reported for foreign proxy; ignored");
+            }
+        }
+        // 实体已不存在(期间被删):无事可推进,revision 已确认。
+        return;
+    }
     // B9:数据源改为内存 runtimes(按 client_id 过滤)。修前每个 ACK 都把
     // 该客户端全部 N 条规则从 DB 读出并逐行反序列化 ProxySpec —— 客户端
     // 对每条 ServiceUpdate 回一个 ApplyResult,批量改 N 条规则就是 O(N²)
@@ -182,34 +202,44 @@ pub async fn on_apply_result(state: &Arc<AppState>, sess: &Arc<Session>, r: &App
                 .collect(),
         };
     for rt in rts {
-        rt.confirmed_revision.store(r.revision, Ordering::Relaxed);
-        let latest = rt.latest_revision.load(Ordering::Relaxed);
-        // N12:state_kind() 只取枚举(snapshot_state 连带 clone reason
-        // String,本循环每 ACK × 每规则都在付)。
-        let st = rt.state_kind().await;
-        let confirmed_enough = r.revision >= latest;
-        let bound = rt.bound.load(Ordering::Relaxed);
-        let new_state = match st {
-            ProxyState::Pending if confirmed_enough && bound => ProxyState::Running,
-            ProxyState::ApplyError if confirmed_enough && bound => ProxyState::Running,
-            other => other,
-        };
-        if new_state != st {
-            rt.set_state(new_state, "applied").await;
-            if new_state == ProxyState::Running {
-                rt.mark_warm_session(sess);
-                let spec = rt.spec.read().await.clone();
-                warm_proxy(state, sess, &rt, &spec).await;
-            }
-        } else if st == ProxyState::Running {
-            // 已 running 的补充预热(重连后);N4:按会话实例去重 ——
-            // 客户端对每条 ServiceUpdate 各回一个 ACK,修前每个 ACK 都
-            // 深克隆 spec + warm_proxy,批量 N 条 = O(N²) 次克隆+预热。
-            // 池满时 tcp_refill 为无签发 no-op,但 spec 深克隆省不掉。
-            if rt.mark_warm_session(sess) {
-                let spec = rt.spec.read().await.clone();
-                warm_proxy(state, sess, &rt, &spec).await;
-            }
+        advance_confirmed(state, sess, &rt, r.revision).await;
+    }
+}
+
+/// 按"已确认 revision"推进单条规则的状态(定点 ACK 与全量扫共用)。
+async fn advance_confirmed(
+    state: &Arc<AppState>,
+    sess: &Arc<Session>,
+    rt: &Arc<crate::state::ProxyRuntime>,
+    revision: u64,
+) {
+    rt.confirmed_revision.store(revision, Ordering::Relaxed);
+    let latest = rt.latest_revision.load(Ordering::Relaxed);
+    // N12:state_kind() 只取枚举(snapshot_state 连带 clone reason
+    // String,每 ACK × 每规则都在付)。
+    let st = rt.state_kind().await;
+    let confirmed_enough = revision >= latest;
+    let bound = rt.bound.load(Ordering::Relaxed);
+    let new_state = match st {
+        ProxyState::Pending if confirmed_enough && bound => ProxyState::Running,
+        ProxyState::ApplyError if confirmed_enough && bound => ProxyState::Running,
+        other => other,
+    };
+    if new_state != st {
+        rt.set_state(new_state, "applied").await;
+        if new_state == ProxyState::Running {
+            rt.mark_warm_session(sess);
+            let spec = rt.spec.read().await.clone();
+            warm_proxy(state, sess, rt, &spec).await;
+        }
+    } else if st == ProxyState::Running {
+        // 已 running 的补充预热(重连后);N4:按会话实例去重 ——
+        // 客户端对每条 ServiceUpdate 各回一个 ACK,修前每个 ACK 都
+        // 深克隆 spec + warm_proxy,批量 N 条 = O(N²) 次克隆+预热。
+        // 池满时 tcp_refill 为无签发 no-op,但 spec 深克隆省不掉。
+        if rt.mark_warm_session(sess) {
+            let spec = rt.spec.read().await.clone();
+            warm_proxy(state, sess, rt, &spec).await;
         }
     }
 }
@@ -872,5 +902,121 @@ mod notify_client_recovery_bench {
                 state.proxies.runtimes.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod d3_ack_tests {
+    use super::*;
+
+    fn spec(cid: &str, id: u64) -> ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": format!("p{id}"),
+            "kind": "tcp",
+            "client_id": cid,
+            "bind_ip": "127.0.0.1",
+            "bind_port": 20000 + id as u16,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+        }))
+        .unwrap()
+    }
+
+    async fn setup() -> (Arc<AppState>, Arc<Session>) {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let sess = Session::new("c1".into(), "s1".into(), 1, CancellationToken::new(), tx);
+        (state, sess)
+    }
+
+    fn insert_rt(state: &Arc<AppState>, cid: &str, id: u64, latest: u64) {
+        let rt = Arc::new(ProxyRuntime::new(id, cid.to_string(), spec(cid, id)));
+        rt.latest_revision.store(latest, Ordering::Relaxed);
+        state.proxies.runtimes.insert(id, rt);
+        state
+            .proxies
+            .runtimes_by_client
+            .entry(cid.to_string())
+            .or_default()
+            .push(id);
+    }
+
+    fn ack(service_id: Option<u64>, revision: u64) -> ApplyResult {
+        ApplyResult {
+            revision,
+            ok: true,
+            service_id,
+            error: None,
+        }
+    }
+
+    fn confirmed(state: &Arc<AppState>, id: u64) -> u64 {
+        state
+            .proxies
+            .runtimes
+            .get(&id)
+            .unwrap()
+            .confirmed_revision
+            .load(Ordering::Relaxed)
+    }
+
+    /// 定点 ACK 只推进指名规则,同客户端其余规则不动。
+    #[tokio::test]
+    async fn targeted_ack_advances_only_named_proxy() {
+        let (state, sess) = setup().await;
+        insert_rt(&state, "c1", 1, 5);
+        insert_rt(&state, "c1", 2, 5);
+        on_apply_result(&state, &sess, &ack(Some(1), 5)).await;
+        assert_eq!(confirmed(&state, 1), 5);
+        assert_eq!(confirmed(&state, 2), 0, "未指名规则不得被定点 ACK 推进");
+        assert_eq!(sess.applied(), 5);
+    }
+
+    /// 无 service_id(全量确认/旧版客户端)保持全量推进语义。
+    #[tokio::test]
+    async fn full_ack_advances_all() {
+        let (state, sess) = setup().await;
+        insert_rt(&state, "c1", 1, 5);
+        insert_rt(&state, "c1", 2, 5);
+        on_apply_result(&state, &sess, &ack(None, 5)).await;
+        assert_eq!(confirmed(&state, 1), 5);
+        assert_eq!(confirmed(&state, 2), 5);
+    }
+
+    /// 属主校验:定点 ACK 指向他客户端的规则必须被忽略。
+    #[tokio::test]
+    async fn targeted_ack_ignores_foreign_owner() {
+        let (state, sess) = setup().await;
+        insert_rt(&state, "c2", 7, 5); // 属主是 c2,会话是 c1
+        on_apply_result(&state, &sess, &ack(Some(7), 5)).await;
+        assert_eq!(confirmed(&state, 7), 0, "外来规则的定点 ACK 必须被忽略");
+    }
+
+    /// 实体已删除:定点 ACK 落空但 revision 仍被确认(不报错、不panic)。
+    #[tokio::test]
+    async fn targeted_ack_for_deleted_proxy_confirms_revision() {
+        let (state, sess) = setup().await;
+        insert_rt(&state, "c1", 1, 5);
+        state.proxies.runtimes.remove(&9);
+        on_apply_result(&state, &sess, &ack(Some(9), 6)).await;
+        assert_eq!(sess.applied(), 6);
+    }
+
+    /// 协议兼容:旧报文(无 service_id 字段)反序列化为 None;
+    /// None 序列化时不携带该字段(与旧线格式逐字节一致)。
+    #[test]
+    fn apply_result_wire_compat() {
+        let legacy = br#"{"revision":3,"ok":true}"#;
+        let m: ApplyResult = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(m.service_id, None);
+        let none_ack = ack(None, 3);
+        assert_eq!(
+            serde_json::to_string(&none_ack).unwrap(),
+            r#"{"revision":3,"ok":true}"#
+        );
+        assert!(serde_json::to_string(&ack(Some(11), 3))
+            .unwrap()
+            .contains(r#""service_id":11"#));
     }
 }

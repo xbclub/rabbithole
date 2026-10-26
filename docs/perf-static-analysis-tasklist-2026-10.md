@@ -266,7 +266,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 备注:peer.sh UDP 档验证。
 
 ### D-3 [P1] 每 ACK 全量遍历客户端规则,O(N²) 内联在控制读循环 —— 来源 serverMisc-1
-- [ ] 状态:
+- [x] 状态:完成 @ 752d4b7
+> 核查:✅ 问题在但已被部分修过:B9/R2 已把 DB 全量读改为内存 by-client 索引,残余成本 = 每 ACK O(N) 次 `state_kind()` 异步锁读 + 原子写,批量改 N 条(每条独立 bump revision,db.rs:692)= N 个 ACK × O(N)。采用①协议方案:ApplyResult.ok 增加 service_id(serde default + skip,双向兼容——旧服务端忽略未知字段,新服务端 None 回落全量扫;ApplyError.service_id 同语义先例),仅 proxy 实体的 ServiceUpdate ACK 携带。**放弃②**:核实全仓唯一的同 revision 重复全量 ACK 来源是失败重发 SYNC 后的补 ACK,而全量扫正是失败规则(ApplyError/Pending)的自愈机制,短路会让它卡死——②不仅无收益反而有害。行为变化(提交信息已注明):单条 ok ACK 丢失的自愈窗口从"该客户端任一后续 ACK"收窄为"该规则的下一次变更/任一 sync·remove ACK/重连"。
 - 位置:`crates/rh-server/src/runtime.rs:170-214`;调用链 control.rs:951→1056;协议 `crates/rh-protocol/src/message.rs:112-127`(ApplyResult ok 无 service_id)
 - 问题:批量改 N 条规则 = N 个 ACK × O(N) 收集遍历 + N 次 Vec 分配,全在该客户端控制读循环内,挤占 PONG/取消处理。
 - 修法(两档):① 协议方案——ApplyResult ok 路径携带 service_id,降为 O(1) 定点推进(涉及 rh-protocol 协议字段,确认服务端/客户端同仓同发、无跨版本兼容负担后再做);② 保守方案——对 `revision <= 会话已应用 revision` 的重复/落后 ACK 短路跳过整轮遍历(复核提醒:只对同 revision 重复 ACK 生效,逐条编辑场景解不了,可作第一步)。
