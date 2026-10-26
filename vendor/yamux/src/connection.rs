@@ -1198,7 +1198,9 @@ mod halves {
             let mut guard = match this.io.poll_lock(cx) {
                 std::task::Poll::Ready(g) => g,
                 std::task::Poll::Pending => {
-                    crate::sched_diag::on_read_lock_miss();
+                    if crate::sched_diag::enabled() {
+                        crate::sched_diag::on_read_lock_miss();
+                    }
                     return std::task::Poll::Pending;
                 }
             };
@@ -1368,6 +1370,16 @@ mod halves {
         /// 可见,不得死等;§2.4:worker_wakers 广播 + 粘性影子置位;
         /// round-6 §2.2:send_worker_wakers 同被唤醒,SendWorker 由此
         /// 进入 D8 终结)。
+        /// C-3:错误槽热检查快路径。workers_shutdown 由 set_error 同步置位且
+        /// 永不清除(粘性影子),false ⟹ 错误槽必空 → 免锁返回 false;
+        /// true 才取锁确认(返回值与 error.lock().is_some() 完全一致)。
+        fn error_hot(&self) -> bool {
+            if !self.workers_shutdown.load(Ordering::Acquire) {
+                return false;
+            }
+            self.error.lock().is_some()
+        }
+
         fn set_error(&self, e: ConnectionError) {
             let mut slot = self.error.lock();
             if slot.is_some() {
@@ -1963,7 +1975,7 @@ mod halves {
                 }
                 if self.pending_routes.len() >= PENDING_ROUTE_CAP {
                     self.shared.set_recv_waker(cx.waker());
-                    if self.shared.error.lock().is_some() || self.workers_gone() {
+                    if self.shared.error_hot() || self.workers_gone() {
                         continue;
                     }
                     return Poll::Pending; // 侧链满:背压,TCP 停读
@@ -1975,8 +1987,12 @@ mod halves {
                 //    节流(cap 128)。
                 match self.socket.poll_next_unpin(cx) {
                     Poll::Ready(Some(Ok(frame))) => {
-                        crate::sched_diag::FRAMES_IN_POLL
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // C-4:每帧对同一 static cacheline 的原子 RMW 必须
+                        // 门控(模块"关闭时零开销"约定;读者本就有 enabled 门)
+                        if crate::sched_diag::enabled() {
+                            crate::sched_diag::FRAMES_IN_POLL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         match self.on_frame(frame, cx) {
                             Ok(Routed::Done) => {}
                             Ok(Routed::Backpressured { index, msg }) => {
@@ -1987,7 +2003,7 @@ mod halves {
                                 if !self.stash_pending_route(index, msg) {
                                     self.shared.set_recv_waker(cx.waker());
                                     // 复查(要点 1 防线):错误槽/Worker 消亡不丢唤醒
-                                    if self.shared.error.lock().is_some() || self.workers_gone() {
+                                    if self.shared.error_hot() || self.workers_gone() {
                                         continue;
                                     }
                                     return Poll::Pending; // 侧链满:背压,TCP 停读
@@ -2016,7 +2032,7 @@ mod halves {
                         // 不丢唤醒(要点 1 防线;new_streams 由 futures mpsc
                         // 的登记原子性兜住,无复查缝)
                         self.shared.set_recv_waker(cx.waker());
-                        if self.shared.error.lock().is_some() || self.workers_gone() {
+                        if self.shared.error_hot() || self.workers_gone() {
                             continue;
                         }
                         return Poll::Pending;
@@ -2452,7 +2468,7 @@ mod halves {
                 // 其唤醒由 ctrl 通道生产者 waker 保证,与本任务无关。
                 if (sink_idle && !self.shared.to_send.lock().is_empty())
                     || (sink_idle && self.send_out_consumers.iter().any(|c| c.has_pending()))
-                    || self.shared.error.lock().is_some()
+                    || self.shared.error_hot()
                 {
                     continue;
                 }
@@ -2479,8 +2495,11 @@ mod halves {
             } else {
                 None
             };
+            // C-5:ping 到期判定每批一次(修前每帧一次 next_ping =
+            // 锁 + vDSO 取时;ping 10s 一次,批内到点变化无意义)。
+            let ping_due = self.rtt.ping_due();
             while frames < MAX_BATCH_FRAMES && bytes < crate::frame::max_batch_bytes() {
-                let Some(frame) = self.next_frame() else {
+                let Some(frame) = self.next_frame(ping_due) else {
                     break;
                 };
                 let __wl = frame.wire_len();
@@ -2506,15 +2525,19 @@ mod halves {
         /// (pending_read_frame > ping/pending_write_frame 再 > 流命令)。
         /// `None` = 帧源全部空;各 send_out[k] 的消费者 waker 已在 poll
         /// 主循环每轮登记(§3.2),Worker push 空变非空即唤醒本任务。
-        fn next_frame(&mut self) -> Option<Frame<()>> {
+        fn next_frame(&mut self, ping_due: bool) -> Option<Frame<()>> {
             if let Some(frame) = self.shared.pop_to_send() {
                 return Some(frame);
             }
             // Note `next_ping` does not register a waker and thus if not called
             // regularly (idle connection) no ping is sent. This is deliberate
             // as an idle connection does not need RTT measurements.
-            if let Some(frame) = self.rtt.next_ping() {
-                return Some(frame.into());
+            // C-5:ping_due 由 fill_batch 每批预检;到期才进 next_ping
+            // (pop 转换状态),批上限截断时下一批重检,不丢。
+            if ping_due {
+                if let Some(frame) = self.rtt.next_ping() {
+                    return Some(frame.into());
+                }
             }
             // D3 严格轮转:自 out_cursor 起扫描 N 条,取第一条非空的一帧,
             // 取出后 out_cursor = (k + 1) % N——固定顺序在 Worker 0 持续

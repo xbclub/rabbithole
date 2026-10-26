@@ -110,6 +110,15 @@ impl Pool {
     /// B2:先试轮转起始片,miss 时扫描其余片(容量 ≥ min 逐条判定),
     /// 全部 miss 才新分配;put 落哪片不再影响后续 get 命中。
     pub(crate) fn get(&self, min: usize) -> BytesMut {
+        // C-8:小请求精确分配、不经池 —— 控制面小帧(窗口更新/短写,如
+        // stream.rs 的 get(k) k=窗口余量)修前每帧弹出池内 64KiB 类条目
+        // 或按 64KiB 新分配(miss 尾部的 min.max(CLASS)),内存放大
+        // 10-20× 且挤占主力路径的池存量;小缓冲本就被 put 拒收
+        // (< MIN_RECYCLE),精确分配即正常释放,闭环一致。
+        if min < MIN_RECYCLE {
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            return BytesMut::with_capacity(min);
+        }
         if min > CLASS_MAX && min <= LARGE_MAX {
             // C4:大缓冲类 —— 上行 256KiB 读块走这里命中,不再每块新分配。
             let start = self.rotor.fetch_add(1, Ordering::Relaxed) & (SHARDS - 1);
@@ -246,6 +255,24 @@ pub fn put(b: BytesMut) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C-8:小请求精确分配 —— 容量即请求值(不得按 64KiB 类放大),
+    /// 且不得弹出池内存量(条目留给 ≥ MIN_RECYCLE 的主力请求)。
+    #[test]
+    fn pool_small_request_exact_alloc() {
+        let pool = Pool::new();
+        let b = pool.get(200);
+        assert_eq!(b.capacity(), 200);
+        pool.put(BytesMut::with_capacity(CLASS));
+        let small = pool.get(100);
+        assert_eq!(
+            small.capacity(),
+            100,
+            "小请求必须精确分配,不得弹出池内 64KiB 条目"
+        );
+        let big = pool.get(CLASS);
+        assert!(big.capacity() >= CLASS, "存量仍可服务大请求");
+    }
 
     /// B2(红→绿):串行 get→use→put 之后,下一次 get 必须命中刚归还的缓冲。
     /// 修复前 get/put 各自推进 ROTOR,连续 get→put 落在不同片,

@@ -732,7 +732,9 @@ impl StreamReadHalf {
             return Poll::Ready(Ok(()));
         }
         // round-22 诊断:区分"纯 WU"与"0-credit WU+ACK"两条路径。
-        crate::sched_diag::on_wu_path(credit.is_some(), ack_pending);
+        if crate::sched_diag::enabled() {
+            crate::sched_diag::on_wu_path(credit.is_some(), ack_pending);
+        }
         let frame = {
             let mut shared = self.shared();
             let mut header = Header::window_update(self.id, credit.unwrap_or(0));
@@ -793,7 +795,7 @@ impl StreamWriteHalf {
             .sender
             .poll_ready(cx)
             .map_err(|_| self.write_zero_err())?);
-        let body = {
+        let (body, mut ack) = {
             let mut shared = self.shared();
             if !shared.state().can_write() {
                 return Poll::Ready(Err(self.write_zero_err()));
@@ -807,29 +809,36 @@ impl StreamWriteHalf {
             shared
                 .consume_send_window(k as u32)
                 .expect("not exceed receive window");
-            if k == bytes.len() {
+            // C-6:ack_pending 读清 + ACK 状态迁移并入本临界区(修前本帧
+            // 3 次取锁:写窗 / ack_pending / update_state,全在同一把
+            // Shared 锁上)。header 的 flag 修改留锁外 —— add_flag 消费
+            // self.flag(&mut self 独占状态),与 Shared 无关;flag==Ack
+            // 与 ack_pending 的并集即原"header 含 ACK"判定,等价。
+            let mut ack = shared.ack_pending;
+            shared.ack_pending = false;
+            if self.flag == Flag::Ack {
+                ack = true;
+            }
+            if ack {
+                shared.update_state(self.conn, self.id, State::Open { acknowledged: true });
+            }
+            let body = if k == bytes.len() {
                 chunk.take().expect("checked above")
             } else {
                 let rest = bytes.slice(k..);
                 let head = bytes.slice(..k);
                 *chunk = Some(rest);
                 head
-            }
+            };
+            (body, ack)
         };
         let n = body.len();
         let mut frame = Frame::data(self.id, body).expect("body <= u32::MAX").left();
         self.add_flag(frame.header_mut());
-        // C2 补修:共享待 ACK 随数据帧携带(拆半时未排出的 ACK)
-        {
-            let mut shared = self.shared();
-            if shared.ack_pending {
-                shared.ack_pending = false;
-                frame.header_mut().ack();
-            }
-        }
-        if frame.header().flags().contains(ACK) {
-            self.shared()
-                .update_state(self.conn, self.id, State::Open { acknowledged: true });
+        // C2 补修:共享待 ACK 随数据帧携带(拆半时未排出的 ACK)——
+        // 锁内已读清并完成状态迁移,这里只落 header
+        if ack {
+            frame.header_mut().ack();
         }
         let cmd = StreamCommand::SendFrame(frame);
         self.sender

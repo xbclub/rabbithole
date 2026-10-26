@@ -894,9 +894,7 @@ impl Future for ShardWorker {
             // 全部处理落进流缓冲(read_after_close 契约;基线单任务逐帧
             // 同步处理完才见 EOF,分片后的等价语义)。此态排空不受
             // D6 背压门控约束(终结优先落地,建流句柄经暂存走交付)。
-            if this.shared.workers_shutdown.load(Ordering::Acquire)
-                || this.shared.error.lock().is_some()
-            {
+            if this.shared.workers_shutdown.load(Ordering::Acquire) || this.shared.error_hot() {
                 this.drain_ctrl();
                 this.drain_msgs();
                 this.deliver_pending_new();
@@ -1002,7 +1000,7 @@ impl Future for ShardWorker {
             this.ctrl_rx.register_consumer_waker(cx.waker());
             if (this.pending_new.is_empty() && this.msg_rx.has_pending())
                 || this.ctrl_rx.has_pending()
-                || this.shared.error.lock().is_some()
+                || this.shared.error_hot()
                 || this.shared.workers_shutdown.load(Ordering::Acquire)
                 || (this.shared.send_dropped.load(Ordering::Acquire) && !this.send_drop_drained)
             {
@@ -1223,7 +1221,7 @@ impl Future for SendWorker {
             // 观察错误,本 Worker 取走后必须回填,否则 FlushTask 看不到
             // 已发生的中止)。
             if this.shared.workers_shutdown.load(Ordering::Acquire)
-                || this.shared.error.lock().is_some()
+                || this.shared.error_hot()
                 || this.shared.send_dropped.load(Ordering::Acquire)
             {
                 if let Some(e) = this.shared.take_error() {
@@ -1342,7 +1340,7 @@ impl Future for SendWorker {
             // (标志粘性,continue 即进终结分支返回,不自旋)
             if !rerun
                 && (this.shared.workers_shutdown.load(Ordering::Acquire)
-                    || this.shared.error.lock().is_some()
+                    || this.shared.error_hot()
                     || this.shared.send_dropped.load(Ordering::Acquire))
             {
                 rerun = true;

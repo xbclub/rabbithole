@@ -43,6 +43,14 @@ impl Rtt {
         }
     }
 
+    /// C-5:到期预检 —— fill_batch 每批调用一次,替代每帧一次的
+    /// next_ping 全检(锁 + vDSO 取时)。true ⟹ 随后一次 next_ping()
+    /// 必返回 Some(Waiting 且到点;AwaitingPong 恒 false)。
+    pub(crate) fn ping_due(&self) -> bool {
+        let g = self.inner.lock();
+        matches!(&g.state, RttState::Waiting { next } if *next <= Instant::now())
+    }
+
     pub(crate) fn next_ping(&mut self) -> Option<Frame<Ping>> {
         let state = &mut self.inner.lock().state;
 

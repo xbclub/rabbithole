@@ -85,7 +85,9 @@ impl FlowController {
         self.receive_window += credit;
 
         // round-22 诊断:统计实际发出的 WU credit 分布。
-        crate::sched_diag::on_wu_credit(credit as u64);
+        if crate::sched_diag::enabled() {
+            crate::sched_diag::on_wu_credit(credit as u64);
+        }
     }
 
     /// 计算并立即记账(旧语义,供"记账后必有 infallible 压入"的调用点)。
