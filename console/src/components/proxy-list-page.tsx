@@ -177,7 +177,11 @@ export function ProxyListPage({
 
   const noun = emptyNoun ?? title ?? '转发规则';
 
-  const columns = useMemo<RhColumnDef<ServiceRow>[]>(() => {
+  // F-1:修前 useMemo 的依赖含 useMutation 返回对象 ×3(每渲染新引用)
+  // 与内联 onCreateVisitor,缓存永不命中;下游 data-table 还会展开数组
+  // 重建引用,这层 memo 纯属死代码 —— 与姊妹页(visitors-panel 等)
+  // 一致改为内联构建。
+  const columns: RhColumnDef<ServiceRow>[] = (() => {
     const list: RhColumnDef<ServiceRow>[] = [
       {
         id: 'name',
@@ -392,15 +396,7 @@ export function ProxyListPage({
     );
 
     return list;
-  }, [
-    isTunnel,
-    isDomain,
-    isSecret,
-    onCreateVisitor,
-    toggleMutation,
-    rotateMutation,
-    deleteMutation,
-  ]);
+  })();
 
   async function runBatchImport() {
     let parsed: unknown;
