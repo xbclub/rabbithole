@@ -1481,6 +1481,9 @@ async fn ack(sess: &Arc<ClientSession>, revision: u64, service_id: Option<u64>) 
 
 // ---------------- 同步应用 ----------------
 
+/// 仅测试直调(E-5 后生产路径在 run_loop 内联 collect + spawn run,
+/// 见 ServiceSync 分支);保留"收集+执行"完整形态供语义测试驱动。
+#[cfg(test)]
 async fn apply_sync(
     sess: &Arc<ClientSession>,
     revision: u64,
