@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# 进程级 KCP 诊断计数(kcp_loopback_bench 专用)。默认关闭:开启后
+# 生产每包路径对同一 static 缓存行付 5-7 次原子 RMW,跨核多会话下
+# 缓存行乒乓;关闭时递增点全部编译期移除(kcp.rs bump_counter 宏)。
+perf-counters = []
+
 [dependencies]
 rh-protocol = { workspace = true }
 

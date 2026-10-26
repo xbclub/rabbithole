@@ -161,6 +161,16 @@ pub fn counters_reset() {
     COUNTERS.reset()
 }
 
+/// 递增进程级诊断计数:仅在 `perf-counters` 特性下编译,生产构建
+/// 完全移除 —— 这些递增全部落在每包热路径,对同一 static 缓存行的
+/// fetch_add 在跨核多会话下会乒乓,而生产二进制没有任何读者。
+macro_rules! bump_counter {
+    ($field:ident) => {
+        #[cfg(feature = "perf-counters")]
+        COUNTERS.$field.fetch_add(1, Ordering::Relaxed);
+    };
+}
+
 /// 同一唤醒批量消费入站包的上限(≤通道容量 256):单轮工作量 =
 /// 64×input(O(包长)) + 1 update + ≤256KiB recv + 1 flush,天然有界;
 /// recv_many 有 ≥1 条即返回,不凑满、不加等待。
@@ -763,7 +773,7 @@ fn spawn_udp_backlog_drain(sock: Arc<UdpSocket>, dest: Dest, backlog: Arc<UdpBac
                 break;
             }
             let st = drain_once(&bl, |pkt| {
-                COUNTERS.send_attempts.fetch_add(1, Ordering::Relaxed);
+                bump_counter!(send_attempts);
                 dest.try_send(&sock, pkt)
             });
             // bl 自身持一个 strong 引用:仅剩自己(计数 1)说明生产者
@@ -827,7 +837,7 @@ fn output_write_via_backlog(
         return Err(other_err(e));
     }
     if backlog.is_idle() {
-        COUNTERS.send_attempts.fetch_add(1, Ordering::Relaxed);
+        bump_counter!(send_attempts);
         match direct(buf) {
             Ok(n) if n == buf.len() => return Ok(n),
             Ok(n) => {
@@ -959,7 +969,7 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
         }
         #[cfg(test)]
         shared.stats.wakeups.fetch_add(1, Ordering::Relaxed);
-        COUNTERS.wakeups.fetch_add(1, Ordering::Relaxed);
+        bump_counter!(wakeups);
         let got_packet = !batch.is_empty();
         for cmd in batch.drain(..) {
             let SessionCmd::Packet(pkt) = cmd;
@@ -968,10 +978,10 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
                 .stats
                 .packets_consumed
                 .fetch_add(1, Ordering::Relaxed);
-            COUNTERS.packets_consumed.fetch_add(1, Ordering::Relaxed);
+            bump_counter!(packets_consumed);
             #[cfg(test)]
             shared.stats.input_calls.fetch_add(1, Ordering::Relaxed);
-            COUNTERS.input_calls.fetch_add(1, Ordering::Relaxed);
+            bump_counter!(input_calls);
             // input 错误(段格式/conv 不一致)由 demux 前置过滤,
             // 此处按可丢弃网络杂音处理,不终止会话。
             let _ = kcp.input(&pkt);
@@ -1046,7 +1056,7 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
         // 驱动 kcp(重传/探测/输出)
         #[cfg(test)]
         shared.stats.update_calls.fetch_add(1, Ordering::Relaxed);
-        COUNTERS.update_calls.fetch_add(1, Ordering::Relaxed);
+        bump_counter!(update_calls);
         if let Err(e) = kcp.update(now_ms()) {
             error = Some(format!("kcp update: {e}"));
             break;
@@ -1094,7 +1104,7 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
         if user_wrote || got_packet || recv_moved || kcp.wait_snd() > 0 {
             #[cfg(test)]
             shared.stats.flush_calls.fetch_add(1, Ordering::Relaxed);
-            COUNTERS.flush_calls.fetch_add(1, Ordering::Relaxed);
+            bump_counter!(flush_calls);
             if let Err(e) = kcp.flush() {
                 error = Some(format!("kcp flush: {e}"));
                 break;
@@ -1508,7 +1518,7 @@ async fn demux_loop(
         let (n, peer) = tokio::select! {
             r = udp.recv_from(&mut buf) => match r {
                 Ok(x) => {
-                    COUNTERS.recvfrom_calls.fetch_add(1, Ordering::Relaxed);
+                    bump_counter!(recvfrom_calls);
                     x
                 }
                 Err(e) => {
@@ -1744,7 +1754,7 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
                 tokio::select! {
                     r = recv_sock.recv_from(&mut buf) => {
                         let Ok((n, _)) = r else { break };
-                        COUNTERS.recvfrom_calls.fetch_add(1, Ordering::Relaxed);
+                        bump_counter!(recvfrom_calls);
                         if pkt_tx
                             .send(SessionCmd::Packet(buf[..n].to_vec()))
                             .await
@@ -1831,7 +1841,7 @@ pub async fn punch_listen(
                 tokio::select! {
                     r = udp.recv_from(&mut b) => {
                         let Ok((n, from)) = r else { break };
-                        COUNTERS.recvfrom_calls.fetch_add(1, Ordering::Relaxed);
+                        bump_counter!(recvfrom_calls);
                         if from != pinned {
                             continue;
                         }
@@ -2054,7 +2064,7 @@ pub async fn punch_dial(
                 tokio::select! {
                     r = udp.recv_from(&mut buf) => {
                         let Ok((n, from)) = r else { break };
-                        COUNTERS.recvfrom_calls.fetch_add(1, Ordering::Relaxed);
+                        bump_counter!(recvfrom_calls);
                         let pkt = &buf[..n];
                         if n >= KCP_OVERHEAD && (81..=84).contains(&pkt[4]) {
                             // A7:只接受服务端下发的候选来源,拒绝打洞窗口内

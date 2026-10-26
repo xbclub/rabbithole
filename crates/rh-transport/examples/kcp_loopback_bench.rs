@@ -110,6 +110,8 @@ async fn bench_throughput(addr: std::net::SocketAddr, streams: usize, total: u64
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    #[cfg(not(feature = "perf-counters"))]
+    eprintln!("note: 未启用 perf-counters 特性,COUNTERS 统计恒为 0(--features perf-counters 构建)");
     let args: Vec<String> = std::env::args().collect();
     let mib: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(64);
     let reps: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);

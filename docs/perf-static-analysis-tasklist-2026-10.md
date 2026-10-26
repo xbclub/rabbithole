@@ -71,7 +71,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 ## 包 A:KCP 载体(rh-transport/kcp.rs)
 
 ### A-1 [P1] 进程级 COUNTERS 每包 5-7 次原子 RMW —— 来源 kcp-1
-- [ ] 状态:
+- [x] 状态:完成 @ a417712
+> 核查:✅ 问题在(11 处 fetch_add 行号全对上:766/830/962/971/974/1049/1097/1511/1747/1834/2057,全在会话循环/输出回调/收包循环热路径);读者仅 examples/kcp_loopback_bench.rs,kcp.rs 内测试用独立 shared.stats 不受影响。采用 feature 开关方案:`perf-counters`(默认关,宏封装编译期移除;example 无条件可编译,未启用时启动提示计数恒 0)。
 - 位置:`crates/rh-transport/src/kcp.rs:962/971/974/1049/1097/830/766/1511/1747/1834/2057`
 - 问题:生产每包路径对 static COUNTERS(7 个 AtomicU64 同 struct)做 fetch_add,跨核多会话时缓存行乒乓;生产二进制无任何读者(唯一读者是 examples/kcp_loopback_bench.rs)。B3 注释声称成本已移走,实际经 COUNTERS 原样保留。
 - 修法:收进 feature 开关(如 `perf-counters`,bench example 启用)或 cfg(test);或改为每会话本地累积、按需聚合。
