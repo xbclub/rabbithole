@@ -96,7 +96,17 @@ impl SshGateway {
         tracing::info!(%addr, "ssh gateway up");
         loop {
             let (sock, _peer) = tokio::select! {
-                a = l.accept() => match a { Ok(v) => v, Err(_) => continue },
+                // D-14:EMFILE/ENFILE 等持续错误下裸 continue 会紧空转
+                // 打满一核且无任何日志(仓内 vhost/main/control 同场景均有
+                // 退避);对齐:50ms 退避 + warn。
+                a = l.accept() => match a {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ssh gateway accept error");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                },
                 _ = stop.cancelled() => {
                     tracing::info!("ssh gateway stopped (config change)");
                     return Ok(());

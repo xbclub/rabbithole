@@ -31,7 +31,12 @@ impl Db {
                 .create_if_missing(true)
         }
         .foreign_keys(true)
-        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        // D-10:WAL + synchronous=Normal 是 SQLite 官方推荐组合(掉电至多
+        // 回滚最近几笔提交,无损坏风险;FULL 则每笔提交一次 fsync)。
+        // 客户端每次连接的 update_client_meta 单条 UPDATE 即一笔提交,
+        // FULL 的 fsync 在默认路径上白付。
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
         let pool = SqlitePoolOptions::new()
             .max_connections(if in_memory { 1 } else { 8 })
             .connect_with(opts)

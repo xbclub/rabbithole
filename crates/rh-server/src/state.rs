@@ -1430,11 +1430,14 @@ impl ProxyManager {
                 if occupied.contains(&p) {
                     continue;
                 }
+                // D-11:探测改 tokio 异步 bind —— 修前循环体无 await 点,
+                // 端口占用率高时同步逐个探测最长可阻塞 worker 数十毫秒
+                // (15001 次 ≈ 97ms);async bind 是 await 点,任务可让出。
                 let addr = SocketAddr::new(bind_ip, p);
                 let probe = if proto == "udp" {
-                    std::net::UdpSocket::bind(addr).is_ok()
+                    tokio::net::UdpSocket::bind(addr).await.is_ok()
                 } else {
-                    std::net::TcpListener::bind(addr).is_ok()
+                    tokio::net::TcpListener::bind(addr).await.is_ok()
                 };
                 if probe {
                     return Some(p);

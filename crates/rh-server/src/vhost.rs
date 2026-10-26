@@ -381,20 +381,17 @@ async fn handle_http_request(
                 return Ok(custom_404(&r.not_found_html));
             }
         }
-        return Ok(not_found_response(&state));
+        return Ok(not_found_response(&state).await);
     };
     // Basic 认证
     if route.http_credentials.is_some() {
+        // D-9:头值借用直传(修前每请求 to_string 分配一次);
+        // N9:预拼接凭据(route_from 构建时),免每请求 format! 分配
         let got = req
             .headers()
             .get(hyper::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        // N9:预拼接凭据(route_from 构建时),免每请求 format! 分配
-        if !check_basic_auth(
-            got.as_deref(),
-            route.http_credentials.as_deref().unwrap_or(""),
-        ) {
+            .and_then(|v| v.to_str().ok());
+        if !check_basic_auth(got, route.http_credentials.as_deref().unwrap_or("")) {
             let mut resp = hyper::Response::builder()
                 .status(401)
                 .body(full_body(b"Unauthorized"))?;
@@ -425,7 +422,7 @@ async fn handle_http_request(
     };
     // 上游通道(先组选路再取通道:通道属主须与 START_FORWARD 目标一致)
     let Some(rt) = state.proxies.get(route.proxy_id) else {
-        return Ok(not_found_response(&state));
+        return Ok(not_found_response(&state).await);
     };
     // ★先做组选路,再用**同一个 rt** 做缓存读写。
     //
@@ -679,30 +676,31 @@ fn ext_cached(path: &str, extensions: &[String]) -> bool {
         .any(|e| e.as_str().eq_ignore_ascii_case(ext))
 }
 
-fn not_found_response(state: &Arc<AppState>) -> hyper::Response<BoxBody> {
+async fn not_found_response(state: &Arc<AppState>) -> hyper::Response<BoxBody> {
     if let Some(path) = &state.cfg.vhost.custom_404_page {
-        // ★自定义 404 页只读一次盘,之后走进程内缓存。
+        // ★自定义 404 页成功读盘后走进程内缓存;读失败不缓存。
         //
-        // 修前每次 404 都 `std::fs::read` —— 这是**同步 IO 跑在 async 上下文**,
-        // 404 洪峰(扫描器、爬虫)会把 executor 线程逐个堵在 read 上。
-        // 配置在进程生命周期内不变,缓存是安全的;改动需重启(与本配置项
-        // 其他字段一致)。
+        // 配置在进程生命周期内不变,成功路径缓存是安全的(改动需重启,
+        // 与本配置项其他字段一致)。
+        // D-8:缓存值 Bytes(命中克隆 = 引用计数,修前每 404 整页 memcpy);
+        // 首读/读失败路径 tokio::fs(修前 std::fs 同步 IO 跑在 async 上下文,
+        // 404 洪峰把 executor 线程堵在 read 上)。**不做永久负缓存**:
+        // "补文件后生效"是有意行为(只把同步读改成异步,语义保留)。
         static CACHE: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
+            std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, bytes::Bytes>>,
         > = std::sync::OnceLock::new();
         let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-        // 命中:克隆一份(响应体需要所有权)
         let cached = { cache.lock().ok().and_then(|m| m.get(path).cloned()) };
         let body = match cached {
             Some(b) => Some(b),
-            None => match std::fs::read(path) {
+            None => match tokio::fs::read(path).await {
                 Ok(b) => {
+                    let b = bytes::Bytes::from(b);
                     if let Ok(mut m) = cache.lock() {
                         m.insert(path.clone(), b.clone());
                     }
                     Some(b)
                 }
-                // 读失败不缓存:文件可能是部署后补上的
                 Err(_) => None,
             },
         };
@@ -710,7 +708,7 @@ fn not_found_response(state: &Arc<AppState>) -> hyper::Response<BoxBody> {
             return hyper::Response::builder()
                 .status(404)
                 .body(
-                    http_body_util::Full::new(hyper::body::Bytes::from(body))
+                    http_body_util::Full::new(body)
                         .map_err(|never| match never {})
                         .boxed(),
                 )
@@ -1272,36 +1270,30 @@ async fn serve_tcpmux(
     Ok(())
 }
 
-/// 最小 base64 解码(标准字母表)。
+/// Basic 凭据 base64 解码(base64 crate;D-9 替换手写逐字符线性查表)。
+///
+/// 兼容红线:修前手写实现容忍**缺 padding**与**内嵌 \n/\r**(逐字符跳过),
+/// 直接用默认 engine 属行为收紧。这里显式配 `DecodePaddingMode::Indifferent`
+/// (padded/unpadded 均收)+ 解码前滤掉换行,与修前语义一致(有测试钉住
+/// 缺 padding / 带换行 / 标准 padding 三态)。
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut vals = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        if c == '=' || c == '\n' || c == '\r' {
-            continue;
-        }
-        let v = TABLE.iter().position(|&t| t as char == c)?;
-        vals.push(v as u8);
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+    use base64::Engine as _;
+
+    fn decode_any(input: &[u8]) -> Option<Vec<u8>> {
+        // 先按带 padding 解,失败再按无 padding 解(等价 Indifferent;
+        // 用两个预定义常量引擎,免自建 GeneralPurpose)
+        STANDARD
+            .decode(input)
+            .or_else(|_| STANDARD_NO_PAD.decode(input))
+            .ok()
     }
-    let mut out = Vec::with_capacity(vals.len() * 3 / 4);
-    for chunk in vals.chunks(4) {
-        match chunk.len() {
-            4 => {
-                out.push((chunk[0] << 2) | (chunk[1] >> 4));
-                out.push((chunk[1] << 4) | (chunk[2] >> 2));
-                out.push((chunk[2] << 6) | chunk[3]);
-            }
-            3 => {
-                out.push((chunk[0] << 2) | (chunk[1] >> 4));
-                out.push((chunk[1] << 4) | (chunk[2] >> 2));
-            }
-            2 => {
-                out.push((chunk[0] << 2) | (chunk[1] >> 4));
-            }
-            _ => {}
-        }
+    // 常见路径(无换行)零额外分配;有换行才过滤(修前逐字符跳过语义)
+    if !s.bytes().any(|b| b == b'\n' || b == b'\r') {
+        return decode_any(s.as_bytes());
     }
-    Some(out)
+    let filtered: Vec<u8> = s.bytes().filter(|b| *b != b'\n' && *b != b'\r').collect();
+    decode_any(&filtered)
 }
 
 fn conv_pp(v: rh_protocol::ProxyProtoVersion) -> rh_protocol::message::ProxyProto {
@@ -1317,6 +1309,53 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http_body_util::Full;
+
+    /// D-9 红线:base64 解码必须保持修前手写实现的宽容性
+    /// (缺 padding / 内嵌换行均可解;标准形态不受影响)。
+    #[test]
+    fn base64_decode_tolerates_missing_padding_and_newlines() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let b64std = || B64;
+        // 13 字节 ⇒ 编码必含 padding(12 字节恰好整组,测不到缺 padding 分支)
+        let expect = b"admin:secret!".to_vec();
+        // 标准(带 padding)
+        let std = b64std().encode(b"admin:secret!");
+        assert!(std.ends_with('=') || std.len() % 4 == 0, "编码基线");
+        assert_eq!(base64_decode(&std), Some(expect.clone()));
+        // 缺 padding(截掉全部 '=')
+        let trimmed = std.trim_end_matches('=');
+        assert_ne!(std, trimmed, "基线确实含 padding");
+        assert_eq!(
+            base64_decode(trimmed),
+            Some(expect.clone()),
+            "缺 padding 必须可解"
+        );
+        // 内嵌换行(每 20 字符插一个 \r\n,解码结果不变)
+        let mut wrapped = String::new();
+        for (i, c) in std.chars().enumerate() {
+            if i > 0 && i % 20 == 0 {
+                wrapped.push_str("\r\n");
+            }
+            wrapped.push(c);
+        }
+        assert_eq!(base64_decode(&wrapped), Some(expect), "带换行必须可解");
+        // 非法字符必须失败(不得误收)
+        assert!(base64_decode("!!!").is_none());
+    }
+
+    /// D-9:check_basic_auth 走借用 &str(缺 padding 凭据端到端可过)。
+    #[test]
+    fn basic_auth_accepts_unpadded_header() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let b64std = || B64;
+        let creds = "admin:secret";
+        let header = format!("Basic {}", b64std().encode(creds).trim_end_matches('='));
+        assert!(check_basic_auth(Some(&header), creds));
+        assert!(!check_basic_auth(Some("Basic YWRtaW46d3Jvbmc="), creds));
+        assert!(!check_basic_auth(None, creds));
+    }
 
     /// M2 静态缓存键必须含 query。
     ///

@@ -556,12 +556,25 @@ impl axum::serve::Listener for TlsListener {
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
             match self.inner.accept().await {
-                Ok((sock, addr)) => match self.acceptor.accept(sock).await {
-                    Ok(tls) => return (tls, addr),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "web tls handshake failed");
+                // D-13:握手必须有时限 —— 不发 ClientHello 的连接会把
+                // accept(Slowloris 式)永久钉死,管理面整体停摆。10s 覆盖
+                // 高延迟/弱客户端的正常握手;超时视同握手失败,断开继续。
+                Ok((sock, addr)) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        self.acceptor.accept(sock),
+                    )
+                    .await
+                    {
+                        Ok(Ok(tls)) => return (tls, addr),
+                        Ok(Err(e)) => {
+                            tracing::debug!(error = %e, "web tls handshake failed");
+                        }
+                        Err(_) => {
+                            tracing::debug!("web tls handshake timeout (10s)");
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "web accept error");
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
