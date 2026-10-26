@@ -182,7 +182,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 ## 包 C:yamux(vendor/yamux)
 
 ### C-1 [P1] 接收 staging 的 zeroed 水位被 reclaim 误重置 —— 来源 yamuxRest-1(合并 yamuxCore-1)
-- [ ] 状态:
+- [x] 状态:完成 @ e27c8ef
+> 核查:✅ 机理确认但成因修正:读 bytes-1.12.1 `reserve_inner` 源码,KIND_VEC/ARC-unique 的 "no copy necessary" 分支仅抬高 cap 不动任何字节(空闲区仍零),而 capacity 变化触发现有代码 `zeroed=min(zeroed,len)` 误重置——这才是误重置来源;copy-back reclaim 与 fresh-alloc 的重置则是正确必需。红线核实成立:ptr/cap 观测均无法区分三分支(realloc 可原地同 ptr、fresh alloc 可落在更低地址),故不采用水位判别法,改**自管扩容**:容量不足时不调 `buf.reserve`(杜绝内部搬移被观察到),自建新缓冲整块预零填一次、水位=新容量;`advance`/`split_to` 同步递减 cap 与水位(bytes 源码 advance_unchecked 证实 cap-=k),不变量 `zeroed==capacity` 永久保持,读路径零 memset,零填总量从"随流量线性"降为"每连接 ≈2× 峰值容量(几何增长有界)"。代价:staging 驻留高水位最多翻倍(不再回收已消费前缀),仅 1MiB 级大帧流场景可感。
 - 位置:`vendor/yamux/src/frame/io.rs:232-239`(重置条件)、:264-288(消费)、:593(零填)
 - 问题:水位在任何 capacity 变化时重置为 buf.len(),而 bytes 1.12.1 的 reclaim(无新分配、指针复位)也改变 capacity → 稳态每收 1 字节约做 1 字节 memset,写脏的 cacheline 随即被内核拷贝覆盖。
 - 修法:重置条件收窄为"backing 真实搬迁":用分配基址跟踪初始化区间,或 (alloc 代际, zeroed_cap) / 累计消费字节计数。**正确性红线:不要用朴素 as_ptr 比对(reclaim 会把指针移回起点)或"最大容量回落即视为 reclaim"判据(fresh-alloc 可小于历史最大且确实搬移)——误判会把未初始化内存当已零填。** reclaim 仅在上一帧体已 drop 时触发,同 wake 的 fresh-alloc 轮 memset 属契约必需,收益有上界。

@@ -205,7 +205,9 @@ pub(crate) struct Io<T> {
 /// 接收 staging:批量读入 + 零拷贝帧体切片。
 ///
 /// 初始化不变量:`[0, zeroed)` 相对当前 buf 起点已初始化,且恒有
-/// `zeroed >= buf.len()`。向底层 IO 暴露空闲区前,先把将写区间零填,
+/// `zeroed >= buf.len()`;自管扩容后更强:`zeroed == buf.capacity()`
+/// (advance/split_to 同步递减两者,bytes 源码 `advance_unchecked` 亦
+/// 同步 `cap -= k`)。向底层 IO 暴露空闲区前,先把将写区间零填,
 /// 使「未初始化内存 → `&mut [u8]`」的转换满足 futures `AsyncRead`
 /// 的缓冲契约(调用方传入的切片必须已初始化)。
 struct Staging {
@@ -229,13 +231,34 @@ impl Staging {
         self.buf.is_empty()
     }
 
+    /// 容量不足时**自管扩容**:不用 `BytesMut::reserve`。
+    ///
+    /// bytes 1.12.1 的 reserve 内部有三种搬移形态:同分配指针复位
+    /// (reclaim)、同指针原地扩容、换新分配。前两种保留空闲区原有
+    /// 零填,第三种只保留 [0, len)——但三者对外都表现为 capacity 变
+    /// 化,无法凭 ptr/cap 区分(realloc 可原地同指针,fresh alloc 可
+    /// 落在更低地址),水位只能重置回 len,稳态回到「每读 1 字节补
+    /// 1 字节 memset、写脏的 cacheline 随即被内核拷贝覆盖」。
+    ///
+    /// 自管扩容把不确定性消除:新缓冲整块预零填一次,水位直接推进
+    /// 到新容量。此后 `zeroed == capacity` 恒成立,读路径零 memset;
+    /// 每连接零填总量 ≈ 2× 峰值容量(几何增长,有界),不再随流量
+    /// 线性。旧 backing 若仍被未 drop 的零拷贝帧体引用,由引用计数
+    /// 自然延续(与 bytes 的 abandon 路径同语义)。代价:不再回收
+    /// 已消费前缀,staging 驻留高水位最多翻倍。
     fn reserve(&mut self, additional: usize) {
-        let cap_before = self.buf.capacity();
-        self.buf.reserve(additional);
-        if self.buf.capacity() != cap_before {
-            // 扩容/搬移只保留 [0, len):其后重新视为未初始化
-            self.zeroed = self.zeroed.min(self.buf.len());
+        let cap = self.buf.capacity();
+        let len = self.buf.len();
+        if cap - len >= additional {
+            // 容量足够:BytesMut::reserve 短路返回,无任何搬移,水位保持。
+            return;
         }
+        let new_cap = (len + additional).max(cap.saturating_mul(2));
+        let mut nb = BytesMut::with_capacity(new_cap);
+        nb.extend_from_slice(&self.buf);
+        nb.spare_capacity_mut().fill(std::mem::MaybeUninit::new(0));
+        self.buf = nb;
+        self.zeroed = new_cap;
     }
 
     /// 确保空闲区前 `want` 字节已初始化,返回该可写切片
@@ -919,6 +942,39 @@ mod tests {
             max_small_cap > 0,
             "small bodies must be independently owned"
         );
+    }
+
+    /// C-1(任务书):零填水位必须跨消费/扩容保持——判据是不变量
+    /// `zeroed == capacity` 在任意操作序列后成立,且空闲区物理为全零。
+    /// 修前:reserve 观察到任何 capacity 变化都把水位打回 len,同分配
+    /// 指针复位(reclaim)轮会把仍是零的空闲区整段重零填——稳态变成
+    /// 每读 1 字节付 1 字节 memset,写脏的 cacheline 随即被内核拷贝覆盖。
+    #[test]
+    fn staging_zero_watermark_survives_consume_and_growth() {
+        let mut st = Staging::new();
+        // 初始扩容:整块预零填,水位 == 容量
+        st.reserve(64);
+        assert_eq!(st.zeroed, st.buf.capacity());
+
+        // 模拟一轮读+消费:读入 40 字节,消费 12(帧头+小帧体)
+        let s = st.zeroed_spare(40);
+        s.copy_from_slice(&[0xA5u8; 40]);
+        st.appended(40);
+        st.take_body(12);
+        assert_eq!(st.zeroed, st.buf.capacity(), "消费后水位应与 capacity 同步");
+
+        // 空闲区必须物理全零(未被已消费的旧数据污染)
+        let spare = st.zeroed_spare(usize::MAX);
+        assert!(spare.iter().all(|&b| b == 0), "空闲区必须保持零填");
+
+        // 消费到接近清空后再扩容(触发自管重建):数据保真 + 水位恢复
+        st.take_body(st.len() - 1); // 只留 1 字节
+        st.reserve(1024); // 容量不足 → 重建
+        assert_eq!(&st.buf[..1], &[0xA5], "扩容搬迁必须保真");
+        assert_eq!(st.zeroed, st.buf.capacity(), "扩容后水位 == 新容量");
+        let spare = st.zeroed_spare(usize::MAX);
+        assert!(spare.iter().all(|&b| b == 0));
+        assert_eq!(spare.len(), st.buf.capacity() - 1);
     }
 
     // ===== round-5 §5.4 跨帧批量写(Sink 级:WriteState::Batch 契约)=====
