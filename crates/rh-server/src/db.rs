@@ -506,6 +506,16 @@ impl Db {
         Ok(rows.into_iter().map(|r| r.get::<i64, _>(0)).collect())
     }
 
+    /// D-5:与 [`list_proxy_ids`] 对称的 visitor 一列投影(消费方只用 id;
+    /// 修前 update_client 禁用分支全量取回 + 逐行构造 VisitorSpec)。
+    pub async fn list_visitor_ids(&self, client_id: &str) -> Result<Vec<i64>> {
+        let rows = sqlx::query("SELECT id FROM visitors WHERE client_id=?1")
+            .bind(client_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get::<i64, _>(0)).collect())
+    }
+
     /// R3:全部规则的 (id, client_id) 轻量列表(batch_services 的属主
     /// 映射;不做 spec JSON 反序列化 —— 修前 list_proxies(None) 全表
     /// 解析只为取两列)。

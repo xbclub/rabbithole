@@ -1616,11 +1616,11 @@ fn udp_session_admit(
     if sessions.contains_key(&addr) {
         return true;
     }
+    // D-12:读原子快照(热改保存点同步 store),免每新源首包一次
+    // 全局 limits RwLock 读(0 = 不限语义不变)。
     let limit = state
-        .limits
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .max_udp_sessions_per_proxy;
+        .udp_sessions_limit
+        .load(std::sync::atomic::Ordering::Relaxed);
     if limit != 0 && sessions.len() >= limit {
         // B7:超限必须可见 —— 静默丢弃会让"UDP 不通"无从排查。
         state.metrics.udp_sessions_rejected.inc();

@@ -700,7 +700,8 @@ async fn update_client(
             }
             // R4:一列投影(消费方只用 id;修前全量 spec 反序列化)
             let proxies = state.db.list_proxy_ids(&id).await.unwrap_or_default();
-            let visitors = state.db.list_visitors(Some(&id)).await.unwrap_or_default();
+            // D-5:一列投影(消费方只用 id;修前全量 VisitorSpec 构造)
+            let visitors = state.db.list_visitor_ids(&id).await.unwrap_or_default();
             let rev = state.db.bump_revision(&id).await.unwrap_or(0);
             state.bump_cfg_gen(&id);
             // ★teardown 并发,发送仍串行。
@@ -772,11 +773,7 @@ async fn update_client(
                 let payloads: Vec<(&'static str, u64)> = proxies
                     .iter()
                     .map(|pid| ("proxy", *pid as u64))
-                    .chain(
-                        visitors
-                            .iter()
-                            .map(|(vid, _, _, _)| ("visitor", *vid as u64)),
-                    )
+                    .chain(visitors.iter().map(|vid| ("visitor", *vid as u64)))
                     .collect();
                 futures::stream::iter(payloads)
                     .for_each_concurrent(8, |(entity_type, entity_id)| {
@@ -1409,40 +1406,25 @@ async fn enable_service(
     if require_auth(&state, &headers).await.is_err() {
         return unauthorized();
     }
-    let Some(client_id) = state
-        .db
-        .get_proxy(id)
-        .await
-        .ok()
-        .flatten()
-        .map(|(_, cid, _, _)| cid)
+    // D-7:一次查询保留整行(修前第一次只留 enabled 整行丢弃、锁后
+    // 重查一次、禁用分支再查一次取 revision)。同客户端的并发变更
+    // 都经 serial_lock 串行,锁前单次读取无一致性障碍(R1 约定同型)。
+    let Some((_, client_id, mut spec, port_auto)) = state.db.get_proxy(id).await.ok().flatten()
     else {
         return err(3001, "转发规则不存在");
     };
     let lock = state.serial_lock(&client_id);
     let _g = lock.lock().await;
-    let Some((_, client_id, mut spec, port_auto)) = state.db.get_proxy(id).await.ok().flatten()
-    else {
-        return err(3001, "转发规则不存在");
-    };
-    let client_enabled = state
-        .db
-        .get_client(&client_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|c| c.enabled)
-        .unwrap_or(false);
+    // 行缺失(极端竞态)= 按禁用走 deferred、rev=0,与修前 get_client
+    // 失败时的语义一致,不 panic。
+    let client = state.db.get_client(&client_id).await.ok().flatten();
+    let client_enabled = client.as_ref().map(|c| c.enabled).unwrap_or(false);
     // 客户端禁用:仅置 enabled=1 落库(不推进 revision、不 bind,等客户端恢复)
     if !client_enabled {
         state.db.set_proxy_enabled(id, true).await.ok();
         spec.enabled = true;
-        let cur_rev = state
-            .db
-            .get_client(&client_id)
-            .await
-            .ok()
-            .flatten()
+        let cur_rev = client
+            .as_ref()
             .map(|c| c.config_revision.max(0) as u64)
             .unwrap_or(0);
         crate::runtime::teardown_runtime(&state, id as u64).await;
@@ -2676,6 +2658,12 @@ async fn put_server_config(
         if let Some(v) = l.max_mux_streams {
             set(lim.max_mux_streams != v, "max_mux_streams", &mut applied);
             lim.max_mux_streams = v;
+            // D-12:原子快照同步 store(修前从未 store,热改对新会话
+            // 一直不生效——此次一并修正)
+            state.mux_streams.store(
+                crate::config::LimitsConfig::mux_streams(&lim),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         if let Some(v) = l.max_data_conns_per_client {
             set(
@@ -2692,6 +2680,10 @@ async fn put_server_config(
                 &mut applied,
             );
             lim.max_udp_sessions_per_proxy = v;
+            // D-12:数据面读原子快照,这里同步 store
+            state
+                .udp_sessions_limit
+                .store(v, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(v) = l.max_pool_size {
             set(lim.max_pool_size != v, "max_pool_size", &mut applied);

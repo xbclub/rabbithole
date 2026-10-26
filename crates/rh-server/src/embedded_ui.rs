@@ -63,13 +63,36 @@ fn asset_response(path: &str) -> Option<Response> {
         // R2:rust-embed 的 data 是 Cow<'static, _>(release 内嵌 =
         // Borrowed 静态切片,零拷贝出响应;开发态 fs 加载 = Owned,
         // 直接移动 Vec)。修前 Vec::from 每个管理页请求整份拷贝。
+        //
+        // D-15:缓存头。Vite 产物文件名自带内容 hash:
+        // * `/assets/*` 一年 immutable(重命名即失效,磁盘缓存全量复用;
+        //   修前每响应仅 content-type,浏览器每次打开控制台全量重下
+        //   ~1.5MB,经隧道访问尤其浪费);
+        // * index.html(含 SPA 深链回退)no-cache:发版即生效,不陈旧。
+        let cache_control = if name.starts_with("assets/") {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
         return Some(match file.data {
-            std::borrow::Cow::Borrowed(b) => {
-                (StatusCode::OK, [("content-type", mime_of(name))], b).into_response()
-            }
-            std::borrow::Cow::Owned(v) => {
-                (StatusCode::OK, [("content-type", mime_of(name))], v).into_response()
-            }
+            std::borrow::Cow::Borrowed(b) => (
+                StatusCode::OK,
+                [
+                    ("content-type", mime_of(name)),
+                    ("cache-control", cache_control),
+                ],
+                b,
+            )
+                .into_response(),
+            std::borrow::Cow::Owned(v) => (
+                StatusCode::OK,
+                [
+                    ("content-type", mime_of(name)),
+                    ("cache-control", cache_control),
+                ],
+                v,
+            )
+                .into_response(),
         });
     }
     #[allow(unreachable_code)]

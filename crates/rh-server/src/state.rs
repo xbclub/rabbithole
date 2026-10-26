@@ -79,6 +79,9 @@ pub struct AppState {
     /// 复用流上限有效值(limits.max_mux_streams 折算,0 → 不限制),
     /// transport accept 泵每连接读取 → 热改对新会话生效。
     pub mux_streams: Arc<std::sync::atomic::AtomicUsize>,
+    /// D-12:UDP 每规则会话上限的原子缓存(limits.max_udp_sessions_per_proxy
+    /// 快照;数据面仅新源首包读取)。热改保存点同步 store(见 api.rs)。
+    pub udp_sessions_limit: Arc<std::sync::atomic::AtomicUsize>,
     /// F2 每客户端用量/配额缓存。
     pub client_usage: Arc<dashmap::DashMap<String, Arc<ClientUsage>>>,
     /// M3 服务端终结证书(SNI 匹配;certs 表变更后整体重建)。
@@ -388,6 +391,9 @@ impl AppState {
         let mux_streams = Arc::new(std::sync::atomic::AtomicUsize::new(
             cfg.limits.mux_streams(),
         ));
+        let udp_sessions_limit = Arc::new(std::sync::atomic::AtomicUsize::new(
+            cfg.limits.max_udp_sessions_per_proxy,
+        ));
         let proxies = Arc::new(ProxyManager::new(cfg.clone(), hot.clone()));
         let (ssh_tx, ssh_rx) = tokio::sync::watch::channel(0u64);
         let jwt_secret = cfg
@@ -416,6 +422,7 @@ impl AppState {
             hot,
             limits,
             mux_streams,
+            udp_sessions_limit,
             client_usage: Arc::new(dashmap::DashMap::new()),
             certs: Arc::new(RwLock::new(Vec::new())),
             ssh_watch: (ssh_tx, Arc::new(ssh_rx)),
