@@ -79,7 +79,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 验收:三道门绿 + `cargo build --examples` 通过(bench example 仍能编译运行);生产路径零计数。
 
 ### A-2 [P1] write_queue 搬运用 split_off 反复切尾 —— 来源 kcp-2
-- [x] 状态:
+- [x] 状态:完成 @ 292d776
 > 核查:✅ 问题在(kcp.rs:1027-1029 split_off+mem::replace,每片一次新分配 + 尾段 memcpy);修法可行,条目改 `WriteChunk { buf, off }` 游标结构(类型系统强制一致性,优于在 Guarded 加 front_off 隐式不变量)。触点 9 处(声明/两个 push/消费循环/punch/3 处测试)全部核过;kcp.send 收 &[u8],锁内 to_vec 出片(≤64KiB,通常 ≤mss×budget)即可。
 - 位置:`crates/rh-transport/src/kcp.rs:1017-1019`
 - 问题:每片为"尾部剩余"重新分配 + 整段 memcpy;预算受限(慢 ACK/丢包链路)时对同一 64KiB 项按每轮 1 段消费,尾拷贝总量 ≈1.8MB(放大 ~28 倍),恰发生在拥塞恢复最不想烧 CPU 的时刻。
@@ -87,7 +87,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 验收:三道门绿;现有 KCP 测试通过;补一个"大项 + 受限预算"单测断言数据完整。
 
 ### A-3 [P1] 每输出数据报一次 sendto,满窗单轮 ~256 次 syscall —— 来源 kcp-3
-- [ ] 状态:
+- [x] 状态:
+> 核查:✅ 问题在(UdpOutput::write 经 output_write_via_backlog 空闲直发路径,每数据报一次 try_send/try_send_to;kcp.flush 满 MAX_KCP_PENDING_SEGS=256 段即 256 次 syscall);kcp 确实不调 output.flush(全仓 grep 无 Write::flush 消费方)。实施:SendAgg 聚合批——写回调空闲路径入单一大缓冲+长度表(零稳态分配),run_session 每轮迭代尾 flush_now 批量提交;EAGAIN/部分提交余段转 UdpBacklog 串行化(FIFO 保持;余段仍在 kcp snd_buf 计入 wait_snd,收尾守卫的"未确认交付"合同不破)。**门控修正:sendmmsg 用 cfg(target_os="linux") 而非 cfg(unix)——macOS 无 sendmmsg 且 libc 依赖仅声明在 linux target**;非 Linux 生产恒走原逐包路径(new() 返回 None)。
 - 位置:`crates/rh-transport/src/kcp.rs:862-877`(UdpOutput::write)
 - 问题:kcp 0.6.0 每满一个 MTU 就 write_all 一次 → 每 datagram 一次 syscall;未用 sendmmsg/UDP GSO。TX 路径最大固定开销项。
 - 修法:UdpOutput 在单轮 kcp.flush 期间聚合 datagram,会话层 flush 后显式冲刷并 `sendmmsg` 批量提交(Linux 可再加 UDP_SEGMENT/GSO)。注意 kcp 不调 output.flush(已 grep 证实),冲刷点需自建(如 Arc 共享的 flush 句柄)。**sendmmsg 必须 cfg(unix),非 Unix 回落现有逐包路径。**

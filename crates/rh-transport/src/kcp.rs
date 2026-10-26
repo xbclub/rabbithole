@@ -301,6 +301,9 @@ struct Shared {
     /// 入站批缓冲容量高水位(D 守护:跨轮复用不增长;仅测试读)
     #[cfg(test)]
     batch_cap_hwm: AtomicU64,
+    /// A-3 输出聚合批(Linux;None = 未启用)。会话任务每轮迭代尾
+    /// flush_now 批量提交本轮 kcp 输出。
+    send_agg: Option<Arc<SendAgg>>,
 }
 
 /// KCP 会话的字节流句柄。
@@ -556,6 +559,9 @@ struct UdpBacklog {
     /// 唤醒会话/接收循环 —— idle 会话(无后续写/待发数据)不必等下一
     /// 次 UdpOutput::write 才感知。Weak:不延长会话生命周期。
     session: Mutex<Option<std::sync::Weak<Shared>>>,
+    /// A-3 输出聚合批注册槽(生产 Linux 会话经 SendAgg::new 注册;
+    /// SendAgg 持 Weak 反向引用,无 Arc 环)。未注册 = 逐包直发。
+    agg_slot: std::sync::OnceLock<Arc<SendAgg>>,
 }
 
 impl UdpBacklog {
@@ -571,7 +577,13 @@ impl UdpBacklog {
             inflight_packets: AtomicUsize::new(0),
             fatal_error: Mutex::new(None),
             session: Mutex::new(None),
+            agg_slot: std::sync::OnceLock::new(),
         }
+    }
+
+    /// A-3:注册的输出聚合批(生产 Linux 会话;未注册 = 逐包路径)。
+    fn agg(&self) -> Option<&Arc<SendAgg>> {
+        self.agg_slot.get()
     }
 
     /// 绑定会话(生产路径每个 backlog 恰好一次,spawn drain 前调用)。
@@ -817,6 +829,260 @@ impl Dest {
     }
 }
 
+/// A-3:单轮 kcp flush 的输出聚合批。
+///
+/// 修前空闲直发路径每数据报一次 try_send/try_send_to,满窗单轮
+/// (≤ MAX_KCP_PENDING_SEGS=256 段)即 ~256 次 syscall。聚合批把同轮
+/// 数据报收进**单一大缓冲 + 长度表**(稳态零分配:缓冲复用容量),
+/// 会话任务在每轮迭代尾 [`SendAgg::flush_now`] 批量提交。
+///
+/// 满载回落:socket 缓冲满(EAGAIN)或部分提交时,余段转入
+/// [`UdpBacklog`] 串行化(drain 任务等 writable 补送)—— FIFO 顺序
+/// 保持(聚合缓冲内余段一并转移,不与后续轮次竞争),余段仍留在
+/// kcp snd_buf(计入 wait_snd),会话收尾守卫的"未确认交付"合同不破。
+///
+/// 平台门控:sendmmsg 仅 Linux(macOS 无此系统调用,libc 依赖也只
+/// 声明在 linux target)。非 Linux 的 [`SendAgg::new`] 恒 None,写路径
+/// 原样保留修前的逐包直发;flush_now 的逐包回退实现仅供跨平台测试。
+struct SendAgg {
+    sock: Arc<UdpSocket>,
+    dest: Dest,
+    /// Weak 反向引用(聚合批注册在 backlog 的槽上;Weak 防止
+    /// backlog ↔ agg 的 Arc 环)。会话存活期内 upgrade 恒成功
+    /// (kcp 内的 UdpOutput 持有 backlog Arc,直到会话收尾)。
+    backlog: std::sync::Weak<UdpBacklog>,
+    /// 聚合缓冲与各数据报长度(单锁;仅会话任务触达,零争用)。
+    queue: std::sync::Mutex<AggQueue>,
+}
+
+#[derive(Default)]
+struct AggQueue {
+    buf: Vec<u8>,
+    lens: Vec<usize>,
+}
+
+/// sendmmsg 单次提交的数据报数上限(UIO_FASTIOV 口径;非 Linux 逐包
+/// 回退,值为 1 保语义)。
+#[cfg(target_os = "linux")]
+const AGG_BATCH: usize = 64;
+#[cfg(not(target_os = "linux"))]
+const AGG_BATCH: usize = 1;
+/// 聚合挂起上限(超出即在写回调内先冲刷;防缓冲无界,正常满窗 256 内不触)。
+const AGG_MAX_QUEUED: usize = 256;
+
+impl SendAgg {
+    /// 生产构造:仅 Linux 启用聚合(见类型注释);其余平台返回 None,
+    /// UdpOutput 走修前逐包路径。构造即把自身注册进 backlog 的聚合槽
+    /// (UdpOutput::write 经 backlog.agg() 触达,无需改构造字面量)。
+    fn new(backlog: &Arc<UdpBacklog>, sock: Arc<UdpSocket>, dest: Dest) -> Option<Arc<Self>> {
+        #[cfg(target_os = "linux")]
+        {
+            let agg = Arc::new(Self {
+                sock,
+                dest,
+                backlog: Arc::downgrade(backlog),
+                queue: std::sync::Mutex::new(AggQueue::default()),
+            });
+            let _ = backlog.agg_slot.set(agg.clone());
+            Some(agg)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (backlog, sock, dest);
+            None
+        }
+    }
+
+    /// 写回调入口(kcp 输出契约:同步、不可阻塞,除致命错误外报成功)。
+    fn push(&self, buf: &[u8]) {
+        {
+            let mut q = self.queue.lock().unwrap();
+            if q.lens.len() < AGG_MAX_QUEUED {
+                q.buf.extend_from_slice(buf);
+                q.lens.push(buf.len());
+                return;
+            }
+        }
+        // 挂起超限:先内联冲刷再入队。硬错误经 note_fatal 桥传播
+        // (与 backlog drain 同口径),本包仍按契约报成功。
+        let _ = self.flush_now();
+        let mut q = self.queue.lock().unwrap();
+        q.buf.extend_from_slice(buf);
+        q.lens.push(buf.len());
+    }
+
+    /// 冲刷聚合批。锁内同步执行(纯 try 语义,无阻塞调用)。
+    fn flush_now(&self) -> std::io::Result<()> {
+        let mut q = self.queue.lock().unwrap();
+        loop {
+            if q.lens.is_empty() {
+                return Ok(());
+            }
+            let Some(backlog) = self.backlog.upgrade() else {
+                // backlog 已亡(会话收尾):聚合内容随会话废弃
+                q.buf.clear();
+                q.lens.clear();
+                return Ok(());
+            };
+            let sent = match self.send_batch(&q) {
+                Ok(k) => k,
+                Err(e) => {
+                    backlog.note_fatal(format!("kcp agg send: {e}"), q.lens[0]);
+                    return Err(e);
+                }
+            };
+            let attempted = q.lens.len().min(AGG_BATCH);
+            if sent == 0 {
+                // EAGAIN:余段全部转 backlog(writable 唤醒后 drain 补送)
+                self.transfer_to_backlog(&mut q);
+                return Ok(());
+            }
+            let consumed: usize = q.lens[..sent].iter().sum();
+            q.buf.drain(..consumed);
+            q.lens.drain(..sent);
+            if sent < attempted {
+                // 部分提交:余段转 backlog 串行化,保 FIFO
+                self.transfer_to_backlog(&mut q);
+                return Ok(());
+            }
+            // 本批全发;仍有余量则继续
+        }
+    }
+
+    /// 余段(含 buf/lens 全部)按序转入 backlog。
+    fn transfer_to_backlog(&self, q: &mut AggQueue) {
+        let Some(backlog) = self.backlog.upgrade() else {
+            q.buf.clear();
+            q.lens.clear();
+            return;
+        };
+        let mut off = 0usize;
+        for len in q.lens.drain(..) {
+            let _ = backlog.push(&q.buf[off..off + len]);
+            off += len;
+        }
+        q.buf.clear();
+    }
+
+    /// 批量提交当前队列头部一批;返回成功发出的数据报数(0 = EAGAIN)。
+    fn send_batch(&self, q: &AggQueue) -> std::io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            self.send_batch_mmsg(q)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.send_batch_per_packet(q)
+        }
+    }
+
+    /// 逐包回退(非 Linux;生产不启用,仅供跨平台测试走通 flush_now)。
+    fn send_batch_per_packet(&self, q: &AggQueue) -> std::io::Result<usize> {
+        let mut off = 0usize;
+        let mut sent = 0usize;
+        for len in q.lens.iter() {
+            match self.dest.try_send(&self.sock, &q.buf[off..off + len]) {
+                Ok(n) if n == *len => {
+                    sent += 1;
+                    off += len;
+                }
+                Ok(n) => {
+                    return Err(std::io::Error::other(format!(
+                        "kcp udp short write {n}/{len}"
+                    )))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(sent)
+    }
+}
+
+/// sendmmsg 批量提交(std::os::fd 仅存在于此 cfg 块内)。
+#[cfg(target_os = "linux")]
+impl SendAgg {
+    fn send_batch_mmsg(&self, q: &AggQueue) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd as _;
+        let n = q.lens.len().min(AGG_BATCH);
+        let mut iovs: [libc::iovec; AGG_BATCH] = unsafe { std::mem::zeroed() };
+        let mut hdrs: [libc::mmsghdr; AGG_BATCH] = unsafe { std::mem::zeroed() };
+        let mut addrs: [libc::sockaddr_storage; AGG_BATCH] = unsafe { std::mem::zeroed() };
+        let mut off = 0usize;
+        for i in 0..n {
+            iovs[i].iov_base = q.buf[off..].as_ptr() as *mut libc::c_void;
+            iovs[i].iov_len = q.lens[i];
+            let dest_ptr: *mut libc::c_void = match &self.dest {
+                Dest::Connected => std::ptr::null_mut(),
+                Dest::Peer(p) | Dest::Punch(pc) => {
+                    let a: &mut libc::sockaddr_storage = &mut addrs[i];
+                    let len = fill_sockaddr(
+                        a,
+                        if let Dest::Punch(pc) = &self.dest {
+                            pc.current()
+                        } else {
+                            *p
+                        },
+                    );
+                    hdrs[i].msg_hdr.msg_namelen = len;
+                    a as *mut libc::sockaddr_storage as *mut libc::c_void
+                }
+            };
+            if !dest_ptr.is_null() {
+                hdrs[i].msg_hdr.msg_name = dest_ptr;
+            }
+            hdrs[i].msg_hdr.msg_iov = &mut iovs[i];
+            hdrs[i].msg_hdr.msg_iovlen = 1;
+            off += q.lens[i];
+        }
+        let rc = unsafe {
+            libc::sendmmsg(
+                self.sock.as_raw_fd(),
+                hdrs.as_mut_ptr(),
+                n as libc::c_uint,
+                0,
+            )
+        };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(0);
+            }
+            return Err(err);
+        }
+        Ok(rc as usize)
+    }
+}
+
+/// SocketAddr → libc sockaddr(Linux 聚合提交用;零值头 + 显式逐字段)。
+#[cfg(target_os = "linux")]
+fn fill_sockaddr(ss: &mut libc::sockaddr_storage, p: SocketAddr) -> libc::socklen_t {
+    match p {
+        SocketAddr::V4(v4) => {
+            let a: &mut libc::sockaddr_in =
+                unsafe { &mut *(ss as *mut _ as *mut libc::sockaddr_in) };
+            a.sin_family = libc::AF_INET as libc::sa_family_t;
+            a.sin_port = v4.port().to_be();
+            a.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(v4.ip().octets()),
+            };
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+        }
+        SocketAddr::V6(v6) => {
+            let a: &mut libc::sockaddr_in6 =
+                unsafe { &mut *(ss as *mut _ as *mut libc::sockaddr_in6) };
+            a.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            a.sin6_port = v6.port().to_be();
+            a.sin6_addr = libc::in6_addr {
+                s6_addr: v6.ip().octets(),
+            };
+            a.sin6_flowinfo = v6.flowinfo();
+            a.sin6_scope_id = v6.scope_id();
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        }
+    }
+}
+
 fn spawn_udp_backlog_drain(sock: Arc<UdpSocket>, dest: Dest, backlog: Arc<UdpBacklog>) {
     let weak = Arc::downgrade(&backlog);
     tokio::spawn(async move {
@@ -927,6 +1193,23 @@ impl UdpOutput {
 
 impl Write for UdpOutput {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // A-3 聚合路径:空闲直发改为入聚合批(单一大缓冲,零稳态分配),
+        // 会话任务迭代尾 sendmmsg 批量提交;硬错误/容量满语义与直发
+        // 路径一致(fatal 桥 + backlog 串行化)。聚合批注册在 backlog 上
+        // (生产 wiring;测试与 PunchOutput 未注册 → 修前逐包路径)。
+        // 顺带免去每数据报的 Arc clone 闭包(A-7 同款收益)。
+        if let Some(agg) = self.backlog.agg() {
+            if let Some(e) = self.backlog.fatal_error() {
+                return Err(other_err(e));
+            }
+            if self.backlog.is_idle() {
+                bump_counter!(send_attempts);
+                agg.push(buf);
+                return Ok(buf.len());
+            }
+            let _ = self.backlog.push(buf);
+            return Ok(buf.len());
+        }
         let sock = self.sock.clone();
         let peer = self.peer;
         let connected = self.connected;
@@ -1147,6 +1430,14 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
             bump_counter!(flush_calls);
             if let Err(e) = kcp.flush() {
                 error = Some(format!("kcp flush: {e}"));
+                break;
+            }
+        }
+        // A-3:冲刷本轮聚合批(sendmmsg 批量提交;空批仅一次无争用锁)。
+        // EAGAIN/部分提交的余段已在 flush_now 内转 backlog 串行化。
+        if let Some(agg) = &shared.send_agg {
+            if let Err(e) = agg.flush_now() {
+                error = Some(format!("kcp agg flush: {e}"));
                 break;
             }
         }
@@ -1661,8 +1952,10 @@ fn spawn_server_session(
     _max_streams: usize,
     ctl: Arc<DemuxCtl>,
 ) {
-    let (io, shared) = new_io();
     let backlog = Arc::new(UdpBacklog::new());
+    // A-3 输出聚合批(仅 Linux;其余平台 None 走逐包路径)
+    let agg = SendAgg::new(&backlog, udp.clone(), Dest::Peer(peer));
+    let (io, shared) = new_io_with(agg.clone());
     // 错误桥:idle 会话也要能及时收到真实输出错误(不等下一次写)
     backlog.attach_session(&shared);
     let output = UdpOutput {
@@ -1718,6 +2011,11 @@ fn spawn_server_session(
 }
 
 fn new_io() -> (KcpIo, Arc<Shared>) {
+    new_io_with(None)
+}
+
+/// A-3:生产路径带输出聚合批构造;测试/非 Linux 传 None。
+fn new_io_with(send_agg: Option<Arc<SendAgg>>) -> (KcpIo, Arc<Shared>) {
     let shared = Arc::new(Shared {
         guarded: Mutex::new(Guarded {
             read_buf: VecDeque::new(),
@@ -1740,6 +2038,7 @@ fn new_io() -> (KcpIo, Arc<Shared>) {
         stats: KcpCountersStatic::new(),
         #[cfg(test)]
         batch_cap_hwm: AtomicU64::new(0),
+        send_agg,
     });
     (
         KcpIo {
@@ -1762,8 +2061,10 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
     let udp = Arc::new(bind_udp(bind_local).await?);
     udp.connect(cfg.server_addr).await?;
     let conv = (CONV_COUNTER.fetch_add(1, Ordering::Relaxed) as u32) ^ rand_u32();
-    let (io, shared) = new_io();
     let backlog = Arc::new(UdpBacklog::new());
+    // A-3 输出聚合批(仅 Linux;connected socket,sendmmsg 走隐式对端)
+    let agg = SendAgg::new(&backlog, udp.clone(), Dest::Connected);
+    let (io, shared) = new_io_with(agg.clone());
     // 错误桥:idle 会话也要能及时收到真实输出错误(不等下一次写)
     backlog.attach_session(&shared);
     let output = UdpOutput {
@@ -1848,8 +2149,10 @@ pub async fn punch_listen(
     };
     let conv = kcp::get_conv(&buf[..n]);
     // 2. 建会话并投喂首包
-    let (io, shared) = new_io();
     let backlog = Arc::new(UdpBacklog::new());
+    // A-3 输出聚合批(仅 Linux;打洞数据会话对端已锁定)
+    let agg = SendAgg::new(&backlog, udp.clone(), Dest::Peer(peer));
+    let (io, shared) = new_io_with(agg.clone());
     // 错误桥:idle 会话也要能及时收到真实输出错误(不等下一次写)
     backlog.attach_session(&shared);
     let output = UdpOutput {
@@ -2448,6 +2751,97 @@ mod kcp_regress {
     }
 
     // ---------- C:写队列按字节上限回压(修复前失败) ----------
+
+    /// A-3(任务书):聚合批 FIFO —— 空闲时逐包入批、flush_now 依序
+    /// 发出、发尽即清。跨平台:Linux 走 sendmmsg,其余走逐包回退
+    /// (语义断言一致)。
+    #[tokio::test]
+    async fn a03_send_agg_fifo_delivery() {
+        let rx_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = rx_sock.local_addr().unwrap();
+        let tx_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let backlog = Arc::new(UdpBacklog::new());
+        // 直接构造(生产经 SendAgg::new,仅 Linux 返回 Some;测试要跨平台)
+        let agg = Arc::new(SendAgg {
+            sock: tx_sock.clone(),
+            dest: Dest::Peer(addr),
+            backlog: Arc::downgrade(&backlog),
+            queue: std::sync::Mutex::new(AggQueue::default()),
+        });
+        // prime tokio 就绪缓存(生产形态:会话任务先经 select await;
+        // 未 prime 时首次 try_* 恒 WouldBlock,首批本就回落 backlog)
+        tx_sock.writable().await.unwrap();
+        // 3 个可区分数据报:入批 → 冲刷 → 接收序一致
+        let mut expect = Vec::new();
+        for i in 0..3u8 {
+            let pkt = vec![i; 64];
+            agg.push(&pkt);
+            expect.push(pkt);
+        }
+        agg.flush_now().unwrap();
+        for want in &expect {
+            let mut b = [0u8; 128];
+            let (n, from) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx_sock.recv_from(&mut b))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(from, tx_sock.local_addr().unwrap());
+            assert_eq!(&b[..n], want.as_slice(), "聚合批发送顺序必须与入批一致");
+        }
+        {
+            let q = agg.queue.lock().unwrap();
+            assert!(q.lens.is_empty(), "全部发出后聚合批必须清空");
+        }
+        assert!(backlog.is_empty(), "空闲冲刷不得残留 backlog");
+
+        // 满载回落实测仅 Linux:loopback UDP 记 sender wmem,收紧 sndbuf
+        // 后必然 EAGAIN;macOS loopback 满载在接收侧静默丢包、不回压
+        // 发送者,无法在本机构造(回落路径的顺序性由下方
+        // a03_send_agg_transfer_keeps_order 确定性钉住)。
+        #[cfg(target_os = "linux")]
+        {
+            let _ = socket2::SockRef::from(&*tx_sock).set_send_buffer_size(2048);
+            let payload = vec![0xABu8; 1400];
+            for _ in 0..4096 {
+                agg.push(&payload);
+                agg.flush_now().ok();
+                if backlog.queued_packets() > 0 {
+                    break;
+                }
+            }
+            assert!(
+                backlog.queued_packets() > 0,
+                "持续满载必须触发 EAGAIN 余段回落 backlog"
+            );
+        }
+    }
+
+    /// A-3:余段转移的 FIFO —— transfer_to_backlog 必须把聚合缓冲内
+    /// 全部数据报按序转入 backlog(部分提交/EAGAIN 回落的顺序性)。
+    #[tokio::test]
+    async fn a03_send_agg_transfer_keeps_order() {
+        let tx_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let backlog = Arc::new(UdpBacklog::new());
+        let agg = Arc::new(SendAgg {
+            sock: tx_sock,
+            dest: Dest::Connected,
+            backlog: Arc::downgrade(&backlog),
+            queue: std::sync::Mutex::new(AggQueue::default()),
+        });
+        let mut q = AggQueue::default();
+        for i in 0..5u8 {
+            q.buf.extend_from_slice(&[i; 32]);
+            q.lens.push(32);
+        }
+        agg.transfer_to_backlog(&mut q);
+        assert!(q.lens.is_empty() && q.buf.is_empty(), "转移后聚合缓冲清空");
+        let state = backlog.state.lock().unwrap();
+        assert_eq!(state.len(), 5, "全部余段转入 backlog");
+        for (i, pkt) in state.iter().enumerate() {
+            assert_eq!(pkt, &vec![i as u8; 32], "backlog 内顺序与入批一致");
+        }
+    }
 
     /// A-2(任务书):大项 + 受限预算(每轮 1 段,模拟慢 ACK 链路)分多轮
     /// 消费,数据逐字节完整、记账同步清零、消费尽才弹条目 —— 钉住
