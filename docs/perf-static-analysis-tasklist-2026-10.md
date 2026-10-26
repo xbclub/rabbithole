@@ -32,35 +32,40 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 验收:三道门绿;行为不变;现有插件测试通过。
 
 ### E-2 [P2] DNS 解析入口每次命中也做键分配 + 配置克隆 —— 来源 clientMisc-2
-- [ ] 状态:
+- [x] 状态:完成 @ a9a4ae8
+> 核查:✅ 问题在(dns_server 快照 String 深拷 + cache_key 2-3 次 String 分配);server() 改返 Option<Arc<str>>(写点仅 set_server 一处),CacheKey 的 ns 改 Arc<str>(克隆零分配),键构造降为仅 host 小写化一次。
 - 位置:`crates/rh-client/src/dnsquery.rs:160-162`(cache_key)、`:14-16`(dns_server 每次 clone)
 - 问题:缓存命中路径仍付 1-3 次 String 分配 + 2 把进程级 std Mutex;每连接拨号/每插件请求一次。量级噪声级,顺手修。
 - 修法:dns_server 快照改 OnceLock/Arc 读取;cache_key 改 Arc<str> 组合使命中路径零分配。
 - 验收:三道门绿。
 
 ### E-3 [P2] xtcp 直连每流按 name 线性扫规则表 —— 来源 clientMisc-3
-- [ ] 状态:
+- [W] 状态:放弃
+> 核查:❌ 风险与收益不成比例:xtcp 为打洞直连低频路径,每流一次 O(N) 字符串比较且临界区内无 await(不拖停其他分支);by_name 副索引需改造 8 处 .proxies 表访问并在 3 个写点(upsert/apply_sync/remove)维持双表一致性——热路径(almost-never-hit 的 name 查询)换一个一致性维护面,不值。
 - 位置:`crates/rh-client/src/nathole_cli.rs:310-315`(find_by_name),调用点 :270-273
 - 问题:serve_direct 每接受一条流在 proxies 锁内 O(N) String 比较;表以 id 为键本可 O(1)。
 - 修法:随 apply_sync/upsert 维护 name → Arc<ProxySpec> 辅助索引。量级小(临界区内无 await),顺手修。
 - 验收:三道门绿;upsert/apply_sync 后索引一致(现有 session 测试覆盖)。
 
 ### E-4 [P2] upsert visitor 分支持锁跨 await —— 来源 clientSession-1
-- [ ] 状态:
+- [x] 状态:完成 @ a9a4ae8
+> 核查:✅ 问题在(:1606 持 visitors 写锁 await stop_visitor,内部再取 visitor_cancels+sudp_deliver 两把锁);比照 proxy 分支改锁内只判定+insert、stop 移到 drop 后;stop_visitor 仍在 spawn 重试之前同步完成,重试前提不变。control_path_stays_responsive_during_upsert 类测试通过。
 - 位置:`crates/rh-client/src/session.rs:1593-1598`
 - 问题:持有 `sess.visitors` 写锁期间 await stop_visitor(内部再取 4 把锁),违反同文件 proxy 分支与 apply_sync 已确立的"锁内只收集、await 全在锁外"纪律(session.rs:1550 注释)。有 `control_path_stays_responsive_during_upsert` 测试佐证该路径关注此问题。
 - 修法:比照同函数 proxy 分支——锁内只做 changed 判定与 insert,stop_visitor 移到 drop(cur) 之后。
 - 验收:三道门绿;上述测试保持通过。
 
 ### E-5 [P2] apply_sync 全量 stop/start 内联在控制读循环 —— 来源 clientSession-2
-- [ ] 状态:
+- [x] 状态:完成 @ a9a4ae8
+> 核查:✅ 问题在(ServiceSync 分支内联逐实体 stop/start,正比规则数);拆 collect_sync_changes(锁内表更新)+run_sync_changes(启停),run_loop 表更新后立即 ACK、启停 spawn(与 upsert visitor 重试同型);apply_sync 保留直调形态收进 cfg(test),apply_sync_lock_tests(n=3000)语义不变全绿。行为变化(提交信息注明):服务端 confirmed_revision 提前,服务端状态推进用自身 rt.bound 不读客户端 bind 结果,语义安全。后续修正 @ 1e9584d:apply_sync cfg(test) 化消 dead_code。
 - 位置:`crates/rh-client/src/session.rs:1319-1321`(ServiceSync 分支)、:1507-1512、:1538-1543
 - 问题:重连全量 ServiceSync 期间,逐实体的 stop/start(含每个 visitor 一次 listener bind)串行占住 run_loop 读分支,写/心跳/cancel 分支整体停摆,时长正比规则数(千级可达百毫秒)。
 - 修法:实体表更新(锁内收集)完成后即发 ACK,把逐实体 stop/start spawn 出去执行——与 upsert visitor 重试的处理(session.rs:1607-1631)一致。
 - 验收:三道门绿;apply_sync_lock_tests(n=3000)通过;ACK 先于实体启动的行为变化需在提交信息说明(服务端 confirmed_revision 提前,语义安全:客户端仍会逐条执行)。
 
 ### E-6 [P2] ProxySpec 每条变更深克隆 3 次 —— 来源 clientSession-3
-- [ ] 状态:
+- [x] 状态:完成 @ a9a4ae8
+> 核查:✅ 问题在(upsert 表内 Arc 外再深克隆;start_health/health::run 又一次);upsert 构造单份 Arc 表+启动共用,start_health 与 health::run 签名改收 Arc<ProxySpec>(spawn 只 bump 引用计数);apply_sync 本就单次克隆(spec.clone() 归一化),维持。health 测试通过。
 - 位置:`crates/rh-client/src/session.rs:1580-1582`(upsert)、:1499-1502(apply_sync 新增)、:1700(start_health)
 - 问题:一份深克隆 ≈15+ 次分配(N5 注释自证),表已存 Arc 却在链路上再深克隆 2 次。
 - 修法:构建一次 `Arc<ProxySpec>`(含 normalize),表存 Arc、start_health 改收 `Arc<ProxySpec>`(health.rs:11 签名同步改),深克隆降为 1 次。
@@ -166,7 +171,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 验收:三道门绿;disabled_produces_no_timestamp 测试(mux.rs:3330)保持通过。
 
 ### B-4 [P2] 每次 splice relay 重读两个环境变量 —— 来源 splice-1
-- [ ] 状态:完成 @ 2416b8a
+- [x] 状态:完成 @ 2416b8a
 > 核查:✅ 问题在(splice_relay 每次调用 pump_mode_from_env + stats_enabled 各取一次进程环境锁+分配);OnceLock 缓存与 notsent_lowat 先例同型;全仓无测试 set_var RH_SPLICE_*(g1_splice_bench 在 main 起点设置先于首建),缓存安全。splice 测试显式注入路径(inner/with_stats)不受影响。
 - 位置:`crates/rh-transport/src/splice.rs:1155-1156`(调用)、:500/:227(实现)
 - 问题:每次建 relay 各取一次进程环境锁 + String 分配;同文件 notsent_lowat() 已用 OnceLock(:41-49)做同类缓存,这两个开关漏了。
