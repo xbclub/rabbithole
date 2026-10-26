@@ -303,96 +303,96 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 验收:三道门绿;可参照 session.rs 的 apply_sync_lock_tests(n=3000)形态加服务端侧批量 ACK 测试。
 
 ### D-4 [P2] server config 端点同步 std::fs 混入 async handler —— 来源 serverApi-2(合并 serverApi-3)
-- [x] 状态:完> 核查:✅ 问题在(get :2342 同步 read_to_string;put 的 authorized_keys 写与 toml 持久化(序列化+copy+write)同步跑在 async handler)。实施:get 改 tokio::fs::read_to_string;ak 写改 tokio::fs::write;persist 整体 spawn_blocking,disk/config_path 均为快照值进出闭包,与 R1 修法同构。新增端到端读写回归测试 d4_server_config_read_write_roundtrip(put 落盘 + ak 文件 + get 读回)。
-成 @ bd9e0f7
+- [x] 状态:完成 @ bd9e0f7
+> 核查:✅ 问题在(get :2342 同步 read_to_string;put 的 authorized_keys 写与 toml 持久化(序列化+copy+write)同步跑在 async handler)。实施:get 改 tokio::fs::read_to_string;ak 写改 tokio::fs::write;persist 整体 spawn_blocking,disk/config_path 均为快照值进出闭包,与 R1 修法同构。新增端到端读写回归测试 d4_server_config_read_write_roundtrip(put 落盘 + ak 文件 + get 读回)。
 - 位置:`crates/rh-server/src/api.rs:2667-2698`(put:持 hot 读锁窗口内 toml 序列化 + std::fs::copy/write)、:2241-2243(get:同步 read_to_string)
 - 问题:R1 注释自证此模式危害并已修掉 authorized_keys 一处,persist 段同款问题保留;get 侧同步读盘无上界。
 - 修法:put 的序列化与文件写移到锁外并用 spawn_blocking(或 tokio::fs);get 改 tokio::fs::read_to_string。与 R1 对 authorized_keys 的修法完全同构,两处一并覆盖。
 - 验收:三道门绿;server config 读写 API 测试通过。
 
 ### D-5 [P2] update_client 禁用分支 visitor 全量取回只用 vid —— 来源 serverApi-4
-- [x] 状态:完> 核查:✅ 问题在(禁用分支全列取回 visitors 仅用 vid)。db 新增 list_visitor_ids 单列投影,禁用路径不再取回整行。行为不变。
-成 @ 62470a5
+- [x] 状态:完成 @ 62470a5
+> 核查:✅ 问题在(禁用分支全列取回 visitors 仅用 vid)。db 新增 list_visitor_ids 单列投影,禁用路径不再取回整行。行为不变。
 - 位置:`crates/rh-server/src/api.rs:659`;`crates/rh-server/src/db.rs:777-780`
 - 问题:R4 投影优化漏了 visitor 侧(同函数 proxies 行已有"一列投影"注释)。低频管理路径,顺手修。
 - 修法:db.rs 增加 `list_visitor_ids(client_id)` 一列投影(SELECT id),与既有 list_proxy_ids(db.rs:496)对称。
 - 验收:三道门绿;client 禁用流程测试通过。
 
 ### D-6 [P2] require_auth 每请求 Value 树 + 重建 DecodingKey/Validation —— 来源 serverApi-5
-- [x] 状态:完> 核查:✅ 问题在(decode::<serde_json::Value> 动态取 sub/pv,jsonwebtoken 对 Value 目标内部还二次反序列化;每请求 from_secret 深拷贝 + Validation::new 分配)。mint_jwt 写入的全部业务字段即 sub/pv,AuthClaims{sub, pv(default 0)} 与修前 unwrap_or(0) 语义一致;jwt_engine 以 secret 的 Arc 指针为键缓存(Weak,secret 重建即失效,写点仅 change_password)。四态测试 d6_require_auth_typed_claims_four_paths:成功/过期/pv 不符/缺 pv。
-成 @ bd9e0f7
+- [x] 状态:完成 @ bd9e0f7
+> 核查:✅ 问题在(decode::<serde_json::Value> 动态取 sub/pv,jsonwebtoken 对 Value 目标内部还二次反序列化;每请求 from_secret 深拷贝 + Validation::new 分配)。mint_jwt 写入的全部业务字段即 sub/pv,AuthClaims{sub, pv(default 0)} 与修前 unwrap_or(0) 语义一致;jwt_engine 以 secret 的 Arc 指针为键缓存(Weak,secret 重建即失效,写点仅 change_password)。四态测试 d6_require_auth_typed_claims_four_paths:成功/过期/pv 不符/缺 pv。
 - 位置:`crates/rh-server/src/api.rs:320-342`
 - 问题:32 处调用点每请求付:claims → Value 树动态取值、from_secret 拷贝 secret、Validation::new 的 Vec/HashSet 分配;jsonwebtoken 内部 claims 实际还反序列化两次。
 - 修法:定义 `#[derive(Deserialize)] struct Claims { sub: String, pv: i64 }` 强类型解码(顺带消掉内部双解析);DecodingKey/Validation 以 web_jwt_secret 的 Arc 指针为键缓存(写入点仅 api.rs:250 change_password 一处)。
 - 验收:三道门绿;认证成功/过期/密码版本不符的 API 测试通过。
 
 ### D-7 [P2] enable_service 同一请求两次 get_client —— 来源 serverApi-6
-- [x] 状态:完> 核查:✅ 问题在(enable_service 先 get_client 校验、启用时再查一次)。改单查复用;行缺失走与修前一致的降级(deferred/rev=0),不 panic —— 首版 panic! 方案在自审时否决。
-成 @ 62470a5
+- [x] 状态:完成 @ 62470a5
+> 核查:✅ 问题在(enable_service 先 get_client 校验、启用时再查一次)。改单查复用;行缺失走与修前一致的降级(deferred/rev=0),不 panic —— 首版 panic! 方案在自审时否决。
 - 位置:`crates/rh-server/src/api.rs:1351-1370`
 - 问题:第一次只留 enabled 整行丢弃,禁用分支再查一次取 config_revision;主键点查微秒级,顺手修。
 - 修法:第一次保留整行,禁用分支复用(handler 已持 serial_lock,无一致性障碍,对照 enable_service_locked 的 R1 约定)。
 - 验收:三道门绿;enable 流程测试通过。
 
 ### D-8 [P2] 自定义 404 页读失败不缓存,每 404 同步读盘 —— 来源 serverCtl-1
-- [x] 状态:完> 核查:✅ 问题在(not_found 每请求同步 read_to_string)。not_found_response 改 async,成功读入后缓存 Bytes(OnceLock),读用 tokio::fs;**遵守红线:读失败不缓存**(非永久负缓存),下次 404 重试;无自定义页时回落内置 404 不变。
-成 @ 9b6c3ca
+- [x] 状态:完成 @ 9b6c3ca
+> 核查:✅ 问题在(not_found 每请求同步 read_to_string)。not_found_response 改 async,成功读入后缓存 Bytes(OnceLock),读用 tokio::fs;**遵守红线:读失败不缓存**(非永久负缓存),下次 404 重试;无自定义页时回落内置 404 不变。
 - 位置:`crates/rh-server/src/vhost.rs:698`;调用点 :384/:428
 - 问题:配置了 404 页但文件缺失时,每个 404(扫描器洪峰主力)都在 tokio worker 上同步 std::fs::read,永不收敛(注释 705-706 表明"补文件后生效"是有意取舍)。
 - 修法:保守改法 `tokio::fs::read`(保留补文件语义);**不要用永久负缓存**(会废掉补文件生效行为);顺带 :695 `m.get(path).cloned()` 改 Bytes 免整页 memcpy。
 - 验收:三道门绿;vhost 404 路径测试通过。
 
 ### D-9 [P2] Basic 认证每请求 3 次可免分配 + 手写 base64 线性查表 —— 来源 serverCtl-2
-- [x] 状态:完> 核查:✅ 问题在(每请求 format! 拼 "user:pass" + 手写 base64 线性查表解码)。basic auth 改借用直传免 String;base64_decode 双引擎 STANDARD/STANDARD_NO_PAD 依次试(**padding 兼容红线**:与 DecodePaddingMode::Indifferent 等价,带/不带 padding 均收),解码后滤 \r\n。三态测试(含 padding/无 padding/错密),测试明文取 13 字节保证标准编码必带 padding。
-成 @ 9b6c3ca
+- [x] 状态:完成 @ 9b6c3ca
+> 核查:✅ 问题在(每请求 format! 拼 "user:pass" + 手写 base64 线性查表解码)。basic auth 改借用直传免 String;base64_decode 双引擎 STANDARD/STANDARD_NO_PAD 依次试(**padding 兼容红线**:与 DecodePaddingMode::Indifferent 等价,带/不带 padding 均收),解码后滤 \r\n。三态测试(含 padding/无 padding/错密),测试明文取 13 字节保证标准编码必带 padding。
 - 位置:`crates/rh-server/src/vhost.rs:392`(to_string)、:641-648/:1276-1290(check_basic_auth/base64_decode);第二个调用点 :1142-1150
 - 问题:每字符对 64 字节表线性扫描 + 2 个 Vec 分配;base64 crate 已是依赖(control.rs 在用),手写实现纯属重复。
 - 修法::392 改传 Option<&str>;base64_decode 换 base64 crate engine,**必须配 `DecodePaddingMode::Indifferent`** 保持现有容忍缺 padding/内嵌换行的行为(复核确认直接替换属行为收紧)。
 - 验收:三道门绿;认证测试补"缺 padding/带换行"用例后再替换。
 
 ### D-10 [P2] SQLite 只设 WAL 未设 synchronous(默认 FULL,每提交一次 fsync) —— 来源 serverData-2
-- [x] 状态:完> 核查:✅ 现状只设 journal_mode=WAL。补 .synchronous(SqliteSynchronous::Normal) —— WAL 模式下官方推荐组合,每提交一次 fsync 降为 checkpoint 级,掉电最多丢最近事务不损坏库。行为对上层透明。
-成 @ 9b6c3ca
+- [x] 状态:完成 @ 9b6c3ca
+> 核查:✅ 现状只设 journal_mode=WAL。补 .synchronous(SqliteSynchronous::Normal) —— WAL 模式下官方推荐组合,每提交一次 fsync 降为 checkpoint 级,掉电最多丢最近事务不损坏库。行为对上层透明。
 - 位置:`crates/rh-server/src/db.rs:29-43`
 - 问题:sqlx 0.9 不显式下发 synchronous pragma,SQLite 默认 FULL;客户端每次连接的 update_client_meta 单条 UPDATE = 一次隐式提交 = 一次 fsync。
 - 修法:`.synchronous(SqliteSynchronous::Normal)`(SQLite 官方 WAL 推荐组合:掉电至多回滚最近几笔提交、无损坏风险);若刻意保留 FULL,补注释说明并记录。
 - 验收:三道门绿;db 测试通过;提交信息写清持久性取舍依据。
 
 ### D-11 [P2] allocate_port 在 async fn 内阻塞探测最多 1.5 万端口 —— 来源 serverData-3
-- [x] 状态:完> 核查:✅ 问题在(allocate_port 用 std::net::TcpListener 阻塞探测,async fn 内最多上万次)。改 tokio::net::TcpListener 异步 bind,探测语义(逐端口试探到空闲)不变。
-成 @ 9b6c3ca
+- [x] 状态:完成 @ 9b6c3ca
+> 核查:✅ 问题在(allocate_port 用 std::net::TcpListener 阻塞探测,async fn 内最多上万次)。改 tokio::net::TcpListener 异步 bind,探测语义(逐端口试探到空闲)不变。
 - 位置:`crates/rh-server/src/state.rs:1425-1443`(探测在 :1434-1438)
 - 问题:循环体内无 await 点,std bind 逐个探测,端口占用率高时阻塞 worker 数十 ms(实测参照:15001 次 ≈ 97ms)。三个调用点均为低频管理路径。
 - 修法:探测改 tokio::net 异步 bind,或整个循环移入 spawn_blocking。
 - 验收:三道门绿;port_auto 分配测试通过。
 
 ### D-12 [P2] 每新 UDP 源读全局 limits RwLock —— 来源 serverData-4
-- [x] 状态:完> 核查:✅ 问题在(每新 UDP 源 udp_session_admit 读全局 limits RwLock)。state 增加 udp_sessions_limit: Arc<AtomicUsize>(初始化与热改 store 同步),admit 读原子。顺带修正:mux_streams 原子自引入后从未 store(热改对新会话一直不生效),put_server_config 补 store —— 属既有缺陷顺带修,已在提交信息注明。
-成 @ 62470a5
+- [x] 状态:完成 @ 62470a5
+> 核查:✅ 问题在(每新 UDP 源 udp_session_admit 读全局 limits RwLock)。state 增加 udp_sessions_limit: Arc<AtomicUsize>(初始化与热改 store 同步),admit 读原子。顺带修正:mux_streams 原子自引入后从未 store(热改对新会话一直不生效),put_server_config 补 store —— 属既有缺陷顺带修,已在提交信息注明。
 - 位置:`crates/rh-server/src/data.rs:1619-1623`
 - 问题:仅新源首包触发(contains_key 快路径在先),读多写少竞争弱;复核反证:同路径每包必付的是 sessions Mutex insert,此项收益进一步缩小,顺手修。
 - 修法:仿 mux_streams 原子缓存(state.rs:81 先例):max_udp_sessions_per_proxy 存 AtomicI64,热改保存点(api.rs mux_streams.store 同位置)同步 store;0=不限语义在 data.rs:1624 判断,保持不变。
 - 验收:三道门绿;UDP 限额测试通过。
 
 ### D-13 [P2] 管理 API 的 TLS 握手串行在 accept 循环且无超时 —— 来源 serverMisc-2
-- [x] 状态:完> 核查:✅ 问题在(TLS accept 无超时,慢速/恶意握手可长期占住 accept 循环)。握手包 tokio::time::timeout 10s,超时按连接错误处理断开。正常握手不受影响(10s 远超正常 RTT+CPU)。
-成 @ 9b6c3ca
+- [x] 状态:完成 @ 9b6c3ca
+> 核查:✅ 问题在(TLS accept 无超时,慢速/恶意握手可长期占住 accept 循环)。握手包 tokio::time::timeout 10s,超时按连接错误处理断开。正常握手不受影响(10s 远超正常 RTT+CPU)。
 - 位置:`crates/rh-server/src/main.rs:556-571`
 - 问题:axum::serve 等 accept() 返回才 spawn 连接任务,握手既不并发也无时限;一个不发 ClientHello 的连接可让管理面 accept 无限期停摆(Slowloris 式,亦是可用性/韧性修复)。仅 tls_cert/tls_key 配置时生效。
 - 修法:accept 只返回裸 TCP 流,把 `TlsAcceptor::accept` 移进每连接任务并包 `tokio::time::timeout`(如 10s);最低限度先给现有握手包 timeout 防永久停摆。
 - 验收:三道门绿;TLS 启动的管理面手工/集成验证握手正常、超时连接不拖垮 accept。
 
 ### D-14 [P2] SSH 网关 accept 出错裸 continue(忙转 + 零日志) —— 来源 serverMisc-3
-- [x] 状态:完> 核查:✅ 问题在(accept Err 裸 continue:EMFILE/ENFILE 时忙转 + 零日志)。错误分级:致命错误照旧退出;可继续错误 warn! 一条日志 + 50ms 退避再 continue,消除忙转烧 CPU。
-成 @ 9b6c3ca
+- [x] 状态:完成 @ 9b6c3ca
+> 核查:✅ 问题在(accept Err 裸 continue:EMFILE/ENFILE 时忙转 + 零日志)。错误分级:致命错误照旧退出;可继续错误 warn! 一条日志 + 50ms 退避再 continue,消除忙转烧 CPU。
 - 位置:`crates/rh-server/src/sshgateway.rs:98-99`
 - 问题:EMFILE/ENFILE 等持续错误下循环紧空转打满一核且无任何日志;仓内 vhost.rs:22/:771、control.rs:220-223、main.rs:566-567 均有退避,唯独此处裸 continue。
 - 修法:错误分支加 50-100ms 退避 + 一条 warn,对齐既有做法。
 - 验收:三道门绿;sshgateway 测试通过。
 
 ### D-15 [P2] 内嵌控制台静态资源无任何缓存头 —— 来源 serverMisc-4
-- [x] 状态:完> 核查:✅ 问题在(响应无缓存头,浏览器每次回源拉全部静态资源)。带 hash 的 assets/ 加 public, max-age=31536000, immutable;index.html 加 no-cache(SPA 入口须每次校验,防发新版后旧入口钉住旧 hash 资源)。
-成 @ 9b6c3ca
+- [x] 状态:完成 @ 9b6c3ca
+> 核查:✅ 问题在(响应无缓存头,浏览器每次回源拉全部静态资源)。带 hash 的 assets/ 加 public, max-age=31536000, immutable;index.html 加 no-cache(SPA 入口须每次校验,防发新版后旧入口钉住旧 hash 资源)。
 - 位置:`crates/rh-server/src/embedded_ui.rs:66-73`
 - 问题:每响应仅 content-type,无 ETag/Cache-Control;浏览器每次打开控制台全量重下(~1.5MB,经隧道访问尤其浪费)。Vite 产物已自带内容 hash 文件名,缺的只是服务端缓存头;static_dir 分支(ServeDir)有 Last-Modified,两路径行为不一致。
 - 修法:hash 过的 `/assets/*` 下发 `Cache-Control: public, max-age=31536000, immutable`;index.html 下发 `no-cache`(保证发版即生效);保守做法统一 ETag/no-cache 走 304。
@@ -403,8 +403,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 ## 包 F:console 前端
 
 ### F-1 [P2] columns 的 useMemo 永不命中(死代码) —— 来源 console-1
-- [x] 状态:完> 核查:✅ 问题在(依赖数组含 useMutation 返回对象 ×3,react-query 5 每次渲染新引用 + 内联 onCreateVisitor,memo 必不命中;下游 data-table.tsx:195 传 useReactTable 前展开数组重建引用,无下游收益)。删 useMemo 改 IIFE 内联构建,与姊妹页一致;`npm run build`(含 tsc --noEmit)通过。
-成 @ cbf5df6
+- [x] 状态:完成 @ cbf5df6
+> 核查:✅ 问题在(依赖数组含 useMutation 返回对象 ×3,react-query 5 每次渲染新引用 + 内联 onCreateVisitor,memo 必不命中;下游 data-table.tsx:195 传 useReactTable 前展开数组重建引用,无下游收益)。删 useMemo 改 IIFE 内联构建,与姊妹页一致;`npm run build`(含 tsc --noEmit)通过。
 - 位置:`console/src/components/proxy-list-page.tsx:395-403`
 - 问题:依赖含 useMutation 返回对象 ×3(每次渲染 spread 新对象,react-query 5.104.2 实现证实)+ 内联 onCreateVisitor,memo 必不命中;且下游 data-table.tsx:195 传给 useReactTable 的是展开数组,这层 memo 修好也无下游收益——纯死代码。姊妹页(clients/visitors-panel/certs)均为普通内联定义。
 - 修法:直接删掉这层无效 useMemo,与同组列表页保持一致(最省事);或解构 isPending 等基本值修依赖。
