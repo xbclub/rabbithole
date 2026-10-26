@@ -797,7 +797,12 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
     let mut prefetched: Vec<Bytes> = Vec::new();
 
     loop {
-        let t_read = std::time::Instant::now();
+        // B-3:诊断关闭时零取时(模块红线;与 pump_down 的 __t0/__w0 同型)
+        let __t0 = if diag {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // 组装本轮批:首块(pending 或新读)+ 所有已就绪块,直到上限。
         batch.clear();
         let mut batch_bytes = 0usize;
@@ -853,8 +858,8 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
                 }
             }
         }
-        if diag {
-            let el = t_read.elapsed().as_nanos() as u64;
+        if let Some(t) = __t0 {
+            let el = t.elapsed().as_nanos() as u64;
             read_ns += el;
             if el > 1_000_000 {
                 slow_reads += 1;
@@ -868,7 +873,11 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
         }
 
         // 写这批;未达上限时并发读下一块(读结果进 pending,不阻塞写)。
-        let t_write = std::time::Instant::now();
+        let __w0 = if diag {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let write_all = async {
             for c in batch.drain(..) {
                 if b_write.write_chunk(c).await.is_err() {
@@ -928,8 +937,8 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
         // append 保留 prefetched 缓冲容量(B10),避免下轮重新分配。
         pending.append(&mut prefetched);
 
-        if diag {
-            let el = t_write.elapsed().as_nanos() as u64;
+        if let Some(t) = __w0 {
+            let el = t.elapsed().as_nanos() as u64;
             write_ns += el;
             if el > 1_000_000 {
                 slow_writes += 1;

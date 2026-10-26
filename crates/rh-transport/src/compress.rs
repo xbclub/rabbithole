@@ -25,6 +25,8 @@
 use crate::BoxedIo;
 use bytes::{BufMut, BytesMut};
 use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_UNCOMPRESSED_CHUNK: usize = 64 * 1024;
@@ -42,13 +44,15 @@ fn max_frame_len() -> usize {
 /// 把 `inner` 包一层端到端 snappy 压缩,返回面向调用方的普通字节流。
 /// 丢弃返回值时 pump 任务随之结束并释放 inner。
 pub async fn compress_stream(inner: BoxedIo) -> BoxedIo {
-    let (user_side, pump_side) = tokio::io::duplex(64 * 1024);
-    // DuplexStream 无 into_split,保持现状。
-    let (pump_r, pump_w) = tokio::io::split(pump_side);
-    // B4:底层是裸 TcpStream(multiplex=false 的 tcp 载体)时优先无锁
-    // 拆半(into_split 两个独立 fd);修前无条件 `tokio::io::split`,
-    // 压缩写泵与解压读泵共享一把 std::sync::Mutex,与 A2 同机理
-    //(round-69 实测 futex 占 75% syscall 时间)。包装类型照旧回落。
+    // B-2:两条独立单向 duplex(各 64KiB/方向,总量与单 duplex 相同)。
+    // 修前一条 duplex + `tokio::io::split` 让两个 pump 任务共享一把
+    // std::sync::Mutex(DuplexStream 无 into_split);四半端各自独立,
+    // 天然无锁。用户侧两个半端由 [`JoinDuplex`] 拼成单一字节流对象。
+    let (user_w, pump_r) = tokio::io::duplex(64 * 1024); // 上行:用户 → 压泵
+    let (pump_w, user_r) = tokio::io::duplex(64 * 1024); // 下行:解泵 → 用户
+                                                         // B4:底层是裸 TcpStream(multiplex=false 的 tcp 载体)时优先无锁
+                                                         // 拆半(into_split 两个独立 fd);包装类型回落 `tokio::io::split`
+                                                         //(与 A2 同机理,round-69 实测 futex 占 75% syscall 时间)。
     let (inner_r, inner_w): (
         Box<dyn tokio::io::AsyncRead + Send + Unpin>,
         Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
@@ -61,7 +65,45 @@ pub async fn compress_stream(inner: BoxedIo) -> BoxedIo {
     };
     tokio::spawn(compress_pump(pump_r, inner_w));
     tokio::spawn(decompress_pump(inner_r, pump_w));
-    Box::new(user_side)
+    Box::new(JoinDuplex {
+        r: user_r,
+        w: user_w,
+    })
+}
+
+/// B-2:两条单向 duplex 的用户侧半端拼合(读走 `r`,写走 `w`)。
+/// DuplexStream 自身就是"读写两半 + 内部双通道"的拼合体,这里同型:
+/// poll_read 委托 r,poll_write/flush/shutdown 委托 w;drop 时两半
+/// 各自关闭对应方向,pump 侧按 EOF/写失败收敛(与修前语义一致)。
+struct JoinDuplex {
+    r: tokio::io::DuplexStream,
+    w: tokio::io::DuplexStream,
+}
+
+impl tokio::io::AsyncRead for JoinDuplex {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.r).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for JoinDuplex {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.w).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.w).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.w).poll_shutdown(cx)
+    }
 }
 
 fn varint_len(mut v: usize) -> usize {

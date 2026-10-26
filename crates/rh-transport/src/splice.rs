@@ -223,8 +223,11 @@ fn stats_enabled_value(v: Option<&str>) -> bool {
 
 /// `RH_SPLICE_STATS`:生产入口初始化读一次决定是否装配统计,热循环
 /// 不再读 env。开启时泵退出(含 panic unwind)输出 v2 单行 JSON。
+/// B-4:开关本身也经 OnceLock 缓存(修前每次建 relay 读一次进程
+/// 环境锁 + String 分配)。
 fn stats_enabled() -> bool {
-    stats_enabled_value(std::env::var("RH_SPLICE_STATS").ok().as_deref())
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| stats_enabled_value(std::env::var("RH_SPLICE_STATS").ok().as_deref()))
 }
 
 /// 等待时长时钟(单调纳秒差值;可注入,测试用受控时钟)。
@@ -497,10 +500,14 @@ pub(crate) enum PumpMode {
 }
 
 fn pump_mode_from_env() -> PumpMode {
-    match std::env::var("RH_SPLICE_PUMP").as_deref() {
+    // B-4:进程级缓存(OnceLock,同 notsent_lowat 先例)——修前每次建
+    // relay 各取一次进程环境锁 + String 分配。全仓无测试改写该变量,
+    // 缓存不破坏测试策略(g1_splice_bench 在 main 起点设置,先于首建)。
+    static V: std::sync::OnceLock<PumpMode> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("RH_SPLICE_PUMP").as_deref() {
         Ok("legacy") => PumpMode::Legacy,
         _ => PumpMode::Batched,
-    }
+    })
 }
 
 /// 限速:预留式取消安全接口(goal-repair A5;适配 TokenBucket 等)。

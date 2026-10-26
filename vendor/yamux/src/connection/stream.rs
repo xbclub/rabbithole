@@ -795,7 +795,7 @@ impl StreamWriteHalf {
             .sender
             .poll_ready(cx)
             .map_err(|_| self.write_zero_err())?);
-        let (body, mut ack) = {
+        let (body, ack) = {
             let mut shared = self.shared();
             if !shared.state().can_write() {
                 return Poll::Ready(Err(self.write_zero_err()));

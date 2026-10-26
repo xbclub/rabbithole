@@ -212,6 +212,12 @@ struct WsIo {
     // 若此时向上层报 Pending,上层重试同一缓冲时不得再次 start_send,
     // 否则消息重复入队 → 对端字节流错位 → 协议错误断连。
     send_queued: bool,
+    // B-6:写路径复用 scratch。消息载荷经 `split().freeze()` 以共享视图
+    // 移交 tungstenite(send_queued 保证至多一条在途),scratch 前移追加;
+    // 余量不足时 reserve 触发 bytes 1.12 的前缀回收(在途消息已 flush 即
+    // 唯一持有),稳态不随写次数线性分配(修前每 ≤64KiB 块/每批一次
+    // with_capacity + 整载荷拷贝)。
+    scratch: bytes::BytesMut,
 }
 }
 
@@ -223,6 +229,7 @@ impl WsIo {
             rd_pos: 0,
             eof: false,
             send_queued: false,
+            scratch: bytes::BytesMut::new(),
         }
     }
 }
@@ -280,7 +287,9 @@ impl AsyncWrite for WsIo {
     ) -> Poll<io::Result<usize>> {
         let mut this = self.project();
         if !*this.send_queued {
-            let msg = Message::Binary(buf.to_vec().into());
+            this.scratch.clear();
+            this.scratch.extend_from_slice(buf);
+            let msg = Message::Binary(this.scratch.split().freeze());
             match futures::ready!(this.ws.as_mut().poll_ready(cx)) {
                 Ok(()) => match this.ws.as_mut().start_send(msg) {
                     // start_send 返回 Ok 即消息已被 tungstenite 接受并入队
@@ -313,11 +322,11 @@ impl AsyncWrite for WsIo {
         let mut this = self.project();
         let total: usize = bufs.iter().map(|b| b.len()).sum();
         if !*this.send_queued {
-            let mut payload = bytes::BytesMut::with_capacity(total);
+            this.scratch.clear();
             for b in bufs {
-                payload.extend_from_slice(b);
+                this.scratch.extend_from_slice(b);
             }
-            let msg = Message::Binary(payload.freeze());
+            let msg = Message::Binary(this.scratch.split().freeze());
             match futures::ready!(this.ws.as_mut().poll_ready(cx)) {
                 Ok(()) => match this.ws.as_mut().start_send(msg) {
                     // start_send 返回 Ok 即消息已被 tungstenite 接受并入队,
