@@ -206,49 +206,59 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 验收:三道门绿;yamux 测试通过;建议加"满载下可让出"的压力单测。
 
 ### C-3 [P2] error 互斥锁被当热标志高频检查 —— 来源 yamuxCore-3
-- [ ] 状态:
+- [x] 状态:完成 @ a676d61
+> 核查:✅ 问题在(10 处 error.lock().is_some(),全在每轮 poll 路径);修法可行且收紧更强:workers_shutdown 由 set_error 同步置位且永不清除(connection.rs:1378),false ⟹ 错误槽必空,封 ConnShared::error_hot()(flag 假免锁直接 false,true 才取锁确认),返回值与 is_some() 完全一致,10 处统一替换。
 - 位置:`vendor/yamux/src/connection/halves/shard.rs:876-877/974/1194-1196/1312-1316`、`vendor/yamux/src/connection.rs:1966/1990/2019/2455`
 - 问题:2+2N 个任务每轮 poll 对 error 槽 lock-is_some;set_error 本就同步置位粘性 workers_shutdown(:1378),语义等价"曾置位"。
 - 修法:所有 `error.lock().is_some()` 前加 `workers_shutdown.load(Relaxed)` 快路径门(为假跳过取锁);仅取错误值时才真正锁。
 - 验收:三道门绿;yamux 测试通过(错误传播路径不变)。
 
 ### C-4 [P2] 每帧路由路径未门控的 sched_diag 自增 —— 来源 yamuxRest-3
-- [ ] 状态:
+- [x] 状态:完成 @ a676d61
+> 核查:✅ 问题在(五处递增全对上:FRAMES_IN_POLL/on_read_lock_miss/on_wu_credit/on_spare_empty/on_wu_path);统一包进 if sched_diag::enabled()(on_spare_empty 虽在理论不可达分支,一并门控保持约定)。yamux 全量测试绿。
 - 位置:`vendor/yamux/src/connection.rs:1977-1979`(FRAMES_IN_POLL);同型:flow_control.rs:88(on_wu_credit)、connection.rs:1201(on_read_lock_miss)、frame/io.rs:597(on_spare_empty)、stream.rs:735(on_wu_path)
 - 问题:所有连接的接收任务每帧对同一 static cacheline 做原子 RMW,违反 sched_diag"关闭时零开销"的模块约定;读取方全部已有 enabled() 门控,门控递增后语义不变。
 - 修法:五处统一包进 `if crate::sched_diag::enabled()`。
 - 验收:三道门绿;诊断开启时统计仍工作(sched_diag 相关测试)。
 
 ### C-5 [P2] 发送热路径每帧过一次 rtt.next_ping(锁 + vDSO) —— 来源 yamuxRest-4(合并 yamuxCore-4)
-- [ ] 状态:
+- [x] 状态:完成 @ a676d61
+> 核查:✅ 问题在(FlushTask next_frame 每帧 next_ping = 锁 + vDSO);判定抬到 fill_batch 每批一次(rtt.ping_due() 预检),到期才进 next_ping pop;批截断下一批重检 ping 不丢,帧优先级逐位保持。legacy 单任务路径(connection.rs:529)不动——分片默认开启时非热路径。yamux ping/pong 与空闲保活测试通过。
 - 位置:`vendor/yamux/src/connection.rs:2516`(调用)、`vendor/yamux/src/connection/rtt.rs:47-56`(实现)
 - 问题:ping 10s 一次,数据面每帧却付一次 parking_lot Mutex + Instant::now;pop_to_send 在前、next_ping 第二(to_send 常态为空故每帧必经)。
 - 修法:判定抬到"每 poll 一次"(fill_batch 前查一次即可,rtt 状态不可能在取帧中途变到点);或把到期时刻缓存为原子量先无锁比较。保持既有 deliberate 语义:空闲连接无 poll 就不发 ping。
 - 验收:三道门绿;yamux ping/pong 与空闲保活测试通过。
 
 ### C-6 [P2] StreamWriteHalf 每帧对同一把流锁取放 2-3 次 —— 来源 yamuxShard-2
-- [ ] 状态:
+- [x] 状态:完成 @ a676d61
+> 核查:✅ 问题在(三段临界区可合并,复核无顺序障碍成立);ack_pending 读清 + ACK 状态迁移并入第一临界区,header 修改留锁外;ACK 判定 = ack_pending ∪ flag==Ack,与原"header 含 ACK"逐位等价(Flag::Syn 叠加 pending 时仍得 SYN|ACK)。Stream(非 halves)版 :391 不在任务书范围未动。
 - 位置:`vendor/yamux/src/connection/stream.rs:796-833`
 - 问题:poll_write_chunk 三段临界区(写窗口/ack_pending/update_state)可合并;转发热路径每帧执行,常见路径多付 1 次无争用取锁。复核确认合并无顺序障碍(全部状态在同一把 Shared 锁内,唯一锁外状态 self.flag 由 &mut self 独占)。
 - 修法:第一个临界区内一并读清 ack_pending、判定最终 ACK 形态并完成 update_state;header 的 flag 修改(frame.header_mut().ack())留锁外。单帧收敛为 1 次取锁。
 - 验收:三道门绿;yamux 流控/ACK 测试通过。
 
 ### C-7 [P2] to_send 是全连接唯一无界队列 —— 来源 yamuxRest-5
-- [ ] 状态:
+- [W] 状态:放弃
+> 核查:❌ 收益与风险不成比例(任务书自带该判定选项)。复核确认间接反压链成立:WU 堆积→对端窗口耗尽→写侧停发→读侧断粮,稳态上限 ≈ 3 帧 × 活流数(~100KB),非实际无界。有界化要求 WU 快车道回落有界通路,该路径必须"先 poll_ready 再记账"——stream.rs:558 注释明言与单锁热路径不相容(正是当年为消掉它才直压 to_send),重新引入等于撤销既有热路径优化,换一个已被间接钉住的内存上限。不做。
 - 位置:`vendor/yamux/src/connection.rs:1303`
 - 问题:WU 快车道/RST/FIN/Pong 只进不出,载体写侧长停滞时累积。复核补充:存在间接反压(WU 堆积→对端窗口耗尽→写侧停发→读侧断粮),稳态上限 ≈ 3 帧 × 活流数,实际量级 ~100KB。
 - 修法:给 to_send 设条数上限(如 STREAM_COMMAND_CAP 量级),越限时 WU 快车道回落流级 mpsc 有界通路。**注意成本:回落路径必须"先 poll_ready 再记账"(stream.rs:558 注释明言该模式与单锁热路径不相容);鉴于间接反压已钉住上限,本条收益有限,可选——若不做,在提交/文档记录该判定依据。**
 - 验收:三道门绿;停滞场景模拟测试(可参照既有测试基建)。
 
 ### C-8 [P2] 小缓冲 miss 一律按 64KiB 类分配 —— 来源 yamuxCore-5
-- [ ] 状态:
+- [x] 状态:完成 @ a676d61
+> 核查:✅ 问题在(miss 尾部 min.max(CLASS) + 小请求可弹 64KiB 池条目;实际小请求来自 stream.rs:1064 get(k),k=窗口余量);采用任务书第二方案:min < MIN_RECYCLE(16KiB)精确分配不经池——小缓冲本就被 put 拒收,取还闭环一致,顺带解决 mux.rs C4 注释抱怨的 get(12KiB) 弹 64KiB 条目。新增 pool_small_request_exact_alloc 钉住容量精确与池存量不动用。
 - 位置:`vendor/yamux/src/pool.rs:177`、收进条件 :213
 - 问题:控制面小帧每帧背 64KiB 缓冲,内存放大 10-20 倍;池 256 条上限被 64KiB 条目占满(≤18MiB 常驻)。复核确认主要作用在低速率控制帧,绝对驻留 ~128KiB,无 CPU 开销,顺手修。
 - 修法:按容量分档(16/32/64KiB 三档,各档独立计数上界),get 分配最小满足档;或对小 k 直接精确分配不复用(参照 take_body ≤4KiB 路径)。
 - 验收:三道门绿;池相关测试(上界断言)通过。
 
 ### C-9 [P3·存疑] Framer 每帧固定开销(take_error 锁 + workers_gone 遍历) —— 来源 yamuxCore-2
-- [ ] 状态:
+- [ ] 状态:不修,量化建议如下(留人决策)
+> 复核结论维持(单帧 ~50-100ns,低于原发现主张)。量化建议:
+> ① peer.sh mux 档(PEER_REPEAT≥5、每档 15s)修前/修后各一轮,看吞吐保留率与两端 cpu.jsonl 差值——CPU 差 <1% 且保留率不变则按 AGENTS.md 写入 docs/not-supported.md 结案;
+> ② 更细归因:Linux 上 perf record -g 跑 mux 档 30s,火焰图找 connection.rs:1916 附近(fatal 快检 + workers_gone 遍历)self 采样占比,>0.5% 才值得做 workers_gone 快照化;
+> ③ C-3 已把 error 热检全部换 error_hot() 原子门,若残余占比主要在 workers_gone 遍历,单独优化它即可,不必动错误槽。
 - 位置:`vendor/yamux/src/connection.rs:1916`
 - 复核结论:机制存在,但空 poll 为无锁原子操作,实测推算单帧 ~50-100ns,低于原发现主张;不值得盲改。
 - 处置:**不直接修**。若要处理,先量化(mux 档基准 + `perf`/火焰图看该函数占比);确认占比显著再做"错误快路径原子门 + workers_gone 快照化";确认不显著则按 AGENTS.md 写入 `docs/not-supported.md` 并附复核数据。
