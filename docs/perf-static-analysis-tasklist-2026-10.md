@@ -150,35 +150,40 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 备注:peer.sh mux 档看 CPU 与吞吐保留率。
 
 ### B-2 [P2] tokio::io::split 共享锁残留回落两处 —— 来源 mux-2(合并 transports-1)
-- [ ] 状态:
+- [x] 状态:compress 侧完成 / mux_relay 回落侧放弃 @ 2416b8a
+> 核查:▶ 两半分治。compress 侧修法可行且干净:单 duplex+split 改两条独立单向 duplex(各 64KiB/方向,总量不变),新增 JoinDuplex 拼合用户侧两半端(读/写各委托,pump 收敛语义不变);压缩开/关转发测试(rh-client 149 项含 compressed_*)全绿。mux_relay Err 回落侧 ❌ 放弃:建议的"对包装类型剥壳/downcast 拆半"跨 crate 不可行——CountedUserIo/QuotaIo 定义在 rh-server/rh-client,rh-transport 无从命名;服务端热路径 A2 已先剥壳走 mux_relay_split(mux.rs:634 注释),残余 Err 调用仅客户端插件目标回落(锁内本机 TLS/socket IO,任务书复核自证影响弱),改动面与收益不成比例。
 - 位置:`crates/rh-transport/src/mux.rs:609-612`(mux_relay Err 回落)、`crates/rh-transport/src/compress.rs:44-65`
 - 问题:B4/split_boxed_io 修完主路径后,仍有两处共享 std Mutex:插件目标回落的 mux_relay_split 双泵,与 compress 泵侧"一条 duplex + split"。复核确认影响弱(锁内是本机 IO/memcpy),低优先。
 - 修法:mux_relay 对包装类型增加剥壳/downcast 拆半分支走 mux_relay_split;compress 改两条独立单向 duplex(四半端天然无锁)。
 - 验收:三道门绿;压缩开关开/关的转发测试通过。
 
 ### B-3 [P2] pump_up 诊断关闭时仍调 Instant::now —— 来源 mux-3
-- [ ] 状态:
+- [x] 状态:完成 @ 2416b8a
+> 核查:✅ 问题在(:800/:871 两处裸 now;disabled_produces_no_timestamp 测试只覆盖 pump_down);修法照搬 pump_down 的 __t0/__w0 Option<Instant> 模式,现有测试保持通过。
 - 位置:`crates/rh-transport/src/mux.rs:783`、`:854`
 - 问题:违反本文件自声明的"诊断关闭时零开销"红线(mux.rs:1018-1020);pump_down 同位置已正确门控(:1145/:1241)。
 - 修法:两处 Instant::now 移入 `if diag` 分支(存 Option<Instant>),与 pump_down 的 __t0/__w0 模式同型。
 - 验收:三道门绿;disabled_produces_no_timestamp 测试(mux.rs:3330)保持通过。
 
 ### B-4 [P2] 每次 splice relay 重读两个环境变量 —— 来源 splice-1
-- [ ] 状态:
+- [ ] 状态:完成 @ 2416b8a
+> 核查:✅ 问题在(splice_relay 每次调用 pump_mode_from_env + stats_enabled 各取一次进程环境锁+分配);OnceLock 缓存与 notsent_lowat 先例同型;全仓无测试 set_var RH_SPLICE_*(g1_splice_bench 在 main 起点设置先于首建),缓存安全。splice 测试显式注入路径(inner/with_stats)不受影响。
 - 位置:`crates/rh-transport/src/splice.rs:1155-1156`(调用)、:500/:227(实现)
 - 问题:每次建 relay 各取一次进程环境锁 + String 分配;同文件 notsent_lowat() 已用 OnceLock(:41-49)做同类缓存,这两个开关漏了。
 - 修法:两个开关各用 OnceLock(或合并为一个 OnceLock 结构)缓存。复核确认:全仓无测试 set_var("RH_SPLICE_*"),缓存不破坏测试策略。
 - 验收:三道门绿;splice 测试(显式注入走 inner/with_stats)通过。
 
 ### B-5 [P2] 限速路径每块两次装箱分配 —— 来源 splice-2
-- [ ] 状态:
+- [W] 状态:放弃
+> 核查:❌ 收益与改动面不成比例(任务书自标"可选"):改 ChunkLimiter trait 签名(reserve 返回具体 future)需同步 data.rs BucketLimiter、forward.rs ClientBucketLimiter 全部实现方;收益仅在限速激活场景(默认装配不装 limiter 时零开销,已是最优形态),~10k allocs/s @10G 的量级在限速瓶颈权重里可忽略。
 - 位置:`crates/rh-transport/src/splice.rs:1028-1037`、trait 签名 `crates/rh-transport/src/lib.rs:259`
 - 问题:限速激活时每 256KiB 块一次 BoxFuture + 一次 Box<ChunkReservation> + Arc clone(~10k allocs/s @10G);默认装配不装 limiter 时零开销。
 - 修法:reserve 返回具体 future 类型(impl Trait/枚举)消掉两层 Box,或按多块聚合粗粒度预留;改 trait 需同步全部实现方(data.rs BucketLimiter、forward.rs ClientBucketLimiter)。改动面大,收益仅在限速场景,**可选**。
 - 验收:三道门绿;限速开启/关闭的转发测试通过。
 
 ### B-6 [P2] WsIo 写路径每帧/每批整块分配 —— 来源 transports-3
-- [ ] 状态:
+- [x] 状态:完成 @ 2416b8a
+> 核查:✅ 问题在(:283 to_vec、:316 with_capacity);scratch 复用 + split().freeze() 共享视图移交(send_queued 保证至多一条在途,余量不足时 reserve 触发 bytes 1.12 前缀回收);ws/wss 连接测试 8 项通过。
 - 位置:`crates/rh-transport/src/ws.rs:283`(标量写 to_vec)、:316-320(向量写 with_capacity)
 - 问题:ws/wss 载体每 ≤64KiB 块/每 ≤1MiB 批一次堆分配+拷贝,无复用。ws/wss 非默认载体,且 tungstenite 发送侧本有一次整载荷 memcpy(收益有天花板),低优先。
 - 修法:WsIo 内持有跨写复用的 scratch BytesMut,两条写路径统一从 scratch 构造 Message::Binary(payload.freeze())。
