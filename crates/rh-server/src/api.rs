@@ -3132,6 +3132,55 @@ mod tests {
         body_json(disable_service(State(state.clone()), h, Path(id)).await).await
     }
 
+    /// D-12 回归:热改 limits 后,数据面读的原子快照必须同步 store。
+    /// 修前 mux_streams 原子自引入后从未 store —— 热改看似生效
+    /// (API 返回 applied),新会话却一直用启动时的旧值,静默不生效。
+    #[tokio::test]
+    async fn d12_hot_reload_updates_atomic_snapshots() {
+        let cfg = crate::config::ServerConfig::default();
+        let state = diag_state(cfg).await;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // 初始:默认 max_mux_streams=0 → UNLIMITED
+        assert_eq!(
+            state.mux_streams.load(Relaxed),
+            rh_transport::MUX_STREAMS_UNLIMITED
+        );
+
+        // 热改 2048 / 77 → 两个原子立即反映(不等重启)
+        let req: ServerConfigUpdate = serde_json::from_value(json!({
+            "limits": { "max_mux_streams": 2048, "max_udp_sessions_per_proxy": 77 }
+        }))
+        .unwrap();
+        let h = auth_headers(&state).await;
+        let v = body_json(put_server_config(State(state.clone()), h, Json(req)).await).await;
+        // 测试态 config_path 为空,persist 可能失败 —— 但热改必须已生效
+        // (applied 含两项;persist 失败不回滚是既有语义,持久化路径由
+        // d4 测试覆盖)
+        assert!(
+            v["data"]["applied"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x == "limits.max_mux_streams"),
+            "limits 热改应生效:{v}"
+        );
+        assert_eq!(state.mux_streams.load(Relaxed), 2048);
+        assert_eq!(state.udp_sessions_limit.load(Relaxed), 77);
+
+        // 改回 0 → mux 回到 UNLIMITED(映射语义不变)
+        let req: ServerConfigUpdate = serde_json::from_value(json!({
+            "limits": { "max_mux_streams": 0 }
+        }))
+        .unwrap();
+        let h = auth_headers(&state).await;
+        body_json(put_server_config(State(state.clone()), h, Json(req)).await).await;
+        assert_eq!(
+            state.mux_streams.load(Relaxed),
+            rh_transport::MUX_STREAMS_UNLIMITED
+        );
+    }
+
     /// D-4:config 读写端点的文件 IO 异步化回归 —— put 触发
     /// authorized_keys 的 tokio::fs::write 与 toml 持久化的
     /// spawn_blocking 序列化+备份+写盘;get 经 tokio::fs 读回。
