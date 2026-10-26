@@ -172,7 +172,7 @@ const WAITING_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 pub use rh_transport::PrependedIo;
 
 /// 当前自定义 DNS 服务器(见 dnsquery)。
-pub fn dns_server() -> Option<String> {
+pub fn dns_server() -> Option<std::sync::Arc<str>> {
     crate::dnsquery::server()
 }
 
@@ -1317,8 +1317,35 @@ pub async fn dispatch_frame(
         let m: ServerMessage = serde_json::from_slice(payload)?;
         match m {
             ServerMessage::ServiceSync(s) => {
-                apply_sync(sess, s.revision, s.entities).await;
-                ack(sess, s.revision, None).await;
+                // E-5:重连全量同步期间,逐实体 stop/start(含每个 visitor
+                // 一次 listener bind)串行占住读分支,写/心跳/cancel 整体
+                // 停摆,时长正比规则数。表更新(锁内收集)同步完成后即 ACK,
+                // 启停 spawn 出去 —— 与 upsert visitor 重试的处理同型。
+                // 行为变化(有意):服务端 confirmed_revision 提前(ACK 先于
+                // 监听就绪);服务端状态推进用自身 rt.bound,不读客户端 bind
+                // 结果,语义安全,客户端仍会逐条执行启停。
+                let mut new_proxies: HashMap<u64, ProxySpec> = HashMap::new();
+                let mut new_visitors: HashMap<u64, VisitorSpec> = HashMap::new();
+                for e in s.entities {
+                    match e {
+                        rh_protocol::message::SyncEntity::Proxy(p) => {
+                            new_proxies.insert(p.id, *p);
+                        }
+                        rh_protocol::message::SyncEntity::Visitor(v) => {
+                            new_visitors.insert(v.id, v);
+                        }
+                    }
+                }
+                let changes = collect_sync_changes(sess, &new_proxies, &new_visitors).await;
+                let revision = s.revision;
+                ack(sess, revision, None).await;
+                if !changes.is_empty() {
+                    let sess2 = sess.clone();
+                    tokio::spawn(async move {
+                        run_sync_changes(&sess2, changes).await;
+                        info!(revision, "sync applied");
+                    });
+                }
             }
             ServerMessage::ServiceUpdate(u) => {
                 // 定点 ACK:proxy 实体携带 id(visitor 实体服务端无运行时,
@@ -1472,6 +1499,34 @@ async fn apply_sync(
             }
         }
     }
+    let changes = collect_sync_changes(sess, &new_proxies, &new_visitors).await;
+    run_sync_changes(sess, changes).await;
+    info!(revision, "sync applied");
+}
+
+/// E-5:apply_sync 的表更新半部(锁内只收集)。run_loop 的 ServiceSync
+/// 分支同步执行到这里即 ACK,启停 spawn 出去(见调用侧注释)。
+struct SyncChanges {
+    proxies_stop: Vec<u64>,
+    proxies_start: Vec<(u64, std::sync::Arc<ProxySpec>)>,
+    visitors_stop: Vec<u64>,
+    visitors_start: Vec<(u64, VisitorSpec)>,
+}
+
+impl SyncChanges {
+    fn is_empty(&self) -> bool {
+        self.proxies_stop.is_empty()
+            && self.proxies_start.is_empty()
+            && self.visitors_stop.is_empty()
+            && self.visitors_start.is_empty()
+    }
+}
+
+async fn collect_sync_changes(
+    sess: &Arc<ClientSession>,
+    new_proxies: &HashMap<u64, ProxySpec>,
+    new_visitors: &HashMap<u64, VisitorSpec>,
+) -> SyncChanges {
     // proxies
     //
     // ★锁内只收集,锁外才启动/停止。
@@ -1486,7 +1541,7 @@ async fn apply_sync(
     // 锁去做重绑定」),`apply_sync` 是漏点。
     //
     // 锁获取顺序不变(仍是 proxies → health_cancels),只是不再嵌套持有。
-    let (to_stop, to_start) = {
+    let (proxies_stop, proxies_start) = {
         let mut cur = sess.proxies.lock().await;
         let old: Vec<(u64, std::sync::Arc<ProxySpec>)> = cur.drain().collect();
         let mut to_stop: Vec<u64> = Vec::new();
@@ -1502,7 +1557,7 @@ async fn apply_sync(
         // 再 contains」完全等价)。修前先 `keys().collect()` 成 Vec 再
         // `Vec::contains` 线性扫描,规则数 N 时全量同步是 O(N²)。
         let mut to_start: Vec<(u64, std::sync::Arc<ProxySpec>)> = Vec::new();
-        for (id, spec) in &new_proxies {
+        for (id, spec) in new_proxies {
             if cur.contains_key(id) {
                 continue;
             }
@@ -1514,14 +1569,8 @@ async fn apply_sync(
         }
         (to_stop, to_start)
     }; // ← proxies 写锁在这里释放
-    for id in to_stop {
-        stop_proxy(sess, id).await;
-    }
-    for (id, spec) in to_start {
-        start_health(sess, id, &spec).await;
-    }
-    // visitors:同上,锁内只收集。
-    let (to_stop, to_start) = {
+       // visitors:同上,锁内只收集。
+    let (visitors_stop, visitors_start) = {
         let mut cur = sess.visitors.lock().await;
         let old: Vec<(u64, VisitorSpec)> = cur.drain().collect();
         let mut to_stop: Vec<u64> = Vec::new();
@@ -1535,7 +1584,7 @@ async fn apply_sync(
         }
         // 同上:直接查 `cur`,去掉 O(N²) 的 Vec + contains。
         let mut to_start: Vec<(u64, VisitorSpec)> = Vec::new();
-        for (id, spec) in &new_visitors {
+        for (id, spec) in new_visitors {
             if cur.contains_key(id) {
                 continue;
             }
@@ -1545,13 +1594,29 @@ async fn apply_sync(
         }
         (to_stop, to_start)
     }; // ← visitors 写锁在这里释放
-    for id in to_stop {
+    SyncChanges {
+        proxies_stop,
+        proxies_start,
+        visitors_stop,
+        visitors_start,
+    }
+}
+
+/// E-5:apply_sync 的启停半部(全部 await 在锁外)。既被 apply_sync
+/// 同步执行(测试直调语义不变),也被 run_loop spawn 出去执行。
+async fn run_sync_changes(sess: &Arc<ClientSession>, c: SyncChanges) {
+    for id in c.proxies_stop {
+        stop_proxy(sess, id).await;
+    }
+    for (id, spec) in c.proxies_start {
+        start_health(sess, id, &spec).await;
+    }
+    for id in c.visitors_stop {
         stop_visitor(sess, id).await;
     }
-    for (id, spec) in to_start {
+    for (id, spec) in c.visitors_start {
         crate::visitor_run::start(sess.clone(), id, spec).await;
     }
-    info!(revision, "sync applied");
 }
 
 async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) {
@@ -1589,8 +1654,12 @@ async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) 
                     cur.remove(&p.id);
                     let mut p2 = (*p).clone();
                     p2.normalize_kind_configs();
-                    cur.insert(p2.id, std::sync::Arc::new(p2.clone()));
-                    Some(p2)
+                    // E-6:构造一次 Arc 供表与 start_health 共用(修前
+                    // 表内存 Arc 却再深克隆一份出来,≈15+ 次分配)
+                    let id = p2.id;
+                    let arc = std::sync::Arc::new(p2);
+                    cur.insert(id, arc.clone());
+                    Some(arc)
                 }
             }; // ← proxies 写锁在这里释放
             if let Some(spec) = to_start {
@@ -1600,51 +1669,60 @@ async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) 
             }
         }
         rh_protocol::message::SyncEntity::Visitor(v) => {
-            let mut cur = sess.visitors.lock().await;
-            let changed = cur.get(&v.id).map(|o| *o != v).unwrap_or(true);
+            // E-4:锁内只做 changed 判定与 insert(与 proxy 分支/apply_sync
+            // 的"锁内只收集、await 全在锁外"纪律对齐)——修前在持
+            // visitors 写锁期间 await stop_visitor(内部再取 visitor_cancels
+            // 与 sudp_deliver 两把锁),期间 open_data_channel 等读者被挡。
+            let changed = {
+                let mut cur = sess.visitors.lock().await;
+                let changed = cur.get(&v.id).map(|o| *o != v).unwrap_or(true);
+                if changed {
+                    cur.insert(v.id, v.clone());
+                }
+                changed
+            };
             if changed {
                 stop_visitor(sess, v.id).await;
-                cur.insert(v.id, v.clone());
-                drop(cur); // 别持着 visitors 锁去做重绑定
-                           // ★重绑前给旧监听器一点时间释放端口。
-                           //
-                           // `stop_visitor` 只是 `cancel()`,监听任务要跑到下一次
-                           // accept 循环才 drop listener;紧接着 bind 同一端口会
-                           // `EADDRINUSE`,而 `start` 里 bind 失败**只 warn 不重试**
-                           // —— 规则从此永久失联,直到下次配置变更或客户端重启。
-                           // 退避重试把竞态窗口吃掉。
-                           //
-                           // ★重试必须 spawn 出去,不能在这里 await。
-                           //
-                           // 本函数经 `dispatch_frame` **内联**在 `run_loop` 的
-                           // `select!` 读分支里(`session.rs:1132`),而那个 select
-                           // 同时负责 read_frame / send_rx / hb.tick / cancel 四条
-                           // 分支。`start_with_retry` 最坏 10 × 100ms = 1s,阻塞期间
-                           // 这四条全部轮不到:
-                           //   - 发送队列(mpsc 256)只进不出,健康上报 / UserConnect
-                           //     / nathole 候选上报会在 `send_tx.send().await` 上挂起;
-                           //   - 本函数之后的 `ack()` 也被推迟,服务端 confirmed_revision
-                           //     要等重试结束才推进;
-                           //   - 心跳与取消信号同样被推迟。
-                           // 1s 远小于 30s 看门狗(3×心跳),所以**不会**断连自愈 ——
-                           // 表现为「每改一条 visitor 规则,控制面停摆 0~1 秒」。
-                           //
-                           // 为什么 spawn 是安全的(三条):
-                           //   1. `apply_sync` 的 visitor 分支就是这个形态(那里调的
-                           //      `visitor_run::start` 内部 `tokio::spawn(run_tcp/run_udp)`
-                           //      后立即返回),upsert 没理由不同;
-                           //   2. `start_with_retry` 唯一的共享状态写入是
-                           //      `visitor_cancels.lock().await.insert(...)`,tokio::Mutex
-                           //      在 spawn 出去后照常工作;
-                           //   3. `stop_visitor` 已在 spawn **之前**同步完成(cancel 已
-                           //      发出),重试依赖的「旧监听器正在释放」前提不变 ——
-                           //      spawn 只改变「谁等」,不改变「等什么」。
-                           //
-                           // 语义确认:`ack` 的语义是「配置已应用」,不是「监听已
-                           // 就绪」。服务端 `on_apply_result` 推进规则状态用的是
-                           // `rt.bound`(服务端自己的绑定状态),不读客户端 visitor
-                           // 的 bind 结果。所以 upsert 返回时 visitor 尚未 bind 成功
-                           // 不破坏任何现有语义。
+                // 别持着 visitors 锁去做重绑定(上方已 drop)
+                // ★重绑前给旧监听器一点时间释放端口。
+                //
+                // `stop_visitor` 只是 `cancel()`,监听任务要跑到下一次
+                // accept 循环才 drop listener;紧接着 bind 同一端口会
+                // `EADDRINUSE`,而 `start` 里 bind 失败**只 warn 不重试**
+                // —— 规则从此永久失联,直到下次配置变更或客户端重启。
+                // 退避重试把竞态窗口吃掉。
+                //
+                // ★重试必须 spawn 出去,不能在这里 await。
+                //
+                // 本函数经 `dispatch_frame` **内联**在 `run_loop` 的
+                // `select!` 读分支里(`session.rs:1132`),而那个 select
+                // 同时负责 read_frame / send_rx / hb.tick / cancel 四条
+                // 分支。`start_with_retry` 最坏 10 × 100ms = 1s,阻塞期间
+                // 这四条全部轮不到:
+                //   - 发送队列(mpsc 256)只进不出,健康上报 / UserConnect
+                //     / nathole 候选上报会在 `send_tx.send().await` 上挂起;
+                //   - 本函数之后的 `ack()` 也被推迟,服务端 confirmed_revision
+                //     要等重试结束才推进;
+                //   - 心跳与取消信号同样被推迟。
+                // 1s 远小于 30s 看门狗(3×心跳),所以**不会**断连自愈 ——
+                // 表现为「每改一条 visitor 规则,控制面停摆 0~1 秒」。
+                //
+                // 为什么 spawn 是安全的(三条):
+                //   1. `apply_sync` 的 visitor 分支就是这个形态(那里调的
+                //      `visitor_run::start` 内部 `tokio::spawn(run_tcp/run_udp)`
+                //      后立即返回),upsert 没理由不同;
+                //   2. `start_with_retry` 唯一的共享状态写入是
+                //      `visitor_cancels.lock().await.insert(...)`,tokio::Mutex
+                //      在 spawn 出去后照常工作;
+                //   3. `stop_visitor` 已在 spawn **之前**同步完成(cancel 已
+                //      发出),重试依赖的「旧监听器正在释放」前提不变 ——
+                //      spawn 只改变「谁等」,不改变「等什么」。
+                //
+                // 语义确认:`ack` 的语义是「配置已应用」,不是「监听已
+                // 就绪」。服务端 `on_apply_result` 推进规则状态用的是
+                // `rt.bound`(服务端自己的绑定状态),不读客户端 visitor
+                // 的 bind 结果。所以 upsert 返回时 visitor 尚未 bind 成功
+                // 不破坏任何现有语义。
                 let sess2 = sess.clone();
                 let vid = v.id;
                 tokio::spawn(async move {
@@ -1688,7 +1766,9 @@ async fn stop_visitor(sess: &Arc<ClientSession>, id: u64) {
     sess.punched_auth.lock().await.remove(&id);
 }
 
-async fn start_health(sess: &Arc<ClientSession>, id: u64, spec: &ProxySpec) {
+/// E-6:收 `Arc<ProxySpec>`(表内即 Arc,调用方零额外克隆);
+/// 健康任务拿同一 Arc(spawn 只 bump 引用计数)。
+async fn start_health(sess: &Arc<ClientSession>, id: u64, spec: &std::sync::Arc<ProxySpec>) {
     let Some(hc) = spec.health_check.clone() else {
         return;
     };
@@ -1707,7 +1787,7 @@ async fn start_health(sess: &Arc<ClientSession>, id: u64, spec: &ProxySpec) {
         }
     };
     let s2 = sess.clone();
-    let spec = spec.clone();
+    let spec = spec.clone(); // Arc 克隆:引用计数,非深拷
     tokio::spawn(async move {
         crate::health::run(s2, id, spec, hc, c).await;
     });

@@ -11,7 +11,7 @@ use tracing::info;
 pub async fn run(
     sess: Arc<ClientSession>,
     proxy_id: u64,
-    spec: ProxySpec,
+    spec: Arc<ProxySpec>,
     hc: HealthCheckSpec,
     cancel: CancellationToken,
 ) {

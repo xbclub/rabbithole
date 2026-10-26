@@ -5,13 +5,15 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 /// 全局自定义 DNS 服务器(host:port)。
-static DNS_SERVER: Mutex<Option<String>> = Mutex::new(None);
+/// E-2:值 Arc 化——每连接拨号都读一次快照,clone 从 String 深拷
+/// 降为引用计数自增(零分配);写点仅配置加载一处。
+static DNS_SERVER: Mutex<Option<Arc<str>>> = Mutex::new(None);
 
 pub fn set_server(addr: Option<String>) {
-    *DNS_SERVER.lock().unwrap() = addr;
+    *DNS_SERVER.lock().unwrap() = addr.map(std::sync::Arc::from);
 }
 
-pub fn server() -> Option<String> {
+pub fn server() -> Option<Arc<str>> {
     DNS_SERVER.lock().unwrap().clone()
 }
 
@@ -153,12 +155,13 @@ mod tests {
 /// (直接存 `SocketAddr`),键里漏掉 port 会把 A 端口的地址发给 B 端口。
 /// **必须含 dns_server**:不同 DNS 服务器可能给出不同结果(mDNS/内网
 /// 视图),切换配置后不得复用旧条目。
-pub type CacheKey = (String, u16, Option<String>);
+pub type CacheKey = (String, u16, Option<Arc<str>>);
 
 /// 构造缓存键。host 统一小写(DNS 名大小写不敏感),避免 `Example.com`
-/// 与 `example.com` 各占一条。
-pub fn cache_key(host: &str, port: u16, ns: Option<&str>) -> CacheKey {
-    (host.to_ascii_lowercase(), port, ns.map(|s| s.to_string()))
+/// 与 `example.com` 各占一条。E-2:ns 走 Arc 克隆(零分配),键构造
+/// 从 2-3 次 String 分配降为仅 host 小写化一次。
+pub fn cache_key(host: &str, port: u16, ns: Option<&Arc<str>>) -> CacheKey {
+    (host.to_ascii_lowercase(), port, ns.cloned())
 }
 
 /// 正向结果 TTL(默认 30s;`RH_DNS_TTL_SECS` 覆盖)。
@@ -285,8 +288,8 @@ pub fn cache_clear() {
 /// * 命中缓存直接返回,不触发任何真实解析;
 /// * 未命中时用 singleflight:同 key 并发只放一个去解析,其余等结果;
 /// * 结果为 `None` 也缓存(`NEGATIVE_TTL` 5s),避免故障时每次打满超时。
-pub async fn resolve_cached(host: &str, port: u16, ns: Option<String>) -> Option<SocketAddr> {
-    let key = cache_key(host, port, ns.as_deref());
+pub async fn resolve_cached(host: &str, port: u16, ns: Option<Arc<str>>) -> Option<SocketAddr> {
+    let key = cache_key(host, port, ns.as_ref());
 
     if let Some(hit) = look_up(&key, std::time::Instant::now()) {
         return hit;
@@ -440,7 +443,7 @@ mod cache_tests {
 
         let other_port = cache_key("h", 81, None);
         assert!(look_up(&other_port, now).is_none(), "不同 port 不得命中");
-        let other_ns = cache_key("h", 80, Some("1.2.3.4:53"));
+        let other_ns = cache_key("h", 80, Some(&std::sync::Arc::from("1.2.3.4:53")));
         assert!(
             look_up(&other_ns, now).is_none(),
             "不同 dns_server 不得命中"
