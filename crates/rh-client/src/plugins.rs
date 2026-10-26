@@ -121,7 +121,11 @@ pub async fn dial_plugin(plugin: &PluginSpec) -> anyhow::Result<BoxedIo> {
                 };
                 let mut t = tls_stream;
                 let mut u = up;
-                let _ = tokio::io::copy_bidirectional(&mut t, &mut u).await;
+                // 与同文件 cp/copy_limited 的 64KiB 口径对齐;默认 8KiB 会让
+                // 双向各付 8 倍的读侧 syscall 与 await 轮次。
+                let _ =
+                    tokio::io::copy_bidirectional_with_sizes(&mut t, &mut u, 64 * 1024, 64 * 1024)
+                        .await;
             });
             Ok(Box::new(a))
         }
@@ -962,7 +966,7 @@ async fn serve_static_file(
                     if keep { "keep-alive" } else { "close" }
                 );
                 if io.write_all(resp.as_bytes()).await.is_err()
-                    || tokio::io::copy(&mut f, &mut io).await.is_err()
+                    || copy_64k(&mut f, &mut io).await.is_err()
                 {
                     return;
                 }
@@ -974,6 +978,23 @@ async fn serve_static_file(
         if !keep {
             return;
         }
+    }
+}
+
+/// 静态文件体搬运:64KiB 缓冲,对齐同文件 cp/copy_limited 的口径。
+/// `tokio::io::copy` 默认 8KiB,大文件读侧 syscall 与 await 轮次多付 8 倍。
+async fn copy_64k<R, W>(r: &mut R, w: &mut W) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut b = vec![0u8; 64 * 1024];
+    loop {
+        let n = r.read(&mut b).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        w.write_all(&b[..n]).await?;
     }
 }
 
