@@ -323,6 +323,41 @@ impl AppState {
     }
 }
 
+/// D-6:require_auth 的强类型 claims(修前 Value 树动态取值,且
+/// jsonwebtoken 对 Value 目标内部还要把 claims 反序列化两次)。
+/// sub/pv 即 mint_jwt 写入的全部业务字段;pv 缺省 0 与修前
+/// `.get("pv").unwrap_or(0)` 语义一致。
+#[derive(serde::Deserialize)]
+struct AuthClaims {
+    sub: String,
+    #[serde(default)]
+    pv: i64,
+}
+
+/// D-6:解码引擎缓存 —— 键为 secret 的 Arc 指针(写点仅 jwt_secret
+/// 初始化与 change_password 一处重建,见 web_jwt_secret)。修前每请求
+/// from_secret 深拷贝 secret + Validation::new 的 Vec/HashSet 分配。
+type JwtEngine = std::sync::Arc<(jsonwebtoken::DecodingKey, jsonwebtoken::Validation)>;
+
+fn jwt_engine(secret: std::sync::Arc<String>) -> JwtEngine {
+    static CACHE: std::sync::Mutex<Option<(std::sync::Weak<String>, JwtEngine)>> =
+        std::sync::Mutex::new(None);
+    let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((weak, eng)) = g.as_ref() {
+        if let Some(cur) = weak.upgrade() {
+            if std::sync::Arc::ptr_eq(&cur, &secret) {
+                return eng.clone();
+            }
+        }
+    }
+    let eng = std::sync::Arc::new((
+        jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+        jsonwebtoken::Validation::default(),
+    ));
+    *g = Some((std::sync::Arc::downgrade(&secret), eng.clone()));
+    eng
+}
+
 /// JWT 校验中间件:返回 username 或 401 response(装箱避免超大 Err 变体)。
 async fn require_auth(state: &Arc<AppState>, headers: &HeaderMap) -> Result<String, Box<Response>> {
     let bearer = headers
@@ -334,19 +369,11 @@ async fn require_auth(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Stri
         return Err(Box::new(unauthorized()));
     }
     let secret = state.jwt_secret().await;
-    let data = jsonwebtoken::decode::<serde_json::Value>(
-        bearer,
-        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
-        &jsonwebtoken::Validation::default(),
-    );
+    let engine = jwt_engine(secret);
+    let data = jsonwebtoken::decode::<AuthClaims>(bearer, &engine.0, &engine.1);
     match data {
         Ok(d) => {
-            let user = d
-                .claims
-                .get("sub")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let user = d.claims.sub;
             if user.is_empty() {
                 return Err(Box::new(unauthorized()));
             }
@@ -355,7 +382,7 @@ async fn require_auth(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Stri
             // R1:读内存缓存(失效点在本文件 logout / change_password)。
             // R2:epoch 守卫 —— miss 填充与失效交错时,以「填充前捕获的
             // epoch」入条目;任何后续 bump 都令其失配,旧值不会钉死。
-            let want = d.claims.get("pv").and_then(|v| v.as_i64()).unwrap_or(0);
+            let want = d.claims.pv;
             use std::sync::atomic::Ordering as AtomicOrdering;
             let epoch_now = state.pwd_version_epoch.load(AtomicOrdering::Acquire);
             let cached = state
@@ -2310,9 +2337,11 @@ async fn get_server_config(State(state): State<Arc<AppState>>, headers: HeaderMa
     view.web.jwt_secret = None; // 密钥不回显
     let hot = state.hot.read().await.clone();
     let keys_path = hot.ssh_gateway.authorized_keys_file.clone();
-    let authorized_keys = keys_path
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok());
+    // D-4:同步读盘移出 async 上下文(tokio::fs;修前每请求 std::fs)
+    let authorized_keys = match keys_path.as_ref() {
+        Some(p) => tokio::fs::read_to_string(p).await.ok(),
+        None => None,
+    };
     ok(json!({
         "config": serde_json::to_value(&view).unwrap_or(serde_json::Value::Null),
         "hot": {
@@ -2638,7 +2667,7 @@ async fn put_server_config(
         }
     }
     if let Some((path, keys)) = ak_write {
-        if let Err(e) = std::fs::write(&path, &keys) {
+        if let Err(e) = tokio::fs::write(&path, &keys).await {
             return err(
                 500,
                 &format!("authorized_keys 写入失败({}):{e}", path.display()),
@@ -2765,18 +2794,21 @@ async fn put_server_config(
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        // D-4:序列化 + 备份 + 写盘整体移入 spawn_blocking(修前同步
+        // fs 跑在 async handler,持期间 worker 被堵;与 authorized_keys
+        // 的 R1 修法同构)。disk/config 均为快照值,无共享状态。
         disk.web.jwt_secret = state.cfg.web.jwt_secret.clone(); // 保留原值(未脱敏源)
-        persist_err = match toml::to_string_pretty(&disk) {
-            Ok(text) => {
-                let path = &state.cfg.config_path;
-                let bak = path.with_extension("toml.bak");
-                if !bak.exists() {
-                    let _ = std::fs::copy(path, &bak);
-                }
-                std::fs::write(path, text).map_err(|e| e.to_string())
+        let config_path = state.cfg.config_path.clone();
+        persist_err = tokio::task::spawn_blocking(move || {
+            let text = toml::to_string_pretty(&disk).map_err(|e| e.to_string())?;
+            let bak = config_path.with_extension("toml.bak");
+            if !bak.exists() {
+                let _ = std::fs::copy(&config_path, &bak);
             }
-            Err(e) => Err(e.to_string()),
-        };
+            std::fs::write(&config_path, text).map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
     }
     if let Err(e) = persist_err {
         state
@@ -3098,6 +3130,106 @@ mod tests {
     async fn disable(state: &Arc<AppState>, id: i64) -> serde_json::Value {
         let h = auth_headers(state).await;
         body_json(disable_service(State(state.clone()), h, Path(id)).await).await
+    }
+
+    /// D-4:config 读写端点的文件 IO 异步化回归 —— put 触发
+    /// authorized_keys 的 tokio::fs::write 与 toml 持久化的
+    /// spawn_blocking 序列化+备份+写盘;get 经 tokio::fs 读回。
+    /// 修法与 R1(authorized_keys)同构,此处验证端到端行为不变。
+    #[tokio::test]
+    async fn d4_server_config_read_write_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("rh-d4-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("server.toml");
+        let cfg = crate::config::ServerConfig {
+            config_path: cfg_path.clone(),
+            ..Default::default()
+        };
+        // persist 先备份旧文件,persist 前文件必须存在
+        std::fs::write(&cfg_path, toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        let state = diag_state(cfg).await;
+
+        const KEYS: &str = "# d4 test\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICbE d4\n";
+        let req: ServerConfigUpdate =
+            serde_json::from_value(json!({ "authorized_keys": KEYS })).unwrap();
+        let h = auth_headers(&state).await;
+        let v = body_json(put_server_config(State(state.clone()), h, Json(req)).await).await;
+        assert_eq!(v["data"]["persisted"], json!(true), "put 应成功写回:{v}");
+
+        // toml 确实落盘(spawn_blocking 路径),ak 文件写进 config 同目录
+        let text = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(
+            text.contains("[ssh_gateway]"),
+            "toml 应含 ssh_gateway 节:{text}"
+        );
+        let ak_path = dir.join("authorized_keys");
+        assert_eq!(std::fs::read_to_string(&ak_path).unwrap(), KEYS);
+
+        // get:tokio::fs 读回 authorized_keys
+        let h = auth_headers(&state).await;
+        let v = body_json(get_server_config(State(state.clone()), h).await).await;
+        assert_eq!(v["data"]["authorized_keys"], json!(KEYS));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-6:require_auth 强类型 claims + 引擎缓存的行为等价性 ——
+    /// 成功 / 过期 / 密码版本不符 / (防御)pv 字段缺失按 0 处理,
+    /// 四种形态与修前 Value 树路径语义一致。手工签一个无 pv 的令牌
+    /// 验证 serde(default) 分支。
+    #[tokio::test]
+    async fn d6_require_auth_typed_claims_four_paths() {
+        let cfg = crate::config::ServerConfig::default();
+        let state = diag_state(cfg).await;
+
+        // 成功:pv 与库中 admin 的 pwd_version(0)一致
+        let token = mint_jwt(&state, "admin", 1, 0).await.unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        assert_eq!(require_auth(&state, &h).await.unwrap(), "admin");
+
+        // 密码版本不符:pv=7 ≠ 库中 0 → 401
+        let token = mint_jwt(&state, "admin", 1, 7).await.unwrap();
+        h.insert(
+            "authorization",
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        assert!(require_auth(&state, &h).await.is_err());
+
+        // 过期:ttl 0 小时即 iat=exp,默认 60s leeway 内仍有效,签一个
+        // 已过期 2 小时的令牌直接绕过 leeway
+        let secret = state.jwt_secret().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let stale = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &json!({ "sub": "admin", "iat": now - 7200, "exp": now - 3600, "pv": 0 }),
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        h.insert(
+            "authorization",
+            axum::http::HeaderValue::from_str(&format!("Bearer {stale}")).unwrap(),
+        );
+        assert!(require_auth(&state, &h).await.is_err());
+
+        // pv 缺失:手工签无 pv 的令牌 → serde(default) 按 0,与修前
+        // `.get("pv").unwrap_or(0)` 一致 → 认证通过
+        let no_pv = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &json!({ "sub": "admin", "iat": now, "exp": now + 3600 }),
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        h.insert(
+            "authorization",
+            axum::http::HeaderValue::from_str(&format!("Bearer {no_pv}")).unwrap(),
+        );
+        assert_eq!(require_auth(&state, &h).await.unwrap(), "admin");
     }
 
     /// D-1 红线:信封与强类型行结构必须与修前 json! 构造逐字段一致
