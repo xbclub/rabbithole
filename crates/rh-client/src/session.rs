@@ -154,6 +154,8 @@ pub struct ClientSession {
     pub punched_auth: Mutex<HashMap<u64, String>>,
     /// sudp 通道交付:visitor_id → sender。
     pub sudp_deliver: Mutex<HashMap<u64, mpsc::Sender<BoxedIo>>>,
+    /// R1:实体启停串行化链(见 [`spawn_entity_op`])。
+    pub entity_ops: Mutex<()>,
     pub mux: Arc<rh_transport::Multiplexer>,
     pub conn_counter: AtomicU64,
 }
@@ -1114,6 +1116,7 @@ async fn connect_and_run_inner(
         nat_socks: Mutex::new(HashMap::new()),
         punched_auth: Mutex::new(HashMap::new()),
         sudp_deliver: Mutex::new(HashMap::new()),
+        entity_ops: Mutex::new(()),
         mux: mux.clone(),
         conn_counter: AtomicU64::new(0),
     });
@@ -1340,8 +1343,10 @@ pub async fn dispatch_frame(
                 let revision = s.revision;
                 ack(sess, revision, None).await;
                 if !changes.is_empty() {
+                    // R1:启停半部排进串行化链(修前裸 spawn,与紧随的
+                    // ServiceUpdate 可并发对同一 visitor stop/start)
                     let sess2 = sess.clone();
-                    tokio::spawn(async move {
+                    spawn_entity_op(sess, async move {
                         run_sync_changes(&sess2, changes).await;
                         info!(revision, "sync applied");
                     });
@@ -1618,7 +1623,10 @@ async fn run_sync_changes(sess: &Arc<ClientSession>, c: SyncChanges) {
         stop_visitor(sess, id).await;
     }
     for (id, spec) in c.visitors_start {
-        crate::visitor_run::start(sess.clone(), id, spec).await;
+        // R1:与 upsert 同款带重试启动。修前裸调 start 不看返回值 ——
+        // ACK 已前置,bind 失败(旧监听器尚未释放端口的 E-5 窗口)
+        // 后无机制重触发,规则静默失联到下次配置变更。
+        crate::visitor_run::start_with_retry(sess.clone(), id, spec).await;
     }
 }
 
@@ -1667,8 +1675,14 @@ async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) 
             }; // ← proxies 写锁在这里释放
             if let Some(spec) = to_start {
                 // 停止旧健康检查:只碰 health_cancels,与 proxies 表无关。
-                stop_proxy(sess, spec.id).await;
-                start_health(sess, spec.id, &spec).await;
+                // R1:启停入串行化链(修前同步执行,与在途的 SYNC 启停
+                // 半部并发时 health_cancels 的 entry/remove 交错可留
+                // 孤儿健康任务或漏起新任务)。
+                let sess2 = sess.clone();
+                spawn_entity_op(sess, async move {
+                    stop_proxy(&sess2, spec.id).await;
+                    start_health(&sess2, spec.id, &spec).await;
+                });
             }
         }
         rh_protocol::message::SyncEntity::Visitor(v) => {
@@ -1685,51 +1699,18 @@ async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) 
                 changed
             };
             if changed {
-                stop_visitor(sess, v.id).await;
-                // 别持着 visitors 锁去做重绑定(上方已 drop)
-                // ★重绑前给旧监听器一点时间释放端口。
-                //
-                // `stop_visitor` 只是 `cancel()`,监听任务要跑到下一次
-                // accept 循环才 drop listener;紧接着 bind 同一端口会
-                // `EADDRINUSE`,而 `start` 里 bind 失败**只 warn 不重试**
-                // —— 规则从此永久失联,直到下次配置变更或客户端重启。
-                // 退避重试把竞态窗口吃掉。
-                //
-                // ★重试必须 spawn 出去,不能在这里 await。
-                //
-                // 本函数经 `dispatch_frame` **内联**在 `run_loop` 的
-                // `select!` 读分支里(`session.rs:1132`),而那个 select
-                // 同时负责 read_frame / send_rx / hb.tick / cancel 四条
-                // 分支。`start_with_retry` 最坏 10 × 100ms = 1s,阻塞期间
-                // 这四条全部轮不到:
-                //   - 发送队列(mpsc 256)只进不出,健康上报 / UserConnect
-                //     / nathole 候选上报会在 `send_tx.send().await` 上挂起;
-                //   - 本函数之后的 `ack()` 也被推迟,服务端 confirmed_revision
-                //     要等重试结束才推进;
-                //   - 心跳与取消信号同样被推迟。
-                // 1s 远小于 30s 看门狗(3×心跳),所以**不会**断连自愈 ——
-                // 表现为「每改一条 visitor 规则,控制面停摆 0~1 秒」。
-                //
-                // 为什么 spawn 是安全的(三条):
-                //   1. `apply_sync` 的 visitor 分支就是这个形态(那里调的
-                //      `visitor_run::start` 内部 `tokio::spawn(run_tcp/run_udp)`
-                //      后立即返回),upsert 没理由不同;
-                //   2. `start_with_retry` 唯一的共享状态写入是
-                //      `visitor_cancels.lock().await.insert(...)`,tokio::Mutex
-                //      在 spawn 出去后照常工作;
-                //   3. `stop_visitor` 已在 spawn **之前**同步完成(cancel 已
-                //      发出),重试依赖的「旧监听器正在释放」前提不变 ——
-                //      spawn 只改变「谁等」,不改变「等什么」。
-                //
-                // 语义确认:`ack` 的语义是「配置已应用」,不是「监听已
-                // 就绪」。服务端 `on_apply_result` 推进规则状态用的是
-                // `rt.bound`(服务端自己的绑定状态),不读客户端 visitor
-                // 的 bind 结果。所以 upsert 返回时 visitor 尚未 bind 成功
-                // 不破坏任何现有语义。
+                // R1:stop + 带重试启动作为**一个**串行化链单元执行。
+                // 修前 stop 同步、start spawn:与在途 SYNC 启停半部并发
+                // 时,两个 start 的 cancel token 在 visitor_cancels 里
+                // 互相覆盖 —— 先完成者的监听器从此无人能取消(孤儿
+                // 监听器按旧 spec 持续服务),stop 取消的可能是 bind
+                // 失败残留的死 token。链恢复修前全序,且保留 E-4/E-5
+                // 的全部收益:锁内仍只做判定与 insert,ACK 语义仍是
+                // 「配置已应用」。
                 let sess2 = sess.clone();
-                let vid = v.id;
-                tokio::spawn(async move {
-                    crate::visitor_run::start_with_retry(sess2, vid, v).await;
+                spawn_entity_op(sess, async move {
+                    stop_visitor(&sess2, v.id).await;
+                    crate::visitor_run::start_with_retry(sess2.clone(), v.id, v).await;
                 });
             }
         }
@@ -1737,13 +1718,41 @@ async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) 
 }
 
 async fn remove_entity(sess: &Arc<ClientSession>, entity_type: &str, id: u64) {
+    // R1:stop 入串行化链与 upsert/SYNC 启停全序化(表移除保持同步,
+    // ACK 前置语义不变)。
     if entity_type == "proxy" {
         sess.proxies.lock().await.remove(&id);
-        stop_proxy(sess, id).await;
+        let sess2 = sess.clone();
+        spawn_entity_op(sess, async move {
+            stop_proxy(&sess2, id).await;
+        });
     } else {
         sess.visitors.lock().await.remove(&id);
-        stop_visitor(sess, id).await;
+        let sess2 = sess.clone();
+        spawn_entity_op(sess, async move {
+            stop_visitor(&sess2, id).await;
+        });
     }
+}
+
+/// R1:实体启停操作的串行化链。
+///
+/// E-5 把 ServiceSync 的启停 spawn 化后引入了并发窗口:SYNC 的启停
+/// 半部与紧随其后的 ServiceUpdate / ServiceRemove 可并发对同一实体
+/// stop/start —— visitor 侧两个 start 的 cancel token 互相覆盖,
+/// 先完成者的监听器孤儿化(旧 spec 持续服务到会话结束);stop 取消
+/// 的可能是 bind 失败残留的死 token。所有启停(ServiceSync 启停半部
+/// / upsert / remove_entity)统一经本链按到达顺序执行,恢复修前
+/// 全序;链在后台排队,不阻塞 run_loop,E-5 的「ACK 前置」保持。
+fn spawn_entity_op<F>(sess: &Arc<ClientSession>, op: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let s = sess.clone();
+    tokio::spawn(async move {
+        let _guard = s.entity_ops.lock().await;
+        op.await;
+    });
 }
 
 async fn stop_proxy(sess: &Arc<ClientSession>, id: u64) {
@@ -2803,6 +2812,7 @@ mod control_frame_tests {
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
+            entity_ops: Mutex::new(()),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -2888,6 +2898,7 @@ mod control_frame_tests {
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
+            entity_ops: Mutex::new(()),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -2932,6 +2943,7 @@ mod waiting_ttl_tests {
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
+            entity_ops: Mutex::new(()),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -3227,6 +3239,7 @@ mod apply_sync_lock_tests {
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
+            entity_ops: Mutex::new(()),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -3511,6 +3524,7 @@ mod upsert_retry_blocking_tests {
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
+            entity_ops: Mutex::new(()),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -3742,6 +3756,7 @@ mod upsert_proxy_lock_tests {
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
+            entity_ops: Mutex::new(()),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -3812,6 +3827,10 @@ mod upsert_proxy_lock_tests {
     }
 
     /// 语义回归:更新后表里是新 spec,且健康检查被重新拉起。
+    ///
+    /// R1 起 stop/start 走 entity_ops 串行化链(后台排队),upsert 返回
+    /// 时启停可能尚未完成 —— 表断言仍同步(表更新在锁内),启停断言
+    /// 按 2s 预算轮询等静默。
     #[tokio::test]
     async fn upsert_replaces_spec_and_restarts_health() {
         let sess = test_session();
@@ -3821,11 +3840,9 @@ mod upsert_proxy_lock_tests {
             let m = sess.proxies.lock().await;
             assert_eq!(m.get(&5).unwrap().bind_port, 24200, "首次必须入表");
         }
-        assert!(
-            sess.health_cancels.lock().await.contains_key(&5),
-            "配了 health_check 就必须登记取消器"
-        );
-        let first = sess.health_cancels.lock().await.get(&5).cloned().unwrap();
+        let first = eventually_token(&sess, 5)
+            .await
+            .expect("配了 health_check 就必须登记取消器(2s 内)");
 
         // 改成不同端口 → changed 为真 → 旧取消器被 cancel,换新的
         let mut v2 = proxy_with_health(5, 24201);
@@ -3836,8 +3853,34 @@ mod upsert_proxy_lock_tests {
             assert_eq!(m.get(&5).unwrap().bind_port, 24201, "必须换成新 spec");
             assert_eq!(m.len(), 1, "不得产生重复条目");
         }
-        assert!(first.is_cancelled(), "旧健康检查必须被 cancel");
+        eventually(|| first.is_cancelled())
+            .await
+            .expect("旧健康检查必须被 cancel(2s 内)");
         sess.cancel.cancel();
+    }
+
+    /// R1 测试助手:2s 预算内轮询等待条件成立(启停入链后为异步)。
+    async fn eventually(mut probe: impl FnMut() -> bool) -> Option<()> {
+        for _ in 0..200 {
+            if probe() {
+                return Some(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    async fn eventually_token(
+        sess: &Arc<ClientSession>,
+        id: u64,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        for _ in 0..200 {
+            if let Some(t) = sess.health_cancels.lock().await.get(&id).cloned() {
+                return Some(t);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
     }
 
     /// 语义回归:**未变化**的 spec 不得改动表、不得重启健康检查。
@@ -3850,7 +3893,9 @@ mod upsert_proxy_lock_tests {
         let sess = test_session();
         let v = proxy_with_health(6, 24300);
         upsert(&sess, SyncEntity::Proxy(Box::new(v.clone()))).await;
-        let token = sess.health_cancels.lock().await.get(&6).cloned().unwrap();
+        let token = eventually_token(&sess, 6)
+            .await
+            .expect("首次 upsert 后取消器必须登记(2s 内)");
 
         upsert(&sess, SyncEntity::Proxy(Box::new(v))).await;
         assert!(!token.is_cancelled(), "spec 未变化时不得重启健康检查");
@@ -3898,6 +3943,7 @@ mod heartbeat_try_send_tests {
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
+            entity_ops: Mutex::new(()),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -4026,6 +4072,7 @@ mod run_loop_heartbeat_no_lockup_tests {
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
+            entity_ops: Mutex::new(()),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -4146,6 +4193,7 @@ mod dispatch_frame_try_send_tests {
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
+            entity_ops: Mutex::new(()),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -4243,6 +4291,7 @@ mod ack_bounded_send_tests {
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
+            entity_ops: Mutex::new(()),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -4348,5 +4397,205 @@ mod ack_bounded_send_tests {
         ack(&sess, 7, None).await;
         let after = sess.proxies.lock().await.len();
         assert_eq!(before, after, "丢 ACK 不得影响客户端配置状态");
+    }
+}
+
+#[cfg(test)]
+mod r1_sync_update_race_tests {
+    //! R1 回归:ServiceSync 的启停半部(E-5 起 spawn 化)与紧随的
+    //! ServiceUpdate 对同一 visitor 并发时的全序性。
+    //!
+    //! 修前的攻击面(交错时序自证):
+    //!  * SYNC spawn 的 T1 与 UPDATE 的 upsert(T2)并发对同一 visitor
+    //!    start —— 两个 cancel token 在 `visitor_cancels` 互相覆盖,
+    //!    先完成者的监听器从此无人能取消(孤儿监听器按旧 spec 持续
+    //!    服务到会话结束);stop 取消的可能是 bind 失败残留的死 token;
+    //!  * sync 侧裸调 `start` 不看返回值、无重试,bind 失败后规则
+    //!    静默失联(ACK 已前置,无机制重触发)。
+    //!
+    //! 修后:所有启停经 `entity_ops` 链串行,sync 侧改 `start_with_retry`。
+    use super::*;
+    use rh_protocol::message::SyncEntity;
+
+    fn visitor_spec(id: u64, port: u16) -> VisitorSpec {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": format!("v{id}"),
+            "kind": "stcp",
+            "enabled": true,
+            "bind_addr": "127.0.0.1",
+            "bind_port": port,
+            "target_proxy_name": "p",
+        }))
+        .unwrap()
+    }
+
+    fn test_session() -> Arc<ClientSession> {
+        let (tx, _rx) = mpsc::channel::<bytes::Bytes>(256);
+        Arc::new(ClientSession {
+            cfg: Arc::new(ClientConfig::default()),
+            session_id: "s".into(),
+            heartbeat_s: 30,
+            send_tx: tx,
+            cancel: CancellationToken::new(),
+            proxies: Mutex::new(HashMap::new()),
+            visitors: Mutex::new(HashMap::new()),
+            visitor_cancels: Mutex::new(HashMap::new()),
+            health_cancels: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
+            punched: Mutex::new(HashMap::new()),
+            nat_socks: Mutex::new(HashMap::new()),
+            punched_auth: Mutex::new(HashMap::new()),
+            sudp_deliver: Mutex::new(HashMap::new()),
+            entity_ops: Mutex::new(()),
+            mux: rh_transport::mux::wrap_stream_as_client(
+                Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
+                true,
+                100,
+            ),
+            conn_counter: AtomicU64::new(0),
+        })
+    }
+
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    async fn wait_listening(port: u16, budget_ms: u64) -> bool {
+        for _ in 0..(budget_ms / 10) {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// SYNC spawn 后立刻 UPDATE 同一 visitor:最终只有一个监听器、
+    /// token 可 stop、spec 为新、旧端口无孤儿。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_then_update_same_visitor_single_listener() {
+        let sess = test_session();
+        let port1 = free_port();
+        let port2 = free_port();
+
+        // 模拟 run_loop 的 ServiceSync 分支:collect → spawn 启停半部
+        let changes = {
+            let mut nv = HashMap::new();
+            nv.insert(21u64, visitor_spec(21, port1));
+            collect_sync_changes(&sess, &HashMap::new(), &nv).await
+        };
+        let sess2 = sess.clone();
+        spawn_entity_op(&sess, async move {
+            run_sync_changes(&sess2, changes).await;
+        });
+
+        // 紧随的 ServiceUpdate(新端口新 spec):修前与上面的 spawn 并发
+        upsert(&sess, SyncEntity::Visitor(visitor_spec(21, port2))).await;
+
+        // 新端口最终可达(链序:sync start(p1) → update stop+start(p2))
+        assert!(
+            wait_listening(port2, 3000).await,
+            "新 spec 端口 {port2} 必须最终监听可达"
+        );
+        // 表内为新 spec(表更新在锁内,同步断言)
+        assert_eq!(
+            sess.visitors.lock().await.get(&21).unwrap().bind_port,
+            port2,
+            "表内必须是新 spec"
+        );
+        // 恰好一个 token;cancel 它 → 新端口关闭(可 stop,不留孤儿)
+        {
+            let m = sess.visitor_cancels.lock().await;
+            assert_eq!(m.len(), 1, "同一 visitor 只应有一个 cancel token");
+            m.get(&21).unwrap().cancel();
+        }
+        let mut closed = false;
+        for _ in 0..300 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port2))
+                .await
+                .is_err()
+            {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(closed, "cancel token 后监听必须关闭");
+        // 旧端口无孤儿监听(修前 T1 的监听器被覆盖 token 后会残留)
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port1))
+                .await
+                .is_err(),
+            "旧 spec 端口 {port1} 不得残留监听(孤儿)"
+        );
+        sess.cancel.cancel();
+    }
+
+    /// sync 侧启动必须带重试:端口被占后在释放窗口内必须最终起来
+    /// (修前裸调 start,bind 失败即永久失联)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_visitor_start_retries_until_port_released() {
+        let sess = test_session();
+        // 占住端口,250ms 后释放 —— 模拟「stop cancel 后旧监听器滞后
+        // drop」的 EADDRINUSE 窗口
+        let port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let p = l.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                drop(l);
+            });
+            p
+        };
+        let changes = {
+            let mut nv = HashMap::new();
+            nv.insert(22u64, visitor_spec(22, port));
+            collect_sync_changes(&sess, &HashMap::new(), &nv).await
+        };
+        let sess2 = sess.clone();
+        spawn_entity_op(&sess, async move {
+            run_sync_changes(&sess2, changes).await;
+        });
+
+        // start_with_retry 预算 ~1s,250ms 释放后必须起来
+        assert!(
+            wait_listening(port, 3000).await,
+            "sync 启动必须带重试:端口释放后 visitor 要最终监听可达"
+        );
+        sess.cancel.cancel();
+    }
+
+    /// 会话关闭与在途 start 的交错:start 在 bind 窗口内被关闭路径
+    /// cancel 时不得复活监听器(start_with_retry 的会话级熔断)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn visitor_start_does_not_revive_after_session_cancel() {
+        let sess = test_session();
+        let port = free_port();
+        upsert(&sess, SyncEntity::Visitor(visitor_spec(23, port))).await;
+        assert!(wait_listening(port, 2000).await, "先证明监听已建立");
+
+        // 会话关闭:cancel + 全量 stop(shutdown 路径同款)
+        sess.cancel.cancel();
+        let ids: Vec<u64> = sess.visitor_cancels.lock().await.keys().copied().collect();
+        for id in ids {
+            stop_visitor(&sess, id).await;
+        }
+        let mut closed = false;
+        for _ in 0..300 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err()
+            {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(closed, "会话关闭后监听必须关闭且不得被重试复活");
     }
 }

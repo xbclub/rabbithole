@@ -21,6 +21,12 @@ pub async fn start_with_retry(sess: Arc<ClientSession>, visitor_id: u64, spec: V
     // 总预算 ~1s:足够覆盖 cancel 到 listener drop 的调度延迟,
     // 又不会在端口真被别人占用时无限重试。
     for attempt in 0..10 {
+        // R1:会话正在关闭时不再重试 —— start 可能在 bind 窗口内被
+        // 关闭路径 cancel(返回 false),继续重试会把已停止的规则
+        // 重新拉起。
+        if sess.cancel.is_cancelled() {
+            return;
+        }
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
@@ -48,10 +54,21 @@ pub async fn start(sess: Arc<ClientSession>, visitor_id: u64, spec: VisitorSpec)
             let l = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
+                    // R1:bind 失败回收自己插入的 token。修前留死 token:
+                    // 后续 stop cancel 的是死 token,前一代真正活着的
+                    // 监听器永远取不到。启停已全部经 entity_ops 链
+                    // 串行化,不存在并发 start 覆盖,无条件 remove 安全。
                     warn!(visitor = %spec.name, error = %e, "visitor bind failed");
+                    sess.visitor_cancels.lock().await.remove(&visitor_id);
                     return false;
                 }
             };
+            // R1:stop 在 bind 窗口内到达(token 已被取走并 cancel)→
+            // 尊重之,丢弃刚 bind 成功的 listener,不留孤儿。
+            if cancel.is_cancelled() {
+                sess.visitor_cancels.lock().await.remove(&visitor_id);
+                return false;
+            }
             tokio::spawn(run_tcp(sess, visitor_id, spec, l, cancel));
             true
         }
@@ -61,9 +78,14 @@ pub async fn start(sess: Arc<ClientSession>, visitor_id: u64, spec: VisitorSpec)
                 Ok(s) => s,
                 Err(e) => {
                     warn!(visitor = %spec.name, error = %e, "visitor bind failed");
+                    sess.visitor_cancels.lock().await.remove(&visitor_id);
                     return false;
                 }
             };
+            if cancel.is_cancelled() {
+                sess.visitor_cancels.lock().await.remove(&visitor_id);
+                return false;
+            }
             tokio::spawn(run_udp(sess, visitor_id, Arc::new(s), cancel));
             true
         }

@@ -1225,6 +1225,7 @@ mod tests {
             nat_socks: tokio::sync::Mutex::new(Default::default()),
             punched_auth: tokio::sync::Mutex::new(Default::default()),
             sudp_deliver: tokio::sync::Mutex::new(Default::default()),
+            entity_ops: tokio::sync::Mutex::new(()),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
