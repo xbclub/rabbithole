@@ -42,7 +42,9 @@
 ## P1:中影响(7 条)
 
 ### M1 [P1] 服务端 vhost/visitor 中继 8KiB 默认缓冲 + split 共享锁 —— 首轮漏网的全量吞吐路径
-- [ ] 状态:
+- [x] 状态:已完成 @ f2dbed2
+> 核查:✅ data.rs:4101 仍是 tokio::io::split + io::copy(8KiB 默认),5 个调用点行号无漂移、均持所有权。
+> 处置:签名改所有权(BoxedIo×2),user 侧 split_counted_tcp_user / channel 侧 split_boxed_io 拆半(包装流回落共享拆分),copy_64k 64KiB 单缓冲;select+halfclose_grace 原样。三道门绿。基准 tcp 档(passthrough/tcpmux)见文末基准节。
 - 位置:`crates/rh-server/src/data.rs:4101-4117`(copy_bidirectional_bounded);调用点 vhost.rs:944(HTTPS passthrough)/1229/1266(tcpmux)、visitor.rs:296/417(stcp/sudp)
 - 问题:tokio::io::split + io::copy 默认 8KiB + 共享锁双泵,是同文件 R3 口径(32-64KiB)的 1/4-1/8;E-1 在客户端的孪生,首轮单元划分漏掉服务端。
 - 修法:对齐口径——缓冲 64KiB(`copy_bidirectional_with_sizes` 或手写);user 侧复用 split_counted_tcp_user、channel 侧 split_boxed_io 的无锁拆半(签名从 &mut 改所有权,调用点均持所有权可行);TCP 主路径已有 copy_relay_pair/splice,本函数只服务 passthrough/visitor,别动主路径。
@@ -50,21 +52,27 @@
 - 备注:基准 tcp 档(HTTPS passthrough 与 tcpmux 场景)看吞吐保留率。
 
 ### M2 [P1] QUIC 服务端握手无在途上限 —— TCP 已修的同类缺口
-- [ ] 状态:
+- [x] 状态:已完成 @ 07f6435
+> 核查:✅ quic.rs:147-179 仍是无条件 spawn + 15s 超时,零背压;tcp.rs:28/353-399 的信号量方案可平移。
+> 处置:信号量(512)acquire 与 endpoint.accept() 绑成一个 future 进 select,许可随握手 child 归还;测试含负向探针验证断言区分力。三道门绿。
 - 位置:`crates/rh-transport/src/quic.rs:147-179`;对照 tcp.rs:28 HANDSHAKE_MAX_INFLIGHT=512
 - 问题:每个 Incoming 无条件 spawn + 15s 超时,零背压;建连洪水下任务/quinn 状态无界堆积。
 - 修法:镜像 tcp.rs 方案——信号量(512)acquire 与 endpoint.accept() 绑同一 select,拿到许可才 spawn;或 JoinSet+上限+abort_all。
 - 验收:三道门绿;单测:并发大量假 Incoming 时在途数封顶。
 
 ### M3 [P1] on_session_down 全量取回 visitor 行只用 id —— D-5 孪生漏点
-- [ ] 状态:
+- [x] 状态:已完成 @ f10d889
+> 核查:✅ 问题仍在(list_visitors 全量反序列化只为取 id,在 serial_lock 窗口、replaced 早退之前);list_visitor_ids 投影等价可证(spec.id 即 DB 行 id,db.rs:341/388 `spec.id = id as u64`)。
+> 处置:换 list_visitor_ids + 挪到 replaced 判定后(修前在判定前,新会话重注册的同 id 槽位会被旧会话清理误删,与新会话保护意图相悖——顺带修正一致性)。三道门绿。
 - 位置:`crates/rh-server/src/runtime.rs:76-81`
 - 问题:list_visitors 逐行构造完整 VisitorSpec 只为拿 id,且在 serial_lock 窗口内、先于 replaced 早退。
 - 修法:换 `list_visitor_ids`(db.rs 已有,一行);或至少移到 replaced 判定之后。
 - 验收:三道门绿;断连清理测试过。
 
 ### M4 [P1] kcp 入站包池是进程级单 Mutex —— A-4 引入的跨核争用
-- [ ] 状态:
+- [x] 状态:代码已完成 @ c7d2710;kcp 档基准(吞吐+CPU+UDP RTT)待跑
+> 核查:✅ PKT_POOL 仍是单 Mutex,demux 每包 get、N 会话任务每包 put(~17 万临界区/秒 @85k pps);"争用弱"注释确实低估。
+> 处置:16 片分片池,每片 16 槽(总硬上界 256 槽不变);get/put 独立轮转计数(单计数在逐包交替下步长 2 会钉死奇偶子集——自研时发现的坑);get 用 try_lock 扫描永不阻塞。独立实例单测锁复用/封顶/扫描不漏片。三道门绿。
 - 位置:`crates/rh-transport/src/kcp.rs:1272-1287`(PKT_POOL)
 - 问题:demux 每包 get、N 会话任务每包 put,同一锁字跨核乒乓(~17 万临界区/秒 @85k pps),替代的 malloc 本有 per-thread arena;注释自评"争用弱"低估了跨任务形态。
 - 修法:分片池(8-16 片按会话 id 哈希取片)或 demux 本地 free-list + 溢出触全局;put 按来源分片。
@@ -72,20 +80,26 @@
 - 备注:基准 kcp 档吞吐+CPU+**UDP RTT**(A-5 教训)。
 
 ### M5 [P1] UDP 会话表满时锁内逐包 warn —— 攻击场景日志放大
-- [ ] 状态:
+- [x] 状态:已完成 @ 95e4ff9
+> 核查:✅ data.rs udp_session_admit 拒绝分支仍每包 warn(调用点持 sessions 锁,up 泵 1961 / down 泵 2240)。
+> 处置:未走 gc-tick 汇总方案(up 泵无 gc tick,跨 4 个泵签名布线成本高),改 ProxyRuntime 挂 UdpRejectLog:CAS 窗口限频,首条立即上报、其后 15s 一条附窗口累计;指标每包保留。单测锁三行为。三道门绿。
 - 位置:`crates/rh-server/src/data.rs:1624-1633`(udp_session_admit 拒绝分支,持 sessions 锁)
 - 问题:表满后伪造源洪泛每包在临界区内格式化 warn + tracing 全局 writer 锁,up/down 两泵被串行化,日志无上界。
 - 修法:限频(借用 down 泵 15s gc tick 汇总"本周期拒绝 N 包"一条);`udp_sessions_rejected` 计数保留每包。
 - 验收:三道门绿;表满压测下日志行数有界。
 
 ### M6 [P1] SendAgg 聚合缓冲每会话驻留最高 ~300KB 不收缩
-- [ ] 状态:
+- [x] 状态:代码已完成 @ bc10a61;UDP RTT 对照并入基准轮
+> 核查:✅ AggQueue.buf 几何扩容 + drain 保留容量,满窗 256×~1300B ≈ 330KB 后长闲会话每人驻留峰值。
+> 处置:静默轮(空批且本调用零发送)换新 Vec,阈值 2×AGG_BATCH×1300;发送轮不收缩(防持续满载每轮 realloc 抖动)。测试锁三行为。三道门绿。
 - 位置:`crates/rh-transport/src/kcp.rs:870-954`(AggQueue,drain 只减 len)
 - 修法:flush_now 排空后 `capacity > 2×AGG_BATCH×1300` 则 shrink/换新 Vec;偶发再增长由几何扩容摊销。
 - 验收:三道门绿;新增测试:满窗后排空,容量回落。
 
 ### M7/M8 [P1] console 两条(合并一包做)
-- [ ] 状态:
+- [x] 状态:已完成 @ f69f5bd
+> 核查:✅ a) 三态确在页面顶层(107-111),打字即全页重渲染;b) 列表携带整份 spec,四个消费方中编辑弹窗(serviceToFormValues/buildServiceSpec 深拷贝底本)真需要,域名列与概览只需 custom_domains/subdomain 两字段,⌘K 只用 name/kind/status。
+> 处置:a) 抽 BatchImportDialog 子组件,状态内聚,失效口径保持 ['services'] 前缀;b) 列表去 spec+顶层投影,新增 GET /api/services/{id}(secret_key 照旧抹除),编辑弹窗单条取回+加载态,e2e 断言升级为「spec 段不存在」。console build+vitest 50+rh-server 181 过;API 冒烟按用户要求改在 test1 做。
 - a) `console/src/components/proxy-list-page.tsx:107/606-613`:批量导入弹窗每键入一字符整页表格全量重渲染。修:Dialog(含 batchText/batchResults/batchRunning)抽独立子组件,状态内聚。
 - b) `/services` 列表响应携带每条完整 spec(前端 rabbithole.ts:47/124,四个消费方只有编辑弹窗要 spec)。修:后端加轻量投影(列表去 spec,编辑按 id 单条取)+ 前端 api 与消费方改造;**响应结构变化需同步改 console 并验证**(管理 API 非隧道协议,允许变,但要在提交信息写明)。
 - 验收:a) `npm run build` 过 + 弹窗打字不再触发表格重渲染(React DevTools 或日志验证);b) 列表/编辑/批量导入/⌘K 全功能冒烟。
