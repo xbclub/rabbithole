@@ -936,12 +936,13 @@ async fn serve_https(
     } else {
         channel
     };
-    let mut channel = channel;
     let Some(_conn_guard) = crate::data::try_open_user_conn(&state, Some(&rt)) else {
         return Ok(()); // F2 配额超限
     };
-    let mut sock = crate::data::CountedUserIo::user(sock, &state, Some(rt.clone()));
-    let _ = crate::data::copy_bidirectional_bounded(&mut sock, &mut channel).await;
+    let sock = crate::data::CountedUserIo::user(sock, &state, Some(rt.clone()));
+    let _ =
+        crate::data::copy_bidirectional_bounded(Box::new(sock) as rh_transport::BoxedIo, channel)
+            .await;
     Ok(())
 }
 
@@ -1225,8 +1226,12 @@ async fn serve_tcpmux(
         let Some(_conn_guard) = crate::data::try_open_user_conn(&state, Some(&rt)) else {
             return Ok(()); // F2 配额超限
         };
-        let mut sock = crate::data::CountedUserIo::user(sock, &state, Some(rt.clone()));
-        let _ = crate::data::copy_bidirectional_bounded(&mut sock, &mut channel).await;
+        let sock = crate::data::CountedUserIo::user(sock, &state, Some(rt.clone()));
+        let _ = crate::data::copy_bidirectional_bounded(
+            Box::new(sock) as rh_transport::BoxedIo,
+            channel,
+        )
+        .await;
         return Ok(());
     }
     // 标准模式:服务端在用户连接上终结 yamux,每个入站流 = 一次独立数据通道转发
@@ -1257,13 +1262,16 @@ async fn serve_tcpmux(
                 } else {
                     return;
                 };
-                let mut ch = ch;
                 let _conn_guard = match crate::data::try_open_user_conn(&st2, Some(&rt2)) {
                     Some(g) => g,
                     None => return, // F2 配额超限
                 };
-                let mut stream = crate::data::CountedUserIo::user(stream, &st2, Some(rt2.clone()));
-                let _ = crate::data::copy_bidirectional_bounded(&mut stream, &mut ch).await;
+                let stream = crate::data::CountedUserIo::user(stream, &st2, Some(rt2.clone()));
+                let _ = crate::data::copy_bidirectional_bounded(
+                    Box::new(stream) as rh_transport::BoxedIo,
+                    ch,
+                )
+                .await;
             }
         });
     }

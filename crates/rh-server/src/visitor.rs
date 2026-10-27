@@ -283,7 +283,6 @@ async fn relay_udp(
                 return;
             }
         };
-        let mut a = a;
         // 计量归因到目标代理(visitor 流量按目标归属,design-parity 决策 3)
         let _conn_guard = match crate::data::try_open_user_conn(&st, prt.as_ref()) {
             Some(g) => g,
@@ -292,8 +291,9 @@ async fn relay_udp(
                 return;
             }
         };
-        let mut b = crate::data::CountedUserIo::user(b, &st, prt);
-        let _ = crate::data::copy_bidirectional_bounded(&mut a, &mut b).await;
+        let b = crate::data::CountedUserIo::user(b, &st, prt);
+        let _ =
+            crate::data::copy_bidirectional_bounded(a, Box::new(b) as rh_transport::BoxedIo).await;
         st.udp_relays.lock().await.remove(&vid);
     });
 }
@@ -406,15 +406,16 @@ async fn splice_relay(
     proxy_stream: BoxedIo,
     visitor_stream: BoxedIo,
 ) {
-    let mut a = proxy_stream;
     // 计量取 visitor 侧(用户口径),归因到目标代理(design-parity 决策 3)
     let rt = state.proxies.get(proxy_id);
     let _conn_guard = match crate::data::try_open_user_conn(&state, rt.as_ref()) {
         Some(g) => g,
         None => return, // F2 配额超限:中继不建立
     };
-    let mut b = crate::data::CountedUserIo::user(visitor_stream, &state, rt);
-    let _ = crate::data::copy_bidirectional_bounded(&mut a, &mut b).await;
+    let b = crate::data::CountedUserIo::user(visitor_stream, &state, rt);
+    let _ =
+        crate::data::copy_bidirectional_bounded(proxy_stream, Box::new(b) as rh_transport::BoxedIo)
+            .await;
 }
 
 fn conv_proxy_proto(v: rh_protocol::ProxyProtoVersion) -> rh_protocol::message::ProxyProto {

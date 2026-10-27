@@ -4098,20 +4098,59 @@ mod group_listener_ownership_tests {
 /// move 进独立任务。这里用 `select!` 在同一 future 内并发双向 copy:先完成
 /// 的一向关闭对向写半,然后在 `halfclose_grace` 内等第二向自然结束;超时
 /// 则直接返回(拆半句柄随函数返回 drop → fd 释放)。
-pub async fn copy_bidirectional_bounded<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
+/// M1:64KiB 缓冲的单向搬运(io::copy 默认 8KiB 的口径修正)。
+/// 单缓冲贯穿整个中继生命周期,读满写尽循环;EOF 返回累计字节。
+async fn copy_64k<R, W>(r: &mut R, w: &mut W) -> std::io::Result<u64>
 where
-    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
 {
-    let (mut a_r, mut a_w) = tokio::io::split(a);
-    let (mut b_r, mut b_w) = tokio::io::split(b);
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(total);
+        }
+        w.write_all(&buf[..n]).await?;
+        total += n as u64;
+    }
+}
+
+pub async fn copy_bidirectional_bounded(
+    user: rh_transport::BoxedIo,
+    channel: rh_transport::BoxedIo,
+) -> std::io::Result<(u64, u64)> {
+    // M1:修前 tokio::io::split 共享锁双泵 + io::copy 默认 8KiB 缓冲,
+    // 是 E-1(客户端)在服务端 passthrough/visitor 路径的孪生。现
+    // 对齐 copy_relay 的拆半纪律:user 侧先剥 CountedUserIo(TcpStream)
+    // 走 owned 拆半,channel 侧 split_boxed_io;包装类型(压缩流等)
+    // 回落共享锁拆分。缓冲对齐全仓 64KiB 口径。
+    let (mut a_r, mut a_w): RelayHalves = match split_counted_tcp_user(user) {
+        Ok((r, w)) => (r, w),
+        Err(io) => match rh_transport::split_boxed_io(io) {
+            Ok((r, w)) => (Box::new(r), Box::new(w)),
+            Err(io) => {
+                let (r, w) = tokio::io::split(io);
+                (Box::new(r), Box::new(w))
+            }
+        },
+    };
+    let (mut b_r, mut b_w): RelayHalves = match rh_transport::split_boxed_io(channel) {
+        Ok((r, w)) => (Box::new(r), Box::new(w)),
+        Err(io) => {
+            let (r, w) = tokio::io::split(io);
+            (Box::new(r), Box::new(w))
+        }
+    };
     let up = async {
-        let n = tokio::io::copy(&mut a_r, &mut b_w).await.ok();
+        let n = copy_64k(&mut a_r, &mut b_w).await.ok();
         let _ = b_w.shutdown().await;
         n
     };
     let down = async {
-        let n = tokio::io::copy(&mut b_r, &mut a_w).await.ok();
+        let n = copy_64k(&mut b_r, &mut a_w).await.ok();
         let _ = a_w.shutdown().await;
         n
     };
