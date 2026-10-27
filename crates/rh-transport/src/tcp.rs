@@ -170,27 +170,37 @@ async fn verify(
     set_tcp_keepalive(&stream);
     // round-41:载体发送缓冲调优(默认 0 = 不触碰,零漂移)
     apply_carrier_sndbuf(&stream);
-    // round-E2:裸 TCP 分支(tls.is_none() && !ws_upgrade)在装箱前产生
-    // 写侧 fd 副本,供 accept 交付时走 duplex mux。peek_prefix 只从主
-    //(读)侧消费 4 字节——双 fd 共享同一内核收队列,但写侧绝不读
-    //(halves 方向纪律,见 vendor Connection::into_halves_duplex),无
-    // 消费冲突。try_clone 失败 → None → 锁路径。multiplex 监听才需要
-    // 副本(非 mux 监听永不消费,避免每连接白开一个 fd)。
-    let write_dup = if multiplex && tls.is_none() && !ws_upgrade {
-        try_dup_tcp(&stream)
-    } else {
-        None
-    };
-    let io: crate::BoxedIo = match tls {
+    // round-E2:裸 TCP 分支(tls.is_none() && !ws_upgrade)产生写侧 fd
+    // 副本,供 accept 交付时走 duplex mux。写侧绝不读(halves 方向纪律,
+    // 见 vendor Connection::into_halves_duplex),无消费冲突。try_clone
+    // 失败 → None → 锁路径。multiplex 监听才需要副本(非 mux 监听永不
+    // 消费,避免每连接白开一个 fd)。
+    //
+    // L-E b:dup 推迟到 peek 判定**之后** —— 修前在 peek 前 dup,
+    // yamux 连接(副本永远不被消费,装箱即弃)每连接白开一个 fd +
+    // 一次 dup syscall。明文裸流在下方专属分支里先 peek 再按需 dup;
+    // TLS/WS 会话层载体本就不可 fd 复制,恒 None。
+    match tls {
         Some(acceptor) => {
             let tls_stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
                 .await
                 .map_err(|_| other_err("tls handshake timeout"))??;
-            Box::new(tls_stream)
+            post_tls(Box::new(tls_stream), None, ws_upgrade, multiplex).await
         }
-        None => Box::new(stream),
-    };
-    post_tls(io, write_dup, ws_upgrade, multiplex).await
+        None if !ws_upgrade && multiplex => {
+            // 明文 + 多路复用监听:先窥探分类(yamux=对端自带多路,
+            // 无需副本;RHTP 裸流才 dup 写侧)
+            let (prefix, stream) = peek_prefix_tcp(stream).await?;
+            let yamux = prefix != *b"RHTP";
+            let write_dup = if yamux { None } else { try_dup_tcp(&stream) };
+            Ok((
+                crate::PrependedIo::wrap(Box::new(stream) as crate::BoxedIo, prefix.to_vec()),
+                write_dup,
+                yamux,
+            ))
+        }
+        None => post_tls(Box::new(stream), None, ws_upgrade, multiplex).await,
+    }
 }
 
 async fn post_tls(
@@ -225,6 +235,16 @@ async fn post_tls(
 
 /// 窥探首 4 字节(带超时,防慢连接占资源);返回字节与可继续读取的流。
 async fn peek_prefix(mut io: crate::BoxedIo) -> io::Result<([u8; 4], crate::BoxedIo)> {
+    let (b, io) = peek_prefix_tcp(io).await?;
+    Ok((b, io))
+}
+
+/// [`peek_prefix`] 的裸 TcpStream 版(L-E b:明文分支保持未装箱,
+/// peek 后仍可 try_clone 写侧 fd)。
+async fn peek_prefix_tcp<S>(mut io: S) -> io::Result<([u8; 4], S)>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt as _;
     let mut b = [0u8; 4];
     tokio::time::timeout(HANDSHAKE_TIMEOUT, io.read_exact(&mut b))
