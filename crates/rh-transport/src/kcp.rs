@@ -884,6 +884,26 @@ struct AggQueue {
     lens: Vec<usize>,
 }
 
+impl AggQueue {
+    /// M6:静默轮的容量收缩。突发满窗(AGG_MAX_QUEUED×~1300B ≈ 330KB)
+    /// 按几何扩容垫高 buf 容量,而 drain 保留容量 —— 修前长闲会话每人
+    /// 驻留这个峰值。超过 2×AGG_BATCH×1300(约两倍满批字节)时换新
+    /// Vec;偶发再增长由几何扩容摊销。只在静默轮触发(见 flush_now):
+    /// 发送轮收缩会让持续满载每轮 realloc 抖动。
+    fn shrink_if_bloated(&mut self, quiet: bool) {
+        const BUF_OVER: usize = 2 * AGG_BATCH * 1300;
+        if !quiet {
+            return;
+        }
+        if self.buf.capacity() > BUF_OVER {
+            self.buf = Vec::new();
+        }
+        if self.lens.capacity() > 2 * AGG_BATCH {
+            self.lens = Vec::new();
+        }
+    }
+}
+
 /// sendmmsg 单次提交的数据报数上限(UIO_FASTIOV 口径;非 Linux 逐包
 /// 回退,值为 1 保语义)。
 #[cfg(target_os = "linux")]
@@ -937,8 +957,12 @@ impl SendAgg {
     /// 冲刷聚合批。锁内同步执行(纯 try 语义,无阻塞调用)。
     fn flush_now(&self) -> std::io::Result<()> {
         let mut q = self.queue.lock().unwrap();
+        let mut sent_this_call = 0usize;
         loop {
             if q.lens.is_empty() {
+                // M6:静默轮(本调用没发出任何东西)且缓冲因历史突发膨胀
+                // → 容量回落。容量检查在 shrink_if_bloated 内。
+                q.shrink_if_bloated(sent_this_call == 0);
                 return Ok(());
             }
             let Some(backlog) = self.backlog.upgrade() else {
@@ -963,6 +987,7 @@ impl SendAgg {
             let consumed: usize = q.lens[..sent].iter().sum();
             q.buf.drain(..consumed);
             q.lens.drain(..sent);
+            sent_this_call += sent;
             if sent < attempted {
                 // 部分提交:余段转 backlog 串行化,保 FIFO
                 self.transfer_to_backlog(&mut q);
@@ -2966,6 +2991,68 @@ mod kcp_regress {
         // 收紧 sndbuf 后全部发送成功)都是接收满即静默丢包、不回压发送
         // 端,断言依赖内核调参必假绿或必红。回落路径的行为与顺序性由
         // a03_send_agg_transfer_keeps_order 直接调用内部路径确定性钉住。
+    }
+
+    /// M6:聚合缓冲容量回落 —— 突发把 buf 容量垫到超过 2×满批后,
+    /// **发送轮不得收缩**(持续满载无 realloc 抖动),其后第一个
+    /// **静默轮**必须收缩;收缩后聚合仍正常收发。
+    #[tokio::test]
+    async fn m6_send_agg_capacity_recedes_after_quiet_round() {
+        let rx_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = rx_sock.local_addr().unwrap();
+        let tx_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let backlog = Arc::new(UdpBacklog::new());
+        let agg = Arc::new(SendAgg {
+            sock: tx_sock.clone(),
+            dest: Dest::Peer(addr),
+            backlog: Arc::downgrade(&backlog),
+            queue: std::sync::Mutex::new(AggQueue::default()),
+        });
+        tx_sock.writable().await.unwrap();
+        // 200×1300B ≈ 260KB,足够把 buf 容量垫过阈值(Linux 166KB / 2600B)
+        let pkt = vec![7u8; 1300];
+        for _ in 0..200 {
+            agg.push(&pkt);
+        }
+        agg.flush_now().unwrap();
+        {
+            let q = agg.queue.lock().unwrap();
+            assert!(
+                q.buf.capacity() > 2 * AGG_BATCH * 1300,
+                "突发后容量应超过收缩阈值,实际 {}",
+                q.buf.capacity()
+            );
+            assert!(
+                q.buf.capacity() > 2 * AGG_BATCH * 1300,
+                "发送轮不得收缩(满载无抖动),实际 {}",
+                q.buf.capacity()
+            );
+        }
+        // 静默轮:排空且无输出 → 容量必须回落
+        agg.flush_now().unwrap();
+        {
+            let q = agg.queue.lock().unwrap();
+            assert!(
+                q.buf.capacity() <= 2 * AGG_BATCH * 1300,
+                "静默轮后容量必须回落,实际 {}",
+                q.buf.capacity()
+            );
+        }
+        // 收缩后聚合仍可用:一包入批 → 冲刷 → 收到。接收队列里可能还
+        // 残留前面 200 包(内核 FIFO),排干直到读到标记包。
+        agg.push(b"still-alive");
+        agg.flush_now().unwrap();
+        let mut b = [0u8; 2048];
+        let found = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let (n, _) = rx_sock.recv_from(&mut b).await.unwrap();
+                if &b[..n] == b"still-alive" {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(found.is_ok(), "收缩后聚合路径必须照常工作(未收到标记包)");
     }
 
     /// A-3:余段转移的 FIFO —— transfer_to_backlog 必须把聚合缓冲内
