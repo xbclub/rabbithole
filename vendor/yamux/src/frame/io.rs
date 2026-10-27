@@ -213,6 +213,10 @@ pub(crate) struct Io<T> {
 struct Staging {
     buf: BytesMut,
     zeroed: usize,
+    /// R2 测试缝:本实例累计零填字节数(仅 cfg(test) 读写;全局静态
+    /// 会被并行测试互踩,实例字段无此问题)。
+    #[cfg(test)]
+    fill_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl Staging {
@@ -220,6 +224,8 @@ impl Staging {
         Self {
             buf: BytesMut::new(),
             zeroed: 0,
+            #[cfg(test)]
+            fill_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -240,12 +246,17 @@ impl Staging {
     /// 落在更低地址),水位只能重置回 len,稳态回到「每读 1 字节补
     /// 1 字节 memset、写脏的 cacheline 随即被内核拷贝覆盖」。
     ///
-    /// 自管扩容把不确定性消除:新缓冲整块预零填一次,水位直接推进
-    /// 到新容量。此后 `zeroed == capacity` 恒成立,读路径零 memset;
-    /// 每连接零填总量 ≈ 2× 峰值容量(几何增长,有界),不再随流量
-    /// 线性。旧 backing 若仍被未 drop 的零拷贝帧体引用,由引用计数
-    /// 自然延续(与 bytes 的 abandon 路径同语义)。代价:不再回收
-    /// 已消费前缀,staging 驻留高水位最多翻倍。
+    /// 自管扩容把不确定性消除(见上:C-1 的 reclaim 可见性理由)。
+    ///
+    /// R2(2026-10):预零填改**懒填**。修前每次重建整段 memset 新容量
+    /// —— 对 64KiB 零拷贝主力帧,split_to 每帧携走容量 → 每帧重建,
+    /// 整段预填退化成每帧一次全容量 memset,「零填 ≈2× 峰值容量有界」
+    /// 的主张只在容量保留形态(小帧 copy-out)下成立。懒填后不变量
+    /// 放宽为 `len ≤ zeroed ≤ capacity`:搬迁前缀本就初始化(是真实
+    /// 数据),新空闲区由 zeroed_spare 在**实际读入时**按需填 ——
+    /// 零填总量只随实际读入字节数增长,不再随预留容量增长。底层是
+    /// futures 的 AsyncRead(签名要求已初始化切片),每读入字节至少
+    /// 初始化一次是 API 地板;懒填消除的是「预留了但没读」的整段。
     fn reserve(&mut self, additional: usize) {
         let cap = self.buf.capacity();
         let len = self.buf.len();
@@ -256,9 +267,8 @@ impl Staging {
         let new_cap = (len + additional).max(cap.saturating_mul(2));
         let mut nb = BytesMut::with_capacity(new_cap);
         nb.extend_from_slice(&self.buf);
-        nb.spare_capacity_mut().fill(std::mem::MaybeUninit::new(0));
         self.buf = nb;
-        self.zeroed = new_cap;
+        self.zeroed = len;
     }
 
     /// 确保空闲区前 `want` 字节已初始化,返回该可写切片
@@ -272,6 +282,11 @@ impl Staging {
         if fill_from < len + take {
             for b in &mut spare[fill_from - len..take] {
                 *b = std::mem::MaybeUninit::new(0);
+            }
+            #[cfg(test)]
+            {
+                self.fill_bytes
+                    .fetch_add(len + take - fill_from, std::sync::atomic::Ordering::Relaxed);
             }
             self.zeroed = len + take;
         }
@@ -946,37 +961,89 @@ mod tests {
         );
     }
 
-    /// C-1(任务书):零填水位必须跨消费/扩容保持——判据是不变量
-    /// `zeroed == capacity` 在任意操作序列后成立,且空闲区物理为全零。
-    /// 修前:reserve 观察到任何 capacity 变化都把水位打回 len,同分配
-    /// 指针复位(reclaim)轮会把仍是零的空闲区整段重零填——稳态变成
-    /// 每读 1 字节付 1 字节 memset,写脏的 cacheline 随即被内核拷贝覆盖。
+    /// C-1/R2(任务书):水位不变量 + 扩容保真。
+    ///
+    /// R2 后不变量放宽为 `len ≤ zeroed ≤ capacity`(懒填:新空闲区
+    /// 按需初始化);判据:任意操作序列后水位落在区间内,且已初始化
+    /// 前缀在消费/扩容交错下数据保真。修前(C-1)的 bug 是水位被
+    /// reclaim 误重置回 len → 已零填区被反复重填。
     #[test]
-    fn staging_zero_watermark_survives_consume_and_growth() {
+    fn staging_watermark_invariant_and_growth_fidelity() {
         let mut st = Staging::new();
-        // 初始扩容:整块预零填,水位 == 容量
         st.reserve(64);
-        assert_eq!(st.zeroed, st.buf.capacity());
+        assert!(st.zeroed >= st.buf.len() && st.zeroed <= st.buf.capacity());
 
         // 模拟一轮读+消费:读入 40 字节,消费 12(帧头+小帧体)
         let s = st.zeroed_spare(40);
         s.copy_from_slice(&[0xA5u8; 40]);
         st.appended(40);
         st.take_body(12);
-        assert_eq!(st.zeroed, st.buf.capacity(), "消费后水位应与 capacity 同步");
+        assert!(st.zeroed >= st.buf.len() && st.zeroed <= st.buf.capacity());
 
-        // 空闲区必须物理全零(未被已消费的旧数据污染)
-        let spare = st.zeroed_spare(usize::MAX);
-        assert!(spare.iter().all(|&b| b == 0), "空闲区必须保持零填");
-
-        // 消费到接近清空后再扩容(触发自管重建):数据保真 + 水位恢复
+        // 消费到接近清空后再扩容(触发自管重建):数据保真
         st.take_body(st.len() - 1); // 只留 1 字节
         st.reserve(1024); // 容量不足 → 重建
         assert_eq!(&st.buf[..1], &[0xA5], "扩容搬迁必须保真");
-        assert_eq!(st.zeroed, st.buf.capacity(), "扩容后水位 == 新容量");
-        let spare = st.zeroed_spare(usize::MAX);
-        assert!(spare.iter().all(|&b| b == 0));
-        assert_eq!(spare.len(), st.buf.capacity() - 1);
+        assert!(st.zeroed >= st.buf.len() && st.zeroed <= st.buf.capacity());
+        // 懒填:重建后空闲区尚未初始化,水位 == len;按需取用时才填
+        assert_eq!(st.zeroed, st.buf.len(), "懒填:重建后水位应停在 len");
+        let spare = st.zeroed_spare(8);
+        assert_eq!(spare.len(), 8);
+        assert_eq!(st.zeroed, st.buf.len() + 8, "按需推进");
+    }
+
+    /// R2(任务书):零填总量只随**实际读入字节数**增长,不随预留容量
+    /// 增长。修前(reserve 整段预填):预留 1MiB 即使只读 100 字节,
+    /// 零填也是 1MiB;且 64KiB 零拷贝主力帧每帧重建 → 每帧一次全容量
+    /// memset。懒填后:读多少填多少。计数经 cfg(test) 缝观测。
+    #[test]
+    fn r2_zero_fill_tracks_bytes_read_not_reserved_capacity() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // 预留远大于实际读入(1MiB vs 100B):零填必须只计读入量
+        let mut st = Staging::new();
+        st.reserve(1024 * 1024);
+        let s = st.zeroed_spare(100);
+        s.copy_from_slice(&[1u8; 100]);
+        st.appended(100);
+        assert_eq!(
+            st.fill_bytes.load(Relaxed),
+            100,
+            "零填量必须等于实际读入量,不得预填预留区"
+        );
+
+        // 64KiB 主力帧连续流:零填 ≤ 帧数据总量(修前每帧 ≥ 全容量,
+        // 且任何一次大预留都会整段 memset)
+        let mut st2 = Staging::new();
+        let mut delivered = 0usize;
+        for i in 1..=16u8 {
+            let p = vec![i; 64 * 1024];
+            st2.reserve(p.len().saturating_sub(st2.buf.capacity() - st2.buf.len()) + 1);
+            // 经真实读入形态写入(zeroed_spare → copy → appended,
+            // 与 poll_read 路径一致;不得用 extend_from_slice 绕过水位)
+            let mut off = 0;
+            while off < p.len() {
+                // 精确请求剩余量:零填量必须恰等于本次读入(生产读路径
+                // 以 usize::MAX 提供整个空闲区,未读部分留待下次复用、
+                // 不重复填 —— 摊销后同样只随读入量增长)
+                let want = p.len() - off;
+                let s = st2.zeroed_spare(want);
+                let n = s.len();
+                assert!(n > 0 && n <= want, "reserve 后必须能提供剩余量");
+                s[..n].copy_from_slice(&p[off..off + n]);
+                st2.appended(n);
+                off += n;
+            }
+            let body = st2.take_body(p.len());
+            assert_eq!(&body[..], &p[..], "帧 {i} 逐字节保真");
+            delivered += p.len();
+        }
+        let delta2 = st2.fill_bytes.load(Relaxed);
+        // 上界断言:零填总量不得超过实际读入总量(修前每帧重建都
+        // 整段预填新容量,含未读 slack,稳态 ≥ 容量总量)。
+        assert!(
+            delta2 <= delivered,
+            "零填总量 {delta2} 不得超过实际读入 {delivered}"
+        );
     }
 
     // ===== round-5 §5.4 跨帧批量写(Sink 级:WriteState::Batch 契约)=====
