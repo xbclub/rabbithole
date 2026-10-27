@@ -1,9 +1,11 @@
 import { zodResolver } from '@hookform/resolvers/zod';
+import { useQuery } from '@tanstack/react-query';
 import { ChevronDown, Loader2 } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 
+import { getService } from '@/api/rabbithole';
 import type { ClientRow, ServiceRow } from '@/api/rabbithole';
 import { HeaderPairsInput } from '@/components/header-pairs-input';
 import { InfoLabel } from '@/components/info-label';
@@ -54,6 +56,7 @@ import {
 } from '@/features/services/spec';
 import type { ProxyFormValues, ProxyKind, ServiceSpecPayload } from '@/features/services/types';
 import { focusFirstControl } from '@/lib/dialog-focus';
+import { qk } from '@/lib/query-keys';
 
 export type { ProxyKind } from '@/features/services/types';
 
@@ -258,8 +261,17 @@ export function ProxyFormModal({
   onSubmit,
 }: ProxyFormModalProps) {
   const multiKind = kinds.length > 1;
-  const defaultValues: ProxyFormValues = editing
-    ? readbackValues(editing)
+  // M8:编辑回读需要完整 spec,而列表行已不带 spec —— 按 id 单条取回。
+  // 父组件按 editing.id remount 本弹窗,每次编辑重新发起;新建不查询。
+  const fullRowQuery = useQuery({
+    queryKey: qk.service(editing?.id ?? -1),
+    queryFn: () => getService(editing!.id),
+    enabled: open && editing !== null,
+    staleTime: 5_000,
+  });
+  const editingRow = editing ? (fullRowQuery.data ?? null) : null;
+  const defaultValues: ProxyFormValues = editingRow
+    ? readbackValues(editingRow)
     : defaultProxyFormValues(defaultKind, clients[0]?.id ?? '');
 
   const form = useForm<FormSchemaValues>({
@@ -267,6 +279,13 @@ export function ProxyFormModal({
     defaultValues,
   });
   const [advancedOpen, setAdvancedOpen] = useState(false);
+
+  // 编辑行异步到达时(首开无缓存)把表单重置为回读值;useForm 的
+  // defaultValues 只在首渲染生效,不会随后续渲染更新。
+  useEffect(() => {
+    if (editingRow) form.reset(readbackValues(editingRow));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 只在行数据变化时重置
+  }, [editingRow]);
 
   const kind = form.watch('kind') as ProxyKind;
   const pluginKind = form.watch('plugin_kind');
@@ -302,7 +321,9 @@ export function ProxyFormModal({
     }
     if (applied) return;
 
-    const spec = buildServiceSpec(values as ProxyFormValues, { editing });
+    // buildServiceSpec 以编辑目标的原 spec 深拷贝为底本(保留表单未覆盖
+    // 的段落),M8 起必须传**单条取回的完整行**,列表行没有 spec。
+    const spec = buildServiceSpec(values as ProxyFormValues, { editing: editingRow ?? editing });
     await onSubmit(spec);
   });
 
@@ -530,59 +551,72 @@ export function ProxyFormModal({
           </DialogDescription>
         </DialogHeader>
 
-        <Form {...form}>
-          <form onSubmit={handleSubmit} className="space-y-4" id="proxy-form">
-            {groups
-              .filter((group) => !ADVANCED_GROUPS.includes(group) && group !== 'plugin')
-              .map(section)}
+        {editing && !editingRow ? (
+          // M8:编辑回读的完整 spec 异步到达前不渲染表单(避免闪出
+          // 「新建默认值」再被 reset 抹掉)
+          <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
+            <Loader2 className="size-4 animate-spin" />
+            正在读取规则配置…
+          </div>
+        ) : (
+          <Form {...form}>
+            <form onSubmit={handleSubmit} className="space-y-4" id="proxy-form">
+              {groups
+                .filter((group) => !ADVANCED_GROUPS.includes(group) && group !== 'plugin')
+                .map(section)}
 
-            <section className="space-y-4 rounded-lg border p-4">
-              <div className="flex items-center gap-3">
-                <h3 className="text-sm font-semibold">{GROUP_LABELS.plugin}</h3>
-                <Separator className="flex-1" />
-              </div>
-              <div className="grid gap-4 sm:grid-cols-2">
-                {KIND_MATRIX[kind].fields
-                  .filter((rule) => rule.group === 'plugin')
-                  .map(renderField)}
-              </div>
-              {pluginFields ? (
-                <div className="space-y-4 rounded-md border border-dashed p-3">
-                  <p className="text-xs font-medium text-muted-foreground">
-                    <InfoLabel title="插件参数" infoKey="service.plugin_params" />
-                  </p>
-                  <div className="grid gap-4 sm:grid-cols-2">
-                    {pluginFields.map(renderPluginField)}
-                  </div>
+              <section className="space-y-4 rounded-lg border p-4">
+                <div className="flex items-center gap-3">
+                  <h3 className="text-sm font-semibold">{GROUP_LABELS.plugin}</h3>
+                  <Separator className="flex-1" />
                 </div>
-              ) : null}
-            </section>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  {KIND_MATRIX[kind].fields
+                    .filter((rule) => rule.group === 'plugin')
+                    .map(renderField)}
+                </div>
+                {pluginFields ? (
+                  <div className="space-y-4 rounded-md border border-dashed p-3">
+                    <p className="text-xs font-medium text-muted-foreground">
+                      <InfoLabel title="插件参数" infoKey="service.plugin_params" />
+                    </p>
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      {pluginFields.map(renderPluginField)}
+                    </div>
+                  </div>
+                ) : null}
+              </section>
 
-            <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
-              <Separator />
-              <div className="mt-2 flex items-center gap-1">
-                <CollapsibleTrigger asChild>
-                  <Button type="button" variant="ghost" className="gap-2">
-                    高级配置
-                    <ChevronDown
-                      className={`size-4 transition-transform ${advancedOpen ? 'rotate-180' : ''}`}
-                    />
-                  </Button>
-                </CollapsibleTrigger>
-                <InfoLabel iconOnly title="高级配置" infoKey="service.advanced" />
-              </div>
-              <CollapsibleContent className="space-y-4 pt-4">
-                {groups.filter((group) => ADVANCED_GROUPS.includes(group)).map(section)}
-              </CollapsibleContent>
-            </Collapsible>
-          </form>
-        </Form>
+              <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+                <Separator />
+                <div className="mt-2 flex items-center gap-1">
+                  <CollapsibleTrigger asChild>
+                    <Button type="button" variant="ghost" className="gap-2">
+                      高级配置
+                      <ChevronDown
+                        className={`size-4 transition-transform ${advancedOpen ? 'rotate-180' : ''}`}
+                      />
+                    </Button>
+                  </CollapsibleTrigger>
+                  <InfoLabel iconOnly title="高级配置" infoKey="service.advanced" />
+                </div>
+                <CollapsibleContent className="space-y-4 pt-4">
+                  {groups.filter((group) => ADVANCED_GROUPS.includes(group)).map(section)}
+                </CollapsibleContent>
+              </Collapsible>
+            </form>
+          </Form>
+        )}
 
         <DialogFooter>
           <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
             取消
           </Button>
-          <Button type="submit" form="proxy-form" disabled={submitting}>
+          <Button
+            type="submit"
+            form="proxy-form"
+            disabled={submitting || (editing !== null && editingRow === null)}
+          >
             {submitting ? <Loader2 className="size-4 animate-spin" /> : null}
             {editing ? '保存' : '创建规则'}
           </Button>

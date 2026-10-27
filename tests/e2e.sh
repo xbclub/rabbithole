@@ -493,8 +493,13 @@ EOF
 #      (create_ignores_caller_secret_and_generates_32_hex 等 4 条),直接断言
 #      库中值 —— 那才是转发时真正用的唯一事实源。
 #      见 crates/rh-server/src/api.rs。
-SEC_SDB=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([s["spec"]["stcp"]["secret_key"] for s in d if s["name"]=="sdb"][0])')
-[ -z "$SEC_SDB" ]; check $? "列表接口不回显 secret_key(安全加固;随机生成语义见服务端单测)"
+# ★口径再变更(M8,2026-10-27):列表接口已完全不携带 spec 段(投影
+# 化),断言从「spec.stcp.secret_key 为空」升级为「spec 段不存在」,
+# 更强且不依赖嵌套取值。完整 spec 由 GET /api/services/{id} 单条返回
+# (secret_key 同样抹除,由服务端单测 get_service_carries_redacted_spec
+# 覆盖)。随机生成语义仍由 api::secret_key_management_tests 承接。
+SEC_SDB=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print("LEAK" if any("spec" in s for s in d if s["name"]=="sdb") else "")')
+[ -z "$SEC_SDB" ]; check $? "列表接口不携带 spec 段(M8 投影;更不得回显 secret_key)"
 
 # 轮换:服务端重新生成,访问器(无副本)自动继承新值,在途之外的新中继继续可用
 mk_svc "{\"client_id\":\"$CID\",\"name\":\"sdb2\",\"kind\":\"stcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"stcp\":{}}" >/dev/null
@@ -522,15 +527,17 @@ ROT1=$(api -X POST "http://127.0.0.1:$API_PORT/api/services/$SDB2_ID/rotate-secr
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["secret"])')
 ROT2=$(api -X POST "http://127.0.0.1:$API_PORT/api/services/$SDB2_ID/rotate-secret" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["secret"])')
-SEC2=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([s["spec"]["stcp"]["secret_key"] for s in d if s["name"]=="sdb2"][0])')
-python3 - "$ROT1" "$ROT2" "$SEC2" <<'EOF' && ok "轮换端点每次生成新的 32 hex 密钥(且列表不回显)" || bad "轮换端点每次生成新的 32 hex 密钥(且列表不回显)"
+# ★口径再变更(M8):列表不携带 spec 段(见上),listed 断言改为
+# 「spec 段不存在」。
+SEC2=$(api "http://127.0.0.1:$API_PORT/api/services?client_id=$CID" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print("LEAK" if any("spec" in s for s in d if s["name"]=="sdb2") else "")')
+python3 - "$ROT1" "$ROT2" "$SEC2" <<'EOF' && ok "轮换端点每次生成新的 32 hex 密钥(且列表不携带 spec)" || bad "轮换端点每次生成新的 32 hex 密钥(且列表不携带 spec)"
 import sys, re
 rot1, rot2, listed = sys.argv[1], sys.argv[2], sys.argv[3]
 hex32 = re.compile(r"^[0-9a-f]{32}$")
 assert hex32.match(rot1), f"第一次轮换返回值不是 32 hex: {rot1!r}"
 assert hex32.match(rot2), f"第二次轮换返回值不是 32 hex: {rot2!r}"
 assert rot1 != rot2, "两次轮换返回了相同的密钥(没有重新生成)"
-assert listed == "", f"列表仍回显密钥(安全加固被绕过): {listed!r}"
+assert listed == "", f"列表仍携带 spec 段: {listed!r}"
 EOF
 sleep 2
 python3 - "$V_STCP2" <<'EOF' && ok "STCP 轮换后中继不断(访问器自动继承新密钥)" || bad "STCP 轮换后中继不断(访问器自动继承新密钥)"

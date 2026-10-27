@@ -53,20 +53,17 @@ const EVENTS_COLLAPSED = 5;
 
 /**
  * 转发规则的监听标识:TCP/UDP 是 bind_ip:bind_port;HTTP(S) 走域名/子域;
- * 其余 kind 的 spec 段里没有域名,回落到 bind 地址(旧版此处显示占位符「—」)。
+ * 其余 kind 无域名,回落到 bind 地址(旧版此处显示占位符「—」)。
+ * M8:域名信息来自列表行的顶层投影(custom_domains/subdomain),
+ * 列表接口不再携带整份 spec。
  */
 function listenAddress(rule: ServiceRow): string {
   const bind = `${rule.bind_ip}:${rule.bind_port}`;
   if (rule.kind === 'tcp' || rule.kind === 'udp') return bind;
 
-  const section = rule.spec?.[rule.kind];
-  if (section !== null && typeof section === 'object') {
-    const spec = section as Record<string, unknown>;
-    const domains = spec.custom_domains;
-    const first = Array.isArray(domains) ? domains.find((d) => typeof d === 'string') : undefined;
-    if (typeof first === 'string' && first.length > 0) return first;
-    if (typeof spec.subdomain === 'string' && spec.subdomain.length > 0) return spec.subdomain;
-  }
+  const first = rule.custom_domains?.find((d) => d.length > 0);
+  if (first) return first;
+  if (rule.subdomain) return rule.subdomain;
   return bind;
 }
 

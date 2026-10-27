@@ -2,6 +2,8 @@
 export const qk = {
   clients: ['clients'] as const,
   services: (clientId?: string) => ['services', clientId ?? 'all'] as const,
+  /** 单条规则(M8:编辑弹窗回读完整 spec)。列表失效时前缀 ['services'] 一并失效。 */
+  service: (id: number) => ['services', 'detail', id] as const,
   visitors: (clientId?: string) => ['visitors', clientId ?? 'all'] as const,
   certs: ['certs'] as const,
   stats: ['stats'] as const,

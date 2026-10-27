@@ -16,6 +16,7 @@ import {
 } from '@/api/rabbithole';
 import type { ClientRow, ServiceRow } from '@/api/rabbithole';
 import { ConfirmDialog } from '@/components/confirm-dialog';
+import { BatchImportDialog } from '@/components/batch-import-dialog';
 import { DataTable, DataTableColumnHeader } from '@/components/data-table';
 import type { RhColumnDef } from '@/components/data-table';
 import { EmptyState } from '@/components/empty-state';
@@ -28,14 +29,6 @@ import { Badge } from '@/components/ui/badge';
 import { MenubarItem } from '@/components/ui/menubar';
 import { Button } from '@/components/ui/button';
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
-import {
   Select,
   SelectContent,
   SelectItem,
@@ -43,10 +36,8 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
-import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type { ProxyKind, ServiceSpecPayload } from '@/features/services/types';
-import { focusFirstControl } from '@/lib/dialog-focus';
 import { feedbackError, feedbackSuccess } from '@/lib/feedback';
 import { qk } from '@/lib/query-keys';
 import { ROUTES } from '@/router/paths';
@@ -103,12 +94,10 @@ export function ProxyListPage({
   const [deleteTarget, setDeleteTarget] = useState<ServiceRow | null>(null);
   // 打开过一次后再常驻挂载:既能延后加载表单模块,又不丢关闭动画
   const [modalEverOpened, setModalEverOpened] = useState(false);
+  // M7:批量导入弹窗整体抽出为 BatchImportDialog(文本/结果/进行中三态
+  // 内聚子组件)—— 修前这三个 state 挂在本页顶层,弹窗里每键入一个
+  // 字符,整页(含全量表格)都跟着重渲染。
   const [batchOpen, setBatchOpen] = useState(false);
-  const [batchText, setBatchText] = useState('');
-  const [batchResults, setBatchResults] = useState<null | Array<{ name: string; msg: string }>>(
-    null,
-  );
-  const [batchRunning, setBatchRunning] = useState(false);
 
   const servicesQuery = useQuery({ queryKey: qk.services(), queryFn: () => listServices() });
   const clientsQuery = useQuery({ queryKey: qk.clients, queryFn: listClients });
@@ -212,16 +201,9 @@ export function ProxyListPage({
         meta: { label: '域名' },
         header: '域名',
         cell: ({ row }) => {
-          const spec = row.original.spec ?? {};
-          const http = spec.http as Record<string, unknown> | undefined;
-          const https = spec.https as Record<string, unknown> | undefined;
-          const tcpmux = spec.tcpmux as Record<string, unknown> | undefined;
-          const domains =
-            (http?.custom_domains as string[] | undefined) ??
-            (https?.custom_domains as string[] | undefined) ??
-            (tcpmux?.custom_domains as string[] | undefined) ??
-            [];
-          const subdomain = (http?.subdomain ?? https?.subdomain) as string | undefined;
+          // M8:列表行顶层投影(接口不再携带整份 spec)
+          const domains = row.original.custom_domains ?? [];
+          const subdomain = row.original.subdomain ?? undefined;
           if (domains.length === 0 && !subdomain) return '-';
           return (
             <span className="flex flex-wrap items-center gap-1.5">
@@ -398,34 +380,6 @@ export function ProxyListPage({
     return list;
   })();
 
-  async function runBatchImport() {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(batchText);
-    } catch {
-      feedbackError('不是合法的 JSON 数组');
-      return;
-    }
-    if (!Array.isArray(parsed)) {
-      feedbackError('不是合法的 JSON 数组');
-      return;
-    }
-    setBatchRunning(true);
-    const results: Array<{ name: string; msg: string }> = [];
-    for (const item of parsed as Array<Record<string, unknown>>) {
-      const name = typeof item.name === 'string' ? item.name : '?';
-      try {
-        await createService(item);
-        results.push({ name, msg: '成功' });
-      } catch (error) {
-        results.push({ name, msg: error instanceof Error ? error.message : '失败' });
-      }
-    }
-    setBatchResults(results);
-    setBatchRunning(false);
-    invalidate();
-  }
-
   async function runBatchOp(action: 'delete' | 'disable' | 'enable') {
     if (selected.length === 0) return;
     const results = await batchServices(
@@ -512,7 +466,6 @@ export function ProxyListPage({
               variant="outline"
               size="sm"
               onClick={() => {
-                setBatchResults(null);
                 setBatchOpen(true);
               }}
             >
@@ -595,47 +548,7 @@ export function ProxyListPage({
         </Suspense>
       ) : null}
 
-      <Dialog open={batchOpen} onOpenChange={setBatchOpen}>
-        <DialogContent className="sm:max-w-2xl" onOpenAutoFocus={focusFirstControl}>
-          <DialogHeader>
-            <DialogTitle>批量导入规则</DialogTitle>
-            <DialogDescription>
-              粘贴规则 JSON 数组(与单条创建载荷一致),逐条创建并回报结果。
-            </DialogDescription>
-          </DialogHeader>
-          <Textarea
-            value={batchText}
-            onChange={(event) => setBatchText(event.target.value)}
-            rows={10}
-            className="rh-mono text-xs"
-            placeholder='[{"client_id":"…","name":"web","kind":"tcp","bind_port":0,"target_host":"10.0.0.1","target_port":80}]'
-            aria-label="规则 JSON 数组"
-          />
-          {batchResults ? (
-            <div className="max-h-40 space-y-1 overflow-y-auto rounded-md border p-2 text-xs">
-              {batchResults.map((item, index) => (
-                <div key={index} className="flex items-center gap-2">
-                  <span className="rh-mono">{item.name}</span>
-                  <span className={item.msg === '成功' ? 'text-emerald-600' : 'text-destructive'}>
-                    {item.msg}
-                  </span>
-                </div>
-              ))}
-            </div>
-          ) : null}
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setBatchOpen(false)}>
-              关闭
-            </Button>
-            <Button
-              onClick={() => void runBatchImport()}
-              disabled={batchRunning || !batchText.trim()}
-            >
-              {batchRunning ? '导入中…' : '开始导入'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <BatchImportDialog open={batchOpen} onOpenChange={setBatchOpen} />
 
       {/* 密钥页动作超过 2 个,轮换/删除收进 ⋯:确认框全页各一份,受控打开 */}
       <ConfirmDialog

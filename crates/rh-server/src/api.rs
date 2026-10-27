@@ -32,7 +32,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/services", get(list_services).post(create_service))
         .route(
             "/api/services/{id}",
-            put(update_service).delete(delete_service),
+            get(get_service).put(update_service).delete(delete_service),
         )
         .route("/api/services/{id}/enable", post(enable_service))
         .route("/api/services/{id}/disable", post(disable_service))
@@ -942,11 +942,148 @@ struct ServiceListRow {
     status_reason: String,
     healthy: bool,
     pool_ready: usize,
-    spec: ProxySpec,
+    /// M8:域名投影(http/https/tcpmux 段的 custom_domains、http/https 的
+    /// subdomain)。列表不再携带整份 spec,列表页域名列与概览监听标识
+    /// 的全部所需就是这两项。
+    custom_domains: Vec<String>,
+    subdomain: Option<String>,
+    /// M8:仅单条取回(GET /api/services/{id},编辑弹窗回读)携带;
+    /// 列表恒 None 不序列化。返回前抹掉 secret_key(口径不变:密钥
+    /// 仅创建/轮换返回一次,读接口不回显;编辑留空 = 不修改)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec: Option<ProxySpec>,
     // F1 分规则计量(用户侧口径;运行时不在(已禁用)则为 0)
     bytes_in: u64,
     bytes_out: u64,
     conns_current: i64,
+}
+
+/// M8:列表行的域名投影。subdomain 空串视为无(与前端旧读法
+/// `?.subdomain` 的可选语义一致)。
+fn spec_domain_projection(spec: &ProxySpec) -> (Vec<String>, Option<String>) {
+    let (domains, subdomain) = match spec.kind {
+        ProxyKind::Http => (
+            spec.http.as_ref().map(|c| c.custom_domains.clone()),
+            spec.http.as_ref().map(|c| c.subdomain.clone()),
+        ),
+        ProxyKind::Https => (
+            spec.https.as_ref().map(|c| c.custom_domains.clone()),
+            spec.https.as_ref().map(|c| c.subdomain.clone()),
+        ),
+        // tcpmux 段只有 custom_domains,无 subdomain(与前端旧读法一致)
+        ProxyKind::TcpMux => (spec.tcpmux.as_ref().map(|c| c.custom_domains.clone()), None),
+        _ => (None, None),
+    };
+    (
+        domains.unwrap_or_default(),
+        subdomain.filter(|s| !s.is_empty()),
+    )
+}
+
+/// D-1:列表/单条共用的行构造。`with_spec` 仅单条取回为真 —— M8 起
+/// 列表行不带整份 spec(响应体积与 secret 抹除面都随之前移到单条)。
+///
+/// R1:limits 读锁由调用方在循环外取一次传入(修前每行取一次)。
+#[allow(clippy::too_many_arguments)]
+async fn service_row_of(
+    state: &Arc<AppState>,
+    id: i64,
+    client_id: String,
+    mut spec: ProxySpec,
+    with_spec: bool,
+    default_pool_size: u8,
+    max_pool_size: u8,
+) -> ServiceListRow {
+    normalize_spec(&mut spec, default_pool_size, max_pool_size);
+    let (custom_domains, subdomain) = spec_domain_projection(&spec);
+    // 标量字段先取走(修前形态:逐字段 clone,spec 最后整份移入行结构)
+    let name = spec.name.clone();
+    let kind: &'static str = spec.kind.as_str();
+    let enabled = spec.enabled;
+    let bind_ip = spec.bind_ip.clone();
+    let bind_port = spec.bind_port;
+    let target = format!("{}:{}", spec.target_host, spec.target_port);
+    let target_host = spec.target_host.clone();
+    let target_port = spec.target_port;
+    let plugin = spec.plugin.as_ref().map(|p| p.kind().as_str().to_string());
+    let group = spec.group.clone();
+    let spec = if with_spec {
+        // ★单条返回前抹掉 secret_key(列表接口 07b1aa2 的既有策略随
+        // spec 迁移到此):stcp/sudp 的 secret_key 是访问密钥,任何读
+        // 接口不回显;编辑时留空即"不修改"(update 路径按空值保留
+        // 原密钥)。
+        if let Some(secret_cfg) = spec.stcp.as_mut() {
+            secret_cfg.secret_key.clear();
+        }
+        if let Some(secret_cfg) = spec.sudp.as_mut() {
+            secret_cfg.secret_key.clear();
+        }
+        Some(spec)
+    } else {
+        None
+    };
+    // ★一次 `get` 拿 rt,四处复用。
+    //
+    // 修前这里调了 **4 次** `state.proxies.get(id)`(任务书与报告
+    // 早期都写成 3 次,实际还有 `healthy` 那一处,已核实为 4 次):
+    // status / pool_ready / rt_meter / healthy。N 条规则 = 4N 次
+    // dashmap 查找,每次都要 hash + 分片锁。
+    //
+    // 只做零风险的合并:**不动 `snapshot_state` 的阻塞语义**。
+    // 改成 `try_read` 会让列表页在竞争时显示 "unknown",那是接口
+    // 语义变化(报告 §7 已否决),不在本项范围。
+    let rt = state.proxies.get(id as u64);
+    let (status, reason) = match rt.as_ref() {
+        Some(rt) => {
+            let (st, r) = rt.snapshot_state().await;
+            (st.as_str().to_string(), r)
+        }
+        None => ("disabled".into(), String::new()),
+    };
+    let pool_ready = match rt.as_ref() {
+        Some(rt) => match rt.pool.lock().await.as_ref() {
+            Some(p) => p.ready.lock().await.len(),
+            None => 0,
+        },
+        None => 0,
+    };
+    let rt_meter = rt.as_ref().map(|rt| {
+        (
+            rt.bytes_in.load(std::sync::atomic::Ordering::Relaxed),
+            rt.bytes_out.load(std::sync::atomic::Ordering::Relaxed),
+            rt.conns_current
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(0),
+        )
+    });
+    ServiceListRow {
+        id,
+        client_id,
+        name,
+        kind,
+        enabled,
+        bind_ip,
+        bind_port,
+        target,
+        target_host,
+        target_port,
+        plugin,
+        group,
+        status,
+        status_reason: reason,
+        healthy: rt
+            .as_ref()
+            .map(|rt| rt.healthy.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(true),
+        pool_ready,
+        custom_domains,
+        subdomain,
+        spec,
+        // F1 分规则计量(用户侧口径;运行时不在(已禁用)则为 0)
+        bytes_in: rt_meter.map(|(i, _, _)| i).unwrap_or(0),
+        bytes_out: rt_meter.map(|(_, o, _)| o).unwrap_or(0),
+        conns_current: rt_meter.map(|(_, _, c)| c).unwrap_or(0),
+    }
 }
 
 async fn list_services(
@@ -961,93 +1098,61 @@ async fn list_services(
         Ok(r) => r,
         Err(e) => return err(500, &format!("{e}")),
     };
-    let mut out = Vec::new();
     // R1:limits 读锁提到循环外(修前每行取一次;std RwLock,微秒级)
     let (default_pool_size, max_pool_size) = {
         let l = state.limits.read().unwrap_or_else(|e| e.into_inner());
         (l.default_pool_size, l.max_pool_size)
     };
-    for (id, client_id, mut spec) in rows {
-        normalize_spec(&mut spec, default_pool_size, max_pool_size);
-        // ★列表回显前抹掉 secret_key。
-        //
-        // 下方 `"spec": spec` 会把整个 ProxySpec 序列化给前端,而 stcp/sudp
-        // 的 `secret_key` 是访问密钥(与客户端 secret 同级敏感)。它"仅创建时
-        // 返回一次"是既有策略(见 rotate-secret),列表接口不该把它翻出来。
-        // 前端不需要该值:编辑时留空即表示"不修改"(update 路径按空值保留原密钥,
-        // 见 api.rs 里 `old...filter(|c| !c.secret_key.is_empty())`)。
-        // R1:spec 是本行独占所有权,直接原地抹除(修前先整份深克隆)。
-        // 强类型行按声明序直接序列化,下方字段读取都发生在构造时。
-        if let Some(secret_cfg) = spec.stcp.as_mut() {
-            secret_cfg.secret_key.clear();
-        }
-        if let Some(secret_cfg) = spec.sudp.as_mut() {
-            secret_cfg.secret_key.clear();
-        }
-        // ★一次 `get` 拿 rt,四处复用。
-        //
-        // 修前这里调了 **4 次** `state.proxies.get(id)`(任务书与报告
-        // 早期都写成 3 次,实际还有 `healthy` 那一处,已核实为 4 次):
-        // status / pool_ready / rt_meter / healthy。N 条规则 = 4N 次
-        // dashmap 查找,每次都要 hash + 分片锁。
-        //
-        // 只做零风险的合并:**不动 `snapshot_state` 的阻塞语义**。
-        // 改成 `try_read` 会让列表页在竞争时显示 "unknown",那是接口
-        // 语义变化(报告 §7 已否决),不在本项范围。
-        let rt = state.proxies.get(id as u64);
-        let (status, reason) = match rt.as_ref() {
-            Some(rt) => {
-                let (st, r) = rt.snapshot_state().await;
-                (st.as_str().to_string(), r)
-            }
-            None => ("disabled".into(), String::new()),
-        };
-        let pool_ready = match rt.as_ref() {
-            Some(rt) => match rt.pool.lock().await.as_ref() {
-                Some(p) => p.ready.lock().await.len(),
-                None => 0,
-            },
-            None => 0,
-        };
-        let rt_meter = rt.as_ref().map(|rt| {
-            (
-                rt.bytes_in.load(std::sync::atomic::Ordering::Relaxed),
-                rt.bytes_out.load(std::sync::atomic::Ordering::Relaxed),
-                rt.conns_current
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .max(0),
+    let mut out = Vec::new();
+    for (id, client_id, spec) in rows {
+        // M8:列表行不带 spec(with_spec=false),域名走顶层投影
+        out.push(
+            service_row_of(
+                &state,
+                id,
+                client_id,
+                spec,
+                false,
+                default_pool_size,
+                max_pool_size,
             )
-        });
-        // spec 整份移入行结构(放最后构造);被引用的标量字段先 clone,
-        // 相对修前的整树深拷贝仍是净省。
-        out.push(ServiceListRow {
-            id,
-            client_id,
-            name: spec.name.clone(),
-            kind: spec.kind.as_str(),
-            enabled: spec.enabled,
-            bind_ip: spec.bind_ip.clone(),
-            bind_port: spec.bind_port,
-            target: format!("{}:{}", spec.target_host, spec.target_port),
-            target_host: spec.target_host.clone(),
-            target_port: spec.target_port,
-            plugin: spec.plugin.as_ref().map(|p| p.kind().as_str().to_string()),
-            group: spec.group.clone(),
-            status,
-            status_reason: reason,
-            healthy: rt
-                .as_ref()
-                .map(|rt| rt.healthy.load(std::sync::atomic::Ordering::Relaxed))
-                .unwrap_or(true),
-            pool_ready,
-            spec,
-            // F1 分规则计量(用户侧口径;运行时不在(已禁用)则为 0)
-            bytes_in: rt_meter.map(|(i, _, _)| i).unwrap_or(0),
-            bytes_out: rt_meter.map(|(_, o, _)| o).unwrap_or(0),
-            conns_current: rt_meter.map(|(_, _, c)| c).unwrap_or(0),
-        });
+            .await,
+        );
     }
     ok(out)
+}
+
+/// M8:单条取回。编辑弹窗需要完整 spec 回读表单,列表已不携带 ——
+/// 路径 `/api/services/{id}`(GET)。
+async fn get_service(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized();
+    }
+    match state.db.get_proxy(id).await {
+        Ok(Some((id, client_id, spec, _enabled))) => {
+            let (default_pool_size, max_pool_size) = {
+                let l = state.limits.read().unwrap_or_else(|e| e.into_inner());
+                (l.default_pool_size, l.max_pool_size)
+            };
+            let row = service_row_of(
+                &state,
+                id,
+                client_id,
+                spec,
+                true,
+                default_pool_size,
+                max_pool_size,
+            )
+            .await;
+            ok(row)
+        }
+        Ok(None) => err(404, "service not found"),
+        Err(e) => err(500, &format!("{e}")),
+    }
 }
 
 async fn create_service(
@@ -3362,7 +3467,7 @@ mod tests {
             })
         );
 
-        // --- list_services 行(含整份 spec 与两个 Option 字段) ---
+        // --- list_services 行(M8:列表不再携带 spec,域名走顶层投影) ---
         let sp = spec("tcp", "svc", 20001);
         let legacy = json!({
             "id": 42,
@@ -3381,7 +3486,8 @@ mod tests {
             "status_reason": "",
             "healthy": true,
             "pool_ready": 2,
-            "spec": &sp,
+            "custom_domains": [],
+            "subdomain": null,
             "bytes_in": 10,
             "bytes_out": 20,
             "conns_current": 30,
@@ -3403,7 +3509,9 @@ mod tests {
             status_reason: String::new(),
             healthy: true,
             pool_ready: 2,
-            spec: sp,
+            custom_domains: Vec::new(),
+            subdomain: None,
+            spec: None,
             bytes_in: 10,
             bytes_out: 20,
             conns_current: 30,
@@ -4620,7 +4728,8 @@ mod list_services_tests {
         assert_eq!(r["pool_ready"], 0);
     }
 
-    /// secret_key 必须被抹掉(与本次合并无关,但同一条回归路径)。
+    /// M8:列表行**整个 spec 段不出现**(比"抹掉密钥"更强);密钥抹除
+    /// 的语义由单条取回承接(见 get_service Carries_redacted_spec)。
     #[tokio::test]
     async fn secret_key_redacted() {
         let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
@@ -4632,10 +4741,85 @@ mod list_services_tests {
             .unwrap();
         let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
         let rows = call_list(&state).await;
-        assert_eq!(
-            rows[0]["spec"]["stcp"]["secret_key"], "",
-            "列表不得回显 secret_key"
+        assert!(
+            rows[0].get("spec").is_none(),
+            "M8:列表行不得携带 spec 段(更不得回显 secret_key)"
         );
+    }
+
+    /// M8:单条取回(GET /api/services/{id})携带完整 spec 供编辑回读,
+    /// 但 secret_key 必须抹除(读接口永不回显;编辑留空 = 不修改)。
+    #[tokio::test]
+    async fn get_service_carries_redacted_spec() {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_client(CID, "c", &"0".repeat(64), "")
+            .await
+            .unwrap();
+        let id = db
+            .insert_proxy(CID, &spec("s4", 24603, "stcp"), false, "console")
+            .await
+            .unwrap();
+        // 域名投影用例:http 段的 custom_domains/subdomain 提升到顶层
+        let http_spec: ProxySpec = serde_json::from_value(json!({
+            "name": "s5", "kind": "http", "client_id": CID,
+            "bind_ip": "127.0.0.1", "bind_port": 0,
+            "target_host": "10.0.0.1", "target_port": 80, "enabled": true,
+            "http": { "custom_domains": ["a.example.com","b.example.com"], "subdomain": "app" },
+        }))
+        .unwrap();
+        let id2 = db
+            .insert_proxy(CID, &http_spec, false, "console")
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+
+        let resp = get_service(
+            State(state.clone()),
+            auth(&state).await,
+            axum::extract::Path(id),
+        )
+        .await;
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let r = &v["data"];
+        assert!(r.get("spec").is_some(), "单条取回必须携带 spec(编辑回读)");
+        assert_eq!(
+            r["spec"]["stcp"]["secret_key"], "",
+            "单条取回不得回显 secret_key(密钥仅创建/轮换返回一次)"
+        );
+        assert_eq!(r["id"], id);
+
+        let resp2 = get_service(
+            State(state.clone()),
+            auth(&state).await,
+            axum::extract::Path(id2),
+        )
+        .await;
+        let b2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&b2).unwrap();
+        assert_eq!(
+            v2["data"]["custom_domains"],
+            json!(["a.example.com", "b.example.com"]),
+            "custom_domains 投影到顶层"
+        );
+        assert_eq!(v2["data"]["subdomain"], "app", "subdomain 投影到顶层");
+
+        // 不存在的 id:code=404(业务错误约定:HTTP 200 + body code)
+        let resp404 = get_service(
+            State(state.clone()),
+            auth(&state).await,
+            axum::extract::Path(999_999),
+        )
+        .await;
+        let b404 = axum::body::to_bytes(resp404.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v404: serde_json::Value = serde_json::from_slice(&b404).unwrap();
+        assert_eq!(v404["code"], 404, "不存在的 id 返回 code=404");
     }
 
     /// 多条规则:每条都要有正确的计量(不能因复用 rt 变量而串号)。

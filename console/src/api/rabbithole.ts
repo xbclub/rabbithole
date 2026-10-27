@@ -44,7 +44,14 @@ export interface ServiceRow {
   healthy: boolean;
   pool_ready: number;
   plugin: null | string;
-  spec: Record<string, unknown>;
+  /** M8:域名投影(列表页域名列/概览监听标识所需;http/https/tcpmux)。 */
+  custom_domains: string[];
+  subdomain: null | string;
+  /**
+   * 完整 spec:M8 起列表接口不再携带,仅 getService(编辑弹窗回读)
+   * 返回;secret_key 服务端已抹除(编辑留空 = 不修改)。
+   */
+  spec?: Record<string, unknown>;
   /** F1 计量(M1 后端落地前不返回)。 */
   bytes_in?: number;
   bytes_out?: number;
@@ -123,6 +130,10 @@ export async function rotateClientSecret(id: string): Promise<{ secret: string }
 // ---------- services ----------
 export async function listServices(params?: { client_id?: string }): Promise<ServiceRow[]> {
   return httpGet<ServiceRow[]>('/services', { params });
+}
+/** 单条取回(M8:列表不带 spec,编辑弹窗经此拿完整 spec 回读表单)。 */
+export async function getService(id: number): Promise<ServiceRow> {
+  return httpGet<ServiceRow>(`/services/${id}`);
 }
 export async function createService(spec: Record<string, unknown>): Promise<unknown> {
   return httpPost('/services', spec);
