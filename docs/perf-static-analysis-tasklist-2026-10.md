@@ -111,7 +111,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 
 ### A-5 [P2] demux 单任务逐包 recv_from,无 recvmmsg —— 来源 kcp-4
 - [x] 状态:已回退 @ 0801505(实施 @ 645a88e,基准后撤销)
-> 回退核查(2026-10-26 三机基准):recvmmsg 批收使 KCP 隧道 UDP(1200B×window32 回显)每程加 ~110µs 固定延迟 —— RTT p50 3.16→3.82ms、吞吐 96.9→77.4 Mbps(-19%),且回退后实测对 TCP 吞吐零贡献(agg 关闭对照轮与基线持平)。二分矩阵:V0 自建 v0.5.3(96.3,排除构建)、V1 关 agg(78.4,排除 A-3)、V2 demux 翻回逐包(93.1,锁定 A-5 结构)、tcp 轮延迟仅 +65µs(排除 yamux 层)。回退后 demux 统一为 tokio 原生 recv_from 逐包收,保留 demux_route_one 抽取与 A-4 池化;删除 recv_mmsg_batch/sockaddr_to_std 与 demux 内 std::os::fd 用法(该路径从此跨平台同构,可本地验证)。证据:/tmp/ev-udp-base、/tmp/ev-udp-cand、/tmp/ev-v2-demux-flip(见下方基准结论节)。
+> 回退核查(2026-10-26 三机基准):recvmmsg 批收使 KCP 隧道 UDP(1200B×window32 回显)每程加 ~110µs 固定延迟 —— RTT p50 3.16→3.82ms、吞吐 96.9→77.4 Mbps(-19%),且回退后实测对 TCP 吞吐零贡献(agg 关闭轮的 TCP 16流 729 与基线 728-730 持平、UDP 78.4 则与候选 76.2 持平仍陷回归)。二分矩阵:V0 自建 v0.5.3(96.3,排除构建)、V1 关 agg(78.4,排除 A-3)、V2 demux 翻回逐包(93.1,锁定 A-5 结构)、tcp 轮延迟仅 +65µs(排除 yamux 层)。回退后 demux 统一为 tokio 原生 recv_from 逐包收,保留 demux_route_one 抽取与 A-4 池化;删除 recv_mmsg_batch/sockaddr_to_std 与 demux 内 std::os::fd 用法(该路径从此跨平台同构,可本地验证)。证据:/tmp/ev-udp-base、/tmp/ev-udp-cand、/tmp/ev-v2-demux-flip(见下方基准结论节)。
 > 核查:✅ 问题在(demux_loop 每 select 一包一 syscall);采用 recvmmsg 批收(readable().await → recvmmsg(MSG_DONTWAIT)×N 至 EAGAIN 的标准批收形态),仅服务端 demux(客户端/打洞为单会话流量,pps 低一档,不动)。**门控 cfg(target_os="linux") 而非 cfg(unix)**:recvmmsg 同为 Linux-only(与 A-3 同因);单包路由抽 demux_route_one 供两平台共用,行为逐语句等价。libc 用法经 x86_64-unknown-linux-gnu scratch crate 编译验证(ring 交叉构建受阻,本地无法整 crate 交叉检查),余下由 CI linux job 兜底。
 - 位置:`crates/rh-transport/src/kcp.rs:1506-1532`(服务端)、:1741-1759(客户端)
 - 问题:高聚合 pps 下 syscall 频率与单任务调度是收包扩展上限;4MiB SO_RCVBUF 只是兜底。
@@ -265,7 +265,8 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 验收:三道门绿;池相关测试(上界断言)通过。
 
 ### C-9 [P3·存疑] Framer 每帧固定开销(take_error 锁 + workers_gone 遍历) —— 来源 yamuxCore-2
-- [ ] 状态:不修,量化建议如下(留人决策)
+- [W] 状态:不做(已量化归档)@ 0f572ba
+> 终态(2026-10-26):三机基准实测 yamux 路径(tcp+MUX=1)吞吐/延迟/CPU 全持平 —— 量级在端到端不可见,归档不修,登记 docs/not-supported.md §9(数据见下方「三机基准结论」节)。量化建议存档如下:
 > 复核结论维持(单帧 ~50-100ns,低于原发现主张)。量化建议:
 > ① peer.sh mux 档(PEER_REPEAT≥5、每档 15s)修前/修后各一轮,看吞吐保留率与两端 cpu.jsonl 差值——CPU 差 <1% 且保留率不变则按 AGENTS.md 写入 docs/not-supported.md 结案;
 > ② 更细归因:Linux 上 perf record -g 跑 mux 档 30s,火焰图找 connection.rs:1916 附近(fatal 快检 + workers_gone 遍历)self 采样占比,>0.5% 才值得做 workers_gone 快照化;
@@ -392,7 +393,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 - 验收:三道门绿;sshgateway 测试通过。
 
 ### D-15 [P2] 内嵌控制台静态资源无任何缓存头 —— 来源 serverMisc-4
-- [x] 状态:完成 @ 9b6c3ca
+- [x] 状态:完成 @ 62470a5
 > 核查:✅ 问题在(响应无缓存头,浏览器每次回源拉全部静态资源)。带 hash 的 assets/ 加 public, max-age=31536000, immutable;index.html 加 no-cache(SPA 入口须每次校验,防发新版后旧入口钉住旧 hash 资源)。
 - 位置:`crates/rh-server/src/embedded_ui.rs:66-73`
 - 问题:每响应仅 content-type,无 ETag/Cache-Control;浏览器每次打开控制台全量重下(~1.5MB,经隧道访问尤其浪费)。Vite 产物已自带内容 hash 文件名,缺的只是服务端缓存头;static_dir 分支(ServeDir)有 Last-Modified,两路径行为不一致。
@@ -441,7 +442,7 @@ P1 共 11 条:先做独立的单点修(clientMisc-1、serverData-1、mux-1、kcp
 | ev-udp-base | Release v0.5.3 | 93.1 / 3.16ms | 基线复现(前日 96.9/2.92) |
 | ev-udp-cand | main@67e1038 | 76.2 / 3.82ms | 回归今日复现 |
 | (V0) | **自建** v0.5.3(同工具链) | 96.3 / 2.99ms | 构建差异排除 |
-| (V1) | 候选、A-3 agg 关闭 | 78.4 / 3.63ms | A-3 排除;agg 对吞吐零贡献 |
+| (V1) | 候选、A-3 agg 关闭 | 78.4 / 3.63ms | A-3 排除(UDP 与候选持平);recvmmsg 对 TCP 零贡献(16流 729≈基线) |
 | (V2) | 候选、demux 翻回逐包 | 93.1 / 3.14ms | **锁定 A-5**;TCP 1流 562/16流 779 最高 |
 | ev-fix-kcp | 修复 @ 0801505 | **95.0 / 3.08ms** | 修复验证 ✅ |
 
