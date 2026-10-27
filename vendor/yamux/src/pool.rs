@@ -63,8 +63,11 @@ pub(crate) struct Pool {
     /// 大类驻留字节(粗粒度,仅用于预算判定;Relaxed 足够)。
     large_bytes: AtomicUsize,
     rotor: AtomicUsize,
-    /// 新分配计数(诊断缝:命中率回归断言用;仅 miss 新分配路径计数,
-    /// 开销相对 64KiB 分配可忽略)。
+    /// 新分配计数(诊断缝:命中率回归断言用)。
+    /// L-C c:cfg(test) 门控 —— 修前生产热路径每 get/miss 一次原子递增,
+    /// 违反自家「无人观察的计数不上热路径」红线(C-4/A-1 同族);
+    /// 测试用私有实例,门控后全局池零开销。
+    #[cfg(test)]
     allocations: AtomicUsize,
 }
 
@@ -93,6 +96,7 @@ impl Pool {
             ],
             large_bytes: AtomicUsize::new(0),
             rotor: AtomicUsize::new(0),
+            #[cfg(test)]
             allocations: AtomicUsize::new(0),
         }
     }
@@ -116,11 +120,16 @@ impl Pool {
         // 10-20× 且挤占主力路径的池存量;小缓冲本就被 put 拒收
         // (< MIN_RECYCLE),精确分配即正常释放,闭环一致。
         if min < MIN_RECYCLE {
+            #[cfg(test)]
             self.allocations.fetch_add(1, Ordering::Relaxed);
             return BytesMut::with_capacity(min);
         }
         if min > CLASS_MAX && min <= LARGE_MAX {
             // C4:大缓冲类 —— 上行 256KiB 读块走这里命中,不再每块新分配。
+            // L-C a:与小类同款容量过滤 —— 大类池内条目 ∈ (CLASS_MAX,
+            // LARGE_MAX],修前弹出不过滤容量,get(中间尺寸,如
+            // split_send_size 档)可拿到 < min 的条目,违反「容量 ≥ min」
+            // 合同;跳过不足条目放回原片,全 miss 才新分配。
             let start = self.rotor.fetch_add(1, Ordering::Relaxed) & (SHARDS - 1);
             for i in 0..SHARDS {
                 let idx = (start + i) & (SHARDS - 1);
@@ -128,22 +137,47 @@ impl Pool {
                     Ok(g) => g,
                     Err(e) => e.into_inner(),
                 };
-                if let Some(b) = g.pop() {
-                    // 弹出即减预算(put 侧按 cap 累加,这里按实际 capacity 扣回)。
-                    // 修前 get 不减:每次 get→put 净增一块容量,约 128 块后
-                    // `cur + cap > LARGE_BUDGET` 恒成立,put 永远拒收,
-                    // 大类池在稳态下被自己的计数器关停(每块重新分配)。
+                const SLOTS: usize = MAX_IDLE_LARGE / SHARDS;
+                let mut skipped: [Option<BytesMut>; SLOTS] = [const { None }; SLOTS];
+                let mut n_skipped = 0usize;
+                let mut found = None;
+                while let Some(mut b) = g.pop() {
+                    // 弹出即减预算(put 侧按 cap 累加,这里按实际 capacity
+                    // 扣回;放回的条目再加回,保持对称)。
                     self.large_bytes.fetch_sub(b.capacity(), Ordering::Relaxed);
-                    drop(g);
+                    b.clear();
+                    if b.capacity() >= min {
+                        found = Some(b);
+                        break;
+                    }
+                    if n_skipped < SLOTS {
+                        skipped[n_skipped] = Some(b);
+                        n_skipped += 1;
+                    } else {
+                        // 理论不可达(片内条目 ≤ SLOTS);防御性放回,不丢缓冲
+                        self.large_bytes.fetch_add(b.capacity(), Ordering::Relaxed);
+                        g.push(b);
+                    }
+                }
+                for slot in skipped.iter_mut().take(n_skipped) {
+                    if let Some(b) = slot.take() {
+                        self.large_bytes.fetch_add(b.capacity(), Ordering::Relaxed);
+                        g.push(b);
+                    }
+                }
+                drop(g);
+                if let Some(b) = found {
                     return b;
                 }
             }
+            #[cfg(test)]
             self.allocations.fetch_add(1, Ordering::Relaxed);
             return BytesMut::with_capacity(min);
         }
         if min > CLASS_MAX {
             // 池内条目容量恒 ≤ CLASS_MAX,必然 miss:跳过扫描,避免
             // 途中误淘汰较小条目。
+            #[cfg(test)]
             self.allocations.fetch_add(1, Ordering::Relaxed);
             return BytesMut::with_capacity(min);
         }
@@ -182,6 +216,7 @@ impl Pool {
                 return b;
             }
         }
+        #[cfg(test)]
         self.allocations.fetch_add(1, Ordering::Relaxed);
         BytesMut::with_capacity(min.max(CLASS))
     }
@@ -193,15 +228,12 @@ impl Pool {
             if cap > LARGE_MAX {
                 return;
             }
-            // C4:大类归还,按总字节预算封顶。
-            let cur = self.large_bytes.load(Ordering::Relaxed);
-            if cur + cap > LARGE_BUDGET
-                || self
-                    .large_bytes
-                    .compare_exchange(cur, cur + cap, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_err()
-            {
-                // 预算已满或并发更新失败:放弃复用(直接释放)。
+            // C4:大类归还,按总字节预算封顶。L-C b:修前 CAS 失败(并发
+            // 归还竞争)无条件丢缓冲 —— 预算可能本有空间,败者被无辜
+            // 丢弃;改乐观 fetch_add,超预算才回退,条目按真实余量收纳。
+            let prev = self.large_bytes.fetch_add(cap, Ordering::Relaxed);
+            if prev + cap > LARGE_BUDGET {
+                self.large_bytes.fetch_sub(cap, Ordering::Relaxed);
                 return;
             }
             let start = self.rotor.fetch_add(1, Ordering::Relaxed) & (SHARDS - 1);
@@ -272,6 +304,34 @@ mod tests {
         );
         let big = pool.get(CLASS);
         assert!(big.capacity() >= CLASS, "存量仍可服务大请求");
+    }
+
+    /// L-C a:大类 get 的容量过滤 —— 播种 256KiB 条目后 get(512KiB)
+    /// 不得返回容量不足的条目(修前弹出无过滤,split_send_size 类中间
+    /// 尺寸请求可拿到 < min 条目,违反「容量 ≥ min」合同);被跳过的
+    /// 条目必须留在池内继续服务 256KiB 请求(不误淘汰)。
+    #[test]
+    fn pool_large_class_capacity_filter() {
+        let pool = Pool::new();
+        for _ in 0..SHARDS {
+            pool.put(BytesMut::with_capacity(256 * 1024));
+        }
+        let b = pool.get(512 * 1024);
+        assert!(
+            b.capacity() >= 512 * 1024,
+            "大类 get 不得返回容量不足条目(capacity={})",
+            b.capacity()
+        );
+        drop(b);
+        // 存量未被中间尺寸请求消耗:256KiB 请求零新分配命中
+        let before = pool.allocations();
+        let hit = pool.get(256 * 1024);
+        assert!(hit.capacity() >= 256 * 1024);
+        assert_eq!(
+            pool.allocations() - before,
+            0,
+            "播种的 256KiB 条目必须仍在池内(过滤不得误淘汰)"
+        );
     }
 
     /// B2(红→绿):串行 get→use→put 之后,下一次 get 必须命中刚归还的缓冲。
