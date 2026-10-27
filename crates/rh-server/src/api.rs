@@ -2072,6 +2072,22 @@ async fn delete_service_inner(state: &Arc<AppState>, id: i64) -> (i32, String) {
 
 // ---------------- visitors ----------------
 
+/// L-B a:list_visitors 行结构(修前逐行 json! 建 Value 树,含整份
+/// spec 内嵌 —— 管理端列表每行多一次树构建 + spec 序列化双跳)。
+#[derive(serde::Serialize)]
+struct VisitorListRow {
+    id: i64,
+    client_id: String,
+    target_client_id: Option<String>,
+    name: String,
+    kind: &'static str,
+    enabled: bool,
+    bind_addr: String,
+    bind_port: u16,
+    target_proxy_name: String,
+    spec: rh_protocol::VisitorSpec,
+}
+
 async fn list_visitors(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2086,19 +2102,18 @@ async fn list_visitors(
     };
     let out: Vec<_> = rows
         .into_iter()
-        .map(|(id, client_id, target_client, spec)| {
-            json!({
-                "id": id,
-                "client_id": client_id,
-                "target_client_id": target_client,
-                "name": spec.name,
-                "kind": spec.kind.as_str(),
-                "enabled": spec.enabled,
-                "bind_addr": spec.bind_addr,
-                "bind_port": spec.bind_port,
-                "target_proxy_name": spec.target_proxy_name,
-                "spec": spec,
-            })
+        .map(|(id, client_id, target_client, spec)| VisitorListRow {
+            id,
+            client_id,
+            // 修前 json! 直接序列化 DB 原值(空串就是 ""),口径保持
+            target_client_id: Some(target_client),
+            name: spec.name.clone(),
+            kind: spec.kind.as_str(),
+            enabled: spec.enabled,
+            bind_addr: spec.bind_addr.clone(),
+            bind_port: spec.bind_port,
+            target_proxy_name: spec.target_proxy_name.clone(),
+            spec,
         })
         .collect();
     ok(out)
@@ -2433,6 +2448,29 @@ async fn list_events(
 
 // ---------------- 服务器配置(网页可管子集:端口策略/日志级别/SSH 网关) ----------------
 
+/// L-B b:get_server_config 视图(修前每请求整份 ServerConfig 深克隆 +
+/// 4 段 `to_value` 建 Value 树再整体序列化 —— 双跳)。具名结构借用
+/// hot/limits(唯一保留的克隆是脱敏所需的 config 本体),serde 一次走完,
+/// 字段与键名与修前完全一致。
+#[derive(serde::Serialize)]
+struct HotConfigView<'a> {
+    allow_ports: &'a [String],
+    max_services_per_client: usize,
+    log_level: &'a str,
+    ssh_gateway: &'a crate::config::SshGatewayConfig,
+    metrics: &'a crate::config::MetricsConfig,
+    limits: &'a crate::config::LimitsConfig,
+}
+
+#[derive(serde::Serialize)]
+struct ServerConfigView<'a> {
+    config: &'a crate::config::ServerConfig,
+    hot: HotConfigView<'a>,
+    authorized_keys: Option<String>,
+    /// 重启生效项:ALPN 在监听器构建时固化(TLS acceptor),热改无效。
+    alpn: &'a [String],
+}
+
 /// GET:完整配置(脱敏)+ 热配置当前值 + authorized_keys 内容。
 async fn get_server_config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if require_auth(&state, &headers).await.is_err() {
@@ -2440,28 +2478,36 @@ async fn get_server_config(State(state): State<Arc<AppState>>, headers: HeaderMa
     }
     let mut view = state.cfg.as_ref().clone();
     view.web.jwt_secret = None; // 密钥不回显
-    let hot = state.hot.read().await.clone();
-    let keys_path = hot.ssh_gateway.authorized_keys_file.clone();
+    let alpn = view.alpn.clone();
+    // 两段短锁:hot 读锁不得跨文件读 await(修前先克隆释放;这里第一段
+    // 只取路径,读盘后再第二段取视图借用,大配置不克隆)
+    let keys_path = state
+        .hot
+        .read()
+        .await
+        .ssh_gateway
+        .authorized_keys_file
+        .clone();
     // D-4:同步读盘移出 async 上下文(tokio::fs;修前每请求 std::fs)
     let authorized_keys = match keys_path.as_ref() {
         Some(p) => tokio::fs::read_to_string(p).await.ok(),
         None => None,
     };
-    ok(json!({
-        "config": serde_json::to_value(&view).unwrap_or(serde_json::Value::Null),
-        "hot": {
-            "allow_ports": hot.allow_ports,
-            "max_services_per_client": hot.max_services_per_client,
-            "log_level": hot.log_level,
-            "ssh_gateway": serde_json::to_value(&hot.ssh_gateway).unwrap_or(serde_json::Value::Null),
-            "metrics": serde_json::to_value(&hot.metrics).unwrap_or(serde_json::Value::Null),
-            "limits": serde_json::to_value(&*state.limits.read().unwrap_or_else(|e| e.into_inner()))
-                .unwrap_or(serde_json::Value::Null),
+    let hot = state.hot.read().await;
+    let limits = state.limits.read().unwrap_or_else(|e| e.into_inner());
+    ok(ServerConfigView {
+        config: &view,
+        hot: HotConfigView {
+            allow_ports: &hot.allow_ports,
+            max_services_per_client: hot.max_services_per_client,
+            log_level: &hot.log_level,
+            ssh_gateway: &hot.ssh_gateway,
+            metrics: &hot.metrics,
+            limits: &limits,
         },
-        "authorized_keys": authorized_keys,
-        // 重启生效项:ALPN 在监听器构建时固化(TLS acceptor),热改无效。
-        "alpn": state.cfg.alpn,
-    }))
+        authorized_keys,
+        alpn: &alpn,
+    })
 }
 
 #[derive(Deserialize, Default)]
@@ -2949,21 +2995,35 @@ async fn list_certs_api(State(state): State<Arc<AppState>>, headers: HeaderMap) 
         Ok(r) => r,
         Err(e) => return err(500, &format!("{e}")),
     };
-    // key_pem 任何响应不回显
+    // key_pem 任何响应不回显。L-B c:强类型行(修前逐行 json! 建树;
+    // domains 仍需从 DB 的 JSON 字符串解析,保留但只此一跳)
     let out: Vec<_> = rows
         .into_iter()
-        .map(|c| {
-            json!({
-                "id": c.id,
-                "name": c.name,
-                "domains": serde_json::from_str::<Vec<String>>(&c.domains).unwrap_or_default(),
-                "not_after": if c.not_after > 0 { Some(c.not_after) } else { None },
-                "fingerprint": c.fingerprint,
-                "created_at": c.created_at,
-            })
+        .map(|c| CertListRow {
+            id: c.id,
+            name: c.name,
+            domains: serde_json::from_str::<Vec<String>>(&c.domains).unwrap_or_default(),
+            not_after: if c.not_after > 0 {
+                Some(c.not_after)
+            } else {
+                None
+            },
+            fingerprint: c.fingerprint,
+            created_at: c.created_at,
         })
         .collect();
     ok(out)
+}
+
+/// L-B c:证书列表行结构。
+#[derive(serde::Serialize)]
+struct CertListRow {
+    id: i64,
+    name: String,
+    domains: Vec<String>,
+    not_after: Option<i64>,
+    fingerprint: String,
+    created_at: i64,
 }
 
 #[derive(Deserialize)]

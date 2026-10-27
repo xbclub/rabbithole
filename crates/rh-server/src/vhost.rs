@@ -457,7 +457,8 @@ async fn handle_http_request(
         if let Some(hit) = rt.http_cache.lock().unwrap().get(&cache_key) {
             let resp = hyper::Response::builder()
                 .status(hit.status)
-                .header("content-type", hit.content_type.clone())
+                // L-B d:Arc<str>,header 写入走 &* 借用,零克隆
+                .header("content-type", &*hit.content_type)
                 .header("x-cache", "HIT")
                 .body(full_body_body(hit.body.clone()))?; // R2:Bytes 克隆零拷贝
             return Ok(resp);
@@ -583,7 +584,7 @@ async fn handle_http_request(
                 expires: std::time::Instant::now()
                     + std::time::Duration::from_secs(cfg.ttl_seconds.max(1)),
                 status: 200,
-                content_type: ct.clone(),
+                content_type: std::sync::Arc::from(ct.as_str()),
                 body: collected.clone(), // R2:Bytes 引用传递,不再双份拷贝
             };
             rt.http_cache.lock().unwrap().put(

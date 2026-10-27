@@ -1197,7 +1197,8 @@ pub struct VhostTable {
 pub struct HttpCacheEntry {
     pub expires: std::time::Instant,
     pub status: u16,
-    pub content_type: String,
+    /// L-B d:Arc<str>(修前每次 HIT 克隆整个 content-type 串)
+    pub content_type: std::sync::Arc<str>,
     /// R2:Bytes 引用计数(collected 本就是 Bytes;修前入库 to_vec + into
     /// Arc<[u8]> 两次拷贝,HIT 再 to_vec 整包拷回 —— 1MiB 静态资源每命中
     /// 1MiB memcpy)。
@@ -1225,18 +1226,18 @@ impl Default for HttpCache {
 
 impl HttpCache {
     pub fn get(&mut self, key: &str) -> Option<HttpCacheEntry> {
-        let expired = self
-            .map
-            .get(key)
-            .map(|e| e.expires < std::time::Instant::now())
-            .unwrap_or(true);
-        if expired {
-            if let Some(e) = self.map.remove(key) {
-                self.bytes = self.bytes.saturating_sub(e.body.len());
+        // L-B d:get_key_value 单查(修前命中路径 get 判过期 + get.cloned
+        // 双哈希;miss 路径 get + remove 又两次)。命中即返回,过期才
+        // remove_entry 回收字节。
+        if let Some((_, e)) = self.map.get_key_value(key) {
+            if e.expires >= std::time::Instant::now() {
+                return Some(e.clone());
             }
-            return None;
         }
-        self.map.get(key).cloned()
+        if let Some((_, e)) = self.map.remove_entry(key) {
+            self.bytes = self.bytes.saturating_sub(e.body.len());
+        }
+        None
     }
 
     /// 插入(容量不足时先清过期再逐出任意项);超过单项上限或总容量则放弃。
