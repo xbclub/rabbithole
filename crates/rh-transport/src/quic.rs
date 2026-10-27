@@ -13,6 +13,12 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// 在途握手上限(镜像 tcp.rs `HANDSHAKE_MAX_INFLIGHT`)。
+///
+/// ready 队列(512)只背压"已验证待交付";在途握手若无上限,建连洪水
+/// 可在 QUIC_HANDSHAKE_TIMEOUT(15s)内堆积任意多握手任务。取 512 与
+/// 队列对齐,正常负载无感,洪峰时把压力退回内核 UDP 收包缓冲。
+const QUIC_HANDSHAKE_MAX_INFLIGHT: usize = 512;
 /// 空闲超时须显著大于 30s 协议心跳(quinn 默认 30s 恰等于心跳间隔,
 /// 单向抖动即误杀);客户端同时以 keepalive 主动保活。
 const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -106,6 +112,9 @@ pub struct QuicListener {
     ready: tokio::sync::mpsc::Receiver<Incoming>,
     /// 通知 accept 循环退出(只停接受,不动已有连接)。
     shutdown: tokio::sync::watch::Sender<()>,
+    /// 在途握手许可(测试观测用:断言背压发生在 accept 之前)。
+    #[cfg(test)]
+    pub(crate) inflight: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl Drop for QuicListener {
@@ -144,19 +153,40 @@ pub fn listen(
         .map_err(|e| other_err(format!("quic local addr: {e}")))?;
     let (tx, ready) = tokio::sync::mpsc::channel::<Incoming>(512);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
+    // M2:在途握手封顶。修前每个 Incoming 无条件 spawn + 15s 超时,零背压
+    // —— 建连洪水下握手任务无界堆积。★"先拿票、再 accept"绑成一个
+    // future 放进 select(与 tcp.rs 同款):拿不到票时不去 accept;拿到票
+    // 才取连接,许可随握手 child 作用域归还。不能把 acquire 放进 spawn
+    // 出来的 child —— 那样 accept 照常发生,只有并发握手工作量有界,
+    // 任务照样无界堆积(tcp.rs 第一版踩过,详见其注释)。quinn driver
+    // 对已到报文的状态推进是其内部行为,本闸门界住的是我们 spawn 的
+    // 握手任务数与交付节奏。
+    let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(QUIC_HANDSHAKE_MAX_INFLIGHT));
+    #[cfg(test)]
+    let inflight_obs = inflight.clone();
     tokio::spawn(async move {
         loop {
             // biased:先看退出信号,listener drop 后立即停止接受新连接
-            let incoming = tokio::select! {
+            let (incoming, permit) = tokio::select! {
                 biased;
                 _ = shutdown_rx.changed() => return,
-                res = endpoint.accept() => match res {
-                    Some(i) => i,
-                    None => return, // endpoint 已关闭
+                accepted = async {
+                    let permit = inflight
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("quic handshake semaphore never closed");
+                    // None = endpoint 已关闭
+                    endpoint.accept().await.map(|inc| (inc, permit))
+                } => match accepted {
+                    Some(v) => v,
+                    None => return,
                 },
             };
             let tx2 = tx.clone();
             tokio::spawn(async move {
+                // 许可随本 child 结束自动归还(permit 由作用域持有)
+                let _permit = permit;
                 match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
                     Ok(Ok(conn)) => {
                         let remote = conn.remote_address();
@@ -182,6 +212,8 @@ pub fn listen(
         local,
         ready,
         shutdown: shutdown_tx,
+        #[cfg(test)]
+        inflight: inflight_obs,
     })
 }
 
@@ -558,6 +590,81 @@ mod tests {
         s.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"quic-ok!");
         srv.await.unwrap();
+    }
+
+    /// M2:在途握手封顶 —— 许可耗尽时 accept 泵不得取新 Incoming(先拿票、
+    /// 再 accept);归还后必须恢复(不得因背压停摆)。
+    ///
+    /// 与 tcp.rs `pool_full_keeps_connections_in_kernel_accept_queue` 同款
+    /// 缝,但 QUIC 无内核 Recv-Q 可读,以"耗尽许可时新连接不得交付"为外部
+    /// 观测量:修前(无闸门)或把 acquire 放进 spawn 的 child,这里都会交付。
+    ///
+    /// 直接走同步 `super::listen`(不经 async 分发器):current_thread 运行时
+    /// 下返回时泵任务尚未被 poll,先取走全部 512 张许可,泵醒来只能停在
+    /// "拿票"处 —— 与 tcp.rs 同一确定性假设。
+    #[tokio::test]
+    async fn quic_handshake_inflight_cap_blocks_accept_until_permit_freed() {
+        let (cert, key) = crate::tls::auto_cert(&Default::default()).unwrap();
+        let server_cfg = ServerTransportConfig {
+            protocol: Protocol::Quic,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            multiplex: true,
+            tls: crate::TlsServerOptions {
+                cert_pem: Some(cert),
+                key_pem: Some(key),
+                ..Default::default()
+            },
+            alpn: vec![crate::DEFAULT_ALPN.into()],
+        };
+        let mux_streams = std::sync::atomic::AtomicUsize::new(0);
+        let mut listener = super::listen(&server_cfg, &mux_streams).unwrap();
+        let addr = listener.local;
+
+        // 取走全部许可(泵尚未 poll,确定可行)
+        let inflight = listener.inflight.clone();
+        let mut held = Vec::new();
+        while let Ok(p) = std::sync::Arc::clone(&inflight).try_acquire_owned() {
+            held.push(p);
+        }
+        assert_eq!(
+            held.len(),
+            super::QUIC_HANDSHAKE_MAX_INFLIGHT,
+            "应能取走全部在途许可(泵不得先占)"
+        );
+
+        // 真客户端发起连接:许可耗尽,不得交付
+        let client_cfg = ClientTransportConfig {
+            protocol: Protocol::Quic,
+            server_addr: addr,
+            multiplex: true,
+            tls: crate::TlsClientOptions {
+                insecure_skip_verify: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cli = tokio::spawn(async move { crate::connect(&client_cfg).await });
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            super::accept(&mut listener),
+        )
+        .await;
+        assert!(blocked.is_err(), "许可耗尽时不得交付 Incoming");
+
+        // 归还许可:泵恢复,交付 + 客户端连接成功
+        drop(held);
+        let _inc = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::accept(&mut listener),
+        )
+        .await
+        .expect("许可归还后 accept 必须恢复(不得因背压停摆)")
+        .unwrap();
+        let _mux = tokio::time::timeout(std::time::Duration::from_secs(5), cli)
+            .await
+            .expect("客户端任务未收敛")
+            .unwrap()
+            .unwrap();
     }
 
     /// listener drop 后 accept 循环必须退出(资源收敛)。
