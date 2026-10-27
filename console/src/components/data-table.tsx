@@ -13,7 +13,7 @@ import type {
   VisibilityState,
 } from '@tanstack/react-table';
 import { ArrowDown, ArrowUp, ChevronsUpDown, Columns3 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 /**
  * 本表格封装在 TanStack `ColumnDef.meta` 上追加的字段。
@@ -210,8 +210,21 @@ export function DataTable<TData>({
 
   /* eslint-disable react-hooks/exhaustive-deps -- 只在选中集变化时通知外层:
      回调常是内联箭头函数、table 实例每次渲染都是新的,纳入依赖会导致每渲染都回调。 */
+  // L-I b:挂载时选集本就是空,跳过回调 —— 修前挂载即用新空数组回调,
+  // 外层 setState 新引用白触发一轮全表渲染。「从 N 清到 0」仍须通知
+  // (父层要收工具条),用 ref 区分两种空。
+  const notifiedEmpty = useRef(true);
   useEffect(() => {
-    onSelectedRowsChange?.(table.getSelectedRowModel().rows.map((row) => row.original));
+    const rows = table.getSelectedRowModel().rows.map((row) => row.original);
+    if (rows.length === 0) {
+      if (!notifiedEmpty.current) {
+        notifiedEmpty.current = true;
+        onSelectedRowsChange?.(rows);
+      }
+      return;
+    }
+    notifiedEmpty.current = false;
+    onSelectedRowsChange?.(rows);
   }, [rowSelection]);
   /* eslint-enable react-hooks/exhaustive-deps */
 

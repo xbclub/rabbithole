@@ -117,6 +117,9 @@ export default function OverviewPage() {
   const servicesQ = useQuery({
     queryKey: qk.services(),
     queryFn: () => listServices(),
+    // L-I a:「转发规则健康」卡与指标条/事件同源轮询(修前此查询不随
+    // 5s 刷新,池/连接数在页面上冻结,只有切页才更新)
+    refetchInterval: POLL_MS,
   });
 
   const stats = statsQ.data;
