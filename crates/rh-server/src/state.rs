@@ -979,6 +979,8 @@ pub struct ProxyRuntime {
     /// 都无条件深克隆 spec + warm_proxy —— 批量改 N 条 = O(N²) 次克隆
     /// + 预热,全部内联在控制读循环里。预热本只需"会话(重连)后一次"。
     warm_session: std::sync::Mutex<Option<String>>,
+    /// M5:UDP 会话表满拒绝的日志限频(up/down 双泵共享;见 data.rs)。
+    pub udp_reject_log: crate::data::UdpRejectLog,
 }
 
 impl ProxyRuntime {
@@ -1008,6 +1010,7 @@ impl ProxyRuntime {
             serve_handle: Mutex::new(None),
             pool: Mutex::new(None),
             udp_new_channel_tx: Mutex::new(None),
+            udp_reject_log: crate::data::UdpRejectLog::default(),
             metrics_label: id.to_string(),
             usage_cache: std::sync::OnceLock::new(),
             warm_session: std::sync::Mutex::new(None),

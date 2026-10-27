@@ -1605,11 +1605,46 @@ pub async fn udp_on_channel(
     }
 }
 
+/// M5:UDP 会话表满拒绝的日志限频(up/down 双泵共享,挂 ProxyRuntime)。
+///
+/// 修前每包在 sessions 锁内格式化 `warn!` + 走 tracing 全局 writer 锁
+/// —— 表满后伪造源洪泛会把两泵串行化在日志上,日志量也无上界。
+/// 计数每包保留(指标 `udp_sessions_rejected` 不动),日志至多每 15s
+/// 一条、附本窗口累计拒绝数。
+#[derive(Default)]
+pub struct UdpRejectLog {
+    /// 当前统计窗口起点(epoch ms;0 = 从未上报,首条立即放行)。
+    window_ms: std::sync::atomic::AtomicI64,
+    count: std::sync::atomic::AtomicU64,
+}
+
+impl UdpRejectLog {
+    /// 记一次拒绝;返回 >0 表示本调用负责发日志(值为自上次日志以来的
+    /// 累计,含本包),0 = 只计数。窗口起点由 CAS 抢占,并发下每窗口
+    /// 至多一条;与并发计数之间的竞态最多丢几包,对量级无影响。
+    fn note(&self, now: i64) -> u64 {
+        const WINDOW_MS: i64 = 15_000;
+        let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        let w = self.window_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(w) >= WINDOW_MS
+            && self
+                .window_ms
+                .compare_exchange(w, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.count.store(0, Ordering::Relaxed);
+            return n;
+        }
+        0
+    }
+}
+
 /// UDP 服务主循环:等待通道 → 双向搬运;死亡 → 退避重建。
 /// UDP 会话准入:已存在 = 刷新时间戳放行;新会话在 max_udp_sessions_per_proxy
 /// (热配置,0 = 不限)已满时拒绝。返回 false = 本次报文按新会话超限处理。
 fn udp_session_admit(
     state: &Arc<AppState>,
+    rt: &crate::state::ProxyRuntime,
     sessions: &mut std::collections::HashMap<SocketAddr, Instant>,
     addr: SocketAddr,
 ) -> bool {
@@ -1623,13 +1658,19 @@ fn udp_session_admit(
         .load(std::sync::atomic::Ordering::Relaxed);
     if limit != 0 && sessions.len() >= limit {
         // B7:超限必须可见 —— 静默丢弃会让"UDP 不通"无从排查。
+        // M5:指标每包保留;日志限频至多 15s 一条(修前每包一条,锁内
+        // 格式化 + writer 锁把 up/down 两泵串行化,洪泛下日志无上界)。
         state.metrics.udp_sessions_rejected.inc();
-        tracing::warn!(
-            limit,
-            current = sessions.len(),
-            %addr,
-            "udp session table full, dropping new source"
-        );
+        let rejected = rt.udp_reject_log.note(epoch_ms());
+        if rejected > 0 {
+            tracing::warn!(
+                limit,
+                current = sessions.len(),
+                %addr,
+                rejected_since_last_log = rejected,
+                "udp session table full, dropping new source (log rate-limited)"
+            );
+        }
         return false;
     }
     true
@@ -1958,7 +1999,7 @@ async fn udp_pump_up<S: UdpRecv>(
             // 下互抢这把锁,拆成两次取锁纯付争抢成本。insert 提前到写之前,
             // 写失败残留的 entry 由通道死亡路径的 clear() 与 retain GC 兜底。
             let mut s = sessions.lock().unwrap();
-            if !udp_session_admit(state, &mut s, peer) {
+            if !udp_session_admit(state, rt.as_ref(), &mut s, peer) {
                 continue;
             }
             s.insert(peer, Instant::now());
@@ -2237,7 +2278,7 @@ async fn udp_pump_down_with(
                                 // 提前后行为等价。
                                 {
                                     let mut s = sessions.lock().unwrap();
-                                    if !udp_session_admit(state, &mut s, addr) {
+                                    if !udp_session_admit(state, rt.as_ref(), &mut s, addr) {
                                         touch();
                                         continue;
                                     }
@@ -3490,6 +3531,23 @@ mod udp_pump_failure_tests {
 
     fn sessions() -> Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, Instant>>> {
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// M5:会话表满的拒绝日志必须限频 —— 首条立即可见(超限可排查),
+    /// 窗口(15s)内其余只计数,窗口翻页恰好一条并携带累计。
+    /// 时间经参数注入,不受真实时钟影响。
+    #[test]
+    fn m5_udp_reject_log_rate_limits_to_one_per_window() {
+        let rl = super::UdpRejectLog::default();
+        assert_eq!(rl.note(100_000), 1, "首个拒绝必须立刻上报");
+        // 同窗口内 1 万次拒绝:全部只计数
+        let logged = (1..=10_000u32)
+            .filter(|i| rl.note(100_000 + *i as i64) > 0)
+            .count();
+        assert_eq!(logged, 0, "窗口内不得再上报");
+        // 窗口翻页:恰好一条,携带窗口累计(10_000 计数 + 本包)
+        assert_eq!(rl.note(115_000), 10_001);
+        assert_eq!(rl.note(115_001), 0, "新窗口内又只计数");
     }
 
     // ---------------- 问题 2:ctrl 发送不得无限阻塞 ----------------
