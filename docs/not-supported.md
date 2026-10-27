@@ -316,6 +316,53 @@ B-2 的 compress 侧已完成(两条独立单向 duplex,`JoinDuplex` 拼合,
 
 ---
 
+
+## 12. 带宽限速桶的 per-connection 语义(L-H b)
+
+**暂不改为规则级共享桶;登记现状。**(第二轮任务书 L-H b 的语义分支)
+
+### 现状
+
+TCP/HTTP 两侧的规则级限速桶在**每条连接**建立时各建一份
+(rh-server data.rs assign_forward / rh-client forward.rs relay),
+即 N 条并发连接 = N × 配置上限;UDP 侧的桶建在规则 serve loop
+(data.rs udp_serve_loop),全规则连接共享一份。两者口径不一致。
+
+### 判定依据
+
+frp 的 `bandwidth_limit` 是 per-proxy 共享桶(frp 源码
+`pkg/util/net/limiter.go`,proxy 级包装)——我们的 TCP 侧与其
+不一致。但本项目设计文档(design.md/design-parity.md)均未钉死
+该语义,改为共享桶是**用户可见行为变化**(现有部署里"每连接独享
+配额"的用户会在并发下感知收紧),不宜在性能任务书里顺手改。
+
+### 处置
+
+- 语义问题交由独立设计决策处理(若确认对齐 frp,再做规则级
+  共享桶,涉及 ProxyRuntime 挂桶 + UDP/TCP/visitor 三路统一);
+- 每连接一次的 `BandwidthQuantity::parse` 开销(字符串解析,
+  无分配)保留 —— 与建桶同一量级,单独缓存收益不成比例。
+
+---
+
+## 13. L-J 观察项(第二轮任务书,默认不做)
+
+按任务书约定逐条登记,均为复核后确认不影响当前形态:
+
+- **ws.rs JoinDuplex 缺 poll_write_vectored**:当前无向量写消费者
+  (write_frame 经 BoxedIo 包装后 vectored 语义由各层自决),
+  零影响;下次触碰 ws.rs 顺手。
+- **mux.rs pump_down 三处 enabled() 未提升**:每轮三次原子读,
+  ≈0 开销,不动。
+- **kcp PunchOutput/客户端 punch 收包循环错误分支**:槽直接还给
+  分配器 —— 仅会话终结时触发,无泄漏,不动。
+- **plugins.rs static_file into_owned 整头拷贝 + 4 次 tokio::fs**:
+  低频管理面;n17 借用化与 fs 合并待下次触碰该文件时顺手。
+- **plugins.rs read_proxy_request 双 to_vec**:低频(每代理请求
+  一次),split_off 单分配待顺手。
+- **sudp 建道前 pending 逐包 to_vec**:低频窗口,不动。
+
+---
 ## 变更记录
 
 | 日期 | 内容 |
@@ -325,3 +372,4 @@ B-2 的 compress 侧已完成(两条独立单向 duplex,`JoinDuplex` 拼合,
 | 2026-10-26 | 增补 §6~§9:2026-10 性能任务书的四条「不做」内部判定(E-3 by_name 副索引 / B-5 limiter 去装箱 / C-7 to_send 有界化 / C-9 Framer 每帧开销,后者经三机基准量化归档) |
 | 2026-10-26 | 增补 §10:A-5 服务端 demux recvmmsg 批收,经三机基准回退(UDP 每包延迟 -19% 吞吐、零收益;回退提交 0801505) |
 | 2026-10-26 | 复核修正:D-15 hash 归属(9b6c3ca→62470a5)、三处「持平」措辞按指标显式化;补登 §11 B-2 mux_relay 回落侧;C-9 任务书状态翻牌为不做 |
+| 2026-10-27 | 增补 §12(L-H b 限速桶 per-connection 语义,TCP/UDP 口径不一致但改共享桶属用户可见行为变化,交独立设计决策)与 §13(L-J 观察项六条) |
