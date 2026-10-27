@@ -353,9 +353,16 @@ impl AsyncWrite for WsIo {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut this = self.project();
+        let r = futures::ready!(this.ws.as_mut().poll_flush(cx));
         Poll::Ready(
-            futures::ready!(this.ws.as_mut().poll_flush(cx))
-                .map_err(|e| io::Error::other(format!("ws flush: {e}"))),
+            r.map(|()| {
+                // R3:外部 flush 完成 = 在途消息已发尽。修前不清 send_queued,
+                // 下一写会误以为仍有消息在途而跳过 start_send,新载荷被
+                // 静默丢弃(poll_write 被 Pending 取消 + 上层改走 flush 的
+                // 合法序列即可触发)。
+                *this.send_queued = false;
+            })
+            .map_err(|e| io::Error::other(format!("ws flush: {e}"))),
         )
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -468,6 +475,74 @@ mod tests {
         );
         // 8KiB 恰好一份(重复入队会使字节数翻倍)
         assert_eq!(joined.len(), 9 * 1024);
+    }
+
+    /// R3(红→绿):Pending 写被取消 + 外部 flush 完成 + 新写 ——
+    /// 新载荷必须真的发出。修前 poll_flush Ready 不清 send_queued,
+    /// 下一写误判「仍有消息在途」跳过 start_send,新载荷被静默丢弃
+    /// (写返回 Ok 但线上没有)。
+    #[tokio::test]
+    async fn ws_external_flush_then_new_write_not_dropped() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        let (a, b) = tokio::io::duplex(64);
+        let ws = tokio_tungstenite::WebSocketStream::from_partially_read(
+            Box::new(a) as BoxedIo,
+            vec![],
+            Role::Client,
+            None,
+        )
+        .await;
+        let mut c = WsIo::new(ws);
+        let reader = tokio::spawn(async move {
+            let mut b = b;
+            let mut out = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(5), b.read_to_end(&mut out)).await;
+            out
+        });
+
+        // 1) 大载荷单次 poll:duplex(64) 令 start_send 成功后 flush
+        //    Pending —— 正是「已入队未冲完」态(send_queued=true),
+        //    模拟上层把该写 future 取消(noop waker,不再重试)
+        let p1 = vec![0xA5u8; 8 * 1024];
+        {
+            let w = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&w);
+            let p = Pin::new(&mut c).poll_write(&mut cx, &p1);
+            assert!(
+                matches!(p, Poll::Pending),
+                "duplex(64) 下首写必须停在 flush Pending(已入队)"
+            );
+        }
+
+        // 2) 外部 flush:读者持续排空 duplex,flush 推进至 Ready
+        //    (上层「取消写、改走 flush」的合法序列)
+        tokio::time::timeout(Duration::from_secs(5), c.flush())
+            .await
+            .expect("deadline: external flush")
+            .expect("external flush");
+
+        // 3) 新载荷写入:修前此处 Ok 返回但载荷从未 start_send(丢弃)
+        let p2 = vec![0x3Cu8; 1024];
+        let n2 = tokio::time::timeout(Duration::from_secs(5), c.write(&p2))
+            .await
+            .expect("deadline: write p2")
+            .expect("write p2");
+        assert_eq!(n2, p2.len());
+
+        drop(c);
+        let wire = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("deadline: reader join")
+            .unwrap();
+        let frames = parse_client_frames(&wire);
+        let joined: Vec<u8> = frames.concat();
+        let mut want = p1.clone();
+        want.extend_from_slice(&p2);
+        assert_eq!(
+            joined, want,
+            "外部 flush 完成后新写不得被静默丢弃(修前只有 p1 上线)"
+        );
     }
 
     /// B2(红→绿):向量写透传。修前未实现 poll_write_vectored,落到

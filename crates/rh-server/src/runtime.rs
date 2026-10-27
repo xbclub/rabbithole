@@ -213,7 +213,9 @@ async fn advance_confirmed(
     rt: &Arc<crate::state::ProxyRuntime>,
     revision: u64,
 ) {
-    rt.confirmed_revision.store(revision, Ordering::Relaxed);
+    // R3:fetch_max —— 重复/陈旧定点 ACK(失败重发 SYNC 后的补 ACK、
+    // 乱序到达)不得把确认号回退,否则 bind_error_retry 被多余重发
+    let _ = rt.confirmed_revision.fetch_max(revision, Ordering::Relaxed);
     let latest = rt.latest_revision.load(Ordering::Relaxed);
     // N12:state_kind() 只取枚举(snapshot_state 连带 clone reason
     // String,每 ACK × 每规则都在付)。
@@ -907,6 +909,29 @@ mod notify_client_recovery_bench {
 
 #[cfg(test)]
 mod d3_ack_tests {
+    /// R3:陈旧/重复定点 ACK 不得回退 confirmed_revision。
+    /// 修前无条件 store —— 失败重发 SYNC 后的补 ACK(旧 revision)
+    /// 会把确认号打回去,bind_error_retry 被多余重发。
+    #[tokio::test]
+    async fn r3_stale_ack_does_not_regress_confirmed_revision() {
+        let (state, sess) = setup().await;
+        insert_rt(&state, "c1", 1, 10);
+        let rt = state.proxies.runtimes.get(&1).unwrap().clone();
+
+        advance_confirmed(&state, &sess, &rt, 7).await;
+        assert_eq!(rt.confirmed_revision.load(Ordering::Relaxed), 7);
+        // 陈旧 ACK(更旧 revision)到达:确认号必须保持单调
+        advance_confirmed(&state, &sess, &rt, 3).await;
+        assert_eq!(
+            rt.confirmed_revision.load(Ordering::Relaxed),
+            7,
+            "陈旧 ACK 不得回退确认号"
+        );
+        // 新 revision 正常推进
+        advance_confirmed(&state, &sess, &rt, 10).await;
+        assert_eq!(rt.confirmed_revision.load(Ordering::Relaxed), 10);
+    }
+
     use super::*;
 
     fn spec(cid: &str, id: u64) -> ProxySpec {

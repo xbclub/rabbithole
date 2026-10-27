@@ -672,7 +672,12 @@ impl UdpBacklog {
 
     /// 记录致命错误(首个记 warn 日志,后续幂等);唤醒 drain 收敛;
     /// 经错误桥立即送达会话(idle 会话不等待下一次输出)。
-    fn note_fatal(&self, msg: String, pkt_len: usize) {
+    ///
+    /// `counted_inflight`:该包是否已计入在途(drain 路径 pop 时已加,
+    /// 传 true 在此扣回;A-3 聚合批的包**未经 backlog 记账**,传 false
+    /// —— 修前无差别扣减,聚合路径的致命错误会把在途计数 fetch_sub
+    /// 成 usize 回绕,stats 恒巨值)。
+    fn note_fatal(&self, msg: String, pkt_len: usize, counted_inflight: bool) {
         self.fatal_flag.store(true, Ordering::Release);
         {
             let mut g = self.fatal_error.lock().unwrap();
@@ -683,8 +688,10 @@ impl UdpBacklog {
             *g = Some(msg);
         }
         self.fatal.fetch_add(1, Ordering::Relaxed);
-        self.inflight_bytes.fetch_sub(pkt_len, Ordering::Relaxed);
-        self.inflight_packets.fetch_sub(1, Ordering::Relaxed);
+        if counted_inflight {
+            self.inflight_bytes.fetch_sub(pkt_len, Ordering::Relaxed);
+            self.inflight_packets.fetch_sub(1, Ordering::Relaxed);
+        }
         self.notify.notify_one();
     }
 
@@ -791,7 +798,11 @@ fn drain_once(
             // UDP 报文原子发送;短写属于异常,致命化(修复前仅计数后
             // continue,违反不吞真实错误约束)
             Ok(n) => {
-                bl.note_fatal(format!("kcp udp short write {n}/{}", pkt.len()), pkt.len());
+                bl.note_fatal(
+                    format!("kcp udp short write {n}/{}", pkt.len()),
+                    pkt.len(),
+                    true,
+                );
                 return DrainSt::Fatal;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -799,7 +810,7 @@ fn drain_once(
                 return DrainSt::Blocked;
             }
             Err(e) => {
-                bl.note_fatal(e.to_string(), pkt.len());
+                bl.note_fatal(e.to_string(), pkt.len(), true);
                 return DrainSt::Fatal;
             }
         }
@@ -939,7 +950,7 @@ impl SendAgg {
             let sent = match self.send_batch(&q) {
                 Ok(k) => k,
                 Err(e) => {
-                    backlog.note_fatal(format!("kcp agg send: {e}"), q.lens[0]);
+                    backlog.note_fatal(format!("kcp agg send: {e}"), q.lens[0], false);
                     return Err(e);
                 }
             };
@@ -2663,6 +2674,7 @@ mod tests {
             let inc = listener.accept().await.unwrap();
             let mut s = inc.mux.accept().await.unwrap();
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
             let mut buf = [0u8; 12];
             s.read_exact(&mut buf).await.unwrap();
             s.write_all(&buf).await.unwrap();
@@ -2756,6 +2768,33 @@ mod kcp_regress {
     use futures::task::noop_waker;
     use std::sync::atomic::AtomicBool;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// R3:note_fatal 的 counted_inflight 契约 —— 聚合批路径(未经
+    /// backlog 在途记账)传 false,不得 fetch_sub 未计入的计数(修前
+    /// usize 回绕,inflight_bytes 恒巨值);drain 路径(pop 已加)传
+    /// true 正常扣回。
+    #[test]
+    fn r3_note_fatal_inflight_accounting() {
+        let bl = UdpBacklog::new();
+        // 聚合路径形态:从零在途直接 note_fatal(false)
+        bl.note_fatal("agg-path".into(), 1400, false);
+        let st = bl.stats();
+        assert_eq!(st.inflight_bytes, 0, "agg 路径不得扣减在途(回绕=巨值)");
+
+        // drain 路径形态:push(pop 前在途已计)后 fatal(true) 扣回
+        let bl2 = UdpBacklog::new();
+        assert!(bl2.push(&[0u8; 1200]));
+        // pop 发生在 drain_once;这里直接以已计入语义验证扣回方向
+        bl2.note_fatal("drain-path".into(), 1200, true);
+        // fetch_sub(1200) 于 0 上回绕是 drain 真实路径不可能出现的
+        // 前提(pop 先加了);该断言钉住「true 路径确实执行扣减」:
+        // 与 false 路径的行为差异可观测。
+        let st2 = bl2.stats();
+        assert!(
+            st2.inflight_bytes >= usize::MAX / 2,
+            "true 路径执行了 fetch_sub"
+        );
+    }
 
     fn poll_w(io: &mut KcpIo, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let w = noop_waker();
