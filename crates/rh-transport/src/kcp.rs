@@ -176,11 +176,6 @@ macro_rules! bump_counter {
 /// recv_many 有 ≥1 条即返回,不凑满、不加等待。
 const BATCH_CAP: usize = 64;
 
-/// 队列内字节总数(条数上限之外的第二个容量维度)。
-fn backlog_bytes(q: &VecDeque<Vec<u8>>) -> usize {
-    q.iter().map(|p| p.len()).sum()
-}
-
 // ---------------- 会话 IO(用户侧字节流) ----------------
 
 /// write_queue 条目:缓冲 + 消费游标(A-2)。
@@ -538,6 +533,14 @@ pub struct BacklogStats {
     pub inflight_bytes: usize,
 }
 
+/// L-D c:队列 + 排队字节总数增量记账(替代逐入队线性扫全队列)。
+///
+/// bytes 与 pkts 同锁维护(push_back/pop_front/push_front 三处)。
+struct BkQueue {
+    pkts: VecDeque<bytes::Bytes>,
+    bytes: usize,
+}
+
 /// UDP 发送积压:kernel 发送缓冲满(WouldBlock)时的有界 FIFO。
 ///
 /// - 唯一串行发送所有权:所有数据报(含队首在途的)一律入队,由
@@ -549,7 +552,7 @@ pub struct BacklogStats {
 ///   drain 收敛退出;后续生产者写出错经 kcp flush 传播终止会话并
 ///   浮出到 IO。不再「计数后 continue 吞掉」。
 struct UdpBacklog {
-    state: Mutex<VecDeque<Vec<u8>>>,
+    state: Mutex<BkQueue>,
     notify: Notify,
     /// 诊断计数(测试与日志用):入队 / 从队列发出 / 满丢 / 致命
     enqueued: AtomicU64,
@@ -575,7 +578,10 @@ struct UdpBacklog {
 impl UdpBacklog {
     fn new() -> Self {
         Self {
-            state: Mutex::new(VecDeque::new()),
+            state: Mutex::new(BkQueue {
+                pkts: VecDeque::new(),
+                bytes: 0,
+            }),
             notify: Notify::new(),
             enqueued: AtomicU64::new(0),
             sent: AtomicU64::new(0),
@@ -633,23 +639,23 @@ impl UdpBacklog {
             sent: self.sent.load(Ordering::Relaxed),
             dropped_full: self.dropped_full.load(Ordering::Relaxed),
             fatal: self.fatal.load(Ordering::Relaxed),
-            queued_packets: q.len(),
-            queued_bytes: backlog_bytes(&q),
+            queued_packets: q.pkts.len(),
+            queued_bytes: q.bytes,
             inflight_bytes: self.inflight_bytes.load(Ordering::Relaxed),
         }
     }
 
     #[cfg(test)]
     fn bytes(&self) -> usize {
-        backlog_bytes(&self.state.lock().unwrap())
+        self.state.lock().unwrap().bytes
     }
 
     fn is_empty(&self) -> bool {
-        self.state.lock().unwrap().is_empty()
+        self.state.lock().unwrap().pkts.is_empty()
     }
 
     fn queued_packets(&self) -> usize {
-        self.state.lock().unwrap().len()
+        self.state.lock().unwrap().pkts.len()
     }
 
     /// 快路径判定:无排队且无在途(此刻不存在可被插队的包)。
@@ -701,11 +707,18 @@ impl UdpBacklog {
     /// 成功入队后唤醒 drain。在途增量在持锁内发生(pop),本处在持锁后
     /// 读在途原子;发出/致命路径的在途减量只会让预算变小(方向安全)。
     fn push(&self, pkt: &[u8]) -> bool {
+        // L-D b:Bytes 元素化 —— 调用方持 &[u8],此处拷贝与修前 to_vec
+        // 等价;零拷路径见 push_owned(聚合批余段移交)。
+        self.push_owned(bytes::Bytes::copy_from_slice(pkt))
+    }
+
+    /// L-D b:零拷入队(聚合批余段经 freeze+slice 移交,免二次拷贝)。
+    fn push_owned(&self, pkt: bytes::Bytes) -> bool {
         let mut q = self.state.lock().unwrap();
         let inflight_b = self.inflight_bytes.load(Ordering::Relaxed);
         let inflight_p = self.inflight_packets.load(Ordering::Relaxed);
-        if q.len() + inflight_p + 1 > MAX_BACKLOG_PACKETS
-            || backlog_bytes(&q) + inflight_b + pkt.len() > MAX_BACKLOG_BYTES
+        if q.pkts.len() + inflight_p + 1 > MAX_BACKLOG_PACKETS
+            || q.bytes + inflight_b + pkt.len() > MAX_BACKLOG_BYTES
         {
             drop(q);
             self.dropped_full.fetch_add(1, Ordering::Relaxed);
@@ -715,7 +728,8 @@ impl UdpBacklog {
             );
             return false;
         }
-        q.push_back(pkt.to_vec());
+        q.bytes += pkt.len();
+        q.pkts.push_back(pkt);
         drop(q);
         self.enqueued.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_one();
@@ -726,9 +740,10 @@ impl UdpBacklog {
     /// 在途记账必须在持锁内完成:释放锁后「队列为空」才可能被生产者
     /// 看到,此时在途 >0 已随之可见(互斥锁的同步序),快路径直发
     /// 不会插队刚弹出的在途包。
-    fn pop_front_inflight(&self) -> Option<Vec<u8>> {
+    fn pop_front_inflight(&self) -> Option<bytes::Bytes> {
         let mut q = self.state.lock().unwrap();
-        let pkt = q.pop_front()?;
+        let pkt = q.pkts.pop_front()?;
+        q.bytes -= pkt.len();
         self.inflight_bytes.fetch_add(pkt.len(), Ordering::Relaxed);
         self.inflight_packets.fetch_add(1, Ordering::Relaxed);
         drop(q);
@@ -746,11 +761,11 @@ impl UdpBacklog {
     /// 生产者 push 已被总预算约束,回插必然放得下;若不满足说明记账
     /// 出错 —— 丢弃回插包本身并计数暴露问题,绝不丢队尾(不能用
     /// 驱逐最新包掩盖超预算)。
-    fn requeue_front(&self, pkt: Vec<u8>) {
+    fn requeue_front(&self, pkt: bytes::Bytes) {
         let mut q = self.state.lock().unwrap();
         self.inflight_bytes.fetch_sub(pkt.len(), Ordering::Relaxed);
         self.inflight_packets.fetch_sub(1, Ordering::Relaxed);
-        if backlog_bytes(&q) + pkt.len() > MAX_BACKLOG_BYTES || q.len() + 1 > MAX_BACKLOG_PACKETS {
+        if q.bytes + pkt.len() > MAX_BACKLOG_BYTES || q.pkts.len() + 1 > MAX_BACKLOG_PACKETS {
             self.dropped_full.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 len = pkt.len(),
@@ -758,7 +773,8 @@ impl UdpBacklog {
             );
             return;
         }
-        q.push_front(pkt);
+        q.bytes += pkt.len();
+        q.pkts.push_front(pkt);
     }
 }
 
@@ -880,7 +896,12 @@ struct SendAgg {
 
 #[derive(Default)]
 struct AggQueue {
-    buf: Vec<u8>,
+    /// L-D b:BytesMut 载体 —— EAGAIN 余段转移时 freeze 后按段 slice
+    /// 移交 backlog,免逐包 to_vec 二次拷贝。常规 push 路径与 Vec 等价。
+    buf: bytes::BytesMut,
+    /// L-D a:读游标 —— buf[..off] 已发出,替代每批 `drain(..consumed)`
+    /// 的整轮 ~1.5× memmove(A-2 同型)。队列排空/转移时归零。
+    off: usize,
     lens: Vec<usize>,
 }
 
@@ -888,7 +909,7 @@ impl AggQueue {
     /// M6:静默轮的容量收缩。突发满窗(AGG_MAX_QUEUED×~1300B ≈ 330KB)
     /// 按几何扩容垫高 buf 容量,而 drain 保留容量 —— 修前长闲会话每人
     /// 驻留这个峰值。超过 2×AGG_BATCH×1300(约两倍满批字节)时换新
-    /// Vec;偶发再增长由几何扩容摊销。只在静默轮触发(见 flush_now):
+    /// 缓冲;偶发再增长由几何扩容摊销。只在静默轮触发(见 flush_now):
     /// 发送轮收缩会让持续满载每轮 realloc 抖动。
     fn shrink_if_bloated(&mut self, quiet: bool) {
         const BUF_OVER: usize = 2 * AGG_BATCH * 1300;
@@ -896,11 +917,12 @@ impl AggQueue {
             return;
         }
         if self.buf.capacity() > BUF_OVER {
-            self.buf = Vec::new();
+            self.buf = bytes::BytesMut::new();
         }
         if self.lens.capacity() > 2 * AGG_BATCH {
             self.lens = Vec::new();
         }
+        self.off = 0;
     }
 }
 
@@ -960,6 +982,11 @@ impl SendAgg {
         let mut sent_this_call = 0usize;
         loop {
             if q.lens.is_empty() {
+                // 排空:读游标归零、len 复位(容量保留复用)
+                if q.off > 0 {
+                    q.buf.clear();
+                    q.off = 0;
+                }
                 // M6:静默轮(本调用没发出任何东西)且缓冲因历史突发膨胀
                 // → 容量回落。容量检查在 shrink_if_bloated 内。
                 q.shrink_if_bloated(sent_this_call == 0);
@@ -984,8 +1011,10 @@ impl SendAgg {
                 self.transfer_to_backlog(&mut q);
                 return Ok(());
             }
+            // L-D a:游标推进,不再 drain 头部(memmove 消除);lens
+            // 的 drain 保留(每条仅 usize,量级可忽略)
             let consumed: usize = q.lens[..sent].iter().sum();
-            q.buf.drain(..consumed);
+            q.off += consumed;
             q.lens.drain(..sent);
             sent_this_call += sent;
             if sent < attempted {
@@ -998,18 +1027,23 @@ impl SendAgg {
     }
 
     /// 余段(含 buf/lens 全部)按序转入 backlog。
+    /// L-D b:整缓冲一次 freeze,按段 slice 移交 —— 免逐包 to_vec
+    /// 二次拷贝(EAGAIN 回落最常见于 socket 缓冲打满的拥塞时刻)。
     fn transfer_to_backlog(&self, q: &mut AggQueue) {
         let Some(backlog) = self.backlog.upgrade() else {
             q.buf.clear();
+            q.off = 0;
             q.lens.clear();
             return;
         };
+        let base = q.off;
+        let frozen = std::mem::replace(&mut q.buf, bytes::BytesMut::new()).freeze();
         let mut off = 0usize;
         for len in q.lens.drain(..) {
-            let _ = backlog.push(&q.buf[off..off + len]);
+            let _ = backlog.push_owned(frozen.slice(base + off..base + off + len));
             off += len;
         }
-        q.buf.clear();
+        q.off = 0;
     }
 
     /// 批量提交当前队列头部一批;返回成功发出的数据报数(0 = EAGAIN)。
@@ -1031,7 +1065,10 @@ impl SendAgg {
         let mut off = 0usize;
         let mut sent = 0usize;
         for len in q.lens.iter() {
-            match self.dest.try_send(&self.sock, &q.buf[off..off + len]) {
+            match self
+                .dest
+                .try_send(&self.sock, &q.buf[q.off + off..q.off + off + len])
+            {
                 Ok(n) if n == *len => {
                     sent += 1;
                     off += len;
@@ -1058,7 +1095,7 @@ impl SendAgg {
         let mut iovs: [libc::iovec; AGG_BATCH] = unsafe { std::mem::zeroed() };
         let mut hdrs: [libc::mmsghdr; AGG_BATCH] = unsafe { std::mem::zeroed() };
         let mut addrs: [libc::sockaddr_storage; AGG_BATCH] = unsafe { std::mem::zeroed() };
-        let mut off = 0usize;
+        let mut off = q.off;
         for i in 0..n {
             iovs[i].iov_base = q.buf[off..].as_ptr() as *mut libc::c_void;
             iovs[i].iov_len = q.lens[i];
@@ -1548,29 +1585,40 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
         // 流控),不丢已接受字节;读端消费后经 poll_read 低水位
         // notify 唤醒本循环继续 recv。
         let mut recv_moved = false;
-        loop {
-            // 读端站立上界精确为 MAX_READ_BUF:流模式下 peeksize ≤ mss
-            // (每段 frg=0),按「剩余空间不足一个满段」提前停,不做
-            // 「先判后整段 extend」的一段越界。
-            let room = {
-                let s = shared.guarded.lock().unwrap();
-                MAX_READ_BUF - s.read_buf.len().min(MAX_READ_BUF)
-            };
-            if room < mss {
-                break;
-            }
-            let Ok(size) = kcp.peeksize() else {
-                break;
-            };
-            recv_scratch.resize(size, 0);
-            match kcp.recv(&mut recv_scratch) {
-                Ok(n) => {
-                    let mut s = shared.guarded.lock().unwrap();
-                    s.read_buf.extend(&recv_scratch[..n]);
-                    s.wake_read();
-                    recv_moved = true;
+        // 读端站立上界精确为 MAX_READ_BUF:流模式下 peeksize ≤ mss
+        // (每段 frg=0),按「剩余空间不足一个满段」提前停,不做
+        // 「先判后整段 extend」的一段越界。
+        //
+        // L-D d:批内合并锁 —— 修前每条消息两次 guarded 锁(读 room /
+        // extend+wake 各一次),N 条消息 = 2N 次锁往返。现一次持锁内
+        // 完成「读 room → peeksize → recv → extend」,wake 收敛到批尾
+        // 一次。kcp.peeksize/recv 是本任务私有的同步 CPU 工作(无
+        // await),持锁窗口 = 同量 CPU 但锁往返从 2N 降到 2。
+        {
+            let mut woke = false;
+            {
+                let mut s = shared.guarded.lock().unwrap();
+                loop {
+                    let room = MAX_READ_BUF - s.read_buf.len().min(MAX_READ_BUF);
+                    if room < mss {
+                        break;
+                    }
+                    let Ok(size) = kcp.peeksize() else {
+                        break;
+                    };
+                    recv_scratch.resize(size, 0);
+                    match kcp.recv(&mut recv_scratch) {
+                        Ok(n) => {
+                            s.read_buf.extend(&recv_scratch[..n]);
+                            recv_moved = true;
+                            woke = true;
+                        }
+                        Err(_) => break,
+                    }
                 }
-                Err(_) => break,
+            }
+            if woke {
+                shared.guarded.lock().unwrap().wake_read();
             }
         }
         // 事件驱动 flush:有新写入 / 刚收到包(及时 ACK)/ 本轮从 kcp
@@ -3170,9 +3218,9 @@ mod kcp_regress {
         agg.transfer_to_backlog(&mut q);
         assert!(q.lens.is_empty() && q.buf.is_empty(), "转移后聚合缓冲清空");
         let state = backlog.state.lock().unwrap();
-        assert_eq!(state.len(), 5, "全部余段转入 backlog");
-        for (i, pkt) in state.iter().enumerate() {
-            assert_eq!(pkt, &vec![i as u8; 32], "backlog 内顺序与入批一致");
+        assert_eq!(state.pkts.len(), 5, "全部余段转入 backlog");
+        for (i, pkt) in state.pkts.iter().enumerate() {
+            assert_eq!(&pkt[..], &vec![i as u8; 32][..], "backlog 内顺序与入批一致");
         }
     }
 
@@ -3389,8 +3437,12 @@ mod kcp_regress {
         assert_eq!(bl.sent.load(Ordering::Relaxed), 1);
         {
             let q = bl.state.lock().unwrap();
-            assert_eq!(q.len(), 1);
-            assert_eq!(q.front().unwrap(), b"two", "WouldBlock 的包必须回队头");
+            assert_eq!(q.pkts.len(), 1);
+            assert_eq!(
+                &q.pkts.front().unwrap()[..],
+                b"two",
+                "WouldBlock 的包必须回队头"
+            );
         }
         let st = drain_once(&bl, |pkt| Ok(pkt.len()));
         assert!(matches!(st, DrainSt::Empty));
@@ -3415,8 +3467,8 @@ mod kcp_regress {
         );
         {
             let q = bl.state.lock().unwrap();
-            assert_eq!(q.len(), 1, "致命后剩余队列交还所有者回收,不再继续发");
-            assert_eq!(q.front().unwrap(), b"b");
+            assert_eq!(q.pkts.len(), 1, "致命后剩余队列交还所有者回收,不再继续发");
+            assert_eq!(&q.pkts.front().unwrap()[..], b"b");
         }
         assert_eq!(bl.sent.load(Ordering::Relaxed), 0);
         assert_eq!(bl.stats().fatal, 1);
@@ -3740,7 +3792,14 @@ mod main_review_tests {
             Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
         });
         assert!(matches!(result, DrainSt::Blocked));
-        let bytes: usize = bl.state.lock().unwrap().iter().map(Vec::len).sum();
+        let bytes: usize = bl
+            .state
+            .lock()
+            .unwrap()
+            .pkts
+            .iter()
+            .map(bytes::Bytes::len)
+            .sum();
         assert!(
             bytes <= MAX_BACKLOG_BYTES,
             "backlog exceeded byte cap after requeue: {bytes} > {MAX_BACKLOG_BYTES}"
@@ -4681,8 +4740,8 @@ mod stronger_tests {
         drain_once(&bl, |_| {
             let _ = bl.push(&packet);
             let q = bl.state.lock().unwrap();
-            observed =
-                q.iter().map(Vec::len).sum::<usize>() + bl.inflight_bytes.load(Ordering::Relaxed);
+            observed = q.pkts.iter().map(bytes::Bytes::len).sum::<usize>()
+                + bl.inflight_bytes.load(Ordering::Relaxed);
             Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
         });
         assert!(
