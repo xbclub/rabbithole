@@ -150,11 +150,16 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
 /// 不如在本端拒绝编码(长度字段截断会产生腐化帧)。
 ///
 /// L-H c(coreProtocol-1,首轮漏收):修前 `encode_frame_bytes` 一次
-/// 分配 + 整帧 memcpy(payload 双拷)再 write_all。改为栈上帧头 +
-/// `write_vectored` 两段写:支持向量写的底层(裸 TCP/Unix stream)单次
-/// syscall;不支持的包装走默认实现(逐段写,首段优先)—— 循环消费
-/// 保证语义与 write_all 一致。**不**拆成两次 write_all(裸 TCP 会变
-/// 2 syscall,任务书红线)。
+/// 分配 + 整帧 memcpy(payload 双拷)再 write_all。
+///
+/// ★两段写只在底层**真支持 writev**(`is_write_vectored`)时启用:
+/// 单次 writev 在内核 socket 锁下原子追加,头/体同 syscall。
+/// 不支持的包装(mux 流等,默认实现=只写首个非空段)必须回落到
+/// 修前的整帧单段 write_all —— 修前「小帧连续 = 单 syscall」在
+/// 实践中承担了**并发写者之间的帧间原子性**:b44fae0 曾对全部
+/// 底层无条件走两段默认实现,4096 并发建连时控制帧头/体被并发
+/// 帧撕开(实测 client `control read error: bad magic` + JSON
+/// 解析错,并发隧道 verified 4096→76),回落路径逐字节等价修前。
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     ty: FrameType,
@@ -166,6 +171,11 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
             "frame payload {} exceeds limit {MAX_FRAME_LEN}",
             payload.len()
         )));
+    }
+    if !w.is_write_vectored() {
+        // 非向量底层:整帧单段(修前行为,保住单 syscall 的帧间原子性)
+        let frame = encode_frame_bytes(ty, payload);
+        return w.write_all(&frame).await;
     }
     let mut header = [0u8; HEADER_LEN];
     header[..4].copy_from_slice(MAGIC);
@@ -196,6 +206,47 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L-H c 回归:非向量底层必须整帧单段写 —— 单次 poll_write 收到
+    /// 完整帧(头+体连续)。b44fae0 曾无条件两段写,默认实现逐段下发,
+    /// 并发写者把头/体撕开(4096 并发建连实测控制流 bad magic)。
+    /// 「单段 = 单 syscall」在内核 socket 锁下承担帧间原子性。
+    #[tokio::test]
+    async fn write_frame_non_vectored_sink_gets_contiguous_frame() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::AsyncWrite;
+
+        struct Rec {
+            writes: Vec<Vec<u8>>,
+        }
+        impl AsyncWrite for Rec {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.writes.push(buf.to_vec());
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut rec = Rec { writes: Vec::new() };
+        write_frame(&mut rec, FrameType::PING, b"hello-body")
+            .await
+            .unwrap();
+        assert_eq!(rec.writes.len(), 1, "非向量底层必须单次写整帧(帧间原子性)");
+        let mut dec = BytesMut::new();
+        dec.extend_from_slice(&rec.writes[0]);
+        let (ty, payload) = decode_frame(&mut dec).unwrap().unwrap();
+        assert_eq!(ty, FrameType::PING);
+        assert_eq!(&payload[..], b"hello-body");
+    }
 
     #[test]
     fn roundtrip() {
