@@ -1294,32 +1294,80 @@ enum SessionCmd {
     Packet(PooledPkt),
 }
 
-// ---------------- A-4:入站包池 ----------------
+// ---------------- A-4:入站包池(M4:分片化) ----------------
 
 /// 入站包缓冲大小(单包上限;与修前收包缓冲一致)。
 const PKT_BUF: usize = 65536;
 /// 池槽上限:在途槽 ≈ 收包任务数 + 通道容量;256 槽 = 16MiB 硬上界。
 const PKT_POOL_CAP: usize = 256;
+/// M4:分片数。修前单 Mutex:demux 每包 get、N 会话任务每包 put,
+/// 同一锁字跨核乒乓(~17 万临界区/秒 @85k pps)。16 片把每片压到
+/// ~1/16 频率;每片仍是最朴素的 Mutex<Vec>,无 lock-free 复杂度。
+const PKT_POOL_SHARDS: usize = 16;
+/// 每片槽上限(总数 = 分片数 × 每片 = PKT_POOL_CAP,硬上界不变)。
+const PKT_PER_SHARD: usize = PKT_POOL_CAP / PKT_POOL_SHARDS;
+const _: () = assert!(PKT_POOL_CAP.is_multiple_of(PKT_POOL_SHARDS));
 
-/// 进程级入站包池(64KiB 槽复用)。1 Gbps ≈ 85k pps,修前每报文
-/// `pkt.to_vec()` 一次 ~1200B 堆分配,且通道 Full 时参数先求值、分配
-/// 照做再丢弃;池化后收包直接读进槽内、整槽移交、消费端 kcp.input
-/// 后归还,稳态零分配。std Mutex 临界区仅 Vec push/pop,争用弱。
-static PKT_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+/// 分片入站包池。选片用轮转原子:包的会话归属在收包时还未知(get
+/// 先于解析),轮转让两侧均匀落片,漂移无关紧要 —— 槽只是复用缓存,
+/// 任何片都能服务任何请求。
+///
+/// get/put 用**两个独立**计数器:单计数在「demux 每包一次 get、会话
+/// 每包一次 put」的逐包交替下步长为 2,put 会钉死在同一奇偶子集,
+/// 有效片数腰斩(单会话锁步正是这种形态);独立计数各自步长 1。
+///
+/// get 永不阻塞:try_lock 从轮转起点扫一圈(空片/被争用片直接跳过),
+/// 全空才新分配;put 阻塞等自己那片(临界区仅一次 push,极短)。
+struct ShardedPktPool {
+    shards: [std::sync::Mutex<Vec<Vec<u8>>>; PKT_POOL_SHARDS],
+    get_tick: std::sync::atomic::AtomicUsize,
+    put_tick: std::sync::atomic::AtomicUsize,
+}
+
+impl ShardedPktPool {
+    const fn new() -> Self {
+        Self {
+            shards: [const { std::sync::Mutex::new(Vec::new()) }; PKT_POOL_SHARDS],
+            get_tick: std::sync::atomic::AtomicUsize::new(0),
+            put_tick: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn get(&self) -> Vec<u8> {
+        use std::sync::atomic::Ordering;
+        let start = self.get_tick.fetch_add(1, Ordering::Relaxed) % PKT_POOL_SHARDS;
+        for i in 0..PKT_POOL_SHARDS {
+            if let Ok(mut g) = self.shards[(start + i) % PKT_POOL_SHARDS].try_lock() {
+                if let Some(v) = g.pop() {
+                    return v;
+                }
+            }
+        }
+        vec![0u8; PKT_BUF]
+    }
+
+    fn put(&self, buf: Vec<u8>) {
+        use std::sync::atomic::Ordering;
+        if buf.len() != PKT_BUF {
+            return;
+        }
+        let s = self.put_tick.fetch_add(1, Ordering::Relaxed) % PKT_POOL_SHARDS;
+        let mut g = self.shards[s].lock().unwrap();
+        if g.len() < PKT_PER_SHARD {
+            g.push(buf);
+        }
+        // 超片上限直接丢弃(槽会再分配;总量硬上界不变)
+    }
+}
+
+static PKT_POOL: ShardedPktPool = ShardedPktPool::new();
 
 fn pkt_pool_get() -> Vec<u8> {
-    PKT_POOL
-        .lock()
-        .unwrap()
-        .pop()
-        .unwrap_or_else(|| vec![0u8; PKT_BUF])
+    PKT_POOL.get()
 }
 
 fn pkt_pool_put(buf: Vec<u8>) {
-    let mut p = PKT_POOL.lock().unwrap();
-    if p.len() < PKT_POOL_CAP && buf.len() == PKT_BUF {
-        p.push(buf);
-    }
+    PKT_POOL.put(buf)
 }
 
 /// 池化入站包:槽 + 有效长度(kcp.input 只看 [..len])。
@@ -3053,6 +3101,53 @@ mod kcp_regress {
         })
         .await;
         assert!(found.is_ok(), "收缩后聚合路径必须照常工作(未收到标记包)");
+    }
+
+    /// M4:分片池语义 —— 复用(标记槽必被取回,扫描不漏片)、总量封顶
+    /// (每片 16 × 16 片 = 256)。独立实例测试,不触全局 PKT_POOL
+    /// (并行测试互踩,见 R2 全局计数器教训)。
+    #[test]
+    fn m4_sharded_pool_cap_and_reuse() {
+        let pool = super::ShardedPktPool::new();
+        // 复用:20 个标记槽 put → 20 次 get 全部命中标记。
+        // 槽直接新造(模拟外部消费后归还),不经 pool.get() —— 否则
+        // 每次 get 会弹出自己刚放的槽,池永远只有 1 个槽。
+        for i in 0..20u32 {
+            let mut b = vec![0u8; super::PKT_BUF];
+            b[..4].copy_from_slice(&(i + 1).to_be_bytes());
+            pool.put(b);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let b = pool.get();
+            seen.insert(u32::from_be_bytes(b[..4].try_into().unwrap()));
+        }
+        assert_eq!(seen.len(), 20, "标记槽必须全部复用(扫描不得漏片): {seen:?}");
+
+        // 封顶:2000 个唯一标记槽 put(每片 125 次远超上限 16)→ 存量
+        // 恰 256;600 次 get 恰好回收 256 个标记槽,其余为新分配(全零)。
+        // 标记域 100_000..=101_999,过滤用 >= 100_000(i=0 恰为边界值)。
+        let pool2 = super::ShardedPktPool::new();
+        for i in 0..2000u32 {
+            let mut b = vec![0u8; super::PKT_BUF];
+            b[..4].copy_from_slice(&(i + 100_000).to_be_bytes());
+            pool2.put(b);
+        }
+        let mut marked = 0usize;
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..600 {
+            let b = pool2.get();
+            let m = u32::from_be_bytes(b[..4].try_into().unwrap());
+            if m >= 100_000 {
+                marked += 1;
+                distinct.insert(m);
+            }
+        }
+        assert_eq!(
+            marked, 256,
+            "总量必须封顶在 256 槽(16 片 × 每片 16),实际回收标记 {marked}"
+        );
+        assert_eq!(distinct.len(), 256, "回收的必须是唯一槽(不得重复入池)");
     }
 
     /// A-3:余段转移的 FIFO —— transfer_to_backlog 必须把聚合缓冲内
