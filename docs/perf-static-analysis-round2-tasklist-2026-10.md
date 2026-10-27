@@ -163,7 +163,7 @@
 
 ### L-H 核心库(4 条)
 - [x] 状态:c/d 完成 @ 673b290(首轮漏收已补);a 延期;b 记 not-supported §12
-> 处置:c) write_frame 栈头+write_vectored(裸 TCP 单 syscall,不拆两次 write_all);d) encode_v1 栈上 fmt/encode_v2 无中间 Vec;b) 限速桶 per-connection 语义(TCP)/per-rule(UDP)不一致,改共享桶属用户可见行为变化,not-supported §12 交独立设计决策;a) certprov 双拷贝+HKDF 缓存未及做。
+> 处置:c) write_frame 栈头+write_vectored —— ⚠ b44fae0 首版对全部底层无条件两段写,三机 tcp 候选轮实测 4096 并发建连撕帧(控制流 bad magic,隧道 verified 4096→1611→76 逐轮恶化;kcp 轮与 tcp 基线全过);76ece9f 修复:仅 is_write_vectored 底层走 writev,其余逐字节回落整帧单段,附回归测试。d) encode_v1 栈上 fmt/encode_v2 无中间 Vec;b) 限速桶 per-connection 语义(TCP)/per-rule(UDP)不一致,改共享桶属用户可见行为变化,not-supported §12 交独立设计决策;a) certprov 双拷贝+HKDF 缓存未及做。
 - [ ] a) certprov.rs:64-97 双拷贝 + 每连接重复 HKDF:SealedCert 按值收、truncate 复用缓冲、derive_key 按 secret 缓存。
 - [ ] b) bandwidth.rs:26 每连接重解析(eq_ignore_ascii_case 零分配)+ 调用方物化一次;**先确认规则桶 per-connection 语义是否本意**(TCP 每连接各一份桶 vs UDP 按规则共享,不一致)——非本意则改为规则级共享桶,是本意则记 not-supported.md。
 - [ ] c) **coreProtocol-1(首轮漏收)**:rh-protocol/frame.rs:151-164 write_frame 每帧双分配双拷;最高频调用点 vhost 每请求 START_FORWARD。修:write_all_vectored([头;payload]) 或复用缓冲预编码变体;**不要**改两次 write_all(裸 TCP 拆 2 syscall)。
