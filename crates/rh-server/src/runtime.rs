@@ -72,13 +72,6 @@ pub async fn on_session_down(state: &Arc<AppState>, sess: &Arc<Session>) {
                 .map(|e| e.value().clone())
                 .collect(),
         };
-    // 会话死亡:该客户端全部 SUDP 常驻中继槽位一并清理
-    if let Ok(visitors) = state.db.list_visitors(Some(&sess.client_id)).await {
-        let mut relays = state.udp_relays.lock().await;
-        for (_vid, _, _, vspec) in &visitors {
-            relays.remove(&vspec.id);
-        }
-    }
     // 若新会话已注册接管,本会话的清理不得波及新会话的池/通道
     let replaced = state
         .sessions
@@ -87,6 +80,18 @@ pub async fn on_session_down(state: &Arc<AppState>, sess: &Arc<Session>) {
         .unwrap_or(false);
     if replaced {
         return;
+    }
+    // M3:会话死亡,该客户端全部 SUDP 常驻中继槽位一并清理。
+    // 挪到 replaced 判定之后:修前在判定之前,新会话重注册的同 id
+    // visitor 槽位会被旧会话的清理误删,与上方"不得波及新会话"相悖。
+    // 且改用 list_visitor_ids 一列投影:修前 list_visitors 逐行反序列化
+    // 完整 VisitorSpec 只为取 id,且这一切发生在 serial_lock 临界区内。
+    // (spec.id 即 DB 行 id,db.rs 写入时 `spec.id = id as u64`。)
+    if let Ok(ids) = state.db.list_visitor_ids(&sess.client_id).await {
+        let mut relays = state.udp_relays.lock().await;
+        for vid in ids {
+            relays.remove(&(vid as u64));
+        }
     }
     for rt in rts {
         rt.confirmed_revision.store(0, Ordering::Relaxed);
