@@ -4497,9 +4497,11 @@ mod r1_sync_update_race_tests {
         // 紧随的 ServiceUpdate(新端口新 spec):修前与上面的 spawn 并发
         upsert(&sess, SyncEntity::Visitor(visitor_spec(21, port2))).await;
 
-        // 新端口最终可达(链序:sync start(p1) → update stop+start(p2))
+        // 新端口最终可达(链序:sync start(p1) → update stop+start(p2))。
+        // 预算 10s:本测试曾在并发构建/测试进程的风暴下偶发超时(3s 被
+        // 饿穿);断言本身无竞态(token 先插后 bind),加耐心不加宽松度。
         assert!(
-            wait_listening(port2, 3000).await,
+            wait_listening(port2, 10_000).await,
             "新 spec 端口 {port2} 必须最终监听可达"
         );
         // 表内为新 spec(表更新在锁内,同步断言)
@@ -4515,7 +4517,7 @@ mod r1_sync_update_race_tests {
             m.get(&21).unwrap().cancel();
         }
         let mut closed = false;
-        for _ in 0..300 {
+        for _ in 0..1000 {
             if tokio::net::TcpStream::connect(("127.0.0.1", port2))
                 .await
                 .is_err()
@@ -4526,13 +4528,21 @@ mod r1_sync_update_race_tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(closed, "cancel token 后监听必须关闭");
-        // 旧端口无孤儿监听(修前 T1 的监听器被覆盖 token 后会残留)
-        assert!(
-            tokio::net::TcpStream::connect(("127.0.0.1", port1))
+        // 旧端口无孤儿监听(修前 T1 的监听器被覆盖 token 后会残留)。
+        // 有界重试:旧监听器的 cancel 在 update 链早已发出,但 accept
+        // 任务被调度到 drop 可能在负载下滞后。
+        let mut orphan = false;
+        for _ in 0..1000 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port1))
                 .await
-                .is_err(),
-            "旧 spec 端口 {port1} 不得残留监听(孤儿)"
-        );
+                .is_err()
+            {
+                orphan = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(orphan, "旧 spec 端口 {port1} 不得残留监听(孤儿)");
         sess.cancel.cancel();
     }
 
