@@ -429,27 +429,55 @@ async fn main() -> anyhow::Result<()> {
     if let Some(dir) = &cfg.web.static_dir {
         // SPA:静态文件优先;未知路径回退 index.html 并返回 200(history 路由可用)
         let static_root = dir.clone();
+        // L-A b(D-15 孪生):SPA 回退的 index.html 字节缓存 —— 首次读取后
+        // 进程内复用(修前每次深链回退都重新 fs::read 整份)。文件变更需
+        // 重启生效,与嵌入式控制台(编译期内嵌)同级的口径;static_dir
+        // 产物由部署方替换,重启窗口可接受。缓存头对齐 embedded_ui:
+        // assets/ 内容哈希名 → 一年 immutable;index(含回退)→ no-cache。
+        let index_cache = std::sync::Arc::new(tokio::sync::OnceCell::new());
         app = app.fallback(move |req: axum::http::Request<axum::body::Body>| {
             let serve = tower_http::services::ServeDir::new(static_root.clone());
             let index_path = static_root.join("index.html");
+            let index_cache = index_cache.clone();
             let is_api = req.uri().path().starts_with("/api/");
+            let path = req.uri().path().to_owned();
             async move {
                 use axum::response::IntoResponse;
                 use tower::ServiceExt;
                 if is_api {
                     return crate::api::err(404, "not found");
                 }
-                let resp = match serve.oneshot(req).await {
+                let mut resp = match serve.oneshot(req).await {
                     Ok(r) => r,
                     Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
                 };
+                let headers = resp.headers_mut();
+                headers.insert(
+                    axum::http::header::CACHE_CONTROL,
+                    axum::http::HeaderValue::from_static(if path.starts_with("/assets/") {
+                        "public, max-age=31536000, immutable"
+                    } else {
+                        "no-cache"
+                    }),
+                );
                 if resp.status() != axum::http::StatusCode::NOT_FOUND {
                     return resp.map(axum::body::Body::new);
                 }
-                match tokio::fs::read(&index_path).await {
-                    Ok(body) => axum::response::Html(body).into_response(),
-                    Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
+                let body = index_cache
+                    .get_or_init(|| async {
+                        tokio::fs::read(&index_path).await.unwrap_or_default()
+                    })
+                    .await
+                    .clone();
+                if body.is_empty() {
+                    return axum::http::StatusCode::NOT_FOUND.into_response();
                 }
+                let mut resp = axum::response::Html(body).into_response();
+                resp.headers_mut().insert(
+                    axum::http::header::CACHE_CONTROL,
+                    axum::http::HeaderValue::from_static("no-cache"),
+                );
+                resp
             }
         });
     } else if embedded_ui::available() {

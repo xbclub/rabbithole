@@ -35,7 +35,8 @@ pub async fn on_session_up(state: &Arc<AppState>, sess: &Arc<Session>) {
     for rt in rts {
         // confirmed 重置(会话替换/重连)
         rt.confirmed_revision.store(0, Ordering::Relaxed);
-        let (st, _r) = rt.snapshot_state().await;
+        // L-A d(N12 孪生):只取枚举,免 reason String clone
+        let st = rt.state_kind().await;
         let new_state = match st {
             ProxyState::Offline
             | ProxyState::Pending
@@ -102,7 +103,8 @@ pub async fn on_session_down(state: &Arc<AppState>, sess: &Arc<Session>) {
             .connections
             .remove_label_values(&[&rt.metrics_label, "tcp"]);
         crate::data::close_proxy_channels(&rt).await;
-        let (st, _) = rt.snapshot_state().await;
+        // L-A d(N12 孪生):只取枚举,免 reason String clone
+        let st = rt.state_kind().await;
         let new_state = match st {
             ProxyState::Disabled | ProxyState::BindError => st,
             _ => ProxyState::Offline,
@@ -286,7 +288,8 @@ pub async fn on_health_report(state: &Arc<AppState>, sess: &Arc<Session>, h: Hea
         return;
     }
     rt.healthy.store(h.healthy, Ordering::Relaxed);
-    let (st, _) = rt.snapshot_state().await;
+    // L-A d(N12 孪生):只取枚举,免 reason String clone
+    let st = rt.state_kind().await;
     let new_state = if h.healthy {
         if st == ProxyState::Unhealthy {
             ProxyState::Running
@@ -708,7 +711,8 @@ pub async fn publish_spec_in_place(
                 CONTROL_SEND_TIMEOUT,
             )
             .await;
-        let (st, _) = rt.snapshot_state().await;
+        // L-A d(N12 孪生):只取枚举,免 reason String clone
+        let st = rt.state_kind().await;
         if st == ProxyState::Running {
             rt.set_state(ProxyState::Pending, "updated").await;
         }

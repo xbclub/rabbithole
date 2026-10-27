@@ -1850,10 +1850,12 @@ async fn open_data_channel(sess: Arc<ClientSession>, m: CreateDataChannel) -> an
             visitor_id,
             user_conn_id,
         } => {
-            let vspec = sess.visitors.lock().await.get(&visitor_id).cloned();
-            let Some(vspec) = vspec else {
+            // L-A e:修前锁内整份深克隆 VisitorSpec,只为喂给 deliver_relay
+            // 的未用参数(该参数已删);改为存在性检查。visitors 表的
+            // Arc 化只剩冷路径(sync/启停,配置变更频次)收益,本轮不做。
+            if !sess.visitors.lock().await.contains_key(&visitor_id) {
                 anyhow::bail!("unknown visitor {visitor_id}");
-            };
+            }
             if user_conn_id == 0 {
                 // sudp:无指派帧;交给 visitor 的 UDP 交付槽(预置已到帧)
                 let tx = sess.sudp_deliver.lock().await.get(&visitor_id).cloned();
@@ -1868,7 +1870,7 @@ async fn open_data_channel(sess: Arc<ClientSession>, m: CreateDataChannel) -> an
                 anyhow::bail!("expected START_VISITOR_RELAY, got {ty:?}");
             }
             let relay: StartVisitorRelay = serde_json::from_slice(&payload)?;
-            crate::visitor_run::deliver_relay(sess.clone(), relay, stream, vspec, leftover).await;
+            crate::visitor_run::deliver_relay(sess.clone(), relay, stream, leftover).await;
         }
     }
     Ok(())

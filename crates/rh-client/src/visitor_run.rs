@@ -244,7 +244,6 @@ pub async fn deliver_relay(
     sess: Arc<ClientSession>,
     relay: StartVisitorRelay,
     channel: BoxedIo,
-    _vspec: VisitorSpec,
     prefix: Vec<u8>,
 ) {
     let Some((mut conn, _, _)) = sess.take_waiting(relay.user_conn_id).await else {

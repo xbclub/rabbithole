@@ -2798,6 +2798,10 @@ async fn put_server_config(
                 crate::config::LimitsConfig::mux_streams(&lim),
                 std::sync::atomic::Ordering::Relaxed,
             );
+            // L-A c:data_conn_limit 的钳制上限随 mux 变化,同步快照
+            state
+                .data_conn_limit
+                .store(lim.data_conn_limit(), std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(v) = l.max_data_conns_per_client {
             set(
@@ -2806,6 +2810,10 @@ async fn put_server_config(
                 &mut applied,
             );
             lim.max_data_conns_per_client = v;
+            // L-A c:数据面原子快照同步 store(route_data_stream 每通道读)
+            state
+                .data_conn_limit
+                .store(lim.data_conn_limit(), std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(v) = l.max_udp_sessions_per_proxy {
             set(

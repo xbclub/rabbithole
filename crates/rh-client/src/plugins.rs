@@ -249,11 +249,12 @@ const PROXY_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// 让用户看到 407/502/REP 而不是莫名其妙的 EOF。
 fn serve_proxy(proto: ProxyProtocol, user: &str, pass: &str) -> anyhow::Result<BoxedIo> {
     let (chan, session) = tokio::io::duplex(64 * 1024);
-    let auth = basic_auth(user, pass);
+    // L-A a:期望凭据建会话时算一次,serve 协程内不再逐请求 format!
+    let expected = expected_credential(&basic_auth(user, pass));
     tokio::spawn(async move {
         match proto {
-            ProxyProtocol::Http => serve_http_proxy(session, auth).await,
-            ProxyProtocol::Socks5 => serve_socks5(session, auth).await,
+            ProxyProtocol::Http => serve_http_proxy(session, expected).await,
+            ProxyProtocol::Socks5 => serve_socks5(session, expected).await,
         }
     });
     Ok(Box::new(chan))
@@ -266,15 +267,20 @@ fn serve_proxy(proto: ProxyProtocol, user: &str, pass: &str) -> anyhow::Result<B
 /// 与 frp 的差异仅在「只填密码不填用户名」这一种配置:frp 仍要求认证
 /// (用户名为空串),我们视为不鉴权。控制台表单里密码是用户名的从属项,
 /// 单独填密码没有可表达的意图。
-fn check_proxy_auth(auth: &Option<(String, String)>, got: Option<&str>) -> bool {
-    let Some((user, pass)) = auth else {
+fn check_proxy_auth(expected: &Option<String>, got: Option<&str>) -> bool {
+    let Some(want) = expected else {
         return true;
     };
     let Some(got) = got else {
         return false;
     };
-    let want = format!("{user}:{pass}");
     rh_transport::constant_time_eq(got.as_bytes(), want.as_bytes())
+}
+
+/// L-A a(D-9 孪生):期望凭据串在插件会话建立时算一次(修前每请求
+/// `format!` 一次);恒定时间比较语义不变。
+fn expected_credential(auth: &Option<(String, String)>) -> Option<String> {
+    auth.as_ref().map(|(u, p)| format!("{u}:{p}"))
 }
 
 /// 拨代理请求里的目的地。
@@ -542,7 +548,7 @@ async fn write_proxy_status(
 /// 一条通道只服务一次请求:CONNECT 成功后连接变成裸隧道,HTTP 语义到此
 /// 结束(与 frp 的 `handleConnectReq` 一致);普通请求转发完一问一答后
 /// 也随 `Connection: close` 收工。
-async fn serve_http_proxy(mut io: tokio::io::DuplexStream, auth: Option<(String, String)>) {
+async fn serve_http_proxy(mut io: tokio::io::DuplexStream, expected: Option<String>) {
     let req = match read_proxy_request(&mut io).await {
         Ok(v) => v,
         Err(HttpProxyError::Status(code, reason)) => {
@@ -556,7 +562,7 @@ async fn serve_http_proxy(mut io: tokio::io::DuplexStream, auth: Option<(String,
         }
         Err(HttpProxyError::Silent) => return,
     };
-    if !check_proxy_auth(&auth, req.credential.as_deref()) {
+    if !check_proxy_auth(&expected, req.credential.as_deref()) {
         // 407 必须带 Proxy-Authenticate,否则客户端无法重试认证
         let _ = write_proxy_status(
             &mut io,
@@ -616,8 +622,8 @@ async fn serve_http_proxy(mut io: tokio::io::DuplexStream, auth: Option<(String,
 /// `commandNotSupported`,frp 侧也没有任何补救。
 ///
 /// 完整证据见 `docs/not-supported.md` §1/§2。**不要再把这两项当待办。**
-async fn serve_socks5(mut io: tokio::io::DuplexStream, auth: Option<(String, String)>) {
-    match socks5_handshake(&mut io, &auth).await {
+async fn serve_socks5(mut io: tokio::io::DuplexStream, expected: Option<String>) {
+    match socks5_handshake(&mut io, &expected).await {
         Ok((host, port)) => {
             let mut remote = match dial_proxy_destination(&host, port).await {
                 Ok(r) => r,
@@ -667,7 +673,7 @@ async fn socks5_reply(io: &mut tokio::io::DuplexStream, rep: u8) -> std::io::Res
 /// 握手早期就该断开(还没到能回 REP 的阶段)。
 async fn socks5_handshake(
     io: &mut tokio::io::DuplexStream,
-    auth: &Option<(String, String)>,
+    expected: &Option<String>,
 ) -> Result<(String, u16), u8> {
     // ---- 方法协商 ----
     let mut head = [0u8; 2];
@@ -682,7 +688,7 @@ async fn socks5_handshake(
         .await
         .map_err(|_| SOCKS_REP_ABORT)?;
     // 需要认证时只接受 0x02(用户名/密码),否则只接受 0x00(免认证)
-    let want = if auth.is_some() { 0x02 } else { 0x00 };
+    let want = if expected.is_some() { 0x02 } else { 0x00 };
     if !methods.contains(&want) {
         let _ = io.write_all(&[0x05, 0xFF]).await;
         return Err(SOCKS_REP_ABORT);
@@ -709,7 +715,7 @@ async fn socks5_handshake(
             String::from_utf8_lossy(&pass)
         );
         // 认证失败:回 0x01 后断开(REP 阶段还没开始)
-        if !check_proxy_auth(auth, Some(&got)) {
+        if !check_proxy_auth(expected, Some(&got)) {
             let _ = io.write_all(&[0x01, 0x01]).await;
             return Err(SOCKS_REP_ABORT);
         }
@@ -796,6 +802,8 @@ async fn serve_static_file(
     strip_prefix: String,
     auth: Option<(String, String)>,
 ) {
+    // L-A a:期望凭据算一次(修前每请求 format! + 手写 base64 两次分配)
+    let expected = expected_credential(&auth);
     // root 的 canonicalize 与 root 生命周期同长:提到循环外只算一次。
     // 修前每个请求都要 async canonicalize 一次(一次额外 await + 一次
     // 路径解析 syscall),而这与请求内容无关。
@@ -868,13 +876,14 @@ async fn serve_static_file(
                 }
             }
         }
-        // basic auth
-        if let Some((u, p)) = &auth {
+        // basic auth(L-A a:恒定时间比较,与代理侧 check_proxy_auth 同口径)
+        if let Some(want) = &expected {
             let got = headers
                 .iter()
                 .find(|(k, _)| k == "authorization")
-                .map(|(_, v)| v.strip_prefix("Basic ").map(|s| s.to_string()));
-            let ok = matches!(got, Some(Some(enc)) if base64_decode(&enc).map(|d| d == format!("{u}:{p}")).unwrap_or(false));
+                .and_then(|(_, v)| v.strip_prefix("Basic "))
+                .and_then(base64_decode);
+            let ok = matches!(&got, Some(d) if rh_transport::constant_time_eq(d.as_bytes(), want.as_bytes()));
             if !ok {
                 let _ = io
                     .write_all(
@@ -1043,36 +1052,17 @@ fn hexval(c: Option<&u8>) -> Option<u8> {
 }
 
 fn base64_decode(s: &str) -> Option<String> {
-    // 手写 base64 解码(无 padding 容错)
-    let mut vals = Vec::new();
-    for c in s.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => break,
-            _ => return None,
-        };
-        vals.push(v);
-    }
-    let mut out = Vec::new();
-    for chunk in vals.chunks(4) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let b3 = *chunk.get(3).unwrap_or(&0) as u32;
-        let n = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
-        out.push((n >> 16) as u8);
-        if chunk.len() > 2 {
-            out.push((n >> 8) as u8);
-        }
-        if chunk.len() > 3 {
-            out.push(n as u8);
-        }
-    }
-    String::from_utf8(out).ok()
+    // L-A a(D-9 孪生):手写解码每调用两次 Vec 分配(vals + out);
+    // 换 crate 的 Indifferent 引擎 —— 缺/带 padding 均收,与旧手写
+    // 版(遇 '=' break 的无 padding 容错)语义一致。
+    use base64::Engine as _;
+    const ENG: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::GeneralPurposeConfig::new()
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+    );
+    let bytes = ENG.decode(s.as_bytes()).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 fn mime_of(ext: Option<&str>) -> &'static str {
@@ -1745,11 +1735,11 @@ mod proxy_tests {
     /// 免鉴权判据:用户名为空即不鉴权(与 static_file 同口径)。
     #[test]
     fn auth_gate_matches_empty_username_rule() {
-        let none = basic_auth("", "");
+        let none = expected_credential(&basic_auth("", ""));
         assert!(check_proxy_auth(&none, None), "空用户名应免鉴权");
         assert!(check_proxy_auth(&none, Some("anything:at-all")));
 
-        let some = basic_auth("u", "p");
+        let some = expected_credential(&basic_auth("u", "p"));
         assert!(check_proxy_auth(&some, Some("u:p")));
         assert!(!check_proxy_auth(&some, Some("u:wrong")));
         assert!(!check_proxy_auth(&some, None), "缺凭据必须拒绝");

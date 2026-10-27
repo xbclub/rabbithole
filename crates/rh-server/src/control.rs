@@ -1131,12 +1131,12 @@ pub async fn route_data_stream(
         + 1;
     // 有效上限已钳制到 mux 顶-1024:应用层必然先于 yamux 拒绝,
     // 不会触发 yamux 的超限 SYN → 终止整条会话
+    // L-A c(D-12 孪生):读原子快照(修前每通道一次全局 limits RwLock
+    // 读;热改保存点同步 store,见 api.rs put_server_config)
     if count as usize
         > state
-            .limits
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .data_conn_limit()
+            .data_conn_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
     {
         sess.data_conn_count
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
