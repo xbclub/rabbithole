@@ -234,7 +234,7 @@ async fn post_tls(
 }
 
 /// 窥探首 4 字节(带超时,防慢连接占资源);返回字节与可继续读取的流。
-async fn peek_prefix(mut io: crate::BoxedIo) -> io::Result<([u8; 4], crate::BoxedIo)> {
+async fn peek_prefix(io: crate::BoxedIo) -> io::Result<([u8; 4], crate::BoxedIo)> {
     let (b, io) = peek_prefix_tcp(io).await?;
     Ok((b, io))
 }
