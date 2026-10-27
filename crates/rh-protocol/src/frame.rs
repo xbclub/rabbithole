@@ -13,7 +13,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 pub const MAGIC: &[u8; 4] = b"RHTP";
 pub const PROTOCOL_FRAME_VERSION: u8 = 1;
@@ -148,19 +148,49 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
 
 /// 异步写入一帧。超限载荷直接报错:对端会以 TooLarge 关闭整条连接,
 /// 不如在本端拒绝编码(长度字段截断会产生腐化帧)。
+///
+/// L-H c(coreProtocol-1,首轮漏收):修前 `encode_frame_bytes` 一次
+/// 分配 + 整帧 memcpy(payload 双拷)再 write_all。改为栈上帧头 +
+/// `write_vectored` 两段写:支持向量写的底层(裸 TCP/Unix stream)单次
+/// syscall;不支持的包装走默认实现(逐段写,首段优先)—— 循环消费
+/// 保证语义与 write_all 一致。**不**拆成两次 write_all(裸 TCP 会变
+/// 2 syscall,任务书红线)。
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     ty: FrameType,
     payload: &[u8],
 ) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
     if payload.len() > MAX_FRAME_LEN {
         return Err(io::Error::other(format!(
             "frame payload {} exceeds limit {MAX_FRAME_LEN}",
             payload.len()
         )));
     }
-    let frame = encode_frame_bytes(ty, payload);
-    w.write_all(&frame).await
+    let mut header = [0u8; HEADER_LEN];
+    header[..4].copy_from_slice(MAGIC);
+    header[4] = PROTOCOL_FRAME_VERSION;
+    header[5..7].copy_from_slice(&ty.0.to_be_bytes());
+    header[7..11].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    let (mut h_done, mut p_done) = (0usize, 0usize);
+    while h_done < HEADER_LEN || p_done < payload.len() {
+        let n = w
+            .write_vectored(&[
+                std::io::IoSlice::new(&header[h_done..]),
+                std::io::IoSlice::new(&payload[p_done..]),
+            ])
+            .await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write whole frame",
+            ));
+        }
+        let hn = n.min(HEADER_LEN - h_done);
+        h_done += hn;
+        p_done += n - hn;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
