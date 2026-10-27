@@ -107,6 +107,8 @@
 ## P2:轻微(按包合并提交,核查后逐条处置)
 
 ### L-A 服务端孪生债(5 条,D/E 包修复的未跟修面)
+- [x] 状态:五条全做 @ f616f3f
+> 处置:a) crate Indifferent 引擎+期望凭据会话期一次算+static 恒定时间对齐;b) assets immutable/index no-cache+回退字节缓存;c) AppState.data_conn_limit 原子快照(两个热改点同步 store);d) 四处 state_kind();e) 删 deliver_relay 未用参+存在性检查消除每中继深克隆(表 Arc 化留冷路径,未做)。
 - [ ] a) plugins.rs:1045-1076/276/877 客户端 base64+format!(D-9 孪生):换 base64 crate Indifferent 引擎;期望凭据建会话时算一次。
 - [ ] b) main.rs:429-454 static_dir 分支无缓存头(D-15 孪生):assets/ immutable 头 + index no-cache;SPA 回退 index.html 字节缓存。
 - [ ] c) control.rs:1128-1144 route_data_stream 每通道读 limits RwLock(D-12 孪生):data_conn_limit 原子快照,热改点同步 store。
@@ -114,12 +116,16 @@
 - [ ] e) session.rs:1844/visitor_run.rs:99/225 VisitorSpec 未 Arc 化(E-6 孪生):visitors 表改 Arc<VisitorSpec>,:1844 锁内深克隆消除,deliver_relay 的 _vspec 未用参数删除,run_tcp 持 Arc。
 
 ### L-B 服务端序列化/状态(4 条,D-1 遗留与状态层)
+- [x] 状态:a/b/c 完成;d 完成 HttpCache 半,batch 去重延期 @ f0767e0
+> 处置:a) VisitorListRow;b) ServerConfigView 借用视图+两段短锁;c) CertListRow;d) get_key_value 单查+Arc<str>;bump_cfg_gen batch 去重需拆 wrapper/inner/locked 三层签名,visitor_cache 规模小收益不抵风险,延期。
 - [ ] a) api.rs:1984-1997 list_visitors 仍 json! 建树内嵌 spec:仿 ClientListRow 强类型化。
 - [ ] b) api.rs:2336-2359 get_server_config 每请求整份 ServerConfig 深克隆 + 4 段 to_value:具名 Serialize 结构。
 - [ ] c) api.rs:2843-2852 list_certs_api 逐行建树 + 每行 from_str 解析 domains:强类型化。
 - [ ] d) state.rs:1215-1228 HttpCache::get 双查找 + String 克隆:get_key_value 单查 + content_type Arc 化;另 state.rs:290-298 bump_cfg_gen 全表扫被 batch 放大 N 倍:batch 去重后统一 bump。
 
 ### L-C yamux/pool 周边(6 条)
+- [x] 状态:a/b/c 完成 @ 1035055;d/e/f 延期
+> 处置:a) 大类容量过滤+clear 补齐;b) put 乐观 fetch_add;c) allocations cfg(test) 门控;d/e/f(RecvHalf 逐帧 N 通道 poll/FlushTask 空锁/drain_ctrl 预算)属 mux 并发核心(唤醒契约/水位门控规格驱动,round-6.1 §1.3 等),需专门会话谨慎处理,本轮不做。
 - [ ] a) pool.rs:122-143 大类 get 弹出无容量过滤(潜伏合同违约,split_send_size 中间尺寸可播种):比照小类加过滤。
 - [ ] b) pool.rs:197-206 大类 put CAS 败者直接丢缓冲:改 fetch_add 后判预算。
 - [ ] c) pool.rs:119/141/147/185 allocations 诊断计数未门控(违反自家红线,C-4/A-1 同族):收进 cfg(test) 或 perf-counters feature。
@@ -128,17 +134,23 @@
 - [ ] f) shard.rs:960 drain_ctrl 不受预算约束(C-2 不对称):ctrl 消费计入 poll 级预算;另 stream.rs:629/686 on_park 双写时间戳删一处。
 
 ### L-D kcp 收尾(4 条)
+- [x] 状态:四条全做 @ 853d81d;基准并入 r2-kcp-base/cand 对照(吞吐±3%带内、UDP RTT 中位 2.856→2.846ms 持平、CPU 峰值 t1 471→413 不升)
+> 处置:a) 读游标;b) BytesMut freeze+slice 零拷转移,backlog 元素 Vec→Bytes;c) BkQueue.bytes 增量记账 O(1);d) 交付循环合锁 2N→2。
 - [ ] a) kcp.rs:952-954 flush_now 每批 Vec 头部 drain(整轮 ~1.5× memmove):改读游标 off,与 A-2 同型。
 - [ ] b) kcp.rs:965-977 EAGAIN 余段 to_vec 二次拷贝:agg buf 改 Bytes,freeze 后 slice 移交 backlog。
 - [ ] c) kcp.rs:180-182/701/746 backlog 每入队线性扫字节预算:queued_bytes 增量记账 O(1)。
 - [ ] d) kcp.rs:1467-1491 交付循环每消息两次 guarded 锁:批内合并(一次读 room,本地 scratch 收,一次 extend+wake)。
 
 ### L-E 传输层(3 条)
+- [x] 状态:b 完成 @ 2fbd207;a/c 延期
+> 处置:b) dup 推迟到 peek 判定后(yamux 连接不再白开 fd);a) 代理拨号 URL/DNS 缓存与 c) QUIC 证书链拷贝提取未及做,留下一轮。
 - [ ] a) tcp.rs:721-727/proxy_dial.rs:120-128 代理拨号每连接重 parse URL + 域名无 DNS 缓存:装配时 parse 一次存 ProxyUrl;代理 (host,port) 解析结果缓存。
 - [ ] b) tcp.rs:179-183 verify 在 peek 判定前就 dup 写侧 fd:明文分支先 peek 判 yamux 再 dup。
 - [ ] c) quic.rs:375-391 connect 证书链最多 3 次深拷:提取一次复用。
 
 ### L-F 存量正确性(3 条,低频触发)
+- [x] 状态:b 完成 @ 673b290(v1 非法行+v2 丢源双缺陷,生产唯一调用方即此形态);a/c 延期
+> 处置:b) unify_family 同族合成+显式 warn,测试解析器补无括号 v6;a) http_connect 残余字节前转、c) login_limiter 键收缩未及做。
 - [ ] a) proxy_dial.rs:143-168 http_connect 丢弃 CONNECT 终止符后残余字节(server-first 协议丢首段):记录命中下标,残余经 PrependedIo 前传。
 - [ ] b) rh-core/proxyproto.rs:33-51 混族地址(v6 源+硬编码 v4 dst)静默 UNSPEC 丢源地址:dst 按源同族合成或透传真实地址;混族 warn。
 - [ ] c) api.rs:124-149 login_limiter_user 键含用户名单调增长:去用户名维度或定期收缩。
@@ -150,6 +162,8 @@
 - [ ] d) visitor.rs:29-85 visitor_cache 未命中路径两次按客户端全量查询内联控制读循环:命中路径 C1 已优化,未命中侧至少把 list_proxies 投影化。
 
 ### L-H 核心库(4 条)
+- [x] 状态:c/d 完成 @ 673b290(首轮漏收已补);a 延期;b 记 not-supported §12
+> 处置:c) write_frame 栈头+write_vectored(裸 TCP 单 syscall,不拆两次 write_all);d) encode_v1 栈上 fmt/encode_v2 无中间 Vec;b) 限速桶 per-connection 语义(TCP)/per-rule(UDP)不一致,改共享桶属用户可见行为变化,not-supported §12 交独立设计决策;a) certprov 双拷贝+HKDF 缓存未及做。
 - [ ] a) certprov.rs:64-97 双拷贝 + 每连接重复 HKDF:SealedCert 按值收、truncate 复用缓冲、derive_key 按 secret 缓存。
 - [ ] b) bandwidth.rs:26 每连接重解析(eq_ignore_ascii_case 零分配)+ 调用方物化一次;**先确认规则桶 per-connection 语义是否本意**(TCP 每连接各一份桶 vs UDP 按规则共享,不一致)——非本意则改为规则级共享桶,是本意则记 not-supported.md。
 - [ ] c) **coreProtocol-1(首轮漏收)**:rh-protocol/frame.rs:151-164 write_frame 每帧双分配双拷;最高频调用点 vhost 每请求 START_FORWARD。修:write_all_vectored([头;payload]) 或复用缓冲预编码变体;**不要**改两次 write_all(裸 TCP 拆 2 syscall)。
@@ -157,10 +171,13 @@
 - 验收:c/d 完成后在本文件标注"首轮漏收已补"。
 
 ### L-I console 收尾(2 条)
+- [x] 状态:两条全做 @ f3f382f
+> 处置:a) servicesQ 挂 5s refetchInterval;b) 挂载空选集跳过回调,清空仍通知(ref 区分)。npm build+vitest 过。
 - [ ] a) pages/overview/index.tsx:120-123 「转发规则健康」卡不随 5s 轮询刷新(池/连接数冻结):挂 refetchInterval 或注释写明取舍。
 - [ ] b) components/data-table.tsx:213-215 挂载即 setSelected([]) 新数组多一轮全表渲染:空选集跳过回调。
 
 ### L-J 可选/观察项(默认不做,写明即可)
+- [x] 状态:六条已记 not-supported.md §13 @ 62359bc
 - ws.rs JoinDuplex 缺 poll_write_vectored(当前无向量写消费者,零影响):记 not-supported.md 或上报 is_write_vectored=false。
 - mux.rs pump_down 三处 enabled() 未提升(≈0 开销):下次触碰该文件顺手。
 - kcp PunchOutput/客户端 punch 收包循环错误分支槽直接还给分配器(仅会话终结,无泄漏):不动。
