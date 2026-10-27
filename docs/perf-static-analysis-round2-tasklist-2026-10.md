@@ -44,7 +44,9 @@
 ### M1 [P1] 服务端 vhost/visitor 中继 8KiB 默认缓冲 + split 共享锁 —— 首轮漏网的全量吞吐路径
 - [x] 状态:已完成 @ f2dbed2
 > 核查:✅ data.rs:4101 仍是 tokio::io::split + io::copy(8KiB 默认),5 个调用点行号无漂移、均持所有权。
-> 处置:签名改所有权(BoxedIo×2),user 侧 split_counted_tcp_user / channel 侧 split_boxed_io 拆半(包装流回落共享拆分),copy_64k 64KiB 单缓冲;select+halfclose_grace 原样。三道门绿。基准 tcp 档(passthrough/tcpmux)见文末基准节。
+> 处置:签名改所有权(BoxedIo×2),user 侧 split_counted_tcp_user / channel 侧 split_boxed_io 拆半(包装流回落共享拆分),copy_64k 64KiB 单缓冲;select+halfclose_grace 原样。三道门绿。
+> 基准:三机 tcp A/B(r2-tcp-base @173cb2a vs r2-tcp-cand @76ece9f,证据 test3:/tmp/ev-r2-tcp-{base,cand})—— 主路径(tcpmux 之外的常规转发)吞吐 4/16 流 ±4% 带内、UDP RTT +0.12ms(kcp 轮 -0.01ms,无系统性回归)、延迟 p50/p90 略优、并发 4096 全过。
+> 测法清单(peer.sh 无 passthrough/tcpmux 场景,按规则不自写压测脚本):①HTTPS passthrough——server 配 https vhost + 证书,loadgen 对 vhost 端口打 TLS 长流,对照 tcp 档口径取隧道绝对值;②tcpmux——建 tcpmux 规则,HTTP CONNECT 代理形态压测;③观察指标:吞吐中位数(隧道绝对值,保留率因 loadgen sink 伪影不可用)、连接建立速率。改动只落在 visitor/passthrough 路径,主路径由上表已覆盖。
 - 位置:`crates/rh-server/src/data.rs:4101-4117`(copy_bidirectional_bounded);调用点 vhost.rs:944(HTTPS passthrough)/1229/1266(tcpmux)、visitor.rs:296/417(stcp/sudp)
 - 问题:tokio::io::split + io::copy 默认 8KiB + 共享锁双泵,是同文件 R3 口径(32-64KiB)的 1/4-1/8;E-1 在客户端的孪生,首轮单元划分漏掉服务端。
 - 修法:对齐口径——缓冲 64KiB(`copy_bidirectional_with_sizes` 或手写);user 侧复用 split_counted_tcp_user、channel 侧 split_boxed_io 的无锁拆半(签名从 &mut 改所有权,调用点均持所有权可行);TCP 主路径已有 copy_relay_pair/splice,本函数只服务 passthrough/visitor,别动主路径。
@@ -73,6 +75,7 @@
 - [x] 状态:代码已完成 @ c7d2710;kcp 档基准(吞吐+CPU+UDP RTT)待跑
 > 核查:✅ PKT_POOL 仍是单 Mutex,demux 每包 get、N 会话任务每包 put(~17 万临界区/秒 @85k pps);"争用弱"注释确实低估。
 > 处置:16 片分片池,每片 16 槽(总硬上界 256 槽不变);get/put 独立轮转计数(单计数在逐包交替下步长 2 会钉死奇偶子集——自研时发现的坑);get 用 try_lock 扫描永不阻塞。独立实例单测锁复用/封顶/扫描不漏片。三道门绿。
+> 基准(含 M6/L-D/R2 一并覆盖):kcp A/B(r2-kcp-base @173cb2a vs r2-kcp-cand @1035055,证据 test3:/tmp/ev-r2-kcp-{base,cand})—— 吞吐各档 ±3% 带内;UDP 吞吐 100.8→100.7 持平;UDP RTT p50 中位 2.856→2.846ms 持平(A-5 式回归不存在);CPU 峰值 t1 471.7→412.7(-12.5%)、t2 409→407;并发 4096×5 全过。tcp 侧见 M1 行。
 - 位置:`crates/rh-transport/src/kcp.rs:1272-1287`(PKT_POOL)
 - 问题:demux 每包 get、N 会话任务每包 put,同一锁字跨核乒乓(~17 万临界区/秒 @85k pps),替代的 malloc 本有 per-thread arena;注释自评"争用弱"低估了跨任务形态。
 - 修法:分片池(8-16 片按会话 id 哈希取片)或 demux 本地 free-list + 溢出触全局;put 按来源分片。
