@@ -355,7 +355,10 @@ kc=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/auth/logout" 
 ub=$(curl -s -w "|%{http_code}" "$BASE_URL/api/nope")
 uc=${ub##*|}
 ucb=$(echo "${ub%|*}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("code"))' 2>/dev/null)
-[ "$uc" != "401" ] && [ "$ucb" = "404" ]; check $? "未知 API 路径携带 404 语义且未被鉴权拦截(HTTP=$uc code=$ucb)"
+# 两种构建风味都合法:裸构建(无内嵌 UI)走 axum 默认 fallback → 真 404;
+# 内嵌 UI 构建走 embedded_ui::handle → err 信封 HTTP 200+body code=404。
+# 本质要求只有一个:不得被鉴权拦截成 401(route_layer 误用的信号)。
+[ "$uc" != "401" ] && { [ "$uc" = "404" ] || [ "$ucb" = "404" ]; }; check $? "未知 API 路径携带 404 语义且未被鉴权拦截(HTTP=$uc code=$ucb)"
 
 # 6) 改密码后 API Key 仍可用 —— Key 独立于 pwd_version 的唯一可执行证明。
 #    ★此步作废 $TOKEN(服务端还会轮换 JWT 密钥),故放在本段末尾,验完立即改回
