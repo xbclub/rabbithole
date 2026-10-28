@@ -5713,3 +5713,547 @@ mod remove_send_concurrency_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod apikey_tests {
+    //! API Key 认证链路的集成测试(H-1):scope 判权 / 缓存失效 /
+    //! 七步校验 / 管理接口行为。路由级用例经真实 router + oneshot
+    //! 走完整中间件链,不经 handler 直调 —— route_layer 顺序错了
+    //! 这批测试第一个红。
+    use super::*;
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    async fn new_state() -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        Arc::new(AppState::new(crate::config::ServerConfig::default(), db))
+    }
+
+    /// 路由级请求:每次重建 router(轻量),走完整 guard 链。
+    async fn call(
+        state: &Arc<AppState>,
+        method: &str,
+        uri: &str,
+        bearer: Option<&str>,
+        json_body: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut b = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(t) = bearer {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        let req = match json_body {
+            Some(payload) => b
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_owned()))
+                .unwrap(),
+            None => b.body(Body::empty()).unwrap(),
+        };
+        let resp = router(state.clone()).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, v)
+    }
+
+    async fn jwt(state: &Arc<AppState>) -> String {
+        mint_jwt(state, "admin", 1, 0).await.unwrap()
+    }
+
+    /// 直插一把 key 到 DB(不经 handler),返回明文。prefix 由调用方给。
+    async fn seed_key(
+        state: &Arc<AppState>,
+        id: &str,
+        name: &str,
+        prefix: &str,
+        scopes: u32,
+        expires_at: Option<i64>,
+    ) -> String {
+        let plaintext = format!("rhk_{prefix}_{}", "ab".repeat(32));
+        state
+            .db
+            .create_api_key(
+                id,
+                name,
+                prefix,
+                &crate::apikey::hash_hex(&plaintext),
+                scopes,
+                "tester",
+                expires_at,
+            )
+            .await
+            .unwrap();
+        plaintext
+    }
+
+    /// 断言被拒:HTTP 401 且 body 统一 "unauthorized"(不泄露具体原因)。
+    async fn assert_blind_401(r: Result<Principal, Box<Response>>) {
+        let resp = match r {
+            Err(resp) => *resp,
+            Ok(_) => panic!("应被拒绝,却认证通过"),
+        };
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["message"], "unauthorized", "不泄露拒绝原因");
+    }
+
+    /// 直调 create_api_key 并断言业务码 1002。
+    async fn expect_1002(
+        state: &Arc<AppState>,
+        name: &str,
+        preset: Option<&str>,
+        scopes: Option<u32>,
+        days: Option<i64>,
+    ) {
+        let resp = create_api_key(
+            State(state.clone()),
+            Extension(Principal::User("admin".into())),
+            Json(CreateApiKeyReq {
+                name: name.to_string(),
+                preset: preset.map(str::to_string),
+                scopes,
+                expires_in_days: days,
+            }),
+        )
+        .await;
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["code"], 1002, "name={name:?} body={v}");
+    }
+
+    /// scopes=0 的 key 对任意受保护组(含只读组)必须 403 —— 这是
+    /// fail-closed 判权的底线:allowed 非零但 key 无任何位。
+    /// 同时钉住 403 必须是**真实 HTTP 状态码**(§2.5:err() 信封是 200)。
+    #[tokio::test]
+    async fn scope_zero_key_denied() {
+        let state = new_state().await;
+        let key = seed_key(&state, "z1", "zero", "a1b2c3d4", 0, None).await;
+
+        for (method, uri) in [
+            ("GET", "/api/clients"),
+            ("GET", "/api/events"),
+            ("GET", "/api/services"),
+        ] {
+            let (status, _) = call(&state, method, uri, Some(&key), None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+    }
+
+    /// GET/HEAD=读、其余=写 的方法映射:只读 key 读得通、写全 403。
+    #[tokio::test]
+    async fn scope_method_mapping() {
+        let state = new_state().await;
+        // 只给 SERVICES_R:GET 通,DELETE/POST enable/POST batch 全是写 → 403
+        let ro = seed_key(&state, "ro1", "ro", "00000001", scope::SERVICES_R, None).await;
+        let (status, _) = call(&state, "GET", "/api/services", Some(&ro), None).await;
+        assert_eq!(status, StatusCode::OK, "GET 应判读方向,只读 key 放行");
+        for (method, uri) in [
+            ("DELETE", "/api/services/999"),
+            ("POST", "/api/services/999/enable"),
+            ("POST", "/api/services/batch"),
+        ] {
+            let (status, _) = call(&state, method, uri, Some(&ro), None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri} 应判写方向");
+        }
+        // SERVICES_W 的 key:POST batch 不再 403(handler 正常执行,空批 → 200)
+        let rw = seed_key(
+            &state,
+            "rw1",
+            "rw",
+            "00000002",
+            scope::SERVICES_R | scope::SERVICES_W,
+            None,
+        )
+        .await;
+        let (status, v) = call(
+            &state,
+            "POST",
+            "/api/services/batch",
+            Some(&rw),
+            Some(r#"{"ids":[],"action":"disable"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "带写位的 key 走 batch 不得 403");
+        assert_eq!(v["code"], 0, "空批应正常返回,body={v}");
+    }
+
+    /// session 组对 Key 一律 403(真实 HTTP,防"logout 一把 key 摸掉全部会话"。
+    /// full 权限也不行 —— 权限大小不改变 session-only 语义)。
+    #[tokio::test]
+    async fn session_only_rejects_key() {
+        let state = new_state().await;
+        let full = seed_key(&state, "f1", "full", "00000003", scope::FULL, None).await;
+
+        let (status, body) = call(&state, "POST", "/api/auth/logout", Some(&full), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "Key 调 logout 必须 403");
+        assert_eq!(body["code"], 403, "403 响应体带 code=403");
+
+        let (status, _) = call(&state, "GET", "/api/user/info", Some(&full), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = call(&state, "GET", "/api/api-keys", Some(&full), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "Key 不能列 key(防横向提权)");
+    }
+
+    /// 完整链路回归:建 key → 用它请求 200 → rotate → **旧 key 必须 401**。
+    /// 抓"rotate 忘了 bump 缓存"的 bug —— 光测 invalidate_apikeys 本身抓不到。
+    #[tokio::test]
+    async fn apikey_rotate_old_key_rejected() {
+        let state = new_state().await;
+        let token = jwt(&state).await;
+
+        let (status, v) = call(
+            &state,
+            "POST",
+            "/api/api-keys",
+            Some(&token),
+            Some(r#"{"name":"rot-me","preset":"readonly"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "创建失败 body={v}");
+        let kid = v["data"]["id"].as_str().unwrap().to_string();
+        let old_key = v["data"]["key"].as_str().unwrap().to_string();
+
+        let (status, _) = call(&state, "GET", "/api/clients", Some(&old_key), None).await;
+        assert_eq!(status, StatusCode::OK, "建好的 key 应可用");
+
+        let (status, v) = call(
+            &state,
+            "POST",
+            &format!("/api/api-keys/{kid}/rotate"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "rotate 失败 body={v}");
+        let new_key = v["data"]["key"].as_str().unwrap().to_string();
+        assert_ne!(new_key, old_key);
+
+        let (status, _) = call(&state, "GET", "/api/clients", Some(&old_key), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "rotate 后旧 key 必须 401");
+        let (status, _) = call(&state, "GET", "/api/clients", Some(&new_key), None).await;
+        assert_eq!(status, StatusCode::OK, "新 key 应可用");
+    }
+
+    /// D-4 的全部 5 个失败分支,每条断言:401 且 body 不泄露具体原因
+    /// (统一 "unauthorized",不区分不存在/已吊销/已过期)。
+    #[tokio::test]
+    async fn verify_api_key_five_rejections() {
+        let state = new_state().await;
+
+        // 1. parse 形态错误
+        assert_blind_401(verify_api_key(&state, "rhk_xxx").await).await;
+        // 2. lookup 查不到(库无此 prefix)
+        let ghost = format!("rhk_deadbeef_{}", "cd".repeat(32));
+        assert_blind_401(verify_api_key(&state, &ghost).await).await;
+        // 3. hash 不匹配(合法形态,错误 secret)
+        let k = seed_key(&state, "h1", "hashm", "00000004", scope::FULL, None).await;
+        let wrong = format!("rhk_00000004_{}", "ee".repeat(32));
+        assert_ne!(wrong, k);
+        assert_blind_401(verify_api_key(&state, &wrong).await).await;
+        // 4. enabled=false(软删后 invalidate,同 prefix 再查 → 库里 enabled=0 当不存在)
+        state.db.set_api_key_enabled("h1", false).await.unwrap();
+        state.invalidate_apikeys();
+        assert_blind_401(verify_api_key(&state, &k).await).await;
+        state.db.set_api_key_enabled("h1", true).await.unwrap();
+        state.invalidate_apikeys();
+        // 5. expires_at 已过(= now-1,边界用 <=)
+        state
+            .db
+            .create_api_key(
+                "h2",
+                "expired",
+                "00000005",
+                &crate::apikey::hash_hex(&format!("rhk_00000005_{}", "ab".repeat(32))),
+                scope::FULL,
+                "tester",
+                Some(crate::db::now_ms() - 1),
+            )
+            .await
+            .unwrap();
+        let exp_key = format!("rhk_00000005_{}", "ab".repeat(32));
+        assert_blind_401(verify_api_key(&state, &exp_key).await).await;
+
+        // 成功用例:正常 key → Ok(Key{..}),touch 不影响返回
+        let ok_key = format!("rhk_00000004_{}", "ab".repeat(32));
+        let p = verify_api_key(&state, &ok_key)
+            .await
+            .expect("有效 key 应通过");
+        match p {
+            Principal::Key { id, name, scopes } => {
+                assert_eq!(id, "h1");
+                assert_eq!(name, "hashm");
+                assert_eq!(scopes, scope::FULL);
+            }
+            _ => panic!("应为 Principal::Key"),
+        }
+    }
+
+    /// resolve_principal 四种输入分流:JWT / API Key / 无 header / 非 Bearer 前缀。
+    #[tokio::test]
+    async fn resolve_principal_jwt_and_key() {
+        let state = new_state().await;
+
+        // JWT 路径
+        let token = jwt(&state).await;
+        let p = resolve_principal(&state, Some(format!("Bearer {token}")))
+            .await
+            .unwrap();
+        assert_eq!(p, Principal::User("admin".into()));
+
+        // API Key 路径(rhk_ 前缀分流,不进 JWT 解码器)
+        let key = seed_key(&state, "r1", "route", "00000006", scope::READONLY, None).await;
+        let p = resolve_principal(&state, Some(format!("Bearer {key}")))
+            .await
+            .unwrap();
+        assert_eq!(
+            p,
+            Principal::Key {
+                id: "r1".into(),
+                name: "route".into(),
+                scopes: scope::READONLY
+            }
+        );
+
+        // 无 header
+        assert!(resolve_principal(&state, None).await.is_err());
+        // 有值但缺 "Bearer " 前缀
+        assert!(
+            resolve_principal(&state, Some(format!("Basic {token}")))
+                .await
+                .is_err(),
+            "非 Bearer 方案必须 401,不做顺序试探"
+        );
+    }
+
+    /// 未知 /api/* 不落进鉴权(防劣化:route_layer 误用成 layer 包住
+    /// fallback 时,这里会变 401)。口径与既有行为一致:HTTP 200 +
+    /// body code=404(err() 信封不带状态码,基线如此)。
+    #[tokio::test]
+    async fn unknown_api_path_still_404() {
+        let state = new_state().await;
+        let mut app = router(state.clone());
+        app = app.fallback(|req: axum::http::Request<Body>| async move {
+            crate::embedded_ui::handle(req.uri().path()).await
+        });
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "未知路径不得被鉴权拦截"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], 404, "body 须携带 JSON 404 语义");
+    }
+
+    /// create_api_key 的 5 类参数校验,逐条断言业务码 1002(HTTP 200 信封)。
+    #[tokio::test]
+    async fn create_api_key_rejects_invalid() {
+        let state = new_state().await;
+
+        expect_1002(&state, "", Some("readonly"), None, None).await; // ① 空 name
+        expect_1002(&state, &"x".repeat(65), Some("readonly"), None, None).await; // ① 65 字符
+        expect_1002(&state, "ok", None, Some(scope::FULL + 1), None).await; // ② 超出 FULL
+        expect_1002(&state, "ok", Some("superuser"), None, None).await; // ③ 未知 preset
+        expect_1002(&state, "ok", None, None, None).await; // ④ 都不给
+        expect_1002(&state, "ok", Some("full"), None, Some(0)).await; // ⑤ 0 天
+        expect_1002(&state, "ok", Some("full"), None, Some(3651)).await; // ⑤ 超 10 年
+        expect_1002(&state, "ok", Some("full"), None, Some(-1)).await; // ⑤ 负数
+    }
+
+    /// 三个 preset 分别落库为 READONLY/OPS/FULL;scopes 与 preset 同时给时
+    /// 以 scopes 为准。
+    #[tokio::test]
+    async fn create_api_key_accepts_presets() {
+        let state = new_state().await;
+
+        for (name, preset, want) in [
+            ("p-ro", "readonly", 5461u32),
+            ("p-ops", "ops", 5503),
+            ("p-full", "full", 16383),
+        ] {
+            let resp = create_api_key(
+                State(state.clone()),
+                Extension(Principal::User("admin".into())),
+                Json(CreateApiKeyReq {
+                    name: name.into(),
+                    preset: Some(preset.into()),
+                    scopes: None,
+                    expires_in_days: None,
+                }),
+            )
+            .await;
+            let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            let id = v["data"]["id"].as_str().unwrap();
+            let row = state
+                .db
+                .list_api_keys()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.id == id)
+                .unwrap();
+            assert_eq!(row.scopes, want, "preset={preset}");
+        }
+
+        // scopes 优先于 preset
+        let resp = create_api_key(
+            State(state.clone()),
+            Extension(Principal::User("admin".into())),
+            Json(CreateApiKeyReq {
+                name: "p-mix".into(),
+                preset: Some("readonly".into()),
+                scopes: Some(scope::CLIENTS_R),
+                expires_in_days: None,
+            }),
+        )
+        .await;
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["data"]["scopes"], 1, "同时给以 scopes 为准");
+    }
+
+    /// rotate 返回体:新明文 rhk_ 开头、prefix 与旧不同、id 不变。
+    #[tokio::test]
+    async fn rotate_returns_new_plaintext() {
+        let state = new_state().await;
+        let ext = Extension(Principal::User("admin".into()));
+
+        let resp = create_api_key(
+            State(state.clone()),
+            ext.clone(),
+            Json(CreateApiKeyReq {
+                name: "rot".into(),
+                preset: Some("full".into()),
+                scopes: None,
+                expires_in_days: None,
+            }),
+        )
+        .await;
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let id = v["data"]["id"].as_str().unwrap().to_string();
+        let old_prefix = v["data"]["prefix"].as_str().unwrap().to_string();
+
+        let resp = rotate_api_key(State(state.clone()), ext, Path(id.clone())).await;
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(v["data"]["key"].as_str().unwrap().starts_with("rhk_"));
+        assert_ne!(v["data"]["prefix"].as_str().unwrap(), old_prefix);
+        assert_eq!(v["data"]["id"].as_str().unwrap(), id, "rotate 不换 id");
+    }
+
+    /// 软删语义:吊销后旧 key 401、list 仍可见且 enabled=false、DB 行还在。
+    #[tokio::test]
+    async fn delete_is_soft() {
+        let state = new_state().await;
+        let key = seed_key(&state, "d1", "del", "00000007", scope::READONLY, None).await;
+
+        let (status, _) = call(&state, "GET", "/api/clients", Some(&key), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let resp = delete_api_key(
+            State(state.clone()),
+            Extension(Principal::User("admin".into())),
+            Path("d1".into()),
+        )
+        .await;
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["data"]["deleted"], true);
+
+        let (status, _) = call(&state, "GET", "/api/clients", Some(&key), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "吊销后旧 key 401");
+
+        let rows = state.db.list_api_keys().await.unwrap();
+        let row = rows.iter().find(|r| r.id == "d1").unwrap();
+        assert!(!row.enabled, "行还在但 enabled=false(软删)");
+    }
+
+    /// created_by 必须落库并被 list 回显 —— 防止"字段加了但没写进去"。
+    #[tokio::test]
+    async fn apikey_created_by_recorded() {
+        let state = new_state().await;
+        let resp = create_api_key(
+            State(state.clone()),
+            Extension(Principal::User("alice".into())),
+            Json(CreateApiKeyReq {
+                name: "by-alice".into(),
+                preset: Some("readonly".into()),
+                scopes: None,
+                expires_in_days: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let row = state
+            .db
+            .list_api_keys()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "by-alice")
+            .unwrap();
+        assert_eq!(row.created_by, "alice");
+    }
+
+    /// list 响应不得出现 key_hash 与明文 key(防内部字段外漏)。
+    #[tokio::test]
+    async fn apikey_list_excludes_key_hash() {
+        let state = new_state().await;
+        seed_key(&state, "l1", "leak", "00000008", scope::READONLY, None).await;
+
+        let resp = list_api_keys(State(state.clone())).await;
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&b).to_string();
+        assert!(!text.contains("key_hash"), "列表不得回显 key_hash");
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["data"].as_array().unwrap().len(), 1);
+        for row in v["data"].as_array().unwrap() {
+            assert!(row.get("key").is_none(), "列表不得含明文字段");
+        }
+    }
+
+    /// 直调 handler(带 Extension)不是 500 —— 防 route_layer 顺序错导致
+    /// 中间件没跑、Extension 缺失、handler 全 500 的回归。
+    #[tokio::test]
+    async fn handler_reachable_with_extension() {
+        let state = new_state().await;
+        let resp = user_info(Extension(Principal::User("admin".into()))).await;
+        assert_eq!(resp.status(), StatusCode::OK, "Extension 注入路径不得 500");
+
+        let resp = list_api_keys(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}

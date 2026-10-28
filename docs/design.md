@@ -580,6 +580,23 @@ CREATE TABLE events (
 
 > 对接注意：vben 的 `logoutApi` 默认使用不带 Bearer 注入的 `baseRequestClient`——**前端需一处一行改动**（`logoutApi` 显式附 `Authorization`），见 §8.2。
 
+**双凭据(2026-10 增,API Key)**:除浏览器 JWT 外,REST API 同时接受
+API Key —— `Authorization: Bearer rhk_<8hex>_<64hex>`。靠 `rhk_` 前缀
+分流(不做"JWT 失败再试 Key"的顺序试探);`key_hash = sha256(完整 bearer 串)`
+只存哈希,明文仅创建/轮换时返回一次。判权为 scope 位掩码(每资源 2 位,
+偶=读奇=写;`READONLY=5461`/`OPS=5503`/`FULL=16383`),GET/HEAD 判读、
+其余判写,`allowed==0` 一律 fail-closed 403。session 类接口
+(logout/password/user/info/auth/codes/menu/all 与 api-keys 管理本身)
+整组拒绝 Key。curl 示例:
+
+```bash
+# 建一把只读 key(需 JWT;明文仅此一次)
+curl -X POST http://host:8080/api/api-keys -H "Authorization: Bearer $JWT" \
+  -H 'Content-Type: application/json' -d '{"name":"ci","preset":"readonly"}'
+# 用 key 调业务接口
+curl http://host:8080/api/clients -H "Authorization: Bearer rhk_xxxxxxxx_..."
+```
+
 ### 7.2 业务接口
 
 | 方法 | 路径 | 说明 |
@@ -596,6 +613,10 @@ CREATE TABLE events (
 | DELETE | `/api/services/{id}` | 删除 + `rule_cancel` + REMOVE 入队（离线则靠全量 SYNC 隐式移除） |
 | GET | `/api/stats/overview` | `{clients_total, clients_online, services_total, services_running, conns_current, bytes_in, bytes_out}` |
 | GET | `/api/events?limit=100&level=` | 倒序 |
+| GET | `/api/api-keys` | API Key 列表(含已吊销);**不回显 key_hash/明文**;session-only(整组拒绝 Key) |
+| POST | `/api/api-keys` | `{name,preset?,scopes?,expires_in_days?}` → `{id,name,prefix,scopes,key}`;**明文 key 仅此一次**;preset=readonly/ops/full,scopes 是 u32 位掩码且优先于 preset |
+| DELETE | `/api/api-keys/{id}` | 软删(`enabled=0`,保留审计痕迹,name 不可复用) → `{deleted:true}` |
+| POST | `/api/api-keys/{id}/rotate` | 换 prefix+hash,旧 key 立即失效 → `{id,prefix,key}`(新明文仅此一次) |
 
 P1 增加 `/api/stats/stream`（SSE）。
 

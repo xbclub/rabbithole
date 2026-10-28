@@ -312,6 +312,93 @@ lcode=$(curl -s -X POST "http://127.0.0.1:$API_PORT/api/auth/login" \
 code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$API_PORT/api/services")
 [ "$code" = "401" ]; check $? "无令牌 401"
 
+# ---------- API Key(双凭据) ----------
+BASE_URL="http://127.0.0.1:$API_PORT"
+
+# 1) 创建只读 API Key(明文仅此一次返回)
+KRESP=$(api -X POST "$BASE_URL/api/api-keys" -H 'Content-Type: application/json' \
+  -d '{"name":"e2e-ro","preset":"readonly"}')
+KEY=$(echo "$KRESP" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["key"])' 2>/dev/null)
+KID=$(echo "$KRESP" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["id"])' 2>/dev/null)
+[ -n "$KEY" ] && [ -n "$KID" ]; check $? "创建 API Key 并取明文"
+
+# 1b) 明文形态 + 列表:有 created_by,无 key_hash/明文
+echo "$KRESP" | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; sys.exit(0 if d["key"].startswith("rhk_") else 1)'
+check $? "创建响应含明文 key(rhk_ 前缀)"
+api "$BASE_URL/api/api-keys" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)["data"]
+assert d, "列表不应为空"
+row=d[0]
+assert "created_by" in row and row["created_by"], "created_by 缺失或为空"
+assert "key_hash" not in row, "列表不得返回 key_hash"
+assert "key" not in row, "列表不得返回明文"
+'
+check $? "列表含 created_by 且不含 key_hash/明文"
+
+# 2) 只读 key 读 clients → 200
+kc=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/api/clients" -H "Authorization: Bearer $KEY")
+[ "$kc" = "200" ]; check $? "API Key 可读 clients(HTTP=$kc)"
+
+# 3) 只读 key 写 clients → 403(真实 HTTP 状态,业务信封是 200 会误判)
+kc=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/clients" \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d '{"name":"nope"}')
+[ "$kc" = "403" ]; check $? "只读 Key 写被拒 403(HTTP=$kc)"
+
+# 4) key 调 session-only 接口 → 403
+kc=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/api/auth/logout" \
+  -H "Authorization: Bearer $KEY")
+[ "$kc" = "403" ]; check $? "API Key 不能调 logout(HTTP=$kc)"
+
+# 5) 未知 /api/*:不得被鉴权拦截(不是 401);既有口径是 HTTP 200 +
+#    body code=404(err 信封不带状态码 —— 与改造前基线一致)
+ub=$(curl -s -w "|%{http_code}" "$BASE_URL/api/nope")
+uc=${ub##*|}
+ucb=$(echo "${ub%|*}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("code"))' 2>/dev/null)
+[ "$uc" != "401" ] && [ "$ucb" = "404" ]; check $? "未知 API 路径携带 404 语义且未被鉴权拦截(HTTP=$uc code=$ucb)"
+
+# 6) 改密码后 API Key 仍可用 —— Key 独立于 pwd_version 的唯一可执行证明。
+#    ★此步作废 $TOKEN(服务端还会轮换 JWT 密钥),故放在本段末尾,验完立即改回
+kc=$(api -X POST "$BASE_URL/api/auth/password" -H 'Content-Type: application/json' \
+  -d '{"old_password":"'"$ADMIN_PASS"'","new_password":"E2e-tmp-456"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')
+[ "$kc" = "0" ]; check $? "改密码成功(code=0)"
+kc=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/api/clients" -H "Authorization: Bearer $KEY")
+[ "$kc" = "200" ]; check $? "改密码后 API Key 仍可用(HTTP=$kc)"
+# 改回原密码,保持后续段落凭据不变;重新登录拿回 TOKEN
+kc=$(curl -s -X POST "$BASE_URL/api/auth/login" -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"E2e-tmp-456"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["accessToken"])')
+TOKEN="$kc"
+kc=$(api -X POST "$BASE_URL/api/auth/password" -H 'Content-Type: application/json' \
+  -d '{"old_password":"E2e-tmp-456","new_password":"'"$ADMIN_PASS"'"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')
+[ "$kc" = "0" ]; check $? "密码已改回"
+TOKEN=$(curl -s -X POST "$BASE_URL/api/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["accessToken"])' 2>/dev/null)
+[ -n "$TOKEN" ]; check $? "改回后重新登录"
+
+# 6b) rotate 返回新明文,且旧 key 失效
+RRESP=$(api -X POST "$BASE_URL/api/api-keys/$KID/rotate")
+NEWKEY=$(echo "$RRESP" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["key"])' 2>/dev/null)
+[ -n "$NEWKEY" ] && [ "$NEWKEY" != "$KEY" ]; check $? "rotate 返回新明文且与旧不同"
+kc=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/api/clients" -H "Authorization: Bearer $KEY")
+[ "$kc" = "401" ]; check $? "rotate 后旧 Key 失效 401(HTTP=$kc)"
+
+# 7) 吊销 → 新 key 也 401;软删后列表仍可见
+kr=$(api -X DELETE "$BASE_URL/api/api-keys/$KID")
+echo "$kr" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["data"]["deleted"] else 1)'
+check $? "吊销 API Key"
+kc=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/api/clients" -H "Authorization: Bearer $NEWKEY")
+[ "$kc" = "401" ]; check $? "吊销后 Key 失效 401(HTTP=$kc)"
+api "$BASE_URL/api/api-keys" | python3 -c '
+import json,sys
+rows=json.load(sys.stdin)["data"]
+assert any((not r["enabled"]) and r["id"] == "'"$(echo "$KID")"'" for r in rows), "软删后列表应仍可见且 enabled=false"
+'
+check $? "软删后列表仍可见(审计保留)"
+
 # ---------- 客户端 ----------
 CRESP=$(curl -s -X POST "http://127.0.0.1:$API_PORT/api/clients" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"name":"e2e"}')
