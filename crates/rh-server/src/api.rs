@@ -109,6 +109,96 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// 权限拒绝:真实 HTTP 403。**不能复用 `err(403,…)`** —— 那返回
+/// HTTP 200 + body{code:403},curl/CI 按状态码分支全部误判"成功"。
+/// 本项目此前从未用过 403,无先例可复用,故新增。
+// 临时 allow:调用方(包 E guard 中间件)落地时移除,见任务书 §4.1
+#[allow(dead_code)]
+fn forbidden(message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"code": 403, "message": message, "data": null})),
+    )
+        .into_response()
+}
+
+// ---------------- principal / scope ----------------
+
+/// 已认证主体。需 Clone(放进 Extension 传给 handler)。
+// 临时 allow:非测试调用方(包 E guard)落地时移除
+#[allow(dead_code)]
+#[derive(Clone)]
+pub enum Principal {
+    /// JWT sub(浏览器会话)。
+    User(String),
+    /// API Key;scope 判权在中间件做,这里只带身份。
+    Key {
+        id: String,
+        name: String,
+        scopes: u32,
+    },
+}
+
+/// API Key 的权限位。每个资源占 2 位:偶数 = 读,奇数 = 写。
+/// 只读资源(STATS/EVENTS)没有写位,其奇位**留空不用** —— 若把
+/// EVENTS_R 压到奇位 7,它就不被 READ_MASK 覆盖,fail-closed 规则下
+/// 该组 allowed 恒 0,配置错误会被静默放大,单测里专门钉住。
+// 临时 allow:guard(包 E)落地时移除
+#[allow(dead_code)]
+pub mod scope {
+    pub const CLIENTS_R: u32 = 1 << 0; // 1
+    pub const CLIENTS_W: u32 = 1 << 1; // 2
+    pub const SERVICES_R: u32 = 1 << 2; // 4
+    pub const SERVICES_W: u32 = 1 << 3; // 8
+    pub const VISITORS_R: u32 = 1 << 4; // 16
+    pub const VISITORS_W: u32 = 1 << 5; // 32
+    pub const STATS_R: u32 = 1 << 6; // 64
+                                     // 位 7 留空(STATS 无写位)
+    pub const EVENTS_R: u32 = 1 << 8; // 256
+                                      // 位 9 留空(EVENTS 无写位)
+    pub const CONFIG_R: u32 = 1 << 10; // 1024
+    pub const CONFIG_W: u32 = 1 << 11; // 2048
+    pub const CERTS_R: u32 = 1 << 12; // 4096
+    pub const CERTS_W: u32 = 1 << 13; // 8192
+
+    /// 偶数位全部(读方向)。是**位模式**,不是常量之和。
+    pub const READ_MASK: u32 = 0x1555; // 5461
+    /// 奇数位全部(写方向)。
+    pub const WRITE_MASK: u32 = 0x2AAA; // 10922
+
+    /// 只读全权 = 所有读位。
+    pub const READONLY: u32 = READ_MASK; // 5461
+    /// 运维常用 = 只读 + clients/services/visitors 三类写(不含 config/certs 写)。
+    pub const OPS: u32 = READONLY | CLIENTS_W | SERVICES_W | VISITORS_W; // 5503
+    /// 全部权限。用 READ_MASK|WRITE_MASK(0x3FFF),不是常量之和 —— 后者
+    /// 漏掉保留位,两者在 create_api_key 的 scopes 校验里行为不同。
+    pub const FULL: u32 = READ_MASK | WRITE_MASK; // 16383
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 每个读常量必须落在 READ_MASK 内,每个写常量必须落在 WRITE_MASK 内。
+        /// 这条测试能一次性抓住"位排错"这一类错误(曾把 EVENTS_R 排到奇位 7)。
+        #[test]
+        fn scope_bits_align_with_masks() {
+            for c in [
+                CLIENTS_R, SERVICES_R, VISITORS_R, STATS_R, EVENTS_R, CONFIG_R, CERTS_R,
+            ] {
+                assert_eq!(c & READ_MASK, c, "读位未落在 READ_MASK 内: {c:#x}");
+            }
+            for c in [CLIENTS_W, SERVICES_W, VISITORS_W, CONFIG_W, CERTS_W] {
+                assert_eq!(c & WRITE_MASK, c, "写位未落在 WRITE_MASK 内: {c:#x}");
+            }
+            assert_eq!(READ_MASK & WRITE_MASK, 0, "读写位不得重叠");
+            assert_eq!(FULL, READ_MASK | WRITE_MASK);
+            assert_eq!(OPS & CONFIG_W, 0, "OPS 不得含 CONFIG_W");
+            assert_eq!(OPS & CERTS_W, 0, "OPS 不得含 CERTS_W");
+            assert_eq!(OPS & READONLY, READONLY, "OPS 必须含全部读位");
+        }
+    }
+}
+
 // ---------------- auth ----------------
 
 #[derive(Deserialize)]
@@ -405,6 +495,114 @@ async fn require_auth(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Stri
         }
         Err(_) => Err(Box::new(unauthorized())),
     }
+}
+
+/// 唯一的凭据解码入口。JWT 与 API Key 都走这里,`require_auth` 之后
+/// 由中间件取代,不允许出现第二份解码实现(两份必然漂移)。
+///
+/// ★入参是 owned String 而非 &HeaderMap/&Request:中间件要把它放进
+/// async 块里 await,借用 Request 会让 future 不 Send(axum 报出的
+/// 表面错误是 E0277 FromFn: Service,极易误诊)。调用方先 to_owned 再传。
+// 临时 allow:调用方(包 E guard)落地时移除,见任务书 §4.1
+#[allow(dead_code)]
+async fn resolve_principal(
+    state: &Arc<AppState>,
+    bearer: Option<String>,
+) -> Result<Principal, Box<Response>> {
+    // 1. 先剥 "Bearer " —— 与 require_auth 第一段一致。
+    //    ★必须先剥再判 rhk_:中间件传的是完整头值("Bearer rhk_…"),
+    //    不剥就 starts_with("rhk_") 永远 false,Key 全部掉进 JWT 分支 401。
+    let Some(raw) = bearer.as_deref() else {
+        return Err(Box::new(unauthorized()));
+    };
+    let Some(raw) = raw.strip_prefix("Bearer ") else {
+        return Err(Box::new(unauthorized()));
+    };
+    if raw.is_empty() {
+        return Err(Box::new(unauthorized()));
+    }
+
+    // 2. API Key 分流(靠 rhk_ 前缀,不做"JWT 失败再试 Key"的顺序试探)
+    if raw.starts_with(crate::apikey::TAG) {
+        return verify_api_key(state, raw).await;
+    }
+
+    // 3. JWT 路径:整体平移 require_auth 的剩余逻辑,一行不改
+    let secret = state.jwt_secret().await;
+    let engine = jwt_engine(secret);
+    let data = jsonwebtoken::decode::<AuthClaims>(raw, &engine.0, &engine.1);
+    match data {
+        Ok(d) => {
+            let user = d.claims.sub;
+            if user.is_empty() {
+                return Err(Box::new(unauthorized()));
+            }
+            let want = d.claims.pv;
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            let epoch_now = state.pwd_version_epoch.load(AtomicOrdering::Acquire);
+            let cached = state
+                .pwd_version_cache
+                .get(&user)
+                .filter(|e| e.value().1 == epoch_now)
+                .map(|e| e.value().0);
+            let cur = match cached {
+                Some(v) => v,
+                None => {
+                    let v = state.db.user_pwd_version(&user).await.unwrap_or(0);
+                    state.pwd_version_cache.insert(user.clone(), (v, epoch_now));
+                    v
+                }
+            };
+            if want != cur {
+                return Err(Box::new(unauthorized()));
+            }
+            Ok(Principal::User(user))
+        }
+        Err(_) => Err(Box::new(unauthorized())),
+    }
+}
+
+/// API Key 校验(D-4 七步)。每一步失败都回同一个 unauthorized() ——
+/// 不泄露「不存在 / 已吊销 / 已过期」的差异。
+///
+/// `bearer` 是**已剥掉 `Bearer ` 前缀**的 `rhk_...` 串(由
+/// resolve_principal 处理后传入),别在这里再 strip 一次。
+// 临时 allow:调用方(包 E guard)落地时移除,见任务书 §4.1
+#[allow(dead_code)]
+async fn verify_api_key(state: &Arc<AppState>, bearer: &str) -> Result<Principal, Box<Response>> {
+    // 1. 形态
+    let Some((prefix, full)) = crate::apikey::parse(bearer) else {
+        return Err(Box::new(unauthorized()));
+    };
+    // 2. 缓存/DB(lookup 只查不判,有效性判断全在本函数)
+    let Some(c) = state.lookup_api_key(prefix).await else {
+        return Err(Box::new(unauthorized()));
+    };
+    // 3. 哈希(口径:sha256(完整串),与 generate 一致)
+    let h = crate::apikey::hash_hex(full);
+    if !crate::apikey::ct_eq(h.as_bytes(), c.key_hash.as_bytes()) {
+        return Err(Box::new(unauthorized()));
+    }
+    // 4. 吊销
+    if !c.enabled {
+        return Err(Box::new(unauthorized()));
+    }
+    // 5. 过期(毫秒;exp <= now 即失效 —— 用 <= 而非 <,否则同毫秒内
+    //    单测不稳定。None = 永不过期,不是立即过期)
+    if let Some(exp) = c.expires_at {
+        if exp <= crate::db::now_ms() {
+            return Err(Box::new(unauthorized()));
+        }
+    }
+    // 6. touch(不 await;60s 节流在 state 内部)。被拒的请求也会走到
+    //    这里之前 return,只有走到第 6 步的才会 touch。
+    state.apikey_touch(&c.id);
+    // 7. ok
+    Ok(Principal::Key {
+        id: c.id,
+        name: c.name,
+        scopes: c.scopes,
+    })
 }
 
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {

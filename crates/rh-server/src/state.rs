@@ -1690,8 +1690,6 @@ fn route_from(
 /// API Key 缓存条目。★必须带 id/name:D-4 第 7 步要构造
 /// `Principal::Key{id,name,scopes}`(id 做审计、name 写进 events 的 actor),
 /// 缺了就得在缓存命中路径上再查一次库。
-// 临时 allow:字段读者(包 D verify_api_key)落地时移除
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct CachedApiKey {
     pub id: String,
@@ -1713,8 +1711,6 @@ impl AppState {
     ///
     /// 有效性判断(disabled / expired)统一放在 api.rs 的 verify_api_key 里,
     /// 「哪一步拒绝」在调用链上只有一个地方,便于审计与测试。
-    // 临时 allow:调用方(包 D verify_api_key)落地时移除
-    #[allow(dead_code)]
     pub async fn lookup_api_key(&self, prefix: &str) -> Option<CachedApiKey> {
         use std::sync::atomic::Ordering as AtomicOrdering;
         // epoch 守卫,照抄 pwd_version 缓存已验证的模式:miss 侧「读 DB →
@@ -1758,8 +1754,6 @@ impl AppState {
     /// SQLite 是单写者,UPDATE last_used_at 若每请求一次会成为全局串行点;
     /// 60s 节流把写频与请求量解耦。节流判断用 Instant(单调时钟,系统时间
     /// 回拨不影响),落库用毫秒(全项目口径)。
-    // 临时 allow:调用方(包 D verify_api_key)落地时移除
-    #[allow(dead_code)]
     pub fn apikey_touch(&self, id: &str) {
         let now = std::time::Instant::now();
         // 60s 内已写过就跳过

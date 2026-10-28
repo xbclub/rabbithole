@@ -49,8 +49,6 @@ pub fn generate() -> Generated {
 /// - 大小写都接受(`is_ascii_hexdigit`),但 hash 对**原始输入串**计算,
 ///   所以大写 key 一定校验失败 —— 不做 to_lowercase,那会让哈希口径变复杂。
 /// - 不做 trim():带前后空格的 key 视为形态错误(401)。
-// 临时 allow:调用方在包 D/F 落地时移除
-#[allow(dead_code)]
 pub fn parse(bearer: &str) -> Option<(&str, &str)> {
     let rest = bearer.strip_prefix(TAG)?;
     let (p, f) = rest.split_once('_')?;
@@ -64,8 +62,6 @@ pub fn parse(bearer: &str) -> Option<(&str, &str)> {
 }
 
 /// hex(sha256(s))。
-// 临时 allow:调用方在包 D/F 落地时移除
-#[allow(dead_code)]
 pub fn hash_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
@@ -74,8 +70,6 @@ pub fn hash_hex(s: &str) -> String {
 ///
 /// 不为这个加 `ring` 依赖 —— rh-server 的 Cargo.toml 里没有 ring,
 /// 手写 XOR 折叠即可满足"不因比较时机泄露匹配进度"。
-// 临时 allow:调用方在包 D verify_api_key 落地时移除
-#[allow(dead_code)]
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -120,9 +114,18 @@ mod tests {
         let (p, f) = parse(&full).unwrap();
         assert_eq!(p, "9f2c1a4b");
         assert_eq!(f, full, "full 必须含 rhk_ 前缀(哈希口径)");
-        // 大写形态也能 parse(形态合法),但 hash 对原串算 → 见 hash 语义
+        // B-1 验收:大写形态能 parse 成功(形态合法),但 hash 对原始
+        // 输入串计算 → 与建 key 时(小写)必然不同,校验必失败。
+        // 这是刻意的安全行为,不为"大小写不敏感"做 to_lowercase。
         let upper = format!("rhk_9F2C1A4B_{}", "AB".repeat(32));
-        assert!(parse(&upper).is_some(), "大写 hex 形态合法");
+        let (up, uf) = parse(&upper).unwrap();
+        assert_eq!(up, "9F2C1A4B");
+        assert_eq!(uf, upper);
+        assert_ne!(
+            hash_hex(uf),
+            hash_hex(&full),
+            "大写串的哈希必须与小写原串不同(同字符异 case)"
+        );
     }
 
     #[test]
