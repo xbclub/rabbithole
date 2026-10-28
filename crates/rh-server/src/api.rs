@@ -822,8 +822,9 @@ async fn create_api_key(
         )
         .await
     {
-        // name UNIQUE 冲突也走这里(SQLITE_CONSTRAINT)
-        return err(500, &format!("创建失败:{e}"));
+        // name UNIQUE 冲突也走这里(SQLITE_CONSTRAINT);错误码对齐
+        // create_client 的既有惯例(1003=创建失败,含重名)
+        return err(1003, &format!("创建失败:{e}"));
     }
     state.invalidate_apikeys();
     state
@@ -850,10 +851,10 @@ async fn rotate_api_key(
     let Principal::User(operator) = principal else {
         return forbidden("该接口仅限控制台会话");
     };
-    // 找不到 → 1004;顺带取 name 供审计
-    let name = match state.db.list_api_keys().await {
+    // 找不到 → 1004;顺带取 name/scopes 供审计
+    let (name, scopes) = match state.db.list_api_keys().await {
         Ok(rows) => match rows.iter().find(|r| r.id == id) {
-            Some(r) => r.name.clone(),
+            Some(r) => (r.name.clone(), r.scopes),
             None => return err(1004, "密钥不存在"),
         },
         Err(e) => return err(500, &format!("{e}")),
@@ -873,7 +874,7 @@ async fn rotate_api_key(
             "warn",
             "apikey",
             &format!("API Key 已轮换:{name}"),
-            &format!(r#"{{"actor":"{operator}"}}"#),
+            &format!(r#"{{"actor":"{operator}","scopes":{scopes}}}"#),
         )
         .await;
     ok(json!({ "id": id, "prefix": g.prefix, "key": g.plaintext }))
@@ -889,9 +890,9 @@ async fn delete_api_key(
     let Principal::User(operator) = principal else {
         return forbidden("该接口仅限控制台会话");
     };
-    let name = match state.db.list_api_keys().await {
+    let (name, scopes) = match state.db.list_api_keys().await {
         Ok(rows) => match rows.iter().find(|r| r.id == id) {
-            Some(r) => r.name.clone(),
+            Some(r) => (r.name.clone(), r.scopes),
             None => return err(1004, "密钥不存在"),
         },
         Err(e) => return err(500, &format!("{e}")),
@@ -908,7 +909,7 @@ async fn delete_api_key(
             "warn",
             "apikey",
             &format!("API Key 已吊销:{name}"),
-            &format!(r#"{{"actor":"{operator}"}}"#),
+            &format!(r#"{{"actor":"{operator}","scopes":{scopes}}}"#),
         )
         .await;
     ok(json!({ "deleted": true }))

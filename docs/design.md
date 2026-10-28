@@ -583,8 +583,7 @@ CREATE TABLE events (
 **双凭据(2026-10 增,API Key)**:除浏览器 JWT 外,REST API 同时接受
 API Key —— `Authorization: Bearer rhk_<8hex>_<64hex>`。靠 `rhk_` 前缀
 分流(不做"JWT 失败再试 Key"的顺序试探);`key_hash = sha256(完整 bearer 串)`
-只存哈希,明文仅创建/轮换时返回一次。判权为 scope 位掩码(每资源 2 位,
-偶=读奇=写;`READONLY=5461`/`OPS=5503`/`FULL=16383`),GET/HEAD 判读、
+只存哈希,明文仅创建/轮换时返回一次。判权为 scope 位掩码,GET/HEAD 判读、
 其余判写,`allowed==0` 一律 fail-closed 403。session 类接口
 (logout/password/user/info/auth/codes/menu/all 与 api-keys 管理本身)
 整组拒绝 Key。curl 示例:
@@ -596,6 +595,20 @@ curl -X POST http://host:8080/api/api-keys -H "Authorization: Bearer $JWT" \
 # 用 key 调业务接口
 curl http://host:8080/api/clients -H "Authorization: Bearer rhk_xxxxxxxx_..."
 ```
+
+scope 位定义(偶=读,奇=写;STATS/EVENTS 为只读资源,相邻奇位保留不用;
+前端 `console/src/features/api-keys/scope.ts` 为逐位镜像,两侧单测互相钉死):
+
+| 位 | 常量 | 值 | | 位 | 常量 | 值 |
+|---|---|---|---|---|---|---|
+| 0 | CLIENTS_R | 1 | | 8 | EVENTS_R | 256 |
+| 1 | CLIENTS_W | 2 | | 9 | *(留空)* | — |
+| 2 | SERVICES_R | 4 | | 10 | CONFIG_R | 1024 |
+| 3 | SERVICES_W | 8 | | 11 | CONFIG_W | 2048 |
+| 4 | VISITORS_R | 16 | | 12 | CERTS_R | 4096 |
+| 5 | VISITORS_W | 32 | | 13 | CERTS_W | 8192 |
+| 6 | STATS_R | 64 | | | | |
+| 7 | *(留空)* | — | 预设 | READONLY=`0x1555`(5461) / OPS=`0x157F`(5503) / FULL=`0x3FFF`(16383) | | |
 
 ### 7.2 业务接口
 

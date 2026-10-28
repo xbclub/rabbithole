@@ -362,33 +362,41 @@ frp 的 `bandwidth_limit` 是 per-proxy 共享桶(frp 源码
   一次),split_off 单分配待顺手。
 - **sudp 建道前 pending 逐包 to_vec**:低频窗口,不动。
 
-## 14. API Key 认证本期不做项(2026-10,任务书 §5)
+## 14. API Key 认证本期不做项(2026-10)
 
-按 `docs/api-key-auth-tasklist-2026-10.md` §5 逐条登记,均为复核后的有意不做:
+按 `docs/api-key-auth-tasklist-2026-10.md` §5 逐条登记,均为复核后的有意不做。
+分三组给出依据;每条的详细论证见任务书对应条目。
 
-- **`?api_key=` 查询参数**:不做。会进访问日志与浏览器历史。
-- **CORS**:不做。API Key 面向服务端;放开等于把 key 交给任意网页。
-- **明文回读/找回**:不做。库里只有 sha256,只能 rotate。
-- **per-resource ACL(只允许管某个 client)**:不做。scope 表与前端复杂度
-  翻倍,等真需求再加 `resource_scope` 列。
-- **复用 `users.role`**:不做。那是死代码(`0001_init.sql:8` 有 CHECK 但
-  零引用),混进来反而乱。
-- **per-IP 失败限速(本期)**:不做。prefix 2³² + secret 256 位不可枚举;
-  `login` 要限速是因为 argon2 贵(m=19456,t=2,约 20MB 内存 + 数十 ms CPU)。
-- **改 `events` 表结构(加 actor 列)**:不做。牵动 `insert_events` 四元组
-  签名 + `PendingEvent` + `write_batch` + 前端 `EventRow`,为一个审计字段
-  不值;actor 塞 `detail` JSON。
-- **用 argon2 哈希 key**:不做。key 是 256 位 CSPRNG,无字典攻击面;慢哈希
-  在热路径上会压垮吞吐。
-- **不带 `rhk_` 前缀的 API Key**:不做。会让 `resolve_principal` 必须"先试
-  API Key 再看 JWT",两个解码器互相污染、且无法区分"格式错"与"密钥错"。
-  统一用前缀分流。
-- **改 scope 的 PUT `/api/api-keys/{id}` 接口**:不做。吊销重建语义更清晰,
-  避免"旧 key 已发出、权限被悄悄改"(F-2b)。
-- **让 API Key 访问 `user_info`/`auth_codes`/`menu_all`**:不做。这三条服务
-  于浏览器 UI,返回体围绕"当前登录用户"构造,对 Key 无对应物。技术上可做
-  但语义不成立;若需"Key 查自己身份",应新增 `GET /api/api-keys/self`
-  而非复用 `user_info`。
+### 依据:安全 —— 做了反而扩大攻击面
+
+**`?api_key=` 查询参数 / CORS / 明文回读 —— 不做。**
+
+查询参数会进访问日志与浏览器历史;CORS 放开等于把 key 交给任意网页
+(API Key 面向服务端调用);库里只有 `sha256(完整 bearer)`,明文找回在
+密码学上不可能,只能 rotate。
+
+### 依据:复杂度 —— 等真需求,本期收益为负
+
+**per-resource ACL、复用 `users.role`、改 scope 的 PUT 接口 —— 不做。**
+
+per-resource ACL 会让 scope 表与前端复杂度翻倍(真需求出现时加
+`resource_scope` 列);`users.role` 是死代码(`0001_init.sql:8` 有 CHECK
+但零引用);原地改 scope 存在"旧 key 已发出、权限被悄悄改"的歧义,
+吊销重建语义更清晰(F-2b)。
+
+### 依据:成本 —— 现有机制已覆盖,增量不值
+
+**per-IP 失败限速、改 events 表结构、argon2 哈希 key、无 rhk_ 前缀的
+Key、Key 访问 user_info/auth_codes/menu_all —— 不做。**
+
+prefix 2³² + secret 256 位不可枚举,失败限速没有 `login`(argon2,
+m=19456,t=2)那样的昂贵计算需要保护;审计 actor 塞 `detail` JSON 即可,
+为它改 `insert_events` 四元组签名 + `PendingEvent` + `write_batch` +
+前端 `EventRow` 不值;key 是 256 位 CSPRNG 无字典攻击面,慢哈希在热路径
+压垮吞吐;无前缀 Key 会迫使 `resolve_principal` 做"先试 Key 再看 JWT"
+的顺序试探,两个解码器互相污染;`user_info` 等三条服务于浏览器 UI,
+返回体围绕"当前登录用户"构造,对 Key 无对应物(需"Key 查自己身份"时
+应新增 `GET /api/api-keys/self`,不复用 `user_info`)。
 
 ---
 ## 变更记录
