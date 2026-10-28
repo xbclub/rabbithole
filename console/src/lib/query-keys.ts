@@ -6,6 +6,7 @@ export const qk = {
   service: (id: number) => ['services', 'detail', id] as const,
   visitors: (clientId?: string) => ['visitors', clientId ?? 'all'] as const,
   certs: ['certs'] as const,
+  apiKeys: ['api-keys'] as const,
   stats: ['stats'] as const,
   events: (limit: number) => ['events', limit] as const,
   serverConfig: ['server-config'] as const,

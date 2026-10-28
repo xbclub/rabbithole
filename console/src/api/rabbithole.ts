@@ -223,6 +223,40 @@ export async function listEvents(params?: { limit?: number; level?: string }): P
   return httpGet<EventRow[]>('/events', { params });
 }
 
+// ---------- api keys(字段全 snake_case,与后端 F-2 响应逐字段一致) ----------
+export interface ApiKeyRow {
+  id: string;
+  name: string;
+  prefix: string;
+  scopes: number;
+  enabled: boolean;
+  created_at: number;
+  created_by: string;
+  last_used_at: null | number;
+  expires_at: null | number;
+}
+
+export async function listApiKeys(): Promise<ApiKeyRow[]> {
+  return httpGet<ApiKeyRow[]>('/api-keys');
+}
+/** 创建响应含一次性明文 `key`(仅此一次,服务端只存哈希,不可找回)。 */
+export async function createApiKey(data: {
+  name: string;
+  preset?: string;
+  scopes?: number;
+  expires_in_days?: number;
+}): Promise<{ id: string; name: string; prefix: string; scopes: number; key: string }> {
+  return httpPost('/api-keys', data);
+}
+export async function rotateApiKey(
+  id: string,
+): Promise<{ id: string; prefix: string; key: string }> {
+  return httpPost(`/api-keys/${id}/rotate`);
+}
+export async function deleteApiKey(id: string): Promise<{ deleted: boolean }> {
+  return httpDelete(`/api-keys/${id}`);
+}
+
 // ---------- 服务器配置(热生效子集) ----------
 
 /** [limits] 全九项;0 = 不限(max_pool_size 语义见字段注释)。 */

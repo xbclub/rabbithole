@@ -1,19 +1,38 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Activity, CircleCheck, KeyRound, RefreshCw, Server, TriangleAlert } from 'lucide-react';
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { useNavigate, useSearchParams } from 'react-router';
 import { z } from 'zod';
 
-import { changePassword, getServerConfig, putServerConfig } from '@/api/rabbithole';
-import type { ServerConfigResult } from '@/api/rabbithole';
+import {
+  changePassword,
+  createApiKey,
+  deleteApiKey,
+  getServerConfig,
+  listApiKeys,
+  putServerConfig,
+  rotateApiKey,
+} from '@/api/rabbithole';
+import type { ApiKeyRow, ServerConfigResult } from '@/api/rabbithole';
+import { ConfirmDialog } from '@/components/confirm-dialog';
 import { InfoLabel } from '@/components/info-label';
-import { MonoCopy } from '@/components/mono';
+import { Mono, MonoCopy } from '@/components/mono';
 import { PageHeader } from '@/components/page-header';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Checkbox } from '@/components/ui/checkbox';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import {
   Form,
   FormControl,
@@ -31,12 +50,23 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Label } from '@/components/ui/label';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
-import { feedbackSuccess, feedbackWarning } from '@/lib/feedback';
+import { fmtRelative, fmtTime } from '@/lib/format';
+import { feedbackError, feedbackSuccess, feedbackWarning } from '@/lib/feedback';
 import { qk } from '@/lib/query-keys';
+import { SCOPE_BITS, scopeBadges } from '@/features/api-keys/scope';
 import { ROUTES } from '@/router/paths';
 import { useAuthStore } from '@/stores/auth';
 
@@ -899,10 +929,345 @@ function PasswordCard() {
   );
 }
 
-const SETTINGS_TABS = ['server', 'metrics', 'password'] as const;
+/** 一次性明文展示弹窗:轻量自写,不复用 secret-modal(那是客户端接入
+ * 凭据专用,内嵌安装模板/地址选择,塞不进 Key 场景)。关闭即清空。 */
+function PlaintextDialog({
+  open,
+  onOpenChange,
+  plaintext,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  plaintext: string;
+}) {
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) onOpenChange(false);
+      }}
+    >
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>API 密钥(仅此一次展示)</DialogTitle>
+          <DialogDescription>
+            服务端只保存哈希,关闭后无法再次查看,只能重新生成(rotate)。
+          </DialogDescription>
+        </DialogHeader>
+        <MonoCopy full={plaintext} className="w-full" ariaLabel="复制 API 密钥" />
+        <Alert>
+          <TriangleAlert />
+          <AlertTitle>请立即复制保存</AlertTitle>
+          <AlertDescription>
+            明文不会再次出现;泄露时先吊销再重建,不要试图找回。
+          </AlertDescription>
+        </Alert>
+        <DialogFooter>
+          <Button
+            variant="outline"
+            onClick={() => {
+              onOpenChange(false); // 关闭即清空 state,不留在内存里
+            }}
+          >
+            我已保存,关闭
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** scope 勾选分组:每资源一行(读/写),自定义模式用。 */
+const SCOPE_GROUPS: { label: string; read: keyof typeof SCOPE_BITS; write: keyof typeof SCOPE_BITS }[] = [
+  { label: '客户端', read: 'clients_r', write: 'clients_w' },
+  { label: '服务规则', read: 'services_r', write: 'services_w' },
+  { label: '访问器', read: 'visitors_r', write: 'visitors_w' },
+  { label: '统计', read: 'stats_r', write: null as never },
+  { label: '事件', read: 'events_r', write: null as never },
+  { label: '服务端配置', read: 'config_r', write: 'config_w' },
+  { label: '证书', read: 'certs_r', write: 'certs_w' },
+];
+
+/** API 密钥管理:列表 / 创建(预设+自定义勾选+有效期) / 轮换 / 吊销。 */
+function ApiKeysCard() {
+  const queryClient = useQueryClient();
+  const listQuery = useQuery({ queryKey: qk.apiKeys, queryFn: listApiKeys });
+
+  const [createOpen, setCreateOpen] = useState(false);
+  const [name, setName] = useState('');
+  const [preset, setPreset] = useState('readonly');
+  const [custom, setCustom] = useState(0);
+  const [days, setDays] = useState('0');
+  const [plaintext, setPlaintext] = useState('');
+
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: qk.apiKeys });
+
+  const createMut = useMutation({
+    mutationFn: () =>
+      createApiKey({
+        name: name.trim(),
+        ...(preset === 'custom' ? { scopes: custom } : { preset }),
+        ...(days !== '0' ? { expires_in_days: Number(days) } : {}),
+      }),
+    onSuccess: (d) => {
+      setCreateOpen(false);
+      setName('');
+      setPreset('readonly');
+      setCustom(0);
+      setDays('0');
+      setPlaintext(d.key); // 仅此一次
+      invalidate();
+    },
+    onError: (e) => feedbackError(`创建失败:${e.message}`),
+  });
+
+  const rotateMut = useMutation({
+    mutationFn: (id: string) => rotateApiKey(id),
+    onSuccess: (d) => {
+      feedbackSuccess('已轮换,旧密钥立即失效');
+      setPlaintext(d.key);
+      invalidate();
+    },
+    onError: (e) => feedbackError(`轮换失败:${e.message}`),
+  });
+
+  const revokeMut = useMutation({
+    mutationFn: (id: string) => deleteApiKey(id),
+    onSuccess: () => {
+      feedbackSuccess('已吊销');
+      invalidate();
+    },
+    onError: (e) => feedbackError(`吊销失败:${e.message}`),
+  });
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <KeyRound className="size-4" />
+          API 密钥
+        </CardTitle>
+        <CardDescription>
+          服务端调用的 Bearer 凭据(rhk_ 前缀);明文仅创建/轮换时展示一次。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex justify-end">
+          <Button onClick={() => setCreateOpen(true)}>新建密钥</Button>
+        </div>
+        {listQuery.isLoading ? (
+          <Skeleton className="h-32 w-full" />
+        ) : listQuery.isError ? (
+          <Alert variant="destructive">
+            <TriangleAlert />
+            <AlertTitle>加载失败</AlertTitle>
+            <AlertDescription>{(listQuery.error as Error).message}</AlertDescription>
+          </Alert>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>名称</TableHead>
+                <TableHead>前缀</TableHead>
+                <TableHead>权限</TableHead>
+                <TableHead>创建者</TableHead>
+                <TableHead>最近使用</TableHead>
+                <TableHead>过期</TableHead>
+                <TableHead>状态</TableHead>
+                <TableHead className="text-right">操作</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {(listQuery.data ?? []).map((row) => (
+                <ApiKeyRowView
+                  key={row.id}
+                  row={row}
+                  onRotate={() => rotateMut.mutate(row.id)}
+                  onRevoke={() => revokeMut.mutate(row.id)}
+                  revokePending={revokeMut.isPending}
+                />
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+
+      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>新建 API 密钥</DialogTitle>
+            <DialogDescription>创建后明文仅展示一次,请立即保存。</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="apikey-name">名称</Label>
+              <Input
+                id="apikey-name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="如 ci-terraform(1-64 字符)"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>权限预设</Label>
+              <Select value={preset} onValueChange={setPreset}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="readonly">只读(全部读权限)</SelectItem>
+                  <SelectItem value="ops">运维(读 + 客户端/规则/访问器写)</SelectItem>
+                  <SelectItem value="full">全部权限</SelectItem>
+                  <SelectItem value="custom">自定义</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {preset === 'custom' && (
+              <div className="grid grid-cols-2 gap-2 rounded-md border p-3">
+                {SCOPE_GROUPS.map((g) => (
+                  <div key={g.label} className="flex items-center gap-3 text-[13px]">
+                    <span className="w-20 text-muted-foreground">{g.label}</span>
+                    <label className="flex items-center gap-1">
+                      <Checkbox
+                        checked={(custom & SCOPE_BITS[g.read]) !== 0}
+                        onCheckedChange={(c) =>
+                          setCustom((v) => (c ? v | SCOPE_BITS[g.read] : v & ~SCOPE_BITS[g.read]))
+                        }
+                      />
+                      读
+                    </label>
+                    {g.write !== null && (
+                      <label className="flex items-center gap-1">
+                        <Checkbox
+                          checked={(custom & SCOPE_BITS[g.write]) !== 0}
+                          onCheckedChange={(c) =>
+                            setCustom((v) => (c ? v | SCOPE_BITS[g.write] : v & ~SCOPE_BITS[g.write]))
+                          }
+                        />
+                        写
+                      </label>
+                    )}
+                  </div>
+                ))}
+                <Mono className="col-span-2">scopes = {custom}</Mono>
+              </div>
+            )}
+            <div className="space-y-2">
+              <Label>有效期</Label>
+              <Select value={days} onValueChange={setDays}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="0">永不过期</SelectItem>
+                  <SelectItem value="1">1 天</SelectItem>
+                  <SelectItem value="7">7 天</SelectItem>
+                  <SelectItem value="30">30 天</SelectItem>
+                  <SelectItem value="90">90 天</SelectItem>
+                  <SelectItem value="365">1 年</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCreateOpen(false)}>
+              取消
+            </Button>
+            <Button
+              disabled={createMut.isPending || name.trim().length === 0}
+              onClick={() => createMut.mutate()}
+            >
+              {createMut.isPending ? '创建中…' : '创建'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <PlaintextDialog
+        open={plaintext !== ''}
+        onOpenChange={(o) => {
+          if (!o) setPlaintext('');
+        }}
+        plaintext={plaintext}
+      />
+    </Card>
+  );
+}
+
+/** 单行:名称/前缀/权限徽标/创建者/最近使用/过期/状态/操作。 */
+function ApiKeyRowView({
+  row,
+  onRotate,
+  onRevoke,
+  revokePending,
+}: {
+  row: ApiKeyRow;
+  onRotate: () => void;
+  onRevoke: () => void;
+  revokePending: boolean;
+}) {
+  return (
+    <TableRow>
+      <TableCell>{row.name}</TableCell>
+      <TableCell>
+        <Mono>rhk_{row.prefix}…</Mono>
+      </TableCell>
+      <TableCell>
+        <div className="flex flex-wrap gap-1">
+          {scopeBadges(row.scopes).map((b) => (
+            <Badge key={b} variant="secondary">
+              {b}
+            </Badge>
+          ))}
+        </div>
+      </TableCell>
+      <TableCell>{row.created_by || '-'}</TableCell>
+      <TableCell className="text-muted-foreground">
+        {row.last_used_at ? fmtRelative(row.last_used_at) : '从未使用'}
+      </TableCell>
+      <TableCell className="text-muted-foreground">
+        {row.expires_at ? fmtTime(row.expires_at) : '永不'}
+      </TableCell>
+      <TableCell>
+        {row.enabled ? <Badge>正常</Badge> : <Badge variant="destructive">已吊销</Badge>}
+      </TableCell>
+      <TableCell className="text-right">
+        {row.enabled && (
+          <div className="flex justify-end gap-2">
+            <ConfirmDialog
+              title={`轮换密钥「${row.name}」`}
+              description="旧密钥立即失效,新明文仅展示一次。"
+              confirmText="轮换"
+              onConfirm={async () => onRotate()}
+              trigger={
+                <Button variant="outline" size="sm">
+                  轮换
+                </Button>
+              }
+            />
+            <ConfirmDialog
+              title={`吊销密钥「${row.name}」`}
+              description="吊销后该密钥立即失效;记录保留用于审计,名称不可复用。"
+              confirmText="吊销"
+              destructive
+              onConfirm={async () => onRevoke()}
+              trigger={
+                <Button variant="outline" size="sm" disabled={revokePending}>
+                  吊销
+                </Button>
+              }
+            />
+          </div>
+        )}
+      </TableCell>
+    </TableRow>
+  );
+}
+
+const SETTINGS_TABS = ['server', 'metrics', 'password', 'apikeys'] as const;
 type SettingsTab = (typeof SETTINGS_TABS)[number];
 
-/** 设置页:服务器配置 / 监控指标 / 修改密码 三 tab,tab 状态写 query 持久化。 */
+/** 设置页:服务器配置 / 监控指标 / 修改密码 / API 密钥 四 tab,tab 状态写 query 持久化。 */
 export default function SettingsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const tabParam = searchParams.get('tab');
@@ -918,12 +1283,13 @@ export default function SettingsPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="设置" description="服务器配置、监控指标与修改密码" />
+      <PageHeader title="设置" description="服务器配置、监控指标、修改密码与 API 密钥" />
       <Tabs value={tab} onValueChange={onTabChange}>
         <TabsList>
           <TabsTrigger value="server">服务器配置</TabsTrigger>
           <TabsTrigger value="metrics">监控指标</TabsTrigger>
           <TabsTrigger value="password">修改密码</TabsTrigger>
+          <TabsTrigger value="apikeys">API 密钥</TabsTrigger>
         </TabsList>
         <TabsContent value="server">
           <ServerConfigCard />
@@ -933,6 +1299,9 @@ export default function SettingsPage() {
         </TabsContent>
         <TabsContent value="password">
           <PasswordCard />
+        </TabsContent>
+        <TabsContent value="apikeys">
+          <ApiKeysCard />
         </TabsContent>
       </Tabs>
     </div>
