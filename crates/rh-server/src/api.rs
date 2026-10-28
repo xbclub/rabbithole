@@ -3,8 +3,9 @@
 use crate::config::CONTROL_SEND_TIMEOUT;
 use crate::db::normalize_spec;
 use crate::state::{AppState, ProxyState};
-use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, Extension, Path, Query, Request, State};
+use axum::http::{Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -13,23 +14,99 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 
+/// 鉴权中间件(任务书 E-1 方式 B:闭包捕获配置 + from_fn)。
+///
+/// 三个参数:`state`(resolve_principal 要查缓存与 JWT 密钥,必须传)、
+/// `need`(该组要求的 scope 位)、`session_only`(整组拒绝 API Key)。
+///
+/// ★`Box::pin` 的返回类型显式声明 `+ Send` —— 一旦有人误把 `&Request`
+/// 跨 `.await`,`rustc` 会在那一行报 "future not Send",而不是变成
+/// E0277 FromFn: Service 这种天书错误(任务书第 15 轮踩过)。
+fn guard(
+    state: Arc<AppState>,
+    need: u32,
+    session_only: bool,
+) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>
+       + Clone
+       + Send
+       + Sync
+       + 'static {
+    move |mut req: Request, next: Next| {
+        let state = state.clone(); // 每次请求克隆一次 Arc(仅引用计数)
+        Box::pin(async move {
+            // ★ header 值先 owned 化,不把 &req 交给 async 函数
+            // (Request<Body> 非 Sync,跨 await 使 future 不 Send)
+            let bearer = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let p = match resolve_principal(&state, bearer).await {
+                Ok(p) => p,
+                Err(r) => return *r,
+            };
+            if session_only && matches!(&p, Principal::Key { .. }) {
+                return forbidden("该接口仅限控制台会话");
+            }
+            if let Principal::Key { id, name, scopes } = &p {
+                // debug 级审计:排查"哪个 key 在什么时候调了什么"时打开,
+                // 默认不输出,不改变对外行为。也是 Key{id,name} 的读者。
+                tracing::debug!(key_id = %id, key = %name, scopes, "api key authenticated");
+                // GET/HEAD = 读,其余 = 写(REST 安全方法假设;新增"GET 带
+                // 副作用"的接口时必须复核,见任务书 §2.4)。
+                let dir = if matches!(*req.method(), Method::GET | Method::HEAD) {
+                    scope::READ_MASK
+                } else {
+                    scope::WRITE_MASK
+                };
+                // ★fail-closed:allowed==0(配置缺陷)也拒绝,不能放行 ——
+                // fail-open 下写错配置 = 该组对任意 key 静默开放。
+                let allowed = need & dir;
+                if allowed == 0 || scopes & allowed == 0 {
+                    return forbidden("API Key 权限不足");
+                }
+            }
+            req.extensions_mut().insert(p);
+            next.run(req).await
+        })
+    }
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
-    let auth = Router::new()
+    // 无保护的 public 组(login 必须匿名可访问)
+    let public = Router::new()
         .route("/api/auth/login", post(login))
+        .with_state(state.clone());
+
+    // session-only 组:整组拒绝 API Key(理由逐条见任务书 §2.2:
+    // logout/password 有吊销副作用、user_info 等服务于浏览器 UI;
+    // 包 F 会在此组追加 api-keys 管理路由防横向提权)
+    let session = Router::new()
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/password", post(change_password))
         .route("/api/user/info", get(user_info))
         .route("/api/auth/codes", get(auth_codes))
-        .route("/api/menu/all", get(menu_all));
+        .route("/api/menu/all", get(menu_all))
+        .with_state(state.clone())
+        .route_layer(middleware::from_fn(guard(state.clone(), 0, true)));
+
     let clients = Router::new()
         .route("/api/clients", get(list_clients).post(create_client))
         .route(
             "/api/clients/{id}",
             put(update_client).delete(delete_client),
         )
-        .route("/api/clients/{id}/rotate-secret", post(rotate_secret));
+        .route("/api/clients/{id}/rotate-secret", post(rotate_secret))
+        .with_state(state.clone())
+        .route_layer(middleware::from_fn(guard(
+            state.clone(),
+            scope::CLIENTS_R | scope::CLIENTS_W,
+            false,
+        )));
+
     let services = Router::new()
         .route("/api/services", get(list_services).post(create_service))
+        .route("/api/services/batch", post(batch_services))
         .route(
             "/api/services/{id}",
             get(get_service).put(update_service).delete(delete_service),
@@ -40,7 +117,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/services/{id}/rotate-secret",
             post(rotate_service_secret),
         )
-        .route("/api/services/batch", post(batch_services));
+        .with_state(state.clone())
+        .route_layer(middleware::from_fn(guard(
+            state.clone(),
+            scope::SERVICES_R | scope::SERVICES_W,
+            false,
+        )));
+
     let visitors = Router::new()
         .route("/api/visitors", get(list_visitors).post(create_visitor))
         .route(
@@ -48,30 +131,73 @@ pub fn router(state: Arc<AppState>) -> Router {
             put(update_visitor).delete(delete_visitor),
         )
         .route("/api/visitors/{id}/enable", post(enable_visitor))
-        .route("/api/visitors/{id}/disable", post(disable_visitor));
-    let misc = Router::new()
+        .route("/api/visitors/{id}/disable", post(disable_visitor))
+        .with_state(state.clone())
+        .route_layer(middleware::from_fn(guard(
+            state.clone(),
+            scope::VISITORS_R | scope::VISITORS_W,
+            false,
+        )));
+
+    // 原 misc 组拆成四组:四类权限混在一组会让一把"只读监控 key"
+    // 等于能读服务端全量配置并列出证书。
+    let stats = Router::new()
         .route("/api/stats/overview", get(stats_overview))
+        .with_state(state.clone())
+        .route_layer(middleware::from_fn(guard(
+            state.clone(),
+            scope::STATS_R,
+            false,
+        )));
+
+    let events = Router::new()
         .route("/api/events", get(list_events))
+        .with_state(state.clone())
+        .route_layer(middleware::from_fn(guard(
+            state.clone(),
+            scope::EVENTS_R,
+            false,
+        )));
+
+    let config = Router::new()
         .route(
             "/api/server/config",
             get(get_server_config).put(put_server_config),
         )
+        .with_state(state.clone())
+        .route_layer(middleware::from_fn(guard(
+            state.clone(),
+            scope::CONFIG_R | scope::CONFIG_W,
+            false,
+        )));
+
+    let certs = Router::new()
         .route("/api/certs", get(list_certs_api).post(create_cert_api))
         .route(
             "/api/certs/{id}",
             put(update_cert_api).delete(delete_cert_api),
-        );
-    auth.merge(clients)
+        )
+        .with_state(state.clone())
+        .route_layer(middleware::from_fn(guard(
+            state.clone(),
+            scope::CERTS_R | scope::CERTS_W,
+            false,
+        )));
+
+    // ★顺序约束:route → with_state → route_layer(route_layer 只包住
+    // 调用前已注册的路由);merge 两侧都已是 Router<()>,终点不再 with_state。
+    public
+        .merge(session)
+        .merge(clients)
         .merge(services)
         .merge(visitors)
-        .merge(misc)
-        .with_state(state)
+        .merge(stats)
+        .merge(events)
+        .merge(config)
+        .merge(certs)
 }
 
-async fn menu_all(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn menu_all() -> Response {
     ok(serde_json::json!([]))
 }
 
@@ -109,11 +235,9 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-/// 权限拒绝:真实 HTTP 403。**不能复用 `err(403,…)`** —— 那返回
-/// HTTP 200 + body{code:403},curl/CI 按状态码分支全部误判"成功"。
+/// 权限拒绝:真实 HTTP 403。**不能复用 `err` 信封** —— 那返回
+/// HTTP 200 + body 里带 403,curl/CI 按状态码分支全部误判"成功"。
 /// 本项目此前从未用过 403,无先例可复用,故新增。
-// 临时 allow:调用方(包 E guard 中间件)落地时移除,见任务书 §4.1
-#[allow(dead_code)]
 fn forbidden(message: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -125,9 +249,7 @@ fn forbidden(message: &str) -> Response {
 // ---------------- principal / scope ----------------
 
 /// 已认证主体。需 Clone(放进 Extension 传给 handler)。
-// 临时 allow:非测试调用方(包 E guard)落地时移除
-#[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum Principal {
     /// JWT sub(浏览器会话)。
     User(String),
@@ -143,8 +265,6 @@ pub enum Principal {
 /// 只读资源(STATS/EVENTS)没有写位,其奇位**留空不用** —— 若把
 /// EVENTS_R 压到奇位 7,它就不被 READ_MASK 覆盖,fail-closed 规则下
 /// 该组 allowed 恒 0,配置错误会被静默放大,单测里专门钉住。
-// 临时 allow:guard(包 E)落地时移除
-#[allow(dead_code)]
 pub mod scope {
     pub const CLIENTS_R: u32 = 1 << 0; // 1
     pub const CLIENTS_W: u32 = 1 << 1; // 2
@@ -166,10 +286,14 @@ pub mod scope {
     /// 奇数位全部(写方向)。
     pub const WRITE_MASK: u32 = 0x2AAA; // 10922
 
+    // 临时 allow:preset 映射(包 F create_api_key)落地时移除
+    #[allow(dead_code)]
     /// 只读全权 = 所有读位。
     pub const READONLY: u32 = READ_MASK; // 5461
+    #[allow(dead_code)]
     /// 运维常用 = 只读 + clients/services/visitors 三类写(不含 config/certs 写)。
     pub const OPS: u32 = READONLY | CLIENTS_W | SERVICES_W | VISITORS_W; // 5503
+    #[allow(dead_code)]
     /// 全部权限。用 READ_MASK|WRITE_MASK(0x3FFF),不是常量之和 —— 后者
     /// 漏掉保留位,两者在 create_api_key 的 scopes 校验里行为不同。
     pub const FULL: u32 = READ_MASK | WRITE_MASK; // 16383
@@ -305,12 +429,12 @@ struct ChangePasswordReq {
 /// 含当前会话,前端需回到登录页)。新密码最短 8 位。
 async fn change_password(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(principal): Extension<Principal>,
     Json(req): Json<ChangePasswordReq>,
 ) -> Response {
-    let user = match require_auth(&state, &headers).await {
-        Ok(u) => u,
-        Err(resp) => return *resp,
+    let Principal::User(user) = principal else {
+        // 双保险:session_only 中间件已挡 Key,此处防将来误改配置
+        return forbidden("该接口仅限控制台会话");
     };
     if req.new_password.len() < 8 {
         return err(1002, "新密码至少需要 8 位");
@@ -448,63 +572,12 @@ fn jwt_engine(secret: std::sync::Arc<String>) -> JwtEngine {
     eng
 }
 
-/// JWT 校验中间件:返回 username 或 401 response(装箱避免超大 Err 变体)。
-async fn require_auth(state: &Arc<AppState>, headers: &HeaderMap) -> Result<String, Box<Response>> {
-    let bearer = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if bearer.is_empty() {
-        return Err(Box::new(unauthorized()));
-    }
-    let secret = state.jwt_secret().await;
-    let engine = jwt_engine(secret);
-    let data = jsonwebtoken::decode::<AuthClaims>(bearer, &engine.0, &engine.1);
-    match data {
-        Ok(d) => {
-            let user = d.claims.sub;
-            if user.is_empty() {
-                return Err(Box::new(unauthorized()));
-            }
-            // B11:令牌版本必须与用户当前 pwd_version 一致。登出/改密递增
-            // 后,旧令牌在下一次请求即失效(无状态 JWT 的吊销点)。
-            // R1:读内存缓存(失效点在本文件 logout / change_password)。
-            // R2:epoch 守卫 —— miss 填充与失效交错时,以「填充前捕获的
-            // epoch」入条目;任何后续 bump 都令其失配,旧值不会钉死。
-            let want = d.claims.pv;
-            use std::sync::atomic::Ordering as AtomicOrdering;
-            let epoch_now = state.pwd_version_epoch.load(AtomicOrdering::Acquire);
-            let cached = state
-                .pwd_version_cache
-                .get(&user)
-                .filter(|e| e.value().1 == epoch_now)
-                .map(|e| e.value().0);
-            let cur = match cached {
-                Some(v) => v,
-                None => {
-                    let v = state.db.user_pwd_version(&user).await.unwrap_or(0);
-                    state.pwd_version_cache.insert(user.clone(), (v, epoch_now));
-                    v
-                }
-            };
-            if want != cur {
-                return Err(Box::new(unauthorized()));
-            }
-            Ok(user)
-        }
-        Err(_) => Err(Box::new(unauthorized())),
-    }
-}
-
 /// 唯一的凭据解码入口。JWT 与 API Key 都走这里,`require_auth` 之后
 /// 由中间件取代,不允许出现第二份解码实现(两份必然漂移)。
 ///
 /// ★入参是 owned String 而非 &HeaderMap/&Request:中间件要把它放进
 /// async 块里 await,借用 Request 会让 future 不 Send(axum 报出的
 /// 表面错误是 E0277 FromFn: Service,极易误诊)。调用方先 to_owned 再传。
-// 临时 allow:调用方(包 E guard)落地时移除,见任务书 §4.1
-#[allow(dead_code)]
 async fn resolve_principal(
     state: &Arc<AppState>,
     bearer: Option<String>,
@@ -567,8 +640,6 @@ async fn resolve_principal(
 ///
 /// `bearer` 是**已剥掉 `Bearer ` 前缀**的 `rhk_...` 串(由
 /// resolve_principal 处理后传入),别在这里再 strip 一次。
-// 临时 allow:调用方(包 E guard)落地时移除,见任务书 §4.1
-#[allow(dead_code)]
 async fn verify_api_key(state: &Arc<AppState>, bearer: &str) -> Result<Principal, Box<Response>> {
     // 1. 形态
     let Some((prefix, full)) = crate::apikey::parse(bearer) else {
@@ -605,31 +676,33 @@ async fn verify_api_key(state: &Arc<AppState>, bearer: &str) -> Result<Principal
     })
 }
 
-async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match require_auth(&state, &headers).await {
-        Ok(user) => {
-            // B11:登出即吊销 —— 递增 pwd_version,该用户全部既有令牌失效。
-            if let Err(e) = state.db.bump_user_pwd_version(&user).await {
-                tracing::warn!(error = %e, user = %user, "logout: bump pwd_version failed");
-            }
-            // R1/R2:递增失效代,本代条目全部失配(含并发填充中的旧值)
-            state
-                .pwd_version_epoch
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            state
-                .events
-                .emit("info", "auth", &format!("已登出:{user}"))
-                .await;
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(r) => *r,
+async fn logout(
+    State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    let Principal::User(user) = principal else {
+        // 双保险:session_only 中间件已挡 Key,此处防将来误改配置
+        return forbidden("该接口仅限控制台会话");
+    };
+    // B11:登出即吊销 —— 递增 pwd_version,该用户全部既有令牌失效。
+    if let Err(e) = state.db.bump_user_pwd_version(&user).await {
+        tracing::warn!(error = %e, user = %user, "logout: bump pwd_version failed");
     }
+    // R1/R2:递增失效代,本代条目全部失配(含并发填充中的旧值)
+    state
+        .pwd_version_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    state
+        .events
+        .emit("info", "auth", &format!("已登出:{user}"))
+        .await;
+    StatusCode::NO_CONTENT.into_response()
 }
 
-async fn user_info(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let user = match require_auth(&state, &headers).await {
-        Ok(u) => u,
-        Err(r) => return *r,
+async fn user_info(Extension(principal): Extension<Principal>) -> Response {
+    let Principal::User(user) = principal else {
+        // 双保险:session_only 中间件已挡 Key,此处防将来误改配置
+        return forbidden("该接口仅限控制台会话");
     };
     ok(json!({
         "userId": user,
@@ -642,10 +715,7 @@ async fn user_info(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
     }))
 }
 
-async fn auth_codes(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn auth_codes() -> Response {
     ok(json!([]))
 }
 
@@ -679,10 +749,7 @@ struct ClientListRow {
     flow_limit: i64,
 }
 
-async fn list_clients(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn list_clients(State(state): State<Arc<AppState>>) -> Response {
     let rows = match state.db.list_clients().await {
         Ok(r) => r,
         Err(e) => return err(500, &format!("{e}")),
@@ -770,12 +837,8 @@ fn validate_quota(rate: Option<&str>, max_conns: i64, max_services: i64) -> Opti
 
 async fn create_client(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(req): Json<CreateClientReq>,
 ) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
     let name = req.name.trim();
     if name.is_empty() || name.len() > 64 {
         return err(1002, "名称长度须为 1-64 字符");
@@ -845,13 +908,9 @@ struct UpdateClientReq {
 
 async fn update_client(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<UpdateClientReq>,
 ) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
     if let Some(name) = &req.name {
         let name = name.trim();
         if name.is_empty() || name.len() > 64 {
@@ -1031,14 +1090,7 @@ async fn update_client(
     ok(json!({"updated": true}))
 }
 
-async fn rotate_secret(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn rotate_secret(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let lock = state.serial_lock(&id);
     let _g = lock.lock().await;
     let new_secret = crate::control::hmac_hex(
@@ -1061,14 +1113,7 @@ async fn rotate_secret(
     ok(json!({ "secret": new_secret }))
 }
 
-async fn delete_client(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn delete_client(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let lock = state.serial_lock(&id);
     let _g = lock.lock().await;
     // R4:一列投影(teardown 只用 pid;修前全量 spec 反序列化)
@@ -1284,14 +1329,7 @@ async fn service_row_of(
     }
 }
 
-async fn list_services(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(q): Query<ListQuery>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn list_services(State(state): State<Arc<AppState>>, Query(q): Query<ListQuery>) -> Response {
     let rows = match state.db.list_proxies(q.client_id.as_deref()).await {
         Ok(r) => r,
         Err(e) => return err(500, &format!("{e}")),
@@ -1322,14 +1360,7 @@ async fn list_services(
 
 /// M8:单条取回。编辑弹窗需要完整 spec 回读表单,列表已不携带 ——
 /// 路径 `/api/services/{id}`(GET)。
-async fn get_service(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn get_service(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
     match state.db.get_proxy(id).await {
         Ok(Some((id, client_id, spec, _enabled))) => {
             let (default_pool_size, max_pool_size) = {
@@ -1355,12 +1386,8 @@ async fn get_service(
 
 async fn create_service(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(mut spec): Json<ProxySpec>,
 ) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
     match create_service_inner(&state, &mut spec).await {
         Ok(v) => ok(v),
         Err((code, msg)) => err(code, &msg),
@@ -1540,13 +1567,9 @@ async fn create_service_inner(
 
 async fn update_service(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<i64>,
     Json(spec): Json<ProxySpec>,
 ) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
     update_service_inner(&state, id, spec).await
 }
 
@@ -1728,14 +1751,7 @@ async fn update_service_inner(state: &Arc<AppState>, id: i64, mut spec: ProxySpe
     ok(json!({"updated": true, "revision": rev}))
 }
 
-async fn enable_service(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn enable_service(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
     // D-7:一次查询保留整行(修前第一次只留 enabled 整行丢弃、锁后
     // 重查一次、禁用分支再查一次取 revision)。同客户端的并发变更
     // 都经 serial_lock 串行,锁前单次读取无一致性障碍(R1 约定同型)。
@@ -1783,12 +1799,8 @@ async fn enable_service(
 /// 在线客户端的原有中继不中断。
 async fn rotate_service_secret(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
     // 首读仅定位属主与资格(串行域);实体在锁内重读,与 update 同口径消解并发竞态
     let Some((_, client_id, first, _)) = state.db.get_proxy(id).await.ok().flatten() else {
         return err(3001, "转发规则不存在");
@@ -1935,14 +1947,7 @@ async fn create_bind_checked(
     Ok(())
 }
 
-async fn disable_service(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn disable_service(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
     let Some(client_id) = state
         .db
         .get_proxy(id)
@@ -1982,14 +1987,7 @@ async fn disable_service(
     ok(json!({"disabled": true, "revision": rev}))
 }
 
-async fn delete_service(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn delete_service(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
     let Some(client_id) = state
         .db
         .get_proxy(id)
@@ -2037,14 +2035,7 @@ struct BatchReq {
     action: String, // enable | disable | delete
 }
 
-async fn batch_services(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<BatchReq>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn batch_services(State(state): State<Arc<AppState>>, Json(req): Json<BatchReq>) -> Response {
     // ★按 client_id 分组:组间并发、组内串行。
     //
     // 为什么必须分组:三个 `*_inner` 内部都会取 `serial_lock(client_id)`,
@@ -2286,14 +2277,7 @@ struct VisitorListRow {
     spec: rh_protocol::VisitorSpec,
 }
 
-async fn list_visitors(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(q): Query<ListQuery>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn list_visitors(State(state): State<Arc<AppState>>, Query(q): Query<ListQuery>) -> Response {
     let rows = match state.db.list_visitors(q.client_id.as_deref()).await {
         Ok(r) => r,
         Err(e) => return err(500, &format!("{e}")),
@@ -2371,12 +2355,8 @@ async fn resolve_visitor_target(state: &Arc<AppState>, spec: &VisitorSpec) -> Op
 
 async fn create_visitor(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(req): Json<CreateVisitorReq>,
 ) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
     let mut spec = req.spec;
     if spec.name.is_empty() || spec.bind_port == 0 {
         return err(4001, "缺少 name 或 bind_port");
@@ -2420,13 +2400,9 @@ async fn create_visitor(
 
 async fn update_visitor(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<i64>,
     Json(mut spec): Json<VisitorSpec>,
 ) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
     // 首读仅为定位属主(串行域);实体在锁内重读,消解与并发管理操作的竞态
     // R1:按 id 精确定位(修前 list_visitors 全表取回 + 线性 find,两次)。
     let Some((_, client_id, _, _)) = state.db.get_visitor(id).await.unwrap_or(None) else {
@@ -2464,25 +2440,11 @@ async fn update_visitor(
     ok(json!({"updated": true}))
 }
 
-async fn enable_visitor(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn enable_visitor(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
     toggle_visitor(state, id, true).await
 }
 
-async fn disable_visitor(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn disable_visitor(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
     toggle_visitor(state, id, false).await
 }
 
@@ -2529,14 +2491,7 @@ async fn toggle_visitor(state: Arc<AppState>, id: i64, enabled: bool) -> Respons
     ok(json!({"enabled": enabled}))
 }
 
-async fn delete_visitor(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn delete_visitor(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
     // 首读定位属主;实体在串行域内重读,防重复删除/迟到操作复活实体。
     // R1:精确查(修前全表取回 + 线性 find,锁内再全表 any)。
     let Some((_, client_id, _, _)) = state.db.get_visitor(id).await.unwrap_or(None) else {
@@ -2581,10 +2536,7 @@ struct StatsOverview {
     bytes_out: u64,
 }
 
-async fn stats_overview(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn stats_overview(State(state): State<Arc<AppState>>) -> Response {
     // R1:COUNT 查询(修前全表取回 + 逐行 spec JSON 反序列化只为 .len();
     // 这是仪表盘轮询端点,管理面频率最高)。
     // R7:两个 COUNT 无依赖,join! 并行(与 build_sync_entities 同型)。
@@ -2627,14 +2579,7 @@ fn default_limit() -> i64 {
     100
 }
 
-async fn list_events(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(q): Query<EventsQuery>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn list_events(State(state): State<Arc<AppState>>, Query(q): Query<EventsQuery>) -> Response {
     // 钉住合法区间:防 limit<=0(SQLite 视为无限制)或超大值拖库
     let limit = q.limit.clamp(1, 500);
     let rows = match state.db.list_events(limit, q.level.as_deref()).await {
@@ -2670,10 +2615,7 @@ struct ServerConfigView<'a> {
 }
 
 /// GET:完整配置(脱敏)+ 热配置当前值 + authorized_keys 内容。
-async fn get_server_config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn get_server_config(State(state): State<Arc<AppState>>) -> Response {
     let mut view = state.cfg.as_ref().clone();
     view.web.jwt_secret = None; // 密钥不回显
     let alpn = view.alpn.clone();
@@ -2784,12 +2726,8 @@ struct MetricsUpdate {
 /// PUT:仅接受热生效子集;应用后回写 toml(原文件备份 .bak 一次,注释会丢失)。
 async fn put_server_config(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(req): Json<ServerConfigUpdate>,
 ) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
     // 校验
     if let Some(p) = &req.ports {
         if let Some(list) = &p.allow_ports {
@@ -3185,10 +3123,7 @@ async fn put_server_config(
 
 // ---------------- 证书管理(M3:SNI 服务端终结) ----------------
 
-async fn list_certs_api(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn list_certs_api(State(state): State<Arc<AppState>>) -> Response {
     let rows = match state.db.list_certs().await {
         Ok(r) => r,
         Err(e) => return err(500, &format!("{e}")),
@@ -3233,14 +3168,7 @@ struct CertReq {
     domains: Option<Vec<String>>,
 }
 
-async fn create_cert_api(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<CertReq>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn create_cert_api(State(state): State<Arc<AppState>>, Json(req): Json<CertReq>) -> Response {
     let name = req.name.trim();
     if name.is_empty() || name.len() > 64 {
         return err(1002, "名称须为 1-64 字符");
@@ -3277,13 +3205,9 @@ async fn create_cert_api(
 
 async fn update_cert_api(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<i64>,
     Json(req): Json<CertReq>,
 ) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
     let name = req.name.trim();
     if name.is_empty() || name.len() > 64 {
         return err(1002, "名称须为 1-64 字符");
@@ -3324,14 +3248,7 @@ async fn update_cert_api(
     ok(json!({"updated": true}))
 }
 
-async fn delete_cert_api(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Response {
-    if require_auth(&state, &headers).await.is_err() {
-        return unauthorized();
-    }
+async fn delete_cert_api(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
     if let Err(e) = state.db.delete_cert(id).await {
         return err(500, &format!("{e}"));
     }
@@ -3453,16 +3370,6 @@ mod tests {
         Arc::new(AppState::new(cfg, db))
     }
 
-    async fn auth_headers(state: &Arc<AppState>) -> HeaderMap {
-        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
-        let mut h = HeaderMap::new();
-        h.insert(
-            "authorization",
-            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
-        h
-    }
-
     fn spec(kind: &str, name: &str, port: u16) -> ProxySpec {
         serde_json::from_value(json!({
             "name": name,
@@ -3484,23 +3391,19 @@ mod tests {
     }
 
     async fn create(state: &Arc<AppState>, s: ProxySpec) -> serde_json::Value {
-        let h = auth_headers(state).await;
-        body_json(create_service(State(state.clone()), h, Json(s)).await).await
+        body_json(create_service(State(state.clone()), Json(s)).await).await
     }
 
     async fn update(state: &Arc<AppState>, id: i64, s: ProxySpec) -> serde_json::Value {
-        let h = auth_headers(state).await;
-        body_json(update_service(State(state.clone()), h, Path(id), Json(s)).await).await
+        body_json(update_service(State(state.clone()), Path(id), Json(s)).await).await
     }
 
     async fn enable(state: &Arc<AppState>, id: i64) -> serde_json::Value {
-        let h = auth_headers(state).await;
-        body_json(enable_service(State(state.clone()), h, Path(id)).await).await
+        body_json(enable_service(State(state.clone()), Path(id)).await).await
     }
 
     async fn disable(state: &Arc<AppState>, id: i64) -> serde_json::Value {
-        let h = auth_headers(state).await;
-        body_json(disable_service(State(state.clone()), h, Path(id)).await).await
+        body_json(disable_service(State(state.clone()), Path(id)).await).await
     }
 
     /// D-12 回归:热改 limits 后,数据面读的原子快照必须同步 store。
@@ -3523,8 +3426,7 @@ mod tests {
             "limits": { "max_mux_streams": 2048, "max_udp_sessions_per_proxy": 77 }
         }))
         .unwrap();
-        let h = auth_headers(&state).await;
-        let v = body_json(put_server_config(State(state.clone()), h, Json(req)).await).await;
+        let v = body_json(put_server_config(State(state.clone()), Json(req)).await).await;
         // 测试态 config_path 为空,persist 可能失败 —— 但热改必须已生效
         // (applied 含两项;persist 失败不回滚是既有语义,持久化路径由
         // d4 测试覆盖)
@@ -3544,8 +3446,7 @@ mod tests {
             "limits": { "max_mux_streams": 0 }
         }))
         .unwrap();
-        let h = auth_headers(&state).await;
-        body_json(put_server_config(State(state.clone()), h, Json(req)).await).await;
+        body_json(put_server_config(State(state.clone()), Json(req)).await).await;
         assert_eq!(
             state.mux_streams.load(Relaxed),
             rh_transport::MUX_STREAMS_UNLIMITED
@@ -3572,8 +3473,7 @@ mod tests {
         const KEYS: &str = "# d4 test\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICbE d4\n";
         let req: ServerConfigUpdate =
             serde_json::from_value(json!({ "authorized_keys": KEYS })).unwrap();
-        let h = auth_headers(&state).await;
-        let v = body_json(put_server_config(State(state.clone()), h, Json(req)).await).await;
+        let v = body_json(put_server_config(State(state.clone()), Json(req)).await).await;
         assert_eq!(v["data"]["persisted"], json!(true), "put 应成功写回:{v}");
 
         // toml 确实落盘(spawn_blocking 路径),ak 文件写进 config 同目录
@@ -3586,37 +3486,37 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&ak_path).unwrap(), KEYS);
 
         // get:tokio::fs 读回 authorized_keys
-        let h = auth_headers(&state).await;
-        let v = body_json(get_server_config(State(state.clone()), h).await).await;
+        let v = body_json(get_server_config(State(state.clone())).await).await;
         assert_eq!(v["data"]["authorized_keys"], json!(KEYS));
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// D-6:require_auth 强类型 claims + 引擎缓存的行为等价性 ——
-    /// 成功 / 过期 / 密码版本不符 / (防御)pv 字段缺失按 0 处理,
-    /// 四种形态与修前 Value 树路径语义一致。手工签一个无 pv 的令牌
-    /// 验证 serde(default) 分支。
+    /// D-6:resolve_principal JWT 路径(原 require_auth)强类型 claims +
+    /// 引擎缓存的行为等价性 —— 成功 / 过期 / 密码版本不符 / (防御)pv 字段
+    /// 缺失按 0 处理,四种形态与修前 Value 树路径语义一致。手工签一个
+    /// 无 pv 的令牌验证 serde(default) 分支。
+    /// require_auth 被 resolve_principal 取代后测试同步迁移:凭据值改以
+    /// Option<String> 传入(中间件的 owned 化形态)。
     #[tokio::test]
-    async fn d6_require_auth_typed_claims_four_paths() {
+    async fn d6_resolve_principal_jwt_claims_four_paths() {
         let cfg = crate::config::ServerConfig::default();
         let state = diag_state(cfg).await;
 
         // 成功:pv 与库中 admin 的 pwd_version(0)一致
         let token = mint_jwt(&state, "admin", 1, 0).await.unwrap();
-        let mut h = HeaderMap::new();
-        h.insert(
-            "authorization",
-            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
-        assert_eq!(require_auth(&state, &h).await.unwrap(), "admin");
+        let p = resolve_principal(&state, Some(format!("Bearer {token}")))
+            .await
+            .unwrap();
+        assert_eq!(p, Principal::User("admin".into()));
 
         // 密码版本不符:pv=7 ≠ 库中 0 → 401
         let token = mint_jwt(&state, "admin", 1, 7).await.unwrap();
-        h.insert(
-            "authorization",
-            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        assert!(
+            resolve_principal(&state, Some(format!("Bearer {token}")))
+                .await
+                .is_err(),
+            "pv=7 与库中 0 不符 → 401"
         );
-        assert!(require_auth(&state, &h).await.is_err());
 
         // 过期:ttl 0 小时即 iat=exp,默认 60s leeway 内仍有效,签一个
         // 已过期 2 小时的令牌直接绕过 leeway
@@ -3631,11 +3531,12 @@ mod tests {
             &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
         )
         .unwrap();
-        h.insert(
-            "authorization",
-            axum::http::HeaderValue::from_str(&format!("Bearer {stale}")).unwrap(),
+        assert!(
+            resolve_principal(&state, Some(format!("Bearer {stale}")))
+                .await
+                .is_err(),
+            "已过期 2 小时 → 401"
         );
-        assert!(require_auth(&state, &h).await.is_err());
 
         // pv 缺失:手工签无 pv 的令牌 → serde(default) 按 0,与修前
         // `.get("pv").unwrap_or(0)` 一致 → 认证通过
@@ -3645,11 +3546,10 @@ mod tests {
             &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
         )
         .unwrap();
-        h.insert(
-            "authorization",
-            axum::http::HeaderValue::from_str(&format!("Bearer {no_pv}")).unwrap(),
-        );
-        assert_eq!(require_auth(&state, &h).await.unwrap(), "admin");
+        let p = resolve_principal(&state, Some(format!("Bearer {no_pv}")))
+            .await
+            .unwrap();
+        assert_eq!(p, Principal::User("admin".into()));
     }
 
     /// D-1 红线:信封与强类型行结构必须与修前 json! 构造逐字段一致
@@ -4418,15 +4318,8 @@ mod batch_services_tests {
         ids: Vec<i64>,
         action: &str,
     ) -> Vec<serde_json::Value> {
-        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
         let resp = batch_services(
             State(state.clone()),
-            headers,
             Json(BatchReq {
                 ids,
                 action: action.into(),
@@ -4538,16 +4431,9 @@ mod batch_services_tests {
                 let per = n.div_ceil(clients);
                 let (state, ids) = state_with_clients(clients, per).await;
                 let ids = ids.into_iter().take(n).collect::<Vec<_>>();
-                let token = mint_jwt(&state, "admin", 1, 0).await.unwrap();
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    "authorization",
-                    axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-                );
                 let t0 = std::time::Instant::now();
                 let resp = batch_services(
                     State(state.clone()),
-                    headers,
                     Json(BatchReq {
                         ids: ids.clone(),
                         action: "disable".into(),
@@ -4757,16 +4643,6 @@ mod delete_client_concurrency_tests {
         .unwrap()
     }
 
-    async fn auth_headers(state: &Arc<AppState>) -> HeaderMap {
-        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
-        let mut h = HeaderMap::new();
-        h.insert(
-            "authorization",
-            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
-        h
-    }
-
     /// 造一个 `serve_handle` = 永不退出的任务。
     async fn stuck_rt(id: u64) -> Arc<crate::state::ProxyRuntime> {
         let rt = Arc::new(crate::state::ProxyRuntime::new(
@@ -4806,12 +4682,7 @@ mod delete_client_concurrency_tests {
         assert_eq!(state.proxies.runtimes.len(), N);
 
         let t0 = std::time::Instant::now();
-        let r = delete_client(
-            State(state.clone()),
-            auth_headers(&state).await,
-            Path(CID.to_string()),
-        )
-        .await;
+        let r = delete_client(State(state.clone()), Path(CID.to_string())).await;
         let elapsed = t0.elapsed();
         let body = axum::body::to_bytes(r.into_body(), usize::MAX)
             .await
@@ -4860,12 +4731,7 @@ mod delete_client_concurrency_tests {
                 )),
             );
         }
-        let r = delete_client(
-            State(state.clone()),
-            auth_headers(&state).await,
-            Path(CID.to_string()),
-        )
-        .await;
+        let r = delete_client(State(state.clone()), Path(CID.to_string())).await;
         let body = axum::body::to_bytes(r.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -4902,23 +4768,8 @@ mod list_services_tests {
         .unwrap()
     }
 
-    async fn auth(state: &Arc<AppState>) -> HeaderMap {
-        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
-        let mut h = HeaderMap::new();
-        h.insert(
-            "authorization",
-            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
-        h
-    }
-
     async fn call_list(state: &Arc<AppState>) -> Vec<serde_json::Value> {
-        let resp = list_services(
-            State(state.clone()),
-            auth(state).await,
-            Query(ListQuery { client_id: None }),
-        )
-        .await;
+        let resp = list_services(State(state.clone()), Query(ListQuery { client_id: None })).await;
         let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -5039,12 +4890,7 @@ mod list_services_tests {
             .unwrap();
         let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
 
-        let resp = get_service(
-            State(state.clone()),
-            auth(&state).await,
-            axum::extract::Path(id),
-        )
-        .await;
+        let resp = get_service(State(state.clone()), axum::extract::Path(id)).await;
         let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -5057,12 +4903,7 @@ mod list_services_tests {
         );
         assert_eq!(r["id"], id);
 
-        let resp2 = get_service(
-            State(state.clone()),
-            auth(&state).await,
-            axum::extract::Path(id2),
-        )
-        .await;
+        let resp2 = get_service(State(state.clone()), axum::extract::Path(id2)).await;
         let b2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -5075,12 +4916,7 @@ mod list_services_tests {
         assert_eq!(v2["data"]["subdomain"], "app", "subdomain 投影到顶层");
 
         // 不存在的 id:code=404(业务错误约定:HTTP 200 + body code)
-        let resp404 = get_service(
-            State(state.clone()),
-            auth(&state).await,
-            axum::extract::Path(999_999),
-        )
-        .await;
+        let resp404 = get_service(State(state.clone()), axum::extract::Path(999_999)).await;
         let b404 = axum::body::to_bytes(resp404.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -5310,8 +5146,7 @@ mod secret_key_management_tests {
             .secret_key
             .clone();
 
-        let resp =
-            rotate_service_secret(State(st.clone()), auth_headers(&st).await, Path(id)).await;
+        let resp = rotate_service_secret(State(st.clone()), Path(id)).await;
         let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -5376,16 +5211,6 @@ mod secret_key_management_tests {
             .clone();
         assert_eq!(after, before, "空 secret_key 的编辑必须保留原密钥");
     }
-
-    async fn auth_headers(state: &Arc<AppState>) -> HeaderMap {
-        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
-        let mut h = HeaderMap::new();
-        h.insert(
-            "authorization",
-            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
-        h
-    }
 }
 
 #[cfg(test)]
@@ -5415,16 +5240,6 @@ mod update_client_teardown_tests {
             "enabled": true,
         }))
         .unwrap()
-    }
-
-    async fn auth(state: &Arc<AppState>) -> HeaderMap {
-        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
-        let mut h = HeaderMap::new();
-        h.insert(
-            "authorization",
-            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
-        h
     }
 
     async fn stuck_rt(id: u64) -> Arc<crate::state::ProxyRuntime> {
@@ -5465,7 +5280,6 @@ mod update_client_teardown_tests {
         let t0 = std::time::Instant::now();
         let r = update_client(
             State(state.clone()),
-            auth(&state).await,
             AxumPath(CID.to_string()),
             Json(UpdateClientReq {
                 enabled: Some(false),
@@ -5543,7 +5357,6 @@ mod update_client_teardown_tests {
 
         let r = update_client(
             State(state.clone()),
-            auth(&state).await,
             AxumPath(CID.to_string()),
             Json(UpdateClientReq {
                 enabled: Some(false),
@@ -5606,16 +5419,6 @@ mod remove_send_concurrency_tests {
         .unwrap()
     }
 
-    async fn auth(state: &Arc<AppState>) -> HeaderMap {
-        let token = mint_jwt(state, "admin", 1, 0).await.unwrap();
-        let mut h = HeaderMap::new();
-        h.insert(
-            "authorization",
-            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
-        h
-    }
-
     async fn setup(n_proxies: usize, n_visitors: usize, cap: usize) -> (Arc<AppState>, MsgRx) {
         let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
         db.create_client(CID, "c", &"0".repeat(64), "")
@@ -5656,7 +5459,6 @@ mod remove_send_concurrency_tests {
     async fn disable(state: &Arc<AppState>) {
         let r = update_client(
             State(state.clone()),
-            auth(state).await,
             AxumPath(CID.to_string()),
             Json(UpdateClientReq {
                 enabled: Some(false),
