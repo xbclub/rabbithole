@@ -1,6 +1,7 @@
 //! rh-server 入口:配置加载、迁移、启动恢复、控制面/vhost/SSH 网关/管理面监听。
 
 mod api;
+mod apikey;
 mod config;
 mod control;
 mod data;
