@@ -1742,8 +1742,6 @@ impl AppState {
     /// pwd_version 同策略,避免「bump 与填充交错」把旧值钉死。
     /// 已知代价:rotate 换 prefix 后旧 prefix 条目永久残留;key 人工创建
     /// (<10³)、rotate 低频、单条约 200B,不构成泄漏,不治理。
-    // 临时 allow:调用方(包 F 写操作)落地时移除
-    #[allow(dead_code)]
     pub fn invalidate_apikeys(&self) {
         use std::sync::atomic::Ordering;
         self.apikey_epoch.fetch_add(1, Ordering::Release);

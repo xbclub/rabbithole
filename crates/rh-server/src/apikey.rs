@@ -12,7 +12,6 @@ use sha2::{Digest, Sha256};
 
 pub const TAG: &str = "rhk_";
 
-#[allow(dead_code)] // 临时:首个调用方(包 D resolve_principal)落地时移除
 #[derive(Clone)]
 pub struct Generated {
     pub plaintext: String,
@@ -21,8 +20,6 @@ pub struct Generated {
 }
 
 /// 生成一枚 key:8 hex 前缀 + 64 hex secret,共用一份随机源。
-// 临时 allow:调用方在包 D/F 落地时移除(见 db.rs 同款说明)
-#[allow(dead_code)]
 pub fn generate() -> Generated {
     // 4 字节前缀 + 32 字节 secret
     let mut buf = [0u8; 36];

@@ -7,7 +7,7 @@ use axum::extract::{ConnectInfo, Extension, Path, Query, Request, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use rh_protocol::{ProxyKind, ProxySpec, VisitorSpec};
 use serde::{Deserialize, Serialize};
@@ -87,6 +87,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/user/info", get(user_info))
         .route("/api/auth/codes", get(auth_codes))
         .route("/api/menu/all", get(menu_all))
+        // API Key 管理必须整组 session-only:一把 ops key 若能调
+        // POST /api/api-keys,就能给自己签发 full 权限的新 key(横向提权)
+        .route("/api/api-keys", get(list_api_keys).post(create_api_key))
+        .route("/api/api-keys/{id}", delete(delete_api_key))
+        .route("/api/api-keys/{id}/rotate", post(rotate_api_key))
         .with_state(state.clone())
         .route_layer(middleware::from_fn(guard(state.clone(), 0, true)));
 
@@ -286,14 +291,10 @@ pub mod scope {
     /// 奇数位全部(写方向)。
     pub const WRITE_MASK: u32 = 0x2AAA; // 10922
 
-    // 临时 allow:preset 映射(包 F create_api_key)落地时移除
-    #[allow(dead_code)]
     /// 只读全权 = 所有读位。
     pub const READONLY: u32 = READ_MASK; // 5461
-    #[allow(dead_code)]
     /// 运维常用 = 只读 + clients/services/visitors 三类写(不含 config/certs 写)。
     pub const OPS: u32 = READONLY | CLIENTS_W | SERVICES_W | VISITORS_W; // 5503
-    #[allow(dead_code)]
     /// 全部权限。用 READ_MASK|WRITE_MASK(0x3FFF),不是常量之和 —— 后者
     /// 漏掉保留位,两者在 create_api_key 的 scopes 校验里行为不同。
     pub const FULL: u32 = READ_MASK | WRITE_MASK; // 16383
@@ -717,6 +718,200 @@ async fn user_info(Extension(principal): Extension<Principal>) -> Response {
 
 async fn auth_codes() -> Response {
     ok(json!([]))
+}
+
+// ---------------- api keys ----------------
+
+#[derive(Deserialize)]
+struct CreateApiKeyReq {
+    name: String,
+    #[serde(default)]
+    preset: Option<String>, // "readonly" | "ops" | "full"
+    /// u32 位掩码,与 preset 二选一;同时给以 scopes 为准。
+    #[serde(default)]
+    scopes: Option<u32>,
+    /// 单位「天」;None = 永不过期(0 不是"永久",是非法值)。
+    #[serde(default)]
+    expires_in_days: Option<i64>,
+}
+
+/// expires_in_days → expires_at(毫秒,全项目口径)。范围 1-3650,
+/// 越界回 1002;不传/None = 永不过期。
+fn to_expires_at(days: Option<i64>) -> Result<Option<i64>, Box<Response>> {
+    const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000; // 86_400_000
+    Ok(match days {
+        None => None,
+        Some(d) => {
+            if !(1..=3650).contains(&d) {
+                return Err(Box::new(err(
+                    1002,
+                    "expires_in_days 须为 1-3650(0 或不传表示永不过期)",
+                )));
+            }
+            // 3650 已上界,checked 只是显式防溢出
+            Some(crate::db::now_ms() + d.checked_mul(MS_PER_DAY).unwrap_or(i64::MAX))
+        }
+    })
+}
+
+/// preset/scopes 二选一解析出最终 scopes(校验含 ⊆ FULL)。
+fn resolve_scopes(req: &CreateApiKeyReq) -> Result<u32, Box<Response>> {
+    let scopes = match (req.scopes, req.preset.as_deref()) {
+        (Some(s), _) => s, // 同时给以 scopes 为准
+        (None, Some("readonly")) => scope::READONLY,
+        (None, Some("ops")) => scope::OPS,
+        (None, Some("full")) => scope::FULL,
+        (None, Some(_)) => return Err(Box::new(err(1002, "未知的 preset"))),
+        (None, None) => return Err(Box::new(err(1002, "需要 preset 或 scopes"))),
+    };
+    if scopes & !scope::FULL != 0 {
+        return Err(Box::new(err(1002, "scopes 超出范围")));
+    }
+    Ok(scopes)
+}
+
+/// 列表:**绝不返回 key_hash 与明文 key**;created_by 必须返回 ——
+/// 它是 DDL 引入的第一个"创建者"字段,列表不回显就是只写不读的死字段,
+/// 多人共用控制台时它是判断"这把 key 该不该吊销"的主要依据。
+async fn list_api_keys(State(state): State<Arc<AppState>>) -> Response {
+    let rows = match state.db.list_api_keys().await {
+        Ok(r) => r,
+        Err(e) => return err(500, &format!("{e}")),
+    };
+    ok(rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id, "name": r.name, "prefix": r.prefix,
+                "scopes": r.scopes, "enabled": r.enabled,
+                "created_at": r.created_at, "created_by": r.created_by,
+                "last_used_at": r.last_used_at, "expires_at": r.expires_at,
+            })
+        })
+        .collect::<Vec<_>>())
+}
+
+async fn create_api_key(
+    State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+    Json(req): Json<CreateApiKeyReq>,
+) -> Response {
+    if !(1..=64).contains(&req.name.chars().count()) {
+        return err(1002, "名称长度须为 1-64 字符");
+    }
+    let scopes = match resolve_scopes(&req) {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    let expires_at = match to_expires_at(req.expires_in_days) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    // session 组已保证只有 JWT 用户能到这里;仍写 let-else 兜底,
+    // 防 session_only 将来被误改时 Key 冒充用户写库
+    let Principal::User(operator) = principal else {
+        return forbidden("该接口仅限控制台会话");
+    };
+
+    let g = crate::apikey::generate();
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Err(e) = state
+        .db
+        .create_api_key(
+            &id, &req.name, &g.prefix, &g.hash, scopes, &operator, expires_at,
+        )
+        .await
+    {
+        // name UNIQUE 冲突也走这里(SQLITE_CONSTRAINT)
+        return err(500, &format!("创建失败:{e}"));
+    }
+    state.invalidate_apikeys();
+    state
+        .events
+        .emit_detail(
+            "info",
+            "apikey",
+            &format!("API Key 已创建:{}", req.name),
+            &format!(r#"{{"actor":"{operator}","scopes":{scopes}}}"#),
+        )
+        .await;
+    // 明文仅此一次返回(库里只有哈希,无法找回,只能 rotate)
+    ok(json!({
+        "id": id, "name": req.name, "prefix": g.prefix,
+        "scopes": scopes, "key": g.plaintext,
+    }))
+}
+
+async fn rotate_api_key(
+    State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> Response {
+    let Principal::User(operator) = principal else {
+        return forbidden("该接口仅限控制台会话");
+    };
+    // 找不到 → 1004;顺带取 name 供审计
+    let name = match state.db.list_api_keys().await {
+        Ok(rows) => match rows.iter().find(|r| r.id == id) {
+            Some(r) => r.name.clone(),
+            None => return err(1004, "密钥不存在"),
+        },
+        Err(e) => return err(500, &format!("{e}")),
+    };
+    let g = crate::apikey::generate();
+    match state.db.rotate_api_key(&id, &g.prefix, &g.hash).await {
+        Ok(true) => {}
+        Ok(false) => return err(1004, "密钥不存在"),
+        Err(e) => return err(500, &format!("{e}")),
+    }
+    // ★必须 bump 缓存:rotate 换了 prefix,但内存里旧 prefix 的条目还在,
+    // 不失效则旧 key 继续 401 不生效(H-1 的 apikey_rotate_old_key_rejected)
+    state.invalidate_apikeys();
+    state
+        .events
+        .emit_detail(
+            "warn",
+            "apikey",
+            &format!("API Key 已轮换:{name}"),
+            &format!(r#"{{"actor":"{operator}"}}"#),
+        )
+        .await;
+    ok(json!({ "id": id, "prefix": g.prefix, "key": g.plaintext }))
+}
+
+/// 软删(enabled=0):保留行让 events 里的审计记录对得上 id,
+/// name 的 UNIQUE 因此不允许复用 —— 有意为之,避免审计歧义。
+async fn delete_api_key(
+    State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> Response {
+    let Principal::User(operator) = principal else {
+        return forbidden("该接口仅限控制台会话");
+    };
+    let name = match state.db.list_api_keys().await {
+        Ok(rows) => match rows.iter().find(|r| r.id == id) {
+            Some(r) => r.name.clone(),
+            None => return err(1004, "密钥不存在"),
+        },
+        Err(e) => return err(500, &format!("{e}")),
+    };
+    match state.db.set_api_key_enabled(&id, false).await {
+        Ok(true) => {}
+        Ok(false) => return err(1004, "密钥不存在"),
+        Err(e) => return err(500, &format!("{e}")),
+    }
+    state.invalidate_apikeys();
+    state
+        .events
+        .emit_detail(
+            "warn",
+            "apikey",
+            &format!("API Key 已吊销:{name}"),
+            &format!(r#"{{"actor":"{operator}"}}"#),
+        )
+        .await;
+    ok(json!({ "deleted": true }))
 }
 
 // ---------------- clients ----------------

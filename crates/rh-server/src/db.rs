@@ -178,8 +178,6 @@ impl Db {
     // ---------- api_keys ----------
 
     /// last_used_at 不写 → 落 NULL(表示"从未使用过")。
-    // 临时 allow:调用方在后续提交(lookup/touch=提交3/4,F 组 handler=提交6)落地时移除
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)] // 逐列对齐 INSERT,与 A-3 定义的签名一致
     pub async fn create_api_key(
         &self,
@@ -220,8 +218,6 @@ impl Db {
     }
 
     /// 管理用,含已吊销(前端要显示"已吊销"状态),按创建时间倒序。
-    // 临时 allow:调用方在后续提交(lookup/touch=提交3/4,F 组 handler=提交6)落地时移除
-    #[allow(dead_code)]
     pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyRow>> {
         let rows = sqlx::query(
             "SELECT id, name, prefix, key_hash, scopes, enabled, created_at, created_by, last_used_at, expires_at FROM api_keys ORDER BY created_at DESC",
@@ -232,8 +228,6 @@ impl Db {
     }
 
     /// 软删/启用;返回是否命中行。
-    // 临时 allow:调用方在后续提交(lookup/touch=提交3/4,F 组 handler=提交6)落地时移除
-    #[allow(dead_code)]
     pub async fn set_api_key_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
         let r = sqlx::query("UPDATE api_keys SET enabled = ?2 WHERE id = ?1")
             .bind(id)
@@ -244,8 +238,6 @@ impl Db {
     }
 
     /// 换 prefix + hash(rotate);返回是否命中行。
-    // 临时 allow:调用方在后续提交(lookup/touch=提交3/4,F 组 handler=提交6)落地时移除
-    #[allow(dead_code)]
     pub async fn rotate_api_key(&self, id: &str, new_prefix: &str, new_hash: &str) -> Result<bool> {
         let r = sqlx::query("UPDATE api_keys SET prefix = ?2, key_hash = ?3 WHERE id = ?1")
             .bind(id)
@@ -1051,7 +1043,6 @@ impl ClientRow {
 }
 
 /// API Key 行结构:DB 层只做字段映射,不含任何鉴权/缓存逻辑。
-#[allow(dead_code)] // 临时:首个调用方(提交3 lookup)落地时移除
 #[derive(Clone)]
 pub struct ApiKeyRow {
     pub id: String,
