@@ -70,6 +70,13 @@ pub struct AppState {
     pub pwd_version_cache: dashmap::DashMap<String, (i64, u64)>,
     /// pwd_version 缓存的失效代(每次 bump 递增;见上)。
     pub pwd_version_epoch: std::sync::atomic::AtomicU64,
+    /// API Key 缓存(require 热路径读;键 = prefix)。与 pwd_version 同款
+    /// epoch 两级缓存:hit 零 IO,miss 查一次 DB 并回填。
+    pub apikey_cache: dashmap::DashMap<String, CachedApiKey>,
+    /// 失效代:创建/吊销/rotate 时 bump,令全部条目失配。
+    pub apikey_epoch: std::sync::atomic::AtomicU64,
+    /// last_used_at 节流:每 key 60s 最多写一次(见 apikey_touch)。
+    pub apikey_touch_at: dashmap::DashMap<String, std::time::Instant>,
     /// C1:每个客户端的本地配置版本(任何规则/访问器变更 +1)。比 DB 的
     /// config_revision 更廉价:纯内存原子,不需要每次解析都读 DB。
     pub client_cfg_gen: Arc<dashmap::DashMap<String, u64>>,
@@ -453,6 +460,9 @@ impl AppState {
             visitor_cache: dashmap::DashMap::new(),
             pwd_version_cache: dashmap::DashMap::new(),
             pwd_version_epoch: std::sync::atomic::AtomicU64::new(0),
+            apikey_cache: dashmap::DashMap::new(),
+            apikey_epoch: std::sync::atomic::AtomicU64::new(0),
+            apikey_touch_at: dashmap::DashMap::new(),
             client_cfg_gen: Arc::new(dashmap::DashMap::new()),
         }
     }
@@ -1677,7 +1687,96 @@ fn route_from(
 }
 
 // ---------------- 数据通道请求签发 ----------------
+/// API Key 缓存条目。★必须带 id/name:D-4 第 7 步要构造
+/// `Principal::Key{id,name,scopes}`(id 做审计、name 写进 events 的 actor),
+/// 缺了就得在缓存命中路径上再查一次库。
+// 临时 allow:字段读者(包 D verify_api_key)落地时移除
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct CachedApiKey {
+    pub id: String,
+    pub name: String,
+    pub key_hash: String,
+    pub scopes: u32,
+    pub enabled: bool,
+    pub expires_at: Option<i64>,
+    /// 填充时的 `apikey_epoch` 快照;与当前 epoch 不等即视为 miss。
+    pub epoch: u64,
+}
+
 impl AppState {
+    /// 按 prefix 查缓存的 API Key。hit 零 IO;miss 查一次 DB 并回填。
+    ///
+    /// **本层只负责「取出记录」,不做任何有效性判断**:
+    /// - 库里没有 → None
+    /// - 库里有(哪怕 enabled=0 或已过期)→ Some(CachedApiKey)
+    ///
+    /// 有效性判断(disabled / expired)统一放在 api.rs 的 verify_api_key 里,
+    /// 「哪一步拒绝」在调用链上只有一个地方,便于审计与测试。
+    // 临时 allow:调用方(包 D verify_api_key)落地时移除
+    #[allow(dead_code)]
+    pub async fn lookup_api_key(&self, prefix: &str) -> Option<CachedApiKey> {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        // epoch 守卫,照抄 pwd_version 缓存已验证的模式:miss 侧「读 DB →
+        // insert」与失效侧「bump」交错时,以填充前捕获的 epoch 入条目,
+        // 任何后续 bump 都令其失配,旧值不会钉死。
+        let epoch_now = self.apikey_epoch.load(AtomicOrdering::Acquire);
+        if let Some(hit) = self.apikey_cache.get(prefix) {
+            if hit.value().epoch == epoch_now {
+                return Some(hit.value().clone());
+            }
+        }
+        let row = self.db.get_api_key_by_prefix(prefix).await.ok().flatten()?;
+        let c = CachedApiKey {
+            id: row.id,
+            name: row.name,
+            key_hash: row.key_hash,
+            scopes: row.scopes,
+            enabled: row.enabled,
+            expires_at: row.expires_at,
+            epoch: epoch_now,
+        };
+        self.apikey_cache.insert(prefix.to_string(), c.clone());
+        Some(c)
+    }
+
+    /// 失效全部 API Key 缓存条目(创建/吊销/rotate 三个写点调用)。
+    ///
+    /// 不 remove 条目 —— epoch 失配即视为 miss,下次查库覆盖。与
+    /// pwd_version 同策略,避免「bump 与填充交错」把旧值钉死。
+    /// 已知代价:rotate 换 prefix 后旧 prefix 条目永久残留;key 人工创建
+    /// (<10³)、rotate 低频、单条约 200B,不构成泄漏,不治理。
+    // 临时 allow:调用方(包 F 写操作)落地时移除
+    #[allow(dead_code)]
+    pub fn invalidate_apikeys(&self) {
+        use std::sync::atomic::Ordering;
+        self.apikey_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// 节流写 last_used_at。同步方法(内部 tokio::spawn,不阻塞调用方)。
+    ///
+    /// SQLite 是单写者,UPDATE last_used_at 若每请求一次会成为全局串行点;
+    /// 60s 节流把写频与请求量解耦。节流判断用 Instant(单调时钟,系统时间
+    /// 回拨不影响),落库用毫秒(全项目口径)。
+    // 临时 allow:调用方(包 D verify_api_key)落地时移除
+    #[allow(dead_code)]
+    pub fn apikey_touch(&self, id: &str) {
+        let now = std::time::Instant::now();
+        // 60s 内已写过就跳过
+        if let Some(prev) = self.apikey_touch_at.get(id) {
+            if now.duration_since(*prev).as_secs() < 60 {
+                return;
+            }
+        }
+        self.apikey_touch_at.insert(id.to_string(), now);
+
+        let db = self.db.clone();
+        let id = id.to_string();
+        tokio::spawn(async move {
+            let _ = db.touch_api_key(&id, crate::db::now_ms()).await;
+        });
+    }
+
     /// B8:完整端口占用判定 = 内存运行态 + DB 已启用行。
     ///
     /// `ProxyManager::port_in_use` 只看已注册的 runtime。两个客户端并发
@@ -2697,5 +2796,76 @@ mod vhost_coalesce_tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let routes = &state.proxies.vhost_http.read().await.clone().routes;
         assert_eq!(routes.len(), 2, "窗口内追加的规则不得丢失");
+    }
+}
+
+#[cfg(test)]
+mod apikey_cache_tests {
+    //! C-4 验收:touch 节流与 epoch 失效的外部可观测断言(不经内部计数器)。
+    use super::*;
+
+    async fn keyed_state() -> (Arc<AppState>, &'static str) {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        db.create_api_key("id1", "n", "pfx", "hash", 0, "admin", None)
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(crate::config::ServerConfig::default(), db));
+        (state, "id1")
+    }
+
+    /// 1000 次 touch 只落 1 次库:断言 DB 里的 last_used_at 变没变。
+    /// sleep 不能省 —— apikey_touch 是 tokio::spawn 异步写,不等它
+    /// 跑完第一次读到的是 None。
+    #[tokio::test]
+    async fn apikey_touch_throttles() {
+        let (state, id) = keyed_state().await;
+
+        state.apikey_touch(id);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let t1 = state
+            .db
+            .get_api_key_by_prefix("pfx")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at;
+        assert!(t1.is_some(), "首次 touch 应写入 last_used_at");
+
+        for _ in 0..999 {
+            state.apikey_touch(id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let t2 = state
+            .db
+            .get_api_key_by_prefix("pfx")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at;
+        assert_eq!(t1, t2, "60s 内重复 touch 不应再写库");
+    }
+
+    /// 失效后 lookup 返回 miss:rotate 换掉 prefix 再 invalidate,
+    /// 旧 prefix 的缓存条目因 epoch 失配而重新查库(库里已无)→ None。
+    #[tokio::test]
+    async fn apikey_cache_epoch_invalidates() {
+        let (state, id) = keyed_state().await;
+
+        // 先填充缓存
+        assert!(state.lookup_api_key("pfx").await.is_some());
+        // rotate:库里旧 prefix 行没了,但缓存条目还在 —— 必须靠 epoch 失配
+        assert!(state
+            .db
+            .rotate_api_key(id, "newp", "newhash")
+            .await
+            .unwrap());
+        state.invalidate_apikeys();
+        assert!(
+            state.lookup_api_key("pfx").await.is_none(),
+            "epoch 失配后应重新查库,库里已无 pfx → None"
+        );
+        // 新 prefix 可查(且带新 hash)
+        let c = state.lookup_api_key("newp").await.unwrap();
+        assert_eq!(c.key_hash, "newhash");
     }
 }

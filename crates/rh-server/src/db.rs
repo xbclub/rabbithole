@@ -209,8 +209,6 @@ impl Db {
 
     /// 鉴权用,只认有效的(enabled=0 直接当不存在);至多 1 行。
     /// ★返回含 key_hash(校验用);`list_api_keys` 才由 API 层决定不回显。
-    // 临时 allow:调用方在后续提交(lookup/touch=提交3/4,F 组 handler=提交6)落地时移除
-    #[allow(dead_code)]
     pub async fn get_api_key_by_prefix(&self, prefix: &str) -> Result<Option<ApiKeyRow>> {
         let row = sqlx::query(
             "SELECT id, name, prefix, key_hash, scopes, enabled, created_at, created_by, last_used_at, expires_at FROM api_keys WHERE prefix = ?1 AND enabled = 1",
@@ -259,8 +257,6 @@ impl Db {
     }
 
     /// UPDATE last_used_at(低频调用,60s 节流由调用方保证)。
-    // 临时 allow:调用方在后续提交(lookup/touch=提交3/4,F 组 handler=提交6)落地时移除
-    #[allow(dead_code)]
     pub async fn touch_api_key(&self, id: &str, ts: i64) -> Result<()> {
         sqlx::query("UPDATE api_keys SET last_used_at = ?2 WHERE id = ?1")
             .bind(id)
