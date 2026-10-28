@@ -10,7 +10,9 @@ pub struct Db {
     pool: SqlitePool,
 }
 
-fn now_ms() -> i64 {
+/// 时间戳统一毫秒口径;`pub(crate)` 供 state.rs 的 apikey_touch 等复用,
+/// 避免两处取时间逻辑漂移。
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -65,6 +67,10 @@ impl Db {
             (
                 "0004_user_pwd_version",
                 include_str!("../../../migrations/0004_user_pwd_version.sql"),
+            ),
+            (
+                "0005_api_keys",
+                include_str!("../../../migrations/0005_api_keys.sql"),
             ),
         ];
         sqlx::query(
@@ -167,6 +173,101 @@ impl Db {
             .fetch_one(&self.pool)
             .await?;
         Ok(r)
+    }
+
+    // ---------- api_keys ----------
+
+    /// last_used_at 不写 → 落 NULL(表示"从未使用过")。
+    // 临时 allow:调用方在后续提交(lookup/touch=提交3/4,F 组 handler=提交6)落地时移除
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)] // 逐列对齐 INSERT,与 A-3 定义的签名一致
+    pub async fn create_api_key(
+        &self,
+        id: &str,
+        name: &str,
+        prefix: &str,
+        hash: &str,
+        scopes: u32,
+        created_by: &str,
+        expires_at: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, prefix, key_hash, scopes, enabled, created_at, created_by, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(prefix)
+        .bind(hash)
+        .bind(scopes as i64)
+        .bind(now_ms())
+        .bind(created_by)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 鉴权用,只认有效的(enabled=0 直接当不存在);至多 1 行。
+    /// ★返回含 key_hash(校验用);`list_api_keys` 才由 API 层决定不回显。
+    // 临时 allow:调用方在后续提交(lookup/touch=提交3/4,F 组 handler=提交6)落地时移除
+    #[allow(dead_code)]
+    pub async fn get_api_key_by_prefix(&self, prefix: &str) -> Result<Option<ApiKeyRow>> {
+        let row = sqlx::query(
+            "SELECT id, name, prefix, key_hash, scopes, enabled, created_at, created_by, last_used_at, expires_at FROM api_keys WHERE prefix = ?1 AND enabled = 1",
+        )
+        .bind(prefix)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| ApiKeyRow::from_row(&r)))
+    }
+
+    /// 管理用,含已吊销(前端要显示"已吊销"状态),按创建时间倒序。
+    // 临时 allow:调用方在后续提交(lookup/touch=提交3/4,F 组 handler=提交6)落地时移除
+    #[allow(dead_code)]
+    pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyRow>> {
+        let rows = sqlx::query(
+            "SELECT id, name, prefix, key_hash, scopes, enabled, created_at, created_by, last_used_at, expires_at FROM api_keys ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(ApiKeyRow::from_row).collect())
+    }
+
+    /// 软删/启用;返回是否命中行。
+    // 临时 allow:调用方在后续提交(lookup/touch=提交3/4,F 组 handler=提交6)落地时移除
+    #[allow(dead_code)]
+    pub async fn set_api_key_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let r = sqlx::query("UPDATE api_keys SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// 换 prefix + hash(rotate);返回是否命中行。
+    // 临时 allow:调用方在后续提交(lookup/touch=提交3/4,F 组 handler=提交6)落地时移除
+    #[allow(dead_code)]
+    pub async fn rotate_api_key(&self, id: &str, new_prefix: &str, new_hash: &str) -> Result<bool> {
+        let r = sqlx::query("UPDATE api_keys SET prefix = ?2, key_hash = ?3 WHERE id = ?1")
+            .bind(id)
+            .bind(new_prefix)
+            .bind(new_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// UPDATE last_used_at(低频调用,60s 节流由调用方保证)。
+    // 临时 allow:调用方在后续提交(lookup/touch=提交3/4,F 组 handler=提交6)落地时移除
+    #[allow(dead_code)]
+    pub async fn touch_api_key(&self, id: &str, ts: i64) -> Result<()> {
+        sqlx::query("UPDATE api_keys SET last_used_at = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(ts)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     // ---------- clients ----------
@@ -949,6 +1050,39 @@ impl ClientRow {
             max_conns: r.get(12),
             max_services: r.get(13),
             flow_limit: r.get(14),
+        }
+    }
+}
+
+/// API Key 行结构:DB 层只做字段映射,不含任何鉴权/缓存逻辑。
+#[allow(dead_code)] // 临时:首个调用方(提交3 lookup)落地时移除
+#[derive(Clone)]
+pub struct ApiKeyRow {
+    pub id: String,
+    pub name: String,
+    pub prefix: String,
+    pub key_hash: String,
+    pub scopes: u32,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub created_by: String,
+    pub last_used_at: Option<i64>,
+    pub expires_at: Option<i64>,
+}
+
+impl ApiKeyRow {
+    fn from_row(r: &SqliteRow) -> Self {
+        Self {
+            id: r.get(0),
+            name: r.get(1),
+            prefix: r.get(2),
+            key_hash: r.get(3),
+            scopes: r.get::<i64, _>(4) as u32,
+            enabled: r.get::<i64, _>(5) != 0,
+            created_at: r.get(6),
+            created_by: r.get(7),
+            last_used_at: r.get(8),
+            expires_at: r.get(9),
         }
     }
 }
