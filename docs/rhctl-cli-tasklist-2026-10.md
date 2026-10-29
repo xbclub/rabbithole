@@ -632,8 +632,19 @@ CreateClientReq/UpdateClientReq,字段以 §1.3 为准);`update` 提供
 - G-3(可选,先决条件:本地三道门 + 交叉编译全绿)ci.yml 增加
   `cli (go)` job:gofmt check / vet / build / test。遵守 AGENTS.md
   「红的门禁比没有门禁更糟」:加之前先在本地按 CI 同款命令跑一遍。
-- [ ] 验收:README 示例逐条可复制执行(对着本地起的服务实测一遍,
+- [x] 验收:README 示例逐条可复制执行(对着本地起的服务实测一遍,
       过程记录进轮次表);ci.yml 若加,`gh run` 确认该 job 绿。
+      ✅ `9cfe93e`。实测:服务端取 **v0.6.0 Release 产物**(darwin/arm64,
+      sha256 校验通过)本地起服,控制台会话签发 full 权限 key 后逐条跑通:
+      profile add(--key-stdin)/use 别名/list 掩码、stats overview、
+      clients 全生命周期(create 的 secret 完整展示)、services 全九命令
+      (get→编辑→update 工作流、stcp rotate-secret 拿明文)、visitors 全六
+      命令、events/config(get/put/未知字段 422)、certs(openssl 自签
+      PEM 上传→list→update→delete);错误路径:重复名(HTTP 200+code≠0
+      → exit 1)、坏 key(401 → exit 1)、key 缺失(exit 2 零请求)、
+      用法错(exit 2 附 usage)。G-2 状态措辞在收尾提交定稿(需引用三轮
+      审计结果)。G-3 已加 `cli (go)` job(本地同款命令全绿后加),
+      推送后 `gh run` 确认见 §6 后记。
 
 ### 包 H:审计执行与收尾(P0,必须最后执行)
 
