@@ -399,6 +399,55 @@ m=19456,t=2)那样的昂贵计算需要保护;审计 actor 塞 `detail` JSON 即
 应新增 `GET /api/api-keys/self`,不复用 `user_info`)。
 
 ---
+
+## 15. rhctl CLI 本期不做项(2026-10)
+
+按 `docs/rhctl-cli-tasklist-2026-10.md` §7 逐条登记,均为复核后的有意
+不做;每条的详细论证见任务书对应条目。
+
+### 依据:安全与凭据模型 —— 做了反而复杂度翻倍
+
+**密码登录 / JWT / api-keys 管理(`rhctl apikeys`)—— 不做。**
+
+CLI 只认 API Key。login 换的是 JWT,牵动 `pwd_version` 吊销语义;
+api-keys 整组 session-only 是服务端防横向提权的有意设计(一把 ops key
+若能建 key 就能给自己签 full)。真需要时作为独立任务评估。
+
+**交互式 shell / OS keyring / viper / 权限强制 —— 不做。**
+
+凭据持久化经 profiles.json 解决(明文文件,业界基线同 kubectl
+kubeconfig / aws credentials;不做权限检查是用户裁定,凭证侧唯一强制
+行为是输出脱敏);keyring 会新增直接依赖并引入平台差异(darwin 走
+cgo、linux 走 dbus);配置面只有 6 个 flag + 单 profile JSON,viper 的
+AutomaticEnv/BindPFlag 优先级坑反而要绕,依赖树从 2 个传递依赖膨胀到
+~8-10 个。真需求出现再评估。
+
+### 依据:与服务端的一致性 —— 复制必漂移
+
+**spec 的 flag 化编辑 —— 不做。**
+
+services/visitors 的 create/update 只吃 JSON 文件(spec 透传,任务书
+§2.5)。`ProxySpec`/`VisitorSpec` 是 20+ 字段、随协议演进的版本化结构,
+权威定义在 `crates/rh-protocol/`;做成 flag 必然与服务端漂移。
+
+**对业务错误码做本地翻译 —— 不做。**
+
+code 与 message 原样透出,CLI 不内置错误码表 —— 那是服务端事实,
+复制必漂移(服务端是权威校验者,CLI 只透传 `{code, message}`)。
+
+### 依据:成本 —— 增量不值
+
+**发版产物集成(release.yml)—— 不做。**
+
+发版流水线是关键路径,失败代价是删标签重打;`rhctl` 以
+`go build ./cmd/rhctl` 自行构建。单独立任务再做。
+
+**用户自定义命令别名(gh 式 `alias set`)—— 不做。**
+
+内置四组别名(ls/rm/rotate/ov)覆盖高频缩写;更长定制用 shell
+alias / 函数已足够,CLI 内再做一层别名存储徒增帮助文档与配置面。
+
+---
 ## 变更记录
 
 | 日期 | 内容 |
@@ -409,3 +458,4 @@ m=19456,t=2)那样的昂贵计算需要保护;审计 actor 塞 `detail` JSON 即
 | 2026-10-26 | 增补 §10:A-5 服务端 demux recvmmsg 批收,经三机基准回退(UDP 每包延迟 -19% 吞吐、零收益;回退提交 0801505) |
 | 2026-10-26 | 复核修正:D-15 hash 归属(9b6c3ca→62470a5)、三处「持平」措辞按指标显式化;补登 §11 B-2 mux_relay 回落侧;C-9 任务书状态翻牌为不做 |
 | 2026-10-27 | 增补 §12(L-H b 限速桶 per-connection 语义,TCP/UDP 口径不一致但改共享桶属用户可见行为变化,交独立设计决策)与 §13(L-J 观察项六条) |
+| 2026-10-29 | 增补 §15:rhctl CLI 本期不做项(任务书 §7 六条:密码登录/发版集成/spec flag 化/交互 shell·keyring·viper·权限强制/错误码本地翻译/自定义别名) |

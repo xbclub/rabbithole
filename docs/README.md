@@ -36,7 +36,7 @@
 | [static-audit-2026-10-perf.md](static-audit-2026-10-perf.md) | **2026-10 全量静态审计**(5.5 万行):性能 / 死代码 / 并行串行 / 零拷贝,30 条发现。**已完成**,提交 `b84e7e1`;另有 12 轮后续扫描记在各自提交信息里 |
 | [task-concurrency-serialization.md](task-concurrency-serialization.md) | 任务书:「应并行/异步却串行」12 项。**已完成**,报告见 [concurrency-serialization-fixes.md](concurrency-serialization-fixes.md)。一次性任务书,基线 `1b8bfd6`,勿当现行指令 |
 | [task-fix-report-errors.md](task-fix-report-errors.md) | 任务书:更正上述报告的 2 处事实错误 + 1 处逻辑矛盾 + 1 处遗漏。**已完成**(`3a0d205` / `9a68def`) |
-| [rhctl-cli-tasklist-2026-10.md](rhctl-cli-tasklist-2026-10.md) | 任务书:管理 REST API 的 Go/cobra CLI 控制端 `rhctl`(API Key 认证)。**待执行**;完成判据 = 连续三轮审计零 finding |
+| [rhctl-cli-tasklist-2026-10.md](rhctl-cli-tasklist-2026-10.md) | 任务书:管理 REST API 的 Go/cobra CLI 控制端 `rhctl`(API Key 认证)。**已完成**:9 任务包落地、28 契约测试对齐 28 个 Key 可达操作、连续三轮审计零 finding(记录见任务书 §6);不做项登记于 [not-supported.md](not-supported.md) §15 |
 
 ## 3. 专题:设计与决策
 

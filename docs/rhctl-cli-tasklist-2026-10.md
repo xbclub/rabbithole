@@ -650,8 +650,11 @@ CreateClientReq/UpdateClientReq,字段以 §1.3 为准);`update` 提供
 
 按 §5 协议执行**连续三轮**审计(在包 A–I 全部完成、复选框回填之后),
 回填 §6 轮次记录;`git status` clean。
-- [ ] 验收:§6 有连续三轮零 finding 记录;每轮的命令输出留痕
+- [x] 验收:§6 有连续三轮零 finding 记录;每轮的命令输出留痕
       (贴进轮次表或附文件路径)。
+      ✅ `4b44299`(被审计代码状态;本节内容在收尾 docs 提交,码不变)。
+      三轮输出全文见 §6 表上方代码块;`git status` clean(构建产物
+      rhctl 已 gitignore)。
 
 ---
 
@@ -691,11 +694,38 @@ CreateClientReq/UpdateClientReq,字段以 §1.3 为准);`update` 提供
 
 > 基线提交:`9518f2e`(包 A 开工前 main HEAD,2026-10-29)。
 
+三轮均在同一最终代码状态(`4b44299`,与实现末提交 `9cfe93e` 同码,
+其后仅文档差异)下连续执行;轮次脚本把 §5.1 四项各做成断言,
+输出逐行留痕如下(三轮输出完全一致):
+
+```
+A①②④ paths=27 ops=38 key-reachable=28;§3.1 28 行一致;session 9+login=10 排除项理由成立
+A③   TestContract 28/28 PASS
+B    gofmt/vet/test/build + cross×3 全绿
+C    tidy-diff=0 / verify 过 / 根出边仅 cobra 系(闭包 ⊆ cobra)
+D    diff 面干净(白名单外文件 0;crates/migrations/console/tests 0)
+```
+
 | 轮次 | 日期 | commit | A 覆盖 | B 质量门 | C 模块 | D 无新引入 | finding(编号+一句话) | 状态 |
 |---|---|---|---|---|---|---|---|---|
-| 1 | | | | | | | | |
-| 2 | | | | | | | | |
-| 3 | | | | | | | | |
+| 1 | 2026-10-29 | 4b44299 | ✓(§3.1 28 行零差异;28 契约测试;10 排除项) | ✓(三道门+交叉×3) | ✓(tidy-diff 0/verify/闭包) | ✓(白名单外 0) | 无 | 零 finding |
+| 2 | 2026-10-29 | 4b44299 | ✓(同上,重跑枚举) | ✓ | ✓ | ✓ | 无 | 零 finding |
+| 3 | 2026-10-29 | 4b44299 | ✓(同上,重跑枚举) | ✓ | ✓ | ✓ | 无 | 零 finding |
+
+细目备注:
+- **A② 对账方法**:§1.0 校验命令第 1 条原文重跑 → key-reachable 28 op
+  与 §3.1 的机械编码(方法+路径)双向 diff 为空;A③ 的 28 个
+  `TestContract_*` 名单与 §3.1「命令」列按命名规则(空格→下划线)
+  双向比对,无多余无缺失;A④ 的 session 组按 router 原文
+  (`let session = Router::new()…route_layer(guard(…, true))`)重提取,
+  9 op + public login 与 §3.2 登记的 10 操作集合相等。
+- **C 项闭包证据**:`go mod graph` 根模块出边仅
+  {cobra, mousetrap, pflag, go@1.27.3}(后两者为 `go get` 自动带入的
+  cobra 传递依赖);其余模块(md2man/blackfriday/yaml/check)全部位于
+  cobra 子树。`go list -m all` 共 8 行,无白名单外直接依赖。
+- **流程备注**:三轮曾先跑过一遍(代码状态相同),因 G 复选框尚未
+  回填、不合 §4「A–I 全部回填后才跑」的次序,在 `4b44299` 回填 G 后
+  **整三轮重跑**,以重跑结果为准(本表)。
 
 ---
 
@@ -722,6 +752,8 @@ CreateClientReq/UpdateClientReq,字段以 §1.3 为准);`update` 提供
    已足够,CLI 内再做一层别名存储徒增帮助文档与配置面。
 
 完成后把本节登记进 `docs/not-supported.md`(新增一节,格式照 §14)。
+
+✅ 已登记为 `docs/not-supported.md` §15(2026-10-29,含变更记录行)。
 
 ---
 
