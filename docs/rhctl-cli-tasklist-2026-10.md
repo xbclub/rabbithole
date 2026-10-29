@@ -572,10 +572,15 @@ CreateClientReq/UpdateClientReq,字段以 §1.3 为准);`update` 提供
 §3.1 #21–#24(output 层已在包 B-3 落地,本组只写命令);`config put`
 文件透传,README 提示 `deny_unknown_fields` 语义(未知字段会被整单
 拒收,先 `config get` 对照)。
-- [ ] 验收:4 契约测试绿;`events list --limit 0` 不本地拦截
+- [x] 验收:4 契约测试绿;`events list --limit 0` 不本地拦截
       (服务端 clamp 是权威,CLI 只透传——测试断言 query 原样发出);
       json 输出与 httptest 返回的 data 逐字节一致;
       内置别名单测:`ls`/`rm`/`rotate`/`ov` 解析到对应主命令。
+      ✅ `3c1db64`。TestContract_{stats_overview,events_list,config_get,
+      config_put};--limit 0 断言 query 恰为 `level=warn&limit=0`;
+      config get 的 json 子测试用带不规则空白的服务端原文断言逐字节一致;
+      TestAlias_Builtin(12 组)+ TestAlias_EndToEnd。至此 TestContract
+      共 28 个,与 §3.1 的 28 个操作一一对应。
 
 ### 包 I:凭证存储与多管理端 profile(P1,标准 CLI 凭证设计)
 

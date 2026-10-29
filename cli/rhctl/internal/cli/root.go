@@ -5,6 +5,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -120,8 +121,10 @@ func newRootCmd() *cobra.Command {
 	return root
 }
 
-// resolveOptions 按取值链解析参数。包 A 实现 flag > env > 默认;
-// 包 I 在 env 与默认之间并入 profile 一级(任务书 A-3)。
+// resolveOptions 按取值链解析(§2.2):flag > env > profile(包 I)> 默认。
+// server 与 key 各自独立取最高优先级;唯一例外:--server <名/别名>
+// 生效整个 profile(临时切机,server+key+insecure 一并生效,
+// --key/--insecure 仍可再覆盖)。
 func resolveOptions(cmd *cobra.Command) (Options, error) {
 	o := Options{
 		Server:  defaultServer,
@@ -129,26 +132,74 @@ func resolveOptions(cmd *cobra.Command) (Options, error) {
 		Timeout: defaultTimeout,
 	}
 
-	// Changed 查根命令的 persistent FlagSet:解析期 merge 进子命令的
-	// 是同一批 *Flag 指针,Changed 状态在两侧互通;不经 ParseFlags
-	// 直接构造(测试)也能查到。
 	flags := cmd.Root().PersistentFlags()
-	if flags.Changed("server") {
-		o.Server = flagServer
-	} else if v := os.Getenv(envServer); v != "" {
-		o.Server = v
+
+	// profile 层:文件加载/校验失败 → 本地错误 exit 2
+	// (拼错的键、命名空间冲突、current 非规范名都不静默)。
+	cfg, err := loadProfiles()
+	if err != nil {
+		return o, err
 	}
 
+	// profile 选择:--profile > RH_PROFILE > 配置文件 current。
+	selectedName := ""
+	if flags.Changed("profile") {
+		selectedName = flagProfile
+	} else if v := os.Getenv(envProfile); v != "" {
+		selectedName = v
+	} else {
+		selectedName = cfg.Current
+	}
+	var effective *Profile
+	if selectedName != "" {
+		canonical, p, ok := cfg.resolveName(selectedName)
+		if !ok {
+			return o, fmt.Errorf("profile %q 不存在。可用:%s", selectedName, strings.Join(cfg.names(), " "))
+		}
+		selectedName, effective = canonical, p
+	}
+
+	// server:--server/RH_SERVER > profile > 默认。值带 http(s):// 前缀
+	// → 纯 URL;不带 → 按名/别名解析为整个 profile(别名访问,§2.2)。
+	serverGiven := ""
+	if flags.Changed("server") {
+		serverGiven = flagServer
+	} else if v := os.Getenv(envServer); v != "" {
+		serverGiven = v
+	}
+	switch {
+	case isURL(serverGiven):
+		o.Server = serverGiven
+	case serverGiven != "":
+		canonical, p, ok := cfg.resolveName(serverGiven)
+		if !ok {
+			return o, fmt.Errorf("--server %q 解析不到 profile(不带 http(s):// 前缀的值按名/别名解析)。可用:%s",
+				serverGiven, strings.Join(cfg.names(), " "))
+		}
+		selectedName, effective = canonical, p
+		o.Server = p.Server
+	case effective != nil:
+		o.Server = effective.Server
+	}
+
+	// key:--key > RH_API_KEY > profile(与 server 各自独立取最高优先级)。
 	if flags.Changed("key") {
 		o.Key = flagKey
 	} else if v := os.Getenv(envAPIKey); v != "" {
 		o.Key = v
+	} else if effective != nil {
+		o.Key = effective.Key
 	}
 
-	if flags.Changed("profile") {
-		o.Profile = flagProfile
-	} else if v := os.Getenv(envProfile); v != "" {
-		o.Profile = v
+	// insecure:--insecure 显式 > profile。
+	if flags.Changed("insecure") {
+		o.Insecure = flagInsecure
+	} else if effective != nil {
+		o.Insecure = effective.Insecure
+	}
+
+	if selectedName != "" {
+		o.Profile = selectedName
 	}
 
 	if flags.Changed("output") && flagOutput != "" {
@@ -159,14 +210,13 @@ func resolveOptions(cmd *cobra.Command) (Options, error) {
 	}
 
 	if flags.Changed("timeout") && flagTimeout != "" {
-		d, err := time.ParseDuration(flagTimeout)
-		if err != nil || d <= 0 {
+		d, terr := time.ParseDuration(flagTimeout)
+		if terr != nil || d <= 0 {
 			return o, fmt.Errorf("--timeout 无效:%q(如 30s、2m)", flagTimeout)
 		}
 		o.Timeout = d
 	}
 
-	o.Insecure = flagInsecure
 	return o, nil
 }
 

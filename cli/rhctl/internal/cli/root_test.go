@@ -1,14 +1,24 @@
 package cli
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+// isolateProfileConfig 把 profile 配置指向不存在的临时路径:取值链
+// 测试必须与开发机/CI 机器上是否存在真实 profiles.json 无关。
+func isolateProfileConfig(t *testing.T) {
+	t.Helper()
+	t.Setenv("RHCTL_CONFIG", filepath.Join(t.TempDir(), "profiles.json"))
+	t.Setenv(envProfile, "")
+}
 
 // A-3 取值链:flag > env > 默认,server 与 key 各自独立(§2.2)。
 // flag 显式给出用 FlagSet.Set 模拟(与命令行解析等效地置 Changed)。
 func TestResolveOptionsFlagEnvDefault(t *testing.T) {
 	t.Run("全部缺省走默认", func(t *testing.T) {
+		isolateProfileConfig(t)
 		t.Setenv(envServer, "")
 		t.Setenv(envAPIKey, "")
 		root := newRootCmd()
@@ -34,6 +44,7 @@ func TestResolveOptionsFlagEnvDefault(t *testing.T) {
 	})
 
 	t.Run("env 高于默认", func(t *testing.T) {
+		isolateProfileConfig(t)
 		t.Setenv(envServer, "http://env:8080")
 		t.Setenv(envAPIKey, "rhk_env")
 		root := newRootCmd()
@@ -50,6 +61,7 @@ func TestResolveOptionsFlagEnvDefault(t *testing.T) {
 	})
 
 	t.Run("flag 高于 env", func(t *testing.T) {
+		isolateProfileConfig(t)
 		t.Setenv(envServer, "http://env:8080")
 		t.Setenv(envAPIKey, "rhk_env")
 		root := newRootCmd()
@@ -72,6 +84,7 @@ func TestResolveOptionsFlagEnvDefault(t *testing.T) {
 	})
 
 	t.Run("server 与 key 各自独立取最高优先级", func(t *testing.T) {
+		isolateProfileConfig(t)
 		// flag 只给 server,env 只给 key:各走各的链(§2.2 定案)。
 		t.Setenv(envAPIKey, "rhk_env")
 		root := newRootCmd()
@@ -88,6 +101,7 @@ func TestResolveOptionsFlagEnvDefault(t *testing.T) {
 	})
 
 	t.Run("timeout 解析", func(t *testing.T) {
+		isolateProfileConfig(t)
 		root := newRootCmd()
 		if err := root.PersistentFlags().Set("timeout", "90s"); err != nil {
 			t.Fatal(err)
@@ -102,6 +116,7 @@ func TestResolveOptionsFlagEnvDefault(t *testing.T) {
 	})
 
 	t.Run("timeout 非法值报错", func(t *testing.T) {
+		isolateProfileConfig(t)
 		for _, bad := range []string{"abc", "0s", "-5s"} {
 			root := newRootCmd()
 			if err := root.PersistentFlags().Set("timeout", bad); err != nil {
@@ -114,6 +129,7 @@ func TestResolveOptionsFlagEnvDefault(t *testing.T) {
 	})
 
 	t.Run("output 非法值报错,json 合法", func(t *testing.T) {
+		isolateProfileConfig(t)
 		root := newRootCmd()
 		if err := root.PersistentFlags().Set("output", "yaml"); err != nil {
 			t.Fatal(err)
