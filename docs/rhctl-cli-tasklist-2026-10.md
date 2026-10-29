@@ -107,6 +107,7 @@
 | 管理 API 默认端口 | **8080**,绑定 127.0.0.1 | `config.rs` `WebConfig::default()` |
 | scope 位 | 见 §1.4(READONLY=5461 / OPS=5503 / FULL=16383) | `api.rs` `pub mod scope` |
 | go 工具链(开发机) | go1.27.3 darwin/arm64 | `go version` |
+| cobra 版本 | **v1.10.2**(传递:pflag v1.0.9、mousetrap v1.1.0) | A-2 `go get …@latest` 解析值,2026-10-29 |
 
 **校验命令集**(第 1 条 2026-10-29 实测可用;注意正则要容忍链式调用的
 **尾逗号**,否则会漏掉多行 `.route(` 块、少算 6 条路径):
@@ -644,7 +645,7 @@ CreateClientReq/UpdateClientReq,字段以 §1.3 为准);`update` 提供
 
 ## 6. 审计轮次记录
 
-> 基线提交:`<包 A 开工前的 main HEAD,开工时回填>`。
+> 基线提交:`9518f2e`(包 A 开工前 main HEAD,2026-10-29)。
 
 | 轮次 | 日期 | commit | A 覆盖 | B 质量门 | C 模块 | D 无新引入 | finding(编号+一句话) | 状态 |
 |---|---|---|---|---|---|---|---|---|

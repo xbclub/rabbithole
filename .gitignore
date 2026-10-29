@@ -78,3 +78,6 @@ benchmark/frp-yamux-src/
 
 # pnpm 的本地内容寻址存储(构建前端时按需重建,不入库)
 /.pnpm-store/
+
+# rhctl CLI 本地构建产物(任务书 §2.1:不入库)
+/cli/rhctl/rhctl
