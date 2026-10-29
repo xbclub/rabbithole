@@ -77,10 +77,14 @@
 ### 流水线会做什么
 
 `console`(前端产物,供 rust-embed 内嵌)→ `build`(6 平台矩阵并行)→
+`cli`(rhctl 六平台,Go 交叉编译,单 ubuntu runner,不碰 Rust 矩阵)→
 `docker`(ghcr.io 多架构镜像)→ `release`(GitHub Release + 附件)。
 
 平台:`x86_64`/`aarch64` × `linux-musl`/`apple-darwin`/`pc-windows-msvc`,
-每个带 `.sha256`。Windows 目标编译较慢(约 10 分钟,其余 2~3 分钟)。
+每个带 `.sha256`。Windows 目标编译较慢(约 10 分钟,其余 2~3 分钟);
+rhctl 归档命名是 `rhctl-<版本>-<os>-<arch>`(Go 生态惯例,非 Rust 三元组),
+版本号由流水线 `-ldflags` 从 git 标签注入 —— **不需要第三处版本登记位**
+(只改 Cargo.toml 与 console/package.json 的约定不变)。
 
 ### 踩过的坑
 

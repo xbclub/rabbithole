@@ -1,8 +1,9 @@
 # 发布流水线:推送 v* 标签触发。
 # 1) console/ 构建前端产物(供 rust-embed 内嵌,一次构建全矩阵复用)
 # 2) 6 目标矩阵编译 rh-server + rh-client(Windows zip,其余 tar.gz)
-# 3) linux musl 静态二进制打包多架构 Docker 镜像(免 QEMU:每架构单平台构建 + manifest 合并),推 ghcr.io
-# 4) 全部归档 + sha256 发布到 GitHub Release
+# 3) rhctl CLI 六平台交叉编译(Go,单 runner;独立 job,不碰 Rust 矩阵)
+# 4) linux musl 静态二进制打包多架构 Docker 镜像(免 QEMU:每架构单平台构建 + manifest 合并),推 ghcr.io
+# 5) 全部归档 + sha256 发布到 GitHub Release
 name: release
 
 on:
@@ -130,6 +131,66 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
+  cli:
+    name: rhctl(${{ matrix.os }}/${{ matrix.arch }})
+    # 独立 job:Go 交叉编译零成本,一台 ubuntu runner 出全六平台,
+    # 不与 console/Rust 矩阵耦合 —— 发版关键路径只增不改。
+    # 归档命名 rhctl-<版本>-<os>-<arch>(Go 生态惯例,区别于 Rust 的
+    # target 三元组);artifact 前缀 dist-cli-* 落进 release job 的
+    # dist-* 汇总,自然挂上 Release。
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: amd64 }
+          - { os: linux, arch: arm64 }
+          - { os: darwin, arch: amd64 }
+          - { os: darwin, arch: arm64 }
+          - { os: windows, arch: amd64 }
+          - { os: windows, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: cli/rhctl/go.mod
+          cache-dependency-path: cli/rhctl/go.sum
+      - name: Build + 打包 + sha256
+        working-directory: cli/rhctl
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          # 版本号从标签注入 -ldflags(--version 的值);非标签触发
+          # (workflow_dispatch 验证)用 dev-<sha>,不冒充正式版本。
+          V="$TAG"
+          if [[ "$GITHUB_REF" != refs/tags/* ]]; then V="dev-${GITHUB_SHA::7}"; fi
+          OUT="rhctl-$V-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "stage/$OUT"
+          cp README.md "stage/$OUT/"
+          LDFLAGS="-X github.com/xbclub/rabbithole/cli/rhctl/internal/cli.Version=$V"
+          if [[ "${{ matrix.os }}" == windows ]]; then
+            go build -ldflags "$LDFLAGS" -o "stage/$OUT/rhctl.exe" ./cmd/rhctl
+            (cd stage && zip -q -r "../$OUT.zip" "$OUT")
+            sha256sum "$OUT.zip" > "$OUT.zip.sha256"
+          else
+            go build -ldflags "$LDFLAGS" -o "stage/$OUT/rhctl" ./cmd/rhctl
+            tar -czf "$OUT.tar.gz" -C stage "$OUT"
+            sha256sum "$OUT.tar.gz" > "$OUT.tar.gz.sha256"
+          fi
+      - name: 上传发布归档
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-cli-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            rhctl-*.tar.gz
+            rhctl-*.tar.gz.sha256
+            rhctl-*.zip
+            rhctl-*.zip.sha256
+          retention-days: 3
+          if-no-files-found: error
+
   docker:
     name: Docker 镜像(server / client,ghcr.io 多架构)
     needs: build
@@ -192,7 +253,7 @@ jobs:
     name: 发布 GitHub Release
     # 仅标签触发;workflow_dispatch 只跑构建与镜像(ci- 前缀标签),不发 Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, docker]
+    needs: [build, docker, cli]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8

@@ -6,13 +6,21 @@ certs 七组管理操作。Go + cobra,除 cobra 外零第三方依赖,`go build`
 
 ## 安装
 
+发版产物(推荐):从 [GitHub Release](https://github.com/xbclub/rabbithole/releases)
+下载对应平台归档(`rhctl-<版本>-<os>-<arch>.tar.gz`,Windows 为 `.zip`),
+附 `.sha256` 校验;解压即用,`--version` 已注入版本号。
+
+源码构建:
+
 ```bash
 cd cli/rhctl
 go build -o rhctl ./cmd/rhctl
-./rhctl --version   # dev(-ldflags 注入正式版本号,发版集成见任务书 §7)
+./rhctl --version   # dev(-ldflags 注入正式版本号,见下)
 ```
 
 交叉编译同理:`GOOS=linux GOARCH=amd64 go build -o rhctl ./cmd/rhctl`。
+发版流水线用 `-ldflags "-X …/internal/cli.Version=<标签>"` 注入版本
+(版本号来自 git 标签,无第三处版本登记位)。
 
 ## 凭据:三级来源
 

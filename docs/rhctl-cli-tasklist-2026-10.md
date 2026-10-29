@@ -738,6 +738,10 @@ D    diff 面干净(白名单外文件 0;crates/migrations/console/tests 0)
 2. **发版产物集成(release.yml)** —— 不改发版流水线。它是发版关键路径,
    失败代价是删标签重打(AGENTS.md);`rhctl` v1 以 `go build ./cmd/rhctl`
    自行构建。单独立任务再做。
+   > 2026-10-29 翻牌:用户裁定「加进 release」,已作为独立任务落地 ——
+   > `release.yml` 新增 `cli` job(Go 六平台单 runner 交叉编译,
+   > `-ldflags` 从标签注入版本,产物 `rhctl-<版本>-<os>-<arch>` +
+   > `.sha256` 挂 Release)。其余五条不做项仍有效(not-supported §15)。
 3. **spec 的 flag 化编辑** —— services/visitors 的 create/update 只吃
    JSON 文件(§2.5)。20+ 字段做成 flag 必然与服务端漂移。
 4. **交互式 shell / 系统 keyring / viper / 权限强制** —— 凭据持久化经
