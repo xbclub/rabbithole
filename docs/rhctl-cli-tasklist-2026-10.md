@@ -494,10 +494,13 @@ server 侧的完整不做清单在 `docs/not-supported.md` §14。
 - A-3 `cmd/rhctl/main.go` + `internal/cli/root.go`:根命令、§2.2 全部
   persistent flags、`--version`、flag>env>默认 的取值逻辑
   (包 I 落地后并入 profile 一级)。
-- [ ] 验收:`go build ./...` 过;`./rhctl --help` 列出全部 persistent
-  flags 与用法、`./rhctl --version` 输出 `dev`(命令组在包 C–F 才注册,
-  本阶段 `--help` 不含子命令属预期);§0 交叉编译三条全过。
-  (「key 缺失 → exit 2 且不发 HTTP」的行为测试在包 B-2,此处不重复。)
+- [x] 验收:`go build ./...` 过;`./rhctl --help` 列出全部 persistent
+      flags 与用法、`./rhctl --version` 输出 `dev`(命令组在包 C–F 才注册,
+      本阶段 `--help` 不含子命令属预期);§0 交叉编译三条全过。
+      (「key 缺失 → exit 2 且不发 HTTP」的行为测试在包 B-2,此处不重复。)
+      ✅ `9553a09`。补记:包 A 阶段根命令尚无子命令,cobra 对「不可运行且
+      无子命令」的命令不输出 usage 段,--help 看不到 flags —— 根命令加了
+      「无参打印帮助」的 RunE 解决,不算偏离验收(验收要的就是列出 flags)。
 
 ### 包 B:API 客户端层(P0)
 
@@ -517,6 +520,16 @@ server 侧的完整不做清单在 `docs/not-supported.md` §14。
   都要用,必须先于命令组落地(单测:json 输出与输入 data 逐字节一致)。
 - [ ] 验收:`go test ./internal/api/... ./internal/cli/...` 绿;§1.2 每行
       至少一个用例名出现在测试输出里。
+      §1.2 七行 ↔ 用例:成功 `TestEnvelope_OK`;业务错误
+      `TestEnvelope_BusinessErrorIsHTTP200`;401 `TestEnvelope_Unauthorized401`;
+      403 `TestEnvelope_Forbidden403`;未知路径
+      `TestEnvelope_UnknownPathIs200WithCode404`;网络
+      `TestEnvelope_NetworkErrorConnectionRefused`/`…Timeout`;本地
+      (key 缺失) `TestEnvelope_MissingKeyNoHTTP`(cli 包,零请求断言)。
+      另有 422 非 JSON(`TestEnvelope_NonJSONBody422`)、头精确/Content-Type/
+      key 不泄漏(`TestEnvelope_AuthorizationHeaderExact`/
+      `TestEnvelope_ContentTypeOnBodyMethods`/`TestEnvelope_KeyNeverInErrorStrings`)。
+      (hash 由后继提交回填)
 
 ### 包 C:clients 组(P0,一提交)
 

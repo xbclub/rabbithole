@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/xbclub/rabbithole/cli/rhctl/internal/api"
 )
 
 // Version 默认 dev;正式版本经 -ldflags "-X …=vX.Y.Z" 注入。
@@ -155,12 +157,15 @@ func resolveOptions(cmd *cobra.Command) (Options, error) {
 	return o, nil
 }
 
-// Execute 运行 CLI 并返回退出码(§2.4):0 成功;1 远端错误
-// (业务 code≠0 / 401 / 403 / 网络,分类在包 B);2 本地错误(用法、
-// key 缺失等)。错误文本由 cobra 打到 stderr。
+// Execute 运行 CLI 并返回退出码(§2.4):0 成功;1 远端错误(业务
+// code≠0 / 401 / 403 / 网络 / 非信封响应);2 本地错误(用法、文件读不到、
+// key 缺失)。错误文本由 cobra 打到 stderr。
 func Execute() int {
 	root := newRootCmd()
 	if err := root.Execute(); err != nil {
+		if api.IsRemote(err) {
+			return 1
+		}
 		return 2
 	}
 	return 0
