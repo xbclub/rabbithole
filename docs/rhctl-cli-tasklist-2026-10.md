@@ -547,8 +547,12 @@ CreateClientReq/UpdateClientReq,字段以 §1.3 为准);`update` 提供
 §3.1 #6–#14 九命令;spec 透传按 §2.5(`--file`/`-`);`batch` 的
 `--ids` 逗号分隔、`--action` 三选一(本地校验,非法 exit 2);
 `get -o json` 输出含 spec。
-- [ ] 验收:9 契约测试绿;`services create --file` 出站 body 与文件
+- [x] 验收:9 契约测试绿;`services create --file` 出站 body 与文件
       内容逐字节一致(除末尾换行);`batch` 非法 action exit 2。
+      ✅ `71df63f`。TestContract_services_{list,get,create,update,enable,
+      disable,rotate_secret,batch,delete};文件与 stdin 两种透传都断言
+      逐字节一致;非法 action / 非数字 id / 非 JSON 文件均为本地错误且
+      断言零请求。
 
 ### 包 E:visitors + certs 组(P0,一提交)
 

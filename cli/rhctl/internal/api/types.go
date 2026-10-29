@@ -33,3 +33,11 @@ type ServicesBatchReq struct {
 	IDs    []int64 `json:"ids"`
 	Action string  `json:"action"`
 }
+
+// CertReq 对齐 api.rs CertReq:PEM 全文内嵌;domains 缺省时服务端取证书 SAN。
+type CertReq struct {
+	Name    string   `json:"name"`
+	CertPEM string   `json:"cert_pem"`
+	KeyPEM  string   `json:"key_pem"`
+	Domains []string `json:"domains,omitempty"`
+}
