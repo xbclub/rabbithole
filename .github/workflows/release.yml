@@ -180,14 +180,16 @@ jobs:
             sha256sum "$OUT.tar.gz" > "$OUT.tar.gz.sha256"
           fi
       - name: 上传发布归档
+        # upload-artifact 从仓库根解析 glob,产物在 cli/rhctl/ 下,
+        # 路径必须带目录前缀(step 的 working-directory 对 action 不生效)。
         uses: actions/upload-artifact@v7
         with:
           name: dist-cli-${{ matrix.os }}-${{ matrix.arch }}
           path: |
-            rhctl-*.tar.gz
-            rhctl-*.tar.gz.sha256
-            rhctl-*.zip
-            rhctl-*.zip.sha256
+            cli/rhctl/rhctl-*.tar.gz
+            cli/rhctl/rhctl-*.tar.gz.sha256
+            cli/rhctl/rhctl-*.zip
+            cli/rhctl/rhctl-*.zip.sha256
           retention-days: 3
           if-no-files-found: error
 
