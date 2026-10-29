@@ -612,9 +612,14 @@ CreateClientReq/UpdateClientReq,字段以 §1.3 为准);`update` 提供
   `--server` 别名=整 profile 生效 / 未知名 exit 2 列可用名)、
   掩码断言(list 输出不含完整 key,防粘贴外泄)、add→load JSON 往返、
   原子写(写中断不留半截)、`--key-stdin`、remove 清 current。
-- [ ] 验收:两个 profile 指向两台本地服务(httptest 双地址即可)分别
+- [x] 验收:两个 profile 指向两台本地服务(httptest 双地址即可)分别
       `stats overview` 成功,`--profile <别名>` 与 `--server <别名>`
       两条路径都实测;`profile list` 输出不含任何完整 key(脱敏)。
+      ✅ `20395c1`。TestProfile_TwoServersOverview(双 httptest,断言各
+      恰 1 次命中);优先级矩阵 11 例、拒载三类、别名解析、掩码、
+      add→load 往返、原子写(无 .tmp 残留 + 0600)、--key-stdin、
+      remove 清 current 全部落地;真实二进制对 v0.6.0 服务端冒烟通过
+      (见包 G 轮次记录)。
 
 ### 包 G:文档与 CI(P1)
 

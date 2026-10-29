@@ -114,3 +114,33 @@ jobs:
         # 提示(如只有 unix 分支才调用的辅助函数),那不是缺陷。
         # 编译**错误**会让本步失败,这才是要拦的东西。
         run: cargo check --workspace --all-targets
+
+  # rhctl CLI(Go)质量门。本地三道门 + 三条交叉编译全绿后才上线
+  # (AGENTS.md「红的门禁比没有门禁更糟」),先决条件已满足。
+  # 与本地 §0 三道门同款命令;交叉编译(windows/linux-amd64/linux-arm64)
+  # 不进 CI —— Go 交叉编译在本地零成本,矩阵收益低。
+  cli-go:
+    name: cli (go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli/rhctl
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: cli/rhctl/go.mod
+
+      - name: gofmt 检查
+        run: test -z "$(gofmt -l .)"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./...
