@@ -26,3 +26,10 @@ type UpdateClientReq struct {
 	MaxServices *int64  `json:"max_services,omitempty"`
 	FlowLimit   *int64  `json:"flow_limit,omitempty"`
 }
+
+// ServicesBatchReq 对齐 api.rs batch_services:{ids, action}。
+// action 取值 enable|disable|delete(枚举在 CLI 侧本地校验,任务书包 D)。
+type ServicesBatchReq struct {
+	IDs    []int64 `json:"ids"`
+	Action string  `json:"action"`
+}

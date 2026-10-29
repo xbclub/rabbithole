@@ -54,6 +54,24 @@ func envelopeOK(data string) string {
 	return `{"code":0,"data":` + data + `,"message":"ok"}`
 }
 
+// withStdin 把 os.Stdin 替换为 content("--file -" 的测试底座)。
+func withStdin(t *testing.T, content string) {
+	t.Helper()
+	old := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteString(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = old })
+}
+
 // captureServer 起 httptest 服务端:记录(仅允许一次)请求,再由
 // respond 写响应。契约测试的通用底座。
 func captureServer(t *testing.T, respond func(w http.ResponseWriter)) *capturedReq {

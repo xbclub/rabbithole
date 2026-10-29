@@ -536,8 +536,11 @@ server 侧的完整不做清单在 `docs/not-supported.md` §14。
 CreateClientReq/UpdateClientReq,字段以 §1.3 为准);`update` 提供
 `--enabled/--disabled` 布尔对(映射 `{enabled:bool}`);table/json 双输出;
 每命令一个 httptest 契约测试(断言方法/路径/query/body JSON)。
-- [ ] 验收:5 测试绿;`clients create --name x` 的出站 body 与 §1.3
+- [x] 验收:5 测试绿;`clients create --name x` 的出站 body 与 §1.3
       CreateClientReq 逐字段一致(测试断言,不是人工目检)。
+      ✅ `ec050a8`。TestContract_clients_{list,create,update,rotate_secret,delete}
+      五契约测试;create 全字段/仅必填两种 body 断言;互斥对与缺
+      --name 断言零请求。
 
 ### 包 D:services 组(P0,一提交)
 
