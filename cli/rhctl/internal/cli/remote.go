@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/xbclub/rabbithole/cli/rhctl/internal/api"
 )
@@ -22,4 +24,31 @@ func requireKey(o Options) error {
 // newAPIClient 用解析后的 Options 构造 API 客户端。
 func newAPIClient(o Options) *api.Client {
 	return api.NewClient(o.Server, o.Key, o.Timeout, o.Insecure)
+}
+
+// withClient 是远端命令的统一骨架:凭据闸 → 客户端 → f。
+func withClient(f func(*api.Client) error) error {
+	if err := requireKey(opts); err != nil {
+		return err
+	}
+	return f(newAPIClient(opts))
+}
+
+// output 按 -o 分派:json 直出信封 data 原样(§2.4),否则走 render
+// (table 渲染,由命令闭包解析 raw)。
+func output(raw json.RawMessage, render func() error) error {
+	if opts.Output == "json" {
+		return PrintJSON(os.Stdout, raw)
+	}
+	return render()
+}
+
+// warnf 把诊断提示打到 stderr —— 成功的输出不得污染 stdout(§2.4)。
+func warnf(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", a...)
+}
+
+// secretHint 是一次性 secret 的 stderr 警示(§2.6)。
+func secretHint() {
+	warnf("⚠ secret 仅本次返回(服务端只存哈希,无法找回),请立即保存 —— 关闭即失。")
 }

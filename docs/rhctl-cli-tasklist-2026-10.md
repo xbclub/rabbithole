@@ -518,9 +518,9 @@ server 侧的完整不做清单在 `docs/not-supported.md` §14。
 - B-3 `internal/cli/output.go`:table(tabwriter)/json(data 原样)双输出、
   bytes 人类可读、毫秒转本地时区 —— **放在本包**是因为 C–F 每个命令
   都要用,必须先于命令组落地(单测:json 输出与输入 data 逐字节一致)。
-- [ ] 验收:`go test ./internal/api/... ./internal/cli/...` 绿;§1.2 每行
+- [x] 验收:`go test ./internal/api/... ./internal/cli/...` 绿;§1.2 每行
       至少一个用例名出现在测试输出里。
-      §1.2 七行 ↔ 用例:成功 `TestEnvelope_OK`;业务错误
+      ✅ `fba5d6d`。§1.2 七行 ↔ 用例:成功 `TestEnvelope_OK`;业务错误
       `TestEnvelope_BusinessErrorIsHTTP200`;401 `TestEnvelope_Unauthorized401`;
       403 `TestEnvelope_Forbidden403`;未知路径
       `TestEnvelope_UnknownPathIs200WithCode404`;网络
@@ -529,7 +529,6 @@ server 侧的完整不做清单在 `docs/not-supported.md` §14。
       另有 422 非 JSON(`TestEnvelope_NonJSONBody422`)、头精确/Content-Type/
       key 不泄漏(`TestEnvelope_AuthorizationHeaderExact`/
       `TestEnvelope_ContentTypeOnBodyMethods`/`TestEnvelope_KeyNeverInErrorStrings`)。
-      (hash 由后继提交回填)
 
 ### 包 C:clients 组(P0,一提交)
 

@@ -45,6 +45,15 @@ type Options struct {
 // opts 保存本次调用的解析结果。
 var opts Options
 
+// groupFactories 收集各命令组的构造函数(init 期注册),newRootCmd 时
+// 逐个构建挂载。注册工厂而非实例:实例上的 FlagSet.Changed 会跨
+// newRootCmd 调用残留,测试(同进程多次建树)会互相污染。
+var groupFactories []func() *cobra.Command
+
+func registerGroup(f func() *cobra.Command) {
+	groupFactories = append(groupFactories, f)
+}
+
 // flag 绑定变量。默认值一律留空、是否显式给出用 FlagSet.Changed 判断:
 // 注册期填默认值会让 cobra 报上来的值无法区分「用户显式给出」与
 // 「默认填充」,flag > env > 默认 的取值链就断了。
@@ -104,6 +113,10 @@ func newRootCmd() *cobra.Command {
 		"请求超时,如 30s、2m(默认 30s)")
 	pf.BoolVar(&flagInsecure, "insecure", false,
 		"跳过 TLS 证书校验(自签场景)")
+
+	for _, f := range groupFactories {
+		root.AddCommand(f())
+	}
 	return root
 }
 
