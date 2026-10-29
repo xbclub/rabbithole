@@ -162,6 +162,13 @@ body(服务端是 `serde(flatten)`,发嵌套 `{client_id, spec:{…}}` 会被
 | 1 | 远端错误:业务 `code≠0`(注意:**HTTP 仍是 200**,信封里 code 才是判据)、401/403、网络失败 |
 | 2 | 本地错误:用法/参数、文件读不到、key 缺失(不发请求) |
 
+## 配合 AI agent
+
+把下面一句话交给你的 agent,即可装好 rhctl 并装上它的 skill(即本仓库
+`cli/rhctl/SKILL.md`):
+
+> 从 https://github.com/xbclub/rabbithole/releases/latest 下载当前平台的 rhctl 归档、校验 `.sha256` 后把二进制解压到 PATH,再把仓库里的 `cli/rhctl/SKILL.md` 复制到你技能目录的 `rhctl/SKILL.md`(如 `~/.zcode/skills/` 或 `~/.claude/skills/`),最后运行 `rhctl --version` 验证。
+
 ## 开发
 
 ```bash

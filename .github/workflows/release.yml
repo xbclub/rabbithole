@@ -168,7 +168,7 @@ jobs:
           if [[ "$GITHUB_REF" != refs/tags/* ]]; then V="dev-${GITHUB_SHA::7}"; fi
           OUT="rhctl-$V-${{ matrix.os }}-${{ matrix.arch }}"
           mkdir -p "stage/$OUT"
-          cp README.md "stage/$OUT/"
+          cp README.md SKILL.md "stage/$OUT/"
           LDFLAGS="-X github.com/xbclub/rabbithole/cli/rhctl/internal/cli.Version=$V"
           if [[ "${{ matrix.os }}" == windows ]]; then
             go build -ldflags "$LDFLAGS" -o "stage/$OUT/rhctl.exe" ./cmd/rhctl
