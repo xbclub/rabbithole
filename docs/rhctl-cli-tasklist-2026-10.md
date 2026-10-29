@@ -560,8 +560,12 @@ CreateClientReq/UpdateClientReq,字段以 §1.3 为准);`update` 提供
 「client_id 与 spec 扁平合并」逻辑单独抽函数并单测(嵌套 vs 扁平两种
 输入都测);certs 的 `--cert-file/--key-file` 读文件填 `cert_pem/key_pem`,
 `--domains` 逗号分隔可缺省。
-- [ ] 验收:10 契约测试绿;visitors create 出站 body 是**单层扁平**
+- [x] 验收:10 契约测试绿;visitors create 出站 body 是**单层扁平**
       JSON(测试断言无嵌套 `spec` 键)。
+      ✅ `b20b035`。TestContract_visitors_{list,create,update,enable,disable,
+      delete} + TestContract_certs_{list,create,update,delete};合并函数
+      `mergeVisitorCreate` 单测覆盖嵌套({spec:…} 包装,--client-id 优先)
+      与扁平两种输入;缺 PEM 文件本地错误零请求。
 
 ### 包 F:stats / events / config 组(P0,一提交)
 
