@@ -224,6 +224,21 @@ hardware_cap=… server_cap=… initial_k=… final_k=… shard_workers=…`;
 也可自行构建:`deploy/Dockerfile`(server)与 `deploy/Dockerfile.client`(client)
 (打包 musl 静态二进制,无 RUN 步骤,本地构建方式见文件头注释)。
 
+## CLI 控制端(rhctl)
+
+除 Web 控制台外,还可用命令行 `rhctl`(Go + cobra,单二进制)管理:一把
+API Key(控制台「设置 → API 密钥」签发)完成 clients / services /
+visitors / stats / events / config / certs 全部 28 个管理操作,适合脚本
+与 CI。Release 提供六平台归档(`rhctl-<版本>-<平台>`),详见
+[`cli/rhctl/README.md`](cli/rhctl/README.md)。
+
+### 让 AI agent 替你装
+
+把下面一句话交给你的 agent,即可装好 rhctl 并装上它的 skill
+(即本仓库 `cli/rhctl/SKILL.md`):
+
+> 从 https://github.com/xbclub/rabbithole/releases/latest 下载当前平台的 rhctl 归档、校验 `.sha256` 后把二进制解压到 PATH,再把仓库里的 `cli/rhctl/SKILL.md` 复制到你技能目录的 `rhctl/SKILL.md`(如 `~/.zcode/skills/` 或 `~/.claude/skills/`),最后运行 `rhctl --version` 验证。
+
 ## 发布(Release)
 
 推送 `v*` 标签即触发 [release 工作流](.github/workflows/release.yml):
@@ -237,6 +252,8 @@ git tag v0.1.0 && git push origin v0.1.0
 - **二进制归档**:Windows(zip)/ Linux / macOS(tar.gz)× x86_64 / arm64 共 6 目标,
   每个含 rh-server、rh-client、示例配置与 sha256,发布到 GitHub Release
   (Linux 为 musl 静态链接,任意发行版可直接运行)
+- **rhctl CLI 归档**(v0.7.0 起):`rhctl-<版本>-<os>-<arch>` 六平台
+  (Go 交叉编译),含单二进制、README 与面向 AI agent 的 SKILL.md
 - **Docker 镜像**:`ghcr.io/xbclub/rabbithole:<tag>` 与 `:latest`(amd64 + arm64)
 
 
@@ -249,6 +266,7 @@ crates/rh-core       限速、PROXY protocol、STUN、网络工具
 crates/rh-server     控制面/数据面/管理 API/vhost/SSH 网关/SQLite
 crates/rh-client     会话与重连、转发、插件、健康检查、visitor、打洞
 console/            管理控制台(React 19 + Vite + Tailwind v4 + shadcn/ui)
+cli/rhctl           管理端 CLI rhctl(Go + cobra;API Key 认证,含 agent skill)
 tests/               E2E 与负载测试脚本
 docs/                设计文档、需求矩阵、验收记录、评审日志
 deploy/              部署示例配置与 systemd 单元
