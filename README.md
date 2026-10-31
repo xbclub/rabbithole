@@ -144,6 +144,8 @@ docker run -d --name rh-client --restart unless-stopped \
   ghcr.io/xbclub/rabbithole-client:latest
 # 规则由服务端集中下发,客户端零配置文件;可选 env:RH_PROTOCOL / RH_MULTIPLEX /
 # RH_TLS_INSECURE / RH_TLS_PIN_SHA256 / RH_TRUSTED_CA_FILE / RH_LOG_LEVEL 等
+# RH_SERVER 支持 IP:port 与 域名:port;域名在每次重连时重新解析(缓存 30s,
+# 服务端换 IP 无需改客户端配置),TLS SNI 默认取域名(RH_SERVER_NAME 可覆盖)
 ```
 
 需要高级项(自定义 CA / 代理 / STUN / DNS)时挂载 TOML 配置(模板 `deploy/client.example.toml`),

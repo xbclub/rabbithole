@@ -447,6 +447,46 @@ env_online=$(curl -s "http://127.0.0.1:$API_PORT/api/clients" -H "Authorization:
 err_out=$(cd "$WORK" && "$CLIENT" 2>&1; echo "exit=$?")
 echo "$err_out" | grep -q "RH_SERVER"; check $? "裸启动报错含环境变量指引"
 
+# 第三个客户端:域名接入(issue #2)。RH_SERVER 用 域名:port,解析走
+# 上方的 DNS stub(任意 A 查询 → 127.0.0.1),确定性地覆盖
+# 域名拆分 → dnsquery(自定义 DNS)→ 拨号全链路。
+# 修前 str::parse::<SocketAddr>() 只认 IP:port,域名直接 bad server_addr
+# 无限重连。不用 localhost 是因为它可能先解析到 ::1 而服务端只听 127.0.0.1。
+CRESP3=$(curl -s -X POST "http://127.0.0.1:$API_PORT/api/clients" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"name":"domain-addr"}')
+CID3=$(echo "$CRESP3" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["id"])')
+CSECRET3=$(echo "$CRESP3" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["secret"])')
+cd "$WORK"
+RH_SERVER="server.e2e.test:$CTL_PORT" RH_DNS_SERVER="127.0.0.1:19553" \
+  RH_CLIENT_ID="$CID3" RH_SECRET="$CSECRET3" \
+  "$CLIENT" >"$WORK/client-domain.log" 2>&1 &
+PIDS+=($!)
+cd - >/dev/null
+sleep 3
+dom_online=$(curl -s "http://127.0.0.1:$API_PORT/api/clients" -H "Authorization: Bearer $TOKEN" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print([c["online"] for c in d if c["name"]=="domain-addr"][0])')
+[ "$dom_online" = "True" ]; check $? "域名接入上线(RH_SERVER=域名:port + RH_DNS_SERVER,issue #2)"
+
+# 域名接入的日志不得再出现 bad server_addr(修前的无限重连症状)
+grep -q "bad server_addr" "$WORK/client-domain.log" && bad "域名接入日志不得出现 bad server_addr" \
+  || ok "域名接入日志无 bad server_addr"
+
+# 形状错误快速失败(issue #2):缺端口是永久配置错误,启动即退出并给
+# 格式提示,而不是进重连循环无限退避。3s 探活(不用 timeout:macOS 无该命令)。
+cd "$WORK"
+RH_SERVER="no-port.example" RH_CLIENT_ID=x RH_SECRET=y \
+  "$CLIENT" >"$WORK/client-shape.log" 2>&1 &
+SHAPE_PID=$!
+sleep 3
+if kill -0 "$SHAPE_PID" 2>/dev/null; then
+  kill "$SHAPE_PID" 2>/dev/null
+  bad "缺端口的 server_addr 启动即退出(非重连循环)"
+else
+  ok "缺端口的 server_addr 启动即退出(非重连循环)"
+fi
+cd - >/dev/null
+grep -q "缺少端口" "$WORK/client-shape.log"; check $? "缺端口的 server_addr 报错含格式提示"
+
 mk_svc() { api -X POST "http://127.0.0.1:$API_PORT/api/services" -H 'Content-Type: application/json' -d "$1"; }
 mk_vis() { api -X POST "http://127.0.0.1:$API_PORT/api/visitors" -H 'Content-Type: application/json' -d "$1"; }
 

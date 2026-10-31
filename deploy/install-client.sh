@@ -40,7 +40,7 @@ done
 
 # 交互补齐缺省凭据
 if [ -z "$SERVER" ]; then
-  read -r -p "服务端地址(host:port,如 203.0.113.10:7100):" SERVER
+  read -r -p "服务端地址(IP 或域名:port,如 203.0.113.10:7100):" SERVER
 fi
 if [ -z "$CLIENT_ID" ]; then
   read -r -p "客户端 ID(控制台「客户端」页创建):" CLIENT_ID

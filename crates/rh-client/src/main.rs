@@ -121,6 +121,11 @@ async fn main() -> anyhow::Result<()> {
         !cfg.secret.is_empty(),
         "secret 为空(配置文件 / RH_SECRET / --secret)"
     );
+    // 形状校验快速失败(issue #2):缺端口/端口非数字属于**永久**配置错误,
+    // 与 DNS 故障(瞬态,靠重连自愈)不同——进重连循环只会 1,2,4,...,60s
+    // 无限退避且每轮报同一条看不出原因的错。这里只查形状不做 DNS:
+    // 域名解析失败仍走 session error 重连(服务端域名/IP 随时可能恢复)。
+    cfg.validate_server_addr()?;
 
     let cfg = Arc::new(cfg);
     dnsquery::set_server(cfg.dns_server.clone());

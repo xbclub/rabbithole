@@ -5,6 +5,18 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
 
+/// 解析后的服务端地址(issue #2):`server_addr` 支持 `IP:port` 与 `域名:port`。
+///
+/// - `addr`:实际拨号用地址(IP 直连快路径产物,或域名解析结果);
+/// - `host`:仅当原始配置是**域名**时为 `Some`,用作 TLS SNI / ws Host 头 /
+///   QUIC ServerName 的回退(显式 `RH_SERVER_NAME` 仍优先)。IP 直连为
+///   `None`,保持修前"回退到 IP 串"的行为不变。
+#[derive(Clone, Debug)]
+pub struct ResolvedServer {
+    pub addr: SocketAddr,
+    pub host: Option<String>,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ClientConfig {
@@ -108,7 +120,75 @@ impl ClientConfig {
         Ok(toml::from_str(&text)?)
     }
 
+    /// 解析 `server_addr`(issue #2):`IP:port` 走零开销快路径,域名经
+    /// [`forward::resolve`](crate::forward::resolve) 解析(自定义 DNS /
+    /// TTL 30s 缓存 / 负缓存 5s / 并发去重,全在 `dnsquery` 里)。
+    ///
+    /// **每次重连都调用**(session 侧在 `connect_and_run_inner` 开头):
+    /// 域名解析结果带 TTL 缓存,服务端换 IP 后 ≤30s 内跟上;DNS 故障是
+    /// 瞬态错误,按 session error 退避重连,负缓存避免每轮打满解析超时。
+    ///
+    /// 修前 `transport_cfg` 用 `str::parse::<SocketAddr>()` 只认 `IP:port`
+    /// 字面量,域名必然报 `bad server_addr` 并无限重连(issue #2)。
+    pub async fn resolve_server_addr(&self) -> anyhow::Result<ResolvedServer> {
+        // 快路径:IP 字面量(含 [v6]:port)。不查缓存、不解析、不进 blocking
+        // 线程(forward.rs 的红线),现有 IP 用户零行为变化。
+        if let Ok(addr) = self.server_addr.parse::<SocketAddr>() {
+            return Ok(ResolvedServer { addr, host: None });
+        }
+        let (host, port) = Self::split_host_port(&self.server_addr)?;
+        // 无括号的裸 IPv6(如 `::1:7100`)也按 IP 处理:host 不该进 DNS,
+        // 也不作为 SNI 回退(IP 串作为 ServerName 与修前回退行为一致)。
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return Ok(ResolvedServer {
+                addr: SocketAddr::new(ip, port),
+                host: None,
+            });
+        }
+        let addr = crate::forward::resolve(host, port).await.map_err(|_| {
+            anyhow::anyhow!(
+                "server_addr \"{}\" 域名解析失败(支持 IP:port 与 域名:port;\
+                 自定义 DNS 见 RH_DNS_SERVER)",
+                self.server_addr
+            )
+        })?;
+        Ok(ResolvedServer {
+            addr,
+            host: Some(host.to_string()),
+        })
+    }
+
+    /// 仅校验 `server_addr` 形状,**不做 DNS**(启动快速失败用,见 main.rs)。
+    pub fn validate_server_addr(&self) -> anyhow::Result<()> {
+        if self.server_addr.parse::<SocketAddr>().is_ok() {
+            return Ok(());
+        }
+        Self::split_host_port(&self.server_addr).map(|_| ())
+    }
+
+    /// 拆 `host:port`。按最后一个 `:` 拆(域名不含 `:`,带括号 IPv6 已被
+    /// `SocketAddr` 快路径接住,这里只需处理域名与裸 IPv6);剥离可选的
+    /// `[]` 括号。错误信息带原文与期望格式——issue #2 的教训是
+    /// `bad server_addr xxx` 之外一字不给,用户只能读源码定位。
+    fn split_host_port(s: &str) -> anyhow::Result<(&str, u16)> {
+        let (host, port) = s.rsplit_once(':').ok_or_else(|| {
+            anyhow::anyhow!("server_addr \"{s}\" 缺少端口(应为 IP:port 或 域名:port)")
+        })?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| anyhow::anyhow!("server_addr \"{s}\" 端口非法(应为 0..=65535 的数字)"))?;
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        if host.is_empty() {
+            return Err(anyhow::anyhow!("server_addr \"{s}\" host 为空"));
+        }
+        Ok((host, port))
+    }
+
     /// 构造传输层配置。
+    ///
+    /// `server_addr` 由调用方先经 [`Self::resolve_server_addr`] 解析后传入
+    /// (域名支持在解析层做,本函数只消费 `SocketAddr`)——避免两处各自
+    /// parse 造成语义漂移(session.rs 曾因此让域名静默退回协议基线)。
     ///
     /// **载体数 K 不经过本结构体**(round-44 修正):`mux_pool_size` 由
     /// [`session::initial_k_for`](crate::session::initial_k_for) 结合协议基线
@@ -116,16 +196,15 @@ impl ClientConfig {
     ///
     /// `ClientTransportConfig` 里曾经的 `carriers` 字段被赋值却从未被生产
     /// 代码读取(改它不会改变载体数),已删除。
-    pub fn transport_cfg(&self) -> anyhow::Result<rh_transport::ClientTransportConfig> {
+    pub fn transport_cfg(
+        &self,
+        server: &ResolvedServer,
+    ) -> anyhow::Result<rh_transport::ClientTransportConfig> {
         let protocol = Protocol::parse(&self.protocol)
             .ok_or_else(|| anyhow::anyhow!("bad protocol {}", self.protocol))?;
-        let server_addr: SocketAddr = self
-            .server_addr
-            .parse()
-            .map_err(|_| anyhow::anyhow!("bad server_addr {}", self.server_addr))?;
         Ok(rh_transport::ClientTransportConfig {
             protocol,
-            server_addr,
+            server_addr: server.addr,
             multiplex: self.multiplex,
             tls: rh_transport::TlsClientOptions {
                 trusted_ca: self
@@ -133,7 +212,11 @@ impl ClientConfig {
                     .as_ref()
                     .map(std::fs::read)
                     .transpose()?,
-                server_name: self.server_name.clone(),
+                // SNI / 证书名校验名的回退链:显式 RH_SERVER_NAME > 域名
+                // (来自 server_addr)> 传输层自己的 IP 串回退(修前行为)。
+                // 域名 + trusted_ca 部署因此不再要求额外配 RH_SERVER_NAME;
+                // server_name 不进 rustls 配置缓存键(tls.rs),填它零副作用。
+                server_name: self.server_name.clone().or_else(|| server.host.clone()),
                 insecure_skip_verify: self.tls_insecure_skip_verify,
                 pin_sha256: self.tls_pin_sha256.clone(),
                 // 没有 CA 也没有 pin 时,靠 secret 认证后下发证书来验证对端。
@@ -487,6 +570,12 @@ secret = "s"
     // 本测试逐态锁定"哪些配置会走 secret 验证"。
     #[test]
     fn secret_verified_only_when_nothing_else_trusts() {
+        // transport_cfg 现在接收已解析地址(issue #2);本测试只关心 TLS
+        // 信任开关,统一用 IP 直连形态(host=None,SNI 回退不介入)。
+        let server = ResolvedServer {
+            addr: "127.0.0.1:7100".parse().unwrap(),
+            host: None,
+        };
         let mk = |ca: Option<&str>, pin: Option<&str>, insecure: bool| ClientConfig {
             trusted_ca_file: ca.map(str::to_string),
             tls_pin_sha256: pin.map(str::to_string),
@@ -497,7 +586,7 @@ secret = "s"
         // 默认(零配置):唯一走 secret 下发的路径
         assert!(
             mk(None, None, false)
-                .transport_cfg()
+                .transport_cfg(&server)
                 .unwrap()
                 .tls
                 .secret_verified
@@ -506,7 +595,7 @@ secret = "s"
         // 三种"已有别的信任来源"的配置都不得走 secret 校验
         assert!(
             !mk(Some("/dev/null"), None, false)
-                .transport_cfg()
+                .transport_cfg(&server)
                 .unwrap()
                 .tls
                 .secret_verified,
@@ -514,7 +603,7 @@ secret = "s"
         );
         assert!(
             !mk(None, Some("00"), false)
-                .transport_cfg()
+                .transport_cfg(&server)
                 .unwrap()
                 .tls
                 .secret_verified,
@@ -522,7 +611,7 @@ secret = "s"
         );
         assert!(
             !mk(None, None, true)
-                .transport_cfg()
+                .transport_cfg(&server)
                 .unwrap()
                 .tls
                 .secret_verified,
@@ -530,7 +619,7 @@ secret = "s"
         );
         assert!(
             !mk(Some("/dev/null"), None, true)
-                .transport_cfg()
+                .transport_cfg(&server)
                 .unwrap()
                 .tls
                 .secret_verified,
@@ -665,5 +754,170 @@ mod debug_redaction_tests {
         let cfg = ClientConfig::default();
         let s = format!("{cfg:?}");
         assert!(s.contains("<redacted>"), "无论密钥是否为空都遮蔽");
+    }
+}
+
+/// issue #2:`server_addr` 域名支持 + SNI 回退 + 形状校验。
+#[cfg(test)]
+mod server_addr_tests {
+    use super::*;
+    use crate::dnsquery::DNS_GLOBAL_TEST_LOCK as LOCK;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 注入的解析被调用次数(与 dnsquery::cache_tests 同手法:只计数、
+    /// 不触网,让「有没有真的解析」成为可断言事实)。
+    static QUERIES: AtomicUsize = AtomicUsize::new(0);
+    /// 注入的解析结果(1 = 返回 10.0.0.7,0 = 模拟解析失败)。
+    static RESULT_OK: AtomicUsize = AtomicUsize::new(1);
+
+    fn counting_query(
+        _host: &str,
+        port: u16,
+        _ns: Option<&str>,
+    ) -> futures::future::BoxFuture<'static, Option<SocketAddr>> {
+        QUERIES.fetch_add(1, Ordering::SeqCst);
+        let ok = RESULT_OK.load(Ordering::SeqCst) == 1;
+        Box::pin(async move { ok.then(|| SocketAddr::from(([10, 0, 0, 7], port))) })
+    }
+
+    /// 与 dnsquery 的进程级全局(注入器/缓存)互斥——不持锁会与
+    /// dnsquery::cache_tests 及 plugins 的解析用例互相污染(实测过)。
+    async fn setup(ok: bool) -> tokio::sync::MutexGuard<'static, ()> {
+        let g = LOCK.lock().await;
+        crate::dnsquery::cache_clear();
+        QUERIES.store(0, Ordering::SeqCst);
+        RESULT_OK.store(if ok { 1 } else { 0 }, Ordering::SeqCst);
+        crate::dnsquery::resolve_set_query(Some(counting_query));
+        g
+    }
+
+    fn teardown() {
+        crate::dnsquery::resolve_set_query(None);
+        crate::dnsquery::cache_clear();
+        RESULT_OK.store(1, Ordering::SeqCst);
+    }
+
+    fn cfg_with(server: &str) -> ClientConfig {
+        ClientConfig {
+            server_addr: server.into(),
+            ..ClientConfig::default()
+        }
+    }
+
+    /// 红线:IP:port 快路径不触发任何解析(零行为变化)。
+    #[tokio::test]
+    async fn ip_literal_skips_dns() {
+        let _g = setup(true).await;
+        let r = cfg_with("203.0.113.10:7100")
+            .resolve_server_addr()
+            .await
+            .unwrap();
+        assert_eq!(r.addr, "203.0.113.10:7100".parse::<SocketAddr>().unwrap());
+        assert_eq!(r.host, None, "IP 直连不得产生 SNI 回退 host");
+        // 带括号 IPv6 同样走快路径
+        let r6 = cfg_with("[2001:db8::1]:7100")
+            .resolve_server_addr()
+            .await
+            .unwrap();
+        assert_eq!(r6.host, None);
+        assert_eq!(QUERIES.load(Ordering::SeqCst), 0, "IP 字面量必须零解析调用");
+        teardown();
+    }
+
+    /// 域名:解析出地址,host 保留用于 SNI 回退。
+    #[tokio::test]
+    async fn domain_resolves_and_keeps_host() {
+        let _g = setup(true).await;
+        let r = cfg_with("rh.example.com:7100")
+            .resolve_server_addr()
+            .await
+            .unwrap();
+        assert_eq!(r.addr, SocketAddr::from(([10, 0, 0, 7], 7100)));
+        assert_eq!(r.host.as_deref(), Some("rh.example.com"));
+        assert_eq!(QUERIES.load(Ordering::SeqCst), 1);
+        teardown();
+    }
+
+    /// 裸 IPv6(`::1:7100`,无括号)按 IP 处理:不进 DNS、host=None。
+    #[tokio::test]
+    async fn bracketless_ipv6_treated_as_ip() {
+        let _g = setup(true).await;
+        let r = cfg_with("::1:7100").resolve_server_addr().await.unwrap();
+        assert_eq!(r.addr, "[::1]:7100".parse::<SocketAddr>().unwrap());
+        assert_eq!(r.host, None, "IP 形态不得作为 SNI 回退 host");
+        assert_eq!(QUERIES.load(Ordering::SeqCst), 0);
+        teardown();
+    }
+
+    /// 解析失败:错误必须带原文与格式提示(issue #2 的核心抱怨:
+    /// `bad server_addr xxx` 之外一字不给,用户只能读源码定位)。
+    #[tokio::test]
+    async fn resolution_failure_error_is_actionable() {
+        let _g = setup(false).await;
+        let err = cfg_with("rh.example.com:7100")
+            .resolve_server_addr()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rh.example.com:7100"), "err: {err}");
+        assert!(err.contains("域名解析失败"), "err: {err}");
+        assert!(err.contains("域名:port"), "err 应给出格式提示: {err}");
+        teardown();
+    }
+
+    /// 形状校验(启动快速失败):缺端口/端口非法/host 为空必须报错,
+    /// 合法 IP 与域名(不做 DNS)必须放行。
+    #[test]
+    fn shape_validation() {
+        for good in ["203.0.113.10:7100", "[::1]:7100", "rh.example.com:7100"] {
+            cfg_with(good)
+                .validate_server_addr()
+                .unwrap_or_else(|e| panic!("合法地址 {good} 被拒: {e}"));
+        }
+        for bad in [
+            "rh.example.com",       // 缺端口
+            "rh.example.com:bar",   // 端口非数字
+            "rh.example.com:",      // 端口为空
+            ":7100",                // host 为空
+            "rh.example.com:99999", // 端口越界
+        ] {
+            let err = cfg_with(bad)
+                .validate_server_addr()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(bad), "err 应带原文: {err}");
+        }
+    }
+
+    /// SNI 回退链:显式 server_name > 域名 > None(修前行为)。
+    #[test]
+    fn sni_fallback_chain() {
+        let domain = ResolvedServer {
+            addr: SocketAddr::from(([10, 0, 0, 7], 7100)),
+            host: Some("rh.example.com".into()),
+        };
+        // 域名且未显式配置:SNI 取域名(trusted_ca 部署不再要求 RH_SERVER_NAME)
+        let t = cfg_with("rh.example.com:7100")
+            .transport_cfg(&domain)
+            .unwrap();
+        assert_eq!(t.tls.server_name.as_deref(), Some("rh.example.com"));
+        // 显式配置优先
+        let explicit = ClientConfig {
+            server_name: Some("cert.example.com".into()),
+            ..cfg_with("rh.example.com:7100")
+        };
+        let t = explicit.transport_cfg(&domain).unwrap();
+        assert_eq!(
+            t.tls.server_name.as_deref(),
+            Some("cert.example.com"),
+            "显式 RH_SERVER_NAME 必须压过域名回退"
+        );
+        // IP 直连:None(传输层自行回退到 IP 串,修前行为不变)
+        let ip = ResolvedServer {
+            addr: "203.0.113.10:7100".parse().unwrap(),
+            host: None,
+        };
+        let t = cfg_with("203.0.113.10:7100").transport_cfg(&ip).unwrap();
+        assert_eq!(t.tls.server_name, None);
     }
 }

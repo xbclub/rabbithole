@@ -336,18 +336,33 @@ impl ClientSession {
 /// round-77:自动路径改为按**实测 RTT** 决定 K(而不是恒 1)。依据是
 /// 低延迟下 K=1 快 8%、而 20ms 下 K=4 快 16%(§82),阈值见
 /// [`rh_transport::carriers_for_rtt`]。
-async fn initial_k_for(cfg: &ClientConfig, protocol: rh_transport::Protocol) -> (usize, usize) {
-    initial_k_for_async(cfg, protocol, crate::config::detect_hardware_cap()).await
+async fn initial_k_for(
+    cfg: &ClientConfig,
+    protocol: rh_transport::Protocol,
+    server_addr: std::net::SocketAddr,
+) -> (usize, usize) {
+    initial_k_for_async(
+        cfg,
+        protocol,
+        crate::config::detect_hardware_cap(),
+        server_addr,
+    )
+    .await
 }
 
 /// [`initial_k_for`] 的异步实现(需要一次 RTT 探测)。
 ///
 /// RTT 探测只看 `server_addr` 与 `proxy_url`(与协议无关);探针失败时
 /// 退回协议基线,**不阻断连接**。
+///
+/// `server_addr` 由调用方传入(域名已解析):修前此处自己
+/// `cfg.server_addr.parse::<SocketAddr>()`,域名走 `Err` 分支**静默**退回
+/// 协议基线,RTT 探测被跳过、载体数无声退化且无任何日志(issue #2)。
 pub(crate) async fn initial_k_for_async(
     cfg: &ClientConfig,
     protocol: rh_transport::Protocol,
     hardware_cap: usize,
+    server_addr: std::net::SocketAddr,
 ) -> (usize, usize) {
     let proto_baseline = rh_transport::default_carriers(protocol);
     let baseline = match cfg.mux_pool_size {
@@ -362,20 +377,14 @@ pub(crate) async fn initial_k_for_async(
         // 压成 1,返回基线只会让本函数的输出与最终结果不一致(测试抓到过)。
         None if !protocol.is_tcp_based() || !cfg.multiplex => 1,
         None => {
-            let rtt_k = match cfg.server_addr.parse::<std::net::SocketAddr>() {
-                Ok(addr) => {
-                    // 探针走与真实拨号相同的路径(含 proxy_url);
-                    // 结果按 (addr, proxy_url) 进程内缓存,重连复用。
-                    rh_transport::auto_carriers(
-                        addr,
-                        std::time::Duration::from_secs(2),
-                        cfg.proxy_url.clone(),
-                    )
-                    .await
-                }
-                // 地址是域名或非法:无法探测,退回保守基线。
-                Err(_) => proto_baseline,
-            };
+            // 探针走与真实拨号相同的路径(含 proxy_url);
+            // 结果按 (addr, proxy_url) 进程内缓存,重连复用。
+            let rtt_k = rh_transport::auto_carriers(
+                server_addr,
+                std::time::Duration::from_secs(2),
+                cfg.proxy_url.clone(),
+            )
+            .await;
             // RTT 自适应给的是**下限意义上的建议**,不是上限:
             // 低 RTT(<5ms)返回 1,但 2026-10-20 三机实测单载体在
             // 2.1-2.2G 封顶且与流数无关(瓶颈是单 TCP 拥塞窗 + yamux
@@ -737,7 +746,12 @@ async fn connect_and_run_inner(
     cfg: Arc<ClientConfig>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let mut tcfg = cfg.transport_cfg()?;
+    // 解析服务端地址(issue #2):IP 直连快路径零开销;域名经
+    // forward::resolve(TTL 缓存/自定义 DNS)。放在重连循环**内部**:
+    // 每次重连重新解析,服务端换 IP 后 ≤TTL 内跟上;DNS 故障是瞬态
+    // 错误,按 session error 退避重连(负缓存 5s 防止打满解析超时)。
+    let server = cfg.resolve_server_addr().await?;
+    let mut tcfg = cfg.transport_cfg(&server)?;
     // 证书比对用:记录本次连接实际看到的对端证书(仅加密协议有意义)。
     // 必须逐次新建(不是复用):重连要对当前这次握手的证书做比对。
     //
@@ -756,7 +770,7 @@ async fn connect_and_run_inner(
     }
     // 三段式定容(round-10):显式值/协议基线先过硬件上限,报到后再按
     // 服务端应答收敛。QUIC/KCP 与非 multiplex 不建池(恒单载体)。
-    let (sized_k, hardware_cap) = initial_k_for(&cfg, tcfg.protocol).await;
+    let (sized_k, hardware_cap) = initial_k_for(&cfg, tcfg.protocol, tcfg.server_addr).await;
     let initial_k = if tcfg.protocol.is_tcp_based() && tcfg.multiplex {
         sized_k
     } else {
@@ -1882,6 +1896,13 @@ mod sizing_tests {
     //! `plan_convergence` 的纯逻辑,不依赖真实网络即可锁定。
     use super::*;
 
+    /// RTT 探测目标(issue #2 起 `initial_k_for_async` 显式传入,不再
+    /// 自行 parse `cfg.server_addr`):不可达地址,探针失败退基线。
+    const PROBE_ADDR: std::net::SocketAddr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9)),
+        7000,
+    );
+
     // T-E2(round-73 回退):tcp 默认基线 1 → initial_k=1,不建池。
     //
     // round-10 时 tcp 基线就是 1(单载体已接近路径上限)。round-54 曾改成
@@ -1926,7 +1947,7 @@ mod sizing_tests {
                 server_addr: "203.0.113.9:7000".into(),
                 ..ClientConfig::default()
             };
-            let (k, _hw) = initial_k_for_async(&cfg, p, 8).await;
+            let (k, _hw) = initial_k_for_async(&cfg, p, 8, PROBE_ADDR).await;
             assert_eq!(k, 1, "{p:?} 必须单载体");
         }
         assert_eq!(
@@ -1947,7 +1968,7 @@ mod sizing_tests {
             multiplex: false,
             ..ClientConfig::default()
         };
-        let (k, _hw) = initial_k_for_async(&cfg, rh_transport::Protocol::Tcp, 8).await;
+        let (k, _hw) = initial_k_for_async(&cfg, rh_transport::Protocol::Tcp, 8, PROBE_ADDR).await;
         assert_eq!(k, 1, "multiplex=false 必须单载体");
         assert_eq!(
             rh_transport::probe_call_count(),
@@ -1967,7 +1988,7 @@ mod sizing_tests {
             mux_pool_size: Some(3),
             ..ClientConfig::default()
         };
-        let (k, hw) = initial_k_for_async(&cfg, rh_transport::Protocol::Tcp, 8).await;
+        let (k, hw) = initial_k_for_async(&cfg, rh_transport::Protocol::Tcp, 8, PROBE_ADDR).await;
         assert_eq!(k, 3, "显式值必须原样生效");
         assert_eq!(hw, 8);
         assert_eq!(
@@ -1988,7 +2009,7 @@ mod sizing_tests {
             server_addr: "203.0.113.9:7000".into(),
             ..ClientConfig::default()
         };
-        let (k, _hw) = initial_k_for_async(&cfg, rh_transport::Protocol::Tcp, 8).await;
+        let (k, _hw) = initial_k_for_async(&cfg, rh_transport::Protocol::Tcp, 8, PROBE_ADDR).await;
         // 探测失败 → 1;再与协议基线(2)取 max → 2
         assert_eq!(k, 2, "失败退回 1 后与 tcp 基线 2 取 max");
         assert_eq!(
@@ -2008,7 +2029,7 @@ mod sizing_tests {
             ..ClientConfig::default()
         };
         // 2s 超时下不可达地址会失败;函数必须正常返回
-        let (k, hw) = initial_k_for_async(&cfg, rh_transport::Protocol::Tcp, 8).await;
+        let (k, hw) = initial_k_for_async(&cfg, rh_transport::Protocol::Tcp, 8, PROBE_ADDR).await;
         assert!((1..=8).contains(&k), "K 必须在合法区间,实际 {k}");
         assert_eq!(hw, 8);
     }
