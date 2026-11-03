@@ -112,14 +112,13 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17 -p rh-server -p rh-client
-          # zigbuild 的产物目录可能带或不带 .2.17 后缀,统一归位到打包步骤
-          # 期望的 target/<triple>/release/
-          mkdir -p "target/${{ matrix.target }}/release"
-          for d in "target/x86_64-unknown-linux-gnu.2.17/release" "target/${{ matrix.target }}/release"; do
-            for b in rh-server rh-client; do
-              [ -x "$d/$b" ] && cp -f "$d/$b" "target/${{ matrix.target }}/release/$b"
-            done
-          done
+          # zigbuild 产物落在 target/<triple>/release(实测不带 .2.17 后缀);
+          # 带后缀的旧目录形态保留兜底,同路径跳过避免 cp 报错。
+          if [ -d "target/x86_64-unknown-linux-gnu.2.17/release" ]; then
+            cp -f target/x86_64-unknown-linux-gnu.2.17/release/rh-server \
+                  target/x86_64-unknown-linux-gnu.2.17/release/rh-client \
+                  "target/${{ matrix.target }}/release/"
+          fi
       - name: Build(native)
         if: runner.os != 'Linux'
         run: cargo build --release --target ${{ matrix.target }} -p rh-server -p rh-client
