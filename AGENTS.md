@@ -131,6 +131,16 @@ cargo test --workspace
 三者都在 `.github/workflows/ci.yml` 里跑,本地先过一遍能省一个来回。
 格式化提交已登记在 `.git-blame-ignore-revs`,`git blame` 会跳过它。
 
+改 `cli/`(Go,rhctl)时另有 **Go 三道门**(与 CI 的 `cli (go)` job 同款;
+三条交叉编译本地零成本,不进 CI):
+
+```bash
+cd cli/rhctl
+test -z "$(gofmt -l .)"        # 格式:无输出即通过
+go vet ./... && go test ./...
+GOOS=windows GOARCH=amd64 go build ./...   # 另跑 linux/amd64、linux/arm64
+```
+
 ### 提交:推送前先推 main,再追 CI
 
 **`main` 是唯一长期分支**,直接推,不建特性分支(本项目单人维护)。
@@ -143,12 +153,13 @@ gh run view <run-id> --json jobs \
   --jq '{status, conclusion, jobs: [.jobs[] | {name, conclusion}]}'
 ```
 
-CI 有两个 job:
+CI 有三个 job:
 
 | job | 做什么 | 能抓到什么 |
 |---|---|---|
 | `test + clippy (linux)` | fmt / clippy / 全量测试 | 逻辑错误;**只有 Linux 上能跑的那条背压测试**(靠 `ss` 读内核 accept 队列) |
 | `编译检查 (windows)` | `cargo check --all-targets` | **v0.4.0 那类 msvc 编译失败**(`std::os::fd` 等 Unix 专属用法漏了 `cfg`) |
+| `cli (go)` | `cli/rhctl` 的 gofmt / go vet / go build / go test | rhctl 的 Go 侧质量门(本地同款命令见上方 Go 三道门);交叉编译不进 CI |
 
 ### 看失败日志
 

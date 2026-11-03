@@ -479,7 +479,7 @@ crates/rh-server/src/
 
 ```
 crates/rh-client/src/
-├── main.rs            # rh-client.toml: server_addr, transport, client_id, secret
+├── main.rs            # rh-client.toml: server_addr(IP 或 域名), transport, client_id, secret
 ├── session.rs         # Connecting → Challenged → Authed → Syncing → Running
 │                      #   →(Backoff→Connecting); PONG 超时/断开→Backoff
 ├── services/
@@ -492,6 +492,7 @@ crates/rh-client/src/
 └── backoff.rs         # 指数退避 1s→60s, 成功归零
 ```
 
+- `server_addr` 支持 `IP:port` 与 `域名:port`（issue #2，`368f8ab`）：域名经 `forward::resolve`（`dnsquery`：TTL 30s 正缓存 / 5s 负缓存 / 并发去重）在**每次重连**时重新解析，服务端换 IP 后 ≤30s 跟上，DNS 故障快速失败；TLS SNI / 证书校验名回退链：显式 `RH_SERVER_NAME` > 配置域名，IP 直连形态两者皆不介入。
 - 客户端**不自发拨号**：一切数据连接由服务端 `CREATE_DATA_CHANNEL` 触发（预热亦然），因此全量 SYNC 重发/更高版本 SYNC 不会引发重复拨号（是否补拨由服务端按池在途额度决定）。
 - 规则集应用即内存原子替换（§3.3），无本地端口绑定，因此无"部分应用失败"。
 

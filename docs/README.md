@@ -36,7 +36,13 @@
 | [static-audit-2026-10-perf.md](static-audit-2026-10-perf.md) | **2026-10 全量静态审计**(5.5 万行):性能 / 死代码 / 并行串行 / 零拷贝,30 条发现。**已完成**,提交 `b84e7e1`;另有 12 轮后续扫描记在各自提交信息里 |
 | [task-concurrency-serialization.md](task-concurrency-serialization.md) | 任务书:「应并行/异步却串行」12 项。**已完成**,报告见 [concurrency-serialization-fixes.md](concurrency-serialization-fixes.md)。一次性任务书,基线 `1b8bfd6`,勿当现行指令 |
 | [task-fix-report-errors.md](task-fix-report-errors.md) | 任务书:更正上述报告的 2 处事实错误 + 1 处逻辑矛盾 + 1 处遗漏。**已完成**(`3a0d205` / `9a68def`) |
-| [rhctl-cli-tasklist-2026-10.md](rhctl-cli-tasklist-2026-10.md) | 任务书:管理 REST API 的 Go/cobra CLI 控制端 `rhctl`(API Key 认证)。**已完成**:9 任务包落地、28 契约测试对齐 28 个 Key 可达操作、连续三轮审计零 finding(记录见任务书 §6);不做项登记于 [not-supported.md](not-supported.md) §15 |
+| [perf-static-analysis-tasklist-2026-10.md](perf-static-analysis-tasklist-2026-10.md) | 任务书:第一轮性能静态分析修复(47 条)。**已全部闭环**(41 实施 + 4 `[W]` 已登记 not-supported),勿重做 |
+| [perf-static-analysis-round2-tasklist-2026-10.md](perf-static-analysis-round2-tasklist-2026-10.md) | 任务书:第二轮性能静态分析修复(45 条)。P0/P1 全闭环;**P2 五包部分延期、L-G 四条未处置、R2 mux 档基准未执行**(头部有 2026-11-03 收口核查)—— 未办项以此文件为准 |
+| [api-key-auth-tasklist-2026-10.md](api-key-auth-tasklist-2026-10.md) | 任务书:管理面 API Key 认证(`rhk_` 前缀 / scope 位掩码 / 缓存失效)。10 任务包全部完成,25 测试(21 Rust + 4 前端) |
+| [perf-followup-2026-10-24.md](perf-followup-2026-10-24.md) | 2026-10-24 性能复核后续:19 条发现,8 条已修、其余留档防重复排查(静态结论,未跑三机基准) |
+| [pending-unified-review.md](pending-unified-review.md) | 六轮固定开销优化的统一收尾清单。**已销项**(`9bd748b` 落库),仅 §8.1 测试方法论与 §1 证据分级仍有效 |
+| [post-task-evaluation.md](post-task-evaluation.md) | `9bd748b` 六轮优化的收尾评估:9 项 F 级缺口均不构成真实优化;三机回归验证无性能回归 |
+| [rhctl-cli-tasklist-2026-10.md](rhctl-cli-tasklist-2026-10.md) | 任务书:管理 REST API 的 Go/cobra CLI 控制端 `rhctl`(API Key 认证)。**已完成**:9 任务包落地、28 契约测试对齐 28 个 Key 可达操作、连续三轮审计零 finding(记录见任务书 §6,结论绑定 `4b44299`);不做项登记于 [not-supported.md](not-supported.md) §15 |
 
 ## 3. 专题:设计与决策
 

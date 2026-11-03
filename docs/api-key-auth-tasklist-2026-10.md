@@ -2258,7 +2258,7 @@ import { MonoCopy } from '@/components/mono';
 | **`scope_zero_key_denied`** ★ | `scopes=0` 的 key 调任意受保护组(含只读组)必须 403 |
 | `scope_method_mapping` | 遍历 (method, 期望位):GET→r、DELETE→w、`POST /enable`→w、`POST /batch`→w |
 | `session_only_rejects_key` | session 组对 `Principal::Key` 回 **HTTP 403**(非 200+body) |
-| `forbidden_uses_http_403` | `forbidden(..)` 的 `status()` 必须是 403(防误用 `err()`,见 §2.5) |
+| `forbidden_uses_http_403` | `forbidden(..)` 的 `status()` 必须是 403(防误用 `err()`,见 §2.5)。**【实现偏差补记 2026-11-03】未单独成测** —— 属 §B-3 验收补充所述"两行折入相邻用例"之一(另一行是 `parse_accepts_uppercase_but_hash_mismatch`,折入 `parse_accepts_valid`),403 断言由 `scope_zero_key_denied` / `session_only_rejects_key` 承担(二者逐条断言 `StatusCode::FORBIDDEN`,api.rs 测试段) |
 | `apikey_cache_epoch_invalidates` | rotate + invalidate 后旧 hash 失配 |
 | **`apikey_rotate_old_key_rejected`** ★ | 完整链路:建 key → 用它请求得 200 → rotate → **用旧 key 请求必须 401**。这条能抓住"忘了 bump 缓存"的 bug(光测 `invalidate_apikeys` 本身抓不到) |
 | `apikey_touch_throttles` | 1000 次调用只落 1 次库 |

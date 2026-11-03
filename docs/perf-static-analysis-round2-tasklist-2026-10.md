@@ -3,6 +3,14 @@
 > 来源:第二轮并行静态审计(10 个单元:KCP/mux/compress/ws/yamux×2/服务端×2/客户端/传输层/协议核心/console),聚焦十月修复新增代码 + 首轮漏网。约 45 条新发现:11 条 medium、34 条 low,无 high。11 条 medium 的关键机械事实已由主会话逐一亲验。
 > 首轮任务书见 `docs/perf-static-analysis-tasklist-2026-10.md`(47 条全部闭环,勿重做)。另确认:首轮报告 47 条发现中 coreProtocol-1/2 两条在生成任务书时漏收,本文件补入(见 L-19)。
 > 状态:`[ ]` 待办 / `[x]` 完成(附 hash)/ `[W]` 放弃(写反证;"不做"按 AGENTS.md 记入 docs/not-supported.md)。
+>
+> **⚠ 收口核查(2026-11-03,对照文末完成标准)**:P0 三条、P1 七条全部闭环;
+> P2 十包中 L-A/L-D/L-I/L-J 整包完成,**L-B/L-C/L-E/L-F/L-H 部分延期**
+> (复选框已改 `[ ]`,明细见各包状态行),**L-G 四条未处置**(现场仍在,
+> 核查见该包)。基准要求:M4/M6/L-D 的 kcp 档已跑(结论见 M4 核查行);
+> **R2 的 mux 档(tcp+MUX=1)未执行** —— kcp 轮不经 yamux、tcp 轮未显式开
+> MUX,均不能背书 R2,测法清单已补进 R2 条目,留待专门会话执行。
+> 未办项以本文件为准,已完成项勿重做。
 
 ## 执行约定(与第一轮相同,逐条遵守)
 
@@ -23,8 +31,8 @@
 - 验收:三道门绿;**新增竞态回归测试**(SYNC spawn 后立刻 UPDATE 同一 visitor:最终只有一个监听器、token 可 stop、spec 为新);现有 apply_sync/upsert 测试全过。
 
 ### R2 [P0] yamux 接收 staging 自管扩容在零拷贝主路径每帧重建 —— C-1 修复的主张不成立
-- [x] 状态:完成 @ 3582377
-> 核查:✅ 主张成立(split_to 携走容量 → 64KiB 帧稳态每帧重建 + 整段预零填)。深层核查:yamux 无 tokio 依赖、底层为 futures AsyncRead(签名硬性要求已初始化切片),ReadBuf::uninit 路线不可行,水位机制有存在必要 —— 按任务书原方案懒填:reserve 后水位停在 len,新空闲区由 zeroed_spare 按需填;自管扩容保留(C-1 reclaim 可见性理由仍立),不变量放宽为 len ≤ zeroed ≤ capacity。每字节一次初始化是 futures API 地板,消除的是「预留未读」整段。测试:水位测试改判放宽不变量;新增实例级零填计数缝(全局静态会被并行测试互踩)+ 断言「预留 1MiB 只读 100B → 零填恰 100」「16×64KiB 帧零填 ≤ 读入总量」。基准对照待收尾统一跑(mux/tcp 档)。
+- [x] 状态:代码完成 @ 3582377;**mux 档基准未执行**(测法清单见核查行;完成标准的基准要求未闭环)
+> 核查:✅ 主张成立(split_to 携走容量 → 64KiB 帧稳态每帧重建 + 整段预零填)。深层核查:yamux 无 tokio 依赖、底层为 futures AsyncRead(签名硬性要求已初始化切片),ReadBuf::uninit 路线不可行,水位机制有存在必要 —— 按任务书原方案懒填:reserve 后水位停在 len,新空闲区由 zeroed_spare 按需填;自管扩容保留(C-1 reclaim 可见性理由仍立),不变量放宽为 len ≤ zeroed ≤ capacity。每字节一次初始化是 futures API 地板,消除的是「预留未读」整段。测试:水位测试改判放宽不变量;新增实例级零填计数缝(全局静态会被并行测试互踩)+ 断言「预留 1MiB 只读 100B → 零填恰 100」「16×64KiB 帧零填 ≤ 读入总量」。基准:**mux 档未执行**(2026-11-03 收口补记)—— 其后跑的 kcp 轮(见 M4 行)不经 yamux(`rh-transport/src/lib.rs`:quic/kcp 天然多流,只有 tcp/tls/ws 可选 yamux),tcp 轮(见 M1 行)未显式 MUX=1,**两者均不能背书本条**。测法清单(peer.sh 无现成 mux 档,按约定不自写压测脚本):三角色均显式 `PROTO=tcp RELAY=splice MUX=1 THP_TOOL=loadgen`,`PEER_RUN_ID=r2-mux-{base,cand}`,base=`3582377^`、cand=`3582377`;看 **server 端 CPU 峰值**与吞吐保留率(取多流档,避开 loadgen sink 单流伪影),结论回填此处。
 - 位置:`vendor/yamux/src/frame/io.rs:249-262`(reserve)、:295-311(take_body/split_to)
 - 问题:>4KiB 帧体走 split_to 零拷贝交付,bytes 1.12.1 的 split_to 把容量移交帧体 → staging 容量随每帧缩回 → 下一帧必触发自管重建(新分配 + extend 拷残留 + **整段零填**)。64KiB 转发主力帧每帧 malloc+memcpy+memset,与 e2c0b41 注释"零填 ≈2× 峰值容量有界"矛盾(该主张仅 ≤4KiB 小帧成立)。
 - 修法:**零填改懒填**——自管扩容下 bytes 内部搬移已不可见,reserve 里 `extend_from_slice` 后 `zeroed = len` 即可(新空闲区按需由 zeroed_spare 填),消掉整段 eager memset;顺带修正注释,把"有界"主张收窄为容量保留型流量。可选加:扩容从 crate::pool 取 backing。**不要**改回 bytes reserve(会复活 C-1 原始 bug)。
@@ -72,7 +80,7 @@
 - 验收:三道门绿;断连清理测试过。
 
 ### M4 [P1] kcp 入站包池是进程级单 Mutex —— A-4 引入的跨核争用
-- [x] 状态:代码已完成 @ c7d2710;kcp 档基准(吞吐+CPU+UDP RTT)待跑
+- [x] 状态:代码已完成 @ c7d2710;kcp 档基准(吞吐+CPU+UDP RTT)已跑,结论见核查行(r2-kcp-base/cand)
 > 核查:✅ PKT_POOL 仍是单 Mutex,demux 每包 get、N 会话任务每包 put(~17 万临界区/秒 @85k pps);"争用弱"注释确实低估。
 > 处置:16 片分片池,每片 16 槽(总硬上界 256 槽不变);get/put 独立轮转计数(单计数在逐包交替下步长 2 会钉死奇偶子集——自研时发现的坑);get 用 try_lock 扫描永不阻塞。独立实例单测锁复用/封顶/扫描不漏片。三道门绿。
 > 基准(含 M6/L-D/R2 一并覆盖):kcp A/B(r2-kcp-base @173cb2a vs r2-kcp-cand @1035055,证据 test3:/tmp/ev-r2-kcp-{base,cand})—— 吞吐各档 ±3% 带内;UDP 吞吐 100.8→100.7 持平;UDP RTT p50 中位 2.856→2.846ms 持平(A-5 式回归不存在);CPU 峰值 t1 471.7→412.7(-12.5%)、t2 409→407;并发 4096×5 全过。tcp 侧见 M1 行。
@@ -119,7 +127,7 @@
 - [ ] e) session.rs:1844/visitor_run.rs:99/225 VisitorSpec 未 Arc 化(E-6 孪生):visitors 表改 Arc<VisitorSpec>,:1844 锁内深克隆消除,deliver_relay 的 _vspec 未用参数删除,run_tcp 持 Arc。
 
 ### L-B 服务端序列化/状态(4 条,D-1 遗留与状态层)
-- [x] 状态:a/b/c 完成;d 完成 HttpCache 半,batch 去重延期 @ f0767e0
+- [ ] 状态(部分):a/b/c 完成;d 完成 HttpCache 半,batch 去重延期 @ f0767e0
 > 处置:a) VisitorListRow;b) ServerConfigView 借用视图+两段短锁;c) CertListRow;d) get_key_value 单查+Arc<str>;bump_cfg_gen batch 去重需拆 wrapper/inner/locked 三层签名,visitor_cache 规模小收益不抵风险,延期。
 - [ ] a) api.rs:1984-1997 list_visitors 仍 json! 建树内嵌 spec:仿 ClientListRow 强类型化。
 - [ ] b) api.rs:2336-2359 get_server_config 每请求整份 ServerConfig 深克隆 + 4 段 to_value:具名 Serialize 结构。
@@ -127,7 +135,7 @@
 - [ ] d) state.rs:1215-1228 HttpCache::get 双查找 + String 克隆:get_key_value 单查 + content_type Arc 化;另 state.rs:290-298 bump_cfg_gen 全表扫被 batch 放大 N 倍:batch 去重后统一 bump。
 
 ### L-C yamux/pool 周边(6 条)
-- [x] 状态:a/b/c 完成 @ 1035055;d/e/f 延期
+- [ ] 状态(部分):a/b/c 完成 @ 1035055;d/e/f 延期
 > 处置:a) 大类容量过滤+clear 补齐;b) put 乐观 fetch_add;c) allocations cfg(test) 门控;d/e/f(RecvHalf 逐帧 N 通道 poll/FlushTask 空锁/drain_ctrl 预算)属 mux 并发核心(唤醒契约/水位门控规格驱动,round-6.1 §1.3 等),需专门会话谨慎处理,本轮不做。
 - [ ] a) pool.rs:122-143 大类 get 弹出无容量过滤(潜伏合同违约,split_send_size 中间尺寸可播种):比照小类加过滤。
 - [ ] b) pool.rs:197-206 大类 put CAS 败者直接丢缓冲:改 fetch_add 后判预算。
@@ -145,27 +153,29 @@
 - [ ] d) kcp.rs:1467-1491 交付循环每消息两次 guarded 锁:批内合并(一次读 room,本地 scratch 收,一次 extend+wake)。
 
 ### L-E 传输层(3 条)
-- [x] 状态:b 完成 @ 2fbd207;a/c 延期
+- [ ] 状态(部分):b 完成 @ 2fbd207;a/c 延期
 > 处置:b) dup 推迟到 peek 判定后(yamux 连接不再白开 fd);a) 代理拨号 URL/DNS 缓存与 c) QUIC 证书链拷贝提取未及做,留下一轮。
 - [ ] a) tcp.rs:721-727/proxy_dial.rs:120-128 代理拨号每连接重 parse URL + 域名无 DNS 缓存:装配时 parse 一次存 ProxyUrl;代理 (host,port) 解析结果缓存。
 - [ ] b) tcp.rs:179-183 verify 在 peek 判定前就 dup 写侧 fd:明文分支先 peek 判 yamux 再 dup。
 - [ ] c) quic.rs:375-391 connect 证书链最多 3 次深拷:提取一次复用。
 
 ### L-F 存量正确性(3 条,低频触发)
-- [x] 状态:b 完成 @ 673b290(v1 非法行+v2 丢源双缺陷,生产唯一调用方即此形态);a/c 延期
+- [ ] 状态(部分):b 完成 @ 673b290(v1 非法行+v2 丢源双缺陷,生产唯一调用方即此形态);a/c 延期
 > 处置:b) unify_family 同族合成+显式 warn,测试解析器补无括号 v6;a) http_connect 残余字节前转、c) login_limiter 键收缩未及做。
 - [ ] a) proxy_dial.rs:143-168 http_connect 丢弃 CONNECT 终止符后残余字节(server-first 协议丢首段):记录命中下标,残余经 PrependedIo 前传。
 - [ ] b) rh-core/proxyproto.rs:33-51 混族地址(v6 源+硬编码 v4 dst)静默 UNSPEC 丢源地址:dst 按源同族合成或透传真实地址;混族 warn。
 - [ ] c) api.rs:124-149 login_limiter_user 键含用户名单调增长:去用户名维度或定期收缩。
 
 ### L-G 杂项(4 条)
+- [ ] 状态:**未处置**(2026-11-03 收口核查补记:本包此前是全文件唯一没有处置说明的包,四条现场均在、行号有漂移)。留待下一轮。
+> 核查(2026-11-03):a) 现场漂至 `api.rs:3271-3293`(put_server_config 持久化段 `hot.read()` 跨 `spawn_blocking` await);b) `vhost.rs` 现场:host 解析 `to_lowercase()`(~:321)、`send_start_forward` 的 `peer.to_string()`(~:496)、x-real-ip / x-forwarded-for 每请求 `format!`/`to_string()`(~:524-535);c) `main.rs` `TlsListener::accept` 内联握手仍在,仅 10s 超时(~:583-607);d) `visitor.rs` 未命中路径仍全量 `list_visitors` + `list_proxies`(~:43-67)。
 - [ ] a) api.rs:2779-2812 put_server_config 持 hot 读锁跨 spawn_blocking await:块内提取完快照 drop(hot) 再阻塞写。
 - [ ] b) vhost.rs:318-327/493/520-531 每请求 3-4 次 host/IP 格式化分配:连接级预计算(x-real-ip 头值、peer 串、START_FORWARD user_src)。
 - [ ] c) main.rs:552-584 D-13 完整收尾:握手移出 accept 循环进每连接任务(lazy-TlsStream),消除 10s 队头阻塞残余。
 - [ ] d) visitor.rs:29-85 visitor_cache 未命中路径两次按客户端全量查询内联控制读循环:命中路径 C1 已优化,未命中侧至少把 list_proxies 投影化。
 
 ### L-H 核心库(4 条)
-- [x] 状态:c/d 完成 @ 673b290(首轮漏收已补);a 延期;b 记 not-supported §12
+- [ ] 状态(部分):c/d 完成 @ 673b290(首轮漏收已补);a 延期;b 记 not-supported §12
 > 处置:c) write_frame 栈头+write_vectored —— ⚠ b44fae0 首版对全部底层无条件两段写,三机 tcp 候选轮实测 4096 并发建连撕帧(控制流 bad magic,隧道 verified 4096→1611→76 逐轮恶化;kcp 轮与 tcp 基线全过);76ece9f 修复:仅 is_write_vectored 底层走 writev,其余逐字节回落整帧单段,附回归测试。d) encode_v1 栈上 fmt/encode_v2 无中间 Vec;b) 限速桶 per-connection 语义(TCP)/per-rule(UDP)不一致,改共享桶属用户可见行为变化,not-supported §12 交独立设计决策;a) certprov 双拷贝+HKDF 缓存未及做。
 - [ ] a) certprov.rs:64-97 双拷贝 + 每连接重复 HKDF:SealedCert 按值收、truncate 复用缓冲、derive_key 按 secret 缓存。
 - [ ] b) bandwidth.rs:26 每连接重解析(eq_ignore_ascii_case 零分配)+ 调用方物化一次;**先确认规则桶 per-connection 语义是否本意**(TCP 每连接各一份桶 vs UDP 按规则共享,不一致)——非本意则改为规则级共享桶,是本意则记 not-supported.md。

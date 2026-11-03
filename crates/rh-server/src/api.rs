@@ -5248,8 +5248,9 @@ mod secret_key_management_tests {
     //!
     //! 这里直接驱动 `create_service_inner` / `rotate_service_secret`,断言落在
     //! 「库里存的是什么」—— 这是密钥语义的**唯一事实源**(转发时用的就是它)。
-    //! e2e 侧改为验证它仍能验证的、外部可观察的性质(列表不回显),见
-    //! `tests/e2e.sh` 的 STCP 段。
+    //! e2e 侧改为验证它仍能验证的、外部可观察的性质(列表不回显;M8 投影
+    //! 化后口径再收紧为「列表响应不携带 spec 段」),见 `tests/e2e.sh` 的
+    //! STCP 段。
     use super::*;
 
     const CID: &str = "secret-mgmt-client";

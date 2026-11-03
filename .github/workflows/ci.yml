@@ -7,10 +7,12 @@
 # 观测量。此前 `release.yml` 只构建、不测试,这条用例在 CI 里从未执行过 ——
 # 也就是说那个修复在 CI 上**零覆盖**,回归了也没人知道。
 #
-# 本 workflow 有两个 job:
+# 本 workflow 有三个 job:
 # * `test`(Linux x86_64):执行测试与 clippy —— release.yml 只构建不测试;
 # * `windows-check`(Windows x86_64):**只做编译检查,不跑测试**。
 #   见该 job 内的说明(v0.4.0 的 msvc 目标曾同时红)。
+# * `cli-go`(Linux):`cli/rhctl` 的 gofmt / go vet / go build / go test
+#   (交叉编译不进 CI,见该 job 内说明)。
 #
 # 含 `cargo fmt --check`:仓库已在 `f25f0ff` 做过一次纯格式化提交
 # (登记在 `.git-blame-ignore-revs`),现在格式化是干净的,门禁可以上线。
