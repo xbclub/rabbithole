@@ -90,11 +90,16 @@ jobs:
       - name: Build(aarch64 gnu / cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cross build --release --target ${{ matrix.target }} -p rh-server -p rh-client
+      - name: 安装 zig(x86_64 gnu 专用)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: mlugg/setup-zig@v1
+        with:
+          zig-version: 0.14.1
       - name: 安装 zigbuild(x86_64 gnu,zig 链接钉 glibc 2.17)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: taiki-e/install-action@v2
         with:
-          tool: zig,cargo-zigbuild
+          tool: cargo-zigbuild
       - name: Build(x86_64 gnu / zigbuild)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
