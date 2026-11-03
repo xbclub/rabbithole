@@ -53,11 +53,16 @@
 **结论**:① **主路径无回归** —— new 的全部指标(吞吐/延迟 p50/p99/UDP/
 并发 64–4096 全 verified/建连/HTTP vhost)落在同二进制日方差带内(两个
 musl 轮自身在 4流上档差 7%);② 单流 +7~9% 当时归因为 musl→gnu,**
-v0.8.1 复测推翻了 libc 归因**:cross 构建的 gnu Release 产物单流 2469/2438,
-与 cross 构建的 musl 产物(2473/2475)持平,未复现原生 gnu 构建的 2639–2711。
-修正后的判别变量是 **cross 容器构建 vs 原生构建**(同 rustc 1.98.1、运行时
-同为 ubuntu glibc,只剩 cross 容器的 gcc/ld 与原生工具链的代码布局差异)。
-v0.8.2 起 x86_64-linux-gnu 改 runner 原生构建,验证产物能否兑现该收益;③
+后续三轮复测推翻并彻底闭合了这条线**:cross-gnu(v0.8.1 产物,2469/2438)、
+zigbuild 钉 glibc2.17(2526/2205,还更差)都与 cross-musl(2473/2475)等价
+或更差,未复现原生构建的 2639–2711;v0.8.2 的 runner 原生构建确实换到了
+原生工具链,但产物钉上 GLIBC_2.38(Ubuntu 22.04/Debian 12/RHEL 9 拒跑,
+基准三机 22.04 直接无法验证)。判别变量是 **原生构建环境 vs 交叉构建环境**
+(同 rustc 1.98.1、gnu 产物运行时同为 ubuntu glibc,差异只剩链接器/工具链
+的代码布局),该差异**无法在不钉新 glibc 的前提下发版兑现**。
+**定论(v0.8.3 起)**:可发版的三种工具链(cross-musl/cross-gnu/zig)
+性能等价或更差,musl 静态兼容面最广,linux 产物回 musl,勿再凭
+「gnu 更快」的印象切换;③
 P1 改动的五组次级路径(vhost HTTPS/
 CONNECT/tcpmux、stcp/sudp、客户端 tcpmux)本套件无场景,套件级收益未测,
 由 9 组探针/计量等价测试背书;补测路径见

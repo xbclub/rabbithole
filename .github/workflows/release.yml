@@ -2,8 +2,9 @@
 # 1) console/ 构建前端产物(供 rust-embed 内嵌,一次构建全矩阵复用)
 # 2) 6 目标矩阵编译 rh-server + rh-client(Windows zip,其余 tar.gz)
 # 3) rhctl CLI 六平台交叉编译(Go,单 runner;独立 job,不碰 Rust 矩阵)
-# 4) linux gnu 二进制打包多架构 Docker 镜像(debian-slim 基座;免 QEMU:每架构单平台构建 + manifest 合并),推 ghcr.io
-#    (2026-11-03 起弃 musl:三机实测 musl 产物单流比 gnu 慢 ~7-9%,性能优先)
+# 4) linux musl 静态二进制打包多架构 Docker 镜像(免 QEMU:每架构单平台构建 + manifest 合并),推 ghcr.io
+#    (2026-11-04 回归 musl:cross-gnu/zig 实测与 cross-musl 性能等价或更差,
+#     原生构建的 +7-9% 单流只存在于原生环境且会钉 GLIBC_2.38,见 benchmark/README)
 # 5) 全部归档 + sha256 发布到 GitHub Release
 name: release
 
@@ -53,8 +54,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
           - { os: windows-latest, target: aarch64-pc-windows-msvc }
           - { os: macos-latest, target: x86_64-apple-darwin }
@@ -76,49 +77,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # linux gnu 拆两路:aarch64 用 cross(必须交叉);x86_64 用 cargo-zigbuild
-      # —— 2026-11-03 三机实测:同 rustc(1.98.1)同 libc 下,test1 原生构建
-      # 单流比 cross 容器构建快 ~7-9%(链接器/工具链的代码布局差异),但
-      # runner 原生构建会钉上 GLIBC_2.38(v0.8.2 在 Ubuntu 22.04 上直接拒跑)。
-      # zigbuild 折中:rustc 原生跑,链接用 zig 并钉 glibc 2.17 —— 兼容面
-      # 与 cross 持平,布局是否兑现原生性能以产物基准为准(v0.8.3 验证)。
-      - name: 安装 cross(aarch64 交叉编译)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      # musl 静态:任意发行版直接跑,镜像可挂 alpine。gnu 曾于 2026-11-03
+      # 试过(cross/zigbuild/原生三形态),实测 cross/zig 与 musl 等价或更差、
+      # 原生钉 GLIBC_2.38,证据链见 benchmark/README「次级数据面快路径
+      # P1 回归验证」节,勿凭印象再切。
+      - name: 安装 cross(musl 交叉编译)
+        if: runner.os == 'Linux'
         uses: taiki-e/install-action@v2
         with:
           tool: cross
-      - name: Build(aarch64 gnu / cross)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Build(Linux musl / cross)
+        if: runner.os == 'Linux'
         run: cross build --release --target ${{ matrix.target }} -p rh-server -p rh-client
-      - name: 安装 zig(x86_64 gnu 专用)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          set -euo pipefail
-          # 直接从官方 index.json 取最新稳定版:第三方镜像对旧版本 404,
-          # setup-zig 的镜像重试链一次能烧掉十几分钟 CI 时间。
-          curl -sS https://ziglang.org/download/index.json -o /tmp/zig-index.json
-          VER=$(jq -r 'keys | map(select(. != "master")) | sort_by(split(".") | map(tonumber? // 0)) | last' /tmp/zig-index.json)
-          URL=$(jq -r ".[\"$VER\"][\"x86_64-linux\"][\"tarball\"]" /tmp/zig-index.json)
-          echo "zig $VER <- $URL"
-          curl -sSL "$URL" -o /tmp/zig.tar.xz
-          mkdir -p "$HOME/.zig-toolchain" && tar -xJf /tmp/zig.tar.xz -C "$HOME/.zig-toolchain"
-          echo "$HOME/.zig-toolchain/$(basename "$URL" .tar.xz)" >> "$GITHUB_PATH"
-      - name: 安装 zigbuild(x86_64 gnu,zig 链接钉 glibc 2.17)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
-      - name: Build(x86_64 gnu / zigbuild)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17 -p rh-server -p rh-client
-          # zigbuild 产物落在 target/<triple>/release(实测不带 .2.17 后缀);
-          # 带后缀的旧目录形态保留兜底,同路径跳过避免 cp 报错。
-          if [ -d "target/x86_64-unknown-linux-gnu.2.17/release" ]; then
-            cp -f target/x86_64-unknown-linux-gnu.2.17/release/rh-server \
-                  target/x86_64-unknown-linux-gnu.2.17/release/rh-client \
-                  "target/${{ matrix.target }}/release/"
-          fi
       - name: Build(native)
         if: runner.os != 'Linux'
         run: cargo build --release --target ${{ matrix.target }} -p rh-server -p rh-client
@@ -237,11 +207,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          name: bin-x86_64-unknown-linux-gnu
+          name: bin-x86_64-unknown-linux-musl
           path: bin/amd64
       - uses: actions/download-artifact@v8
         with:
-          name: bin-aarch64-unknown-linux-gnu
+          name: bin-aarch64-unknown-linux-musl
           path: bin/arm64
       # artifact 传输不保留权限位,恢复可执行(Dockerfile 侧另有 COPY --chmod=755 兜底)
       - name: 恢复二进制可执行位

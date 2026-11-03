@@ -62,15 +62,7 @@ case "$MACHINE" in
   *) echo "不支持的架构:$MACHINE(发布包仅覆盖 amd64/arm64)" >&2; exit 1 ;;
 esac
 case "$(uname -s)" in
-  Linux)  TARGET="$ARCH-unknown-linux-gnu"
-          # 2026-11-03 起 linux 产物由 musl 切 gnu(实测 musl 单流慢 ~7-9%,性能优先)。
-          # gnu 动态链接需要 glibc;Alpine 等 musl 主机装不上,指到 Docker 镜像。
-          if [ -f /etc/alpine-release ]; then
-            echo "检测到 Alpine(musl):gnu 二进制无法直接运行,请使用 Docker 镜像 ghcr.io/xbclub/rabbithole(-client)" >&2
-            exit 1
-          fi
-          command -v ldd >/dev/null 2>&1 && ! ldd --version 2>/dev/null | grep -q musl || {
-            echo "无法确认 glibc(ldd 缺失或为 musl):gnu 二进制需要 glibc 环境" >&2; exit 1; } ;;
+  Linux)  TARGET="$ARCH-unknown-linux-musl" ;;
   Darwin) TARGET="$ARCH-apple-darwin"; echo "注意:macOS 无 systemd,仅安装二进制与凭据,末尾打印手动运行指引" >&2 ;;
   *) echo "不支持的系统:$(uname -s),请到 Releases 手动下载" >&2; exit 1 ;;
 esac
