@@ -76,10 +76,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # linux gnu 拆两路:aarch64 用 cross(必须交叉);x86_64 走 runner 原生
-      # 构建 —— 2026-11-03 三机实测:同 rustc(1.98.1)同 libc 下,原生构建
-      # 单流比 cross 容器构建快 ~7-9%(cross 的 gcc/ld 与原生工具链的代码
-      # 布局差异),产物性能优先,x86_64 不再过 cross。
+      # linux gnu 拆两路:aarch64 用 cross(必须交叉);x86_64 用 cargo-zigbuild
+      # —— 2026-11-03 三机实测:同 rustc(1.98.1)同 libc 下,test1 原生构建
+      # 单流比 cross 容器构建快 ~7-9%(链接器/工具链的代码布局差异),但
+      # runner 原生构建会钉上 GLIBC_2.38(v0.8.2 在 Ubuntu 22.04 上直接拒跑)。
+      # zigbuild 折中:rustc 原生跑,链接用 zig 并钉 glibc 2.17 —— 兼容面
+      # 与 cross 持平,布局是否兑现原生性能以产物基准为准(v0.8.3 验证)。
       - name: 安装 cross(aarch64 交叉编译)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         uses: taiki-e/install-action@v2
@@ -88,8 +90,25 @@ jobs:
       - name: Build(aarch64 gnu / cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cross build --release --target ${{ matrix.target }} -p rh-server -p rh-client
+      - name: 安装 zigbuild(x86_64 gnu,zig 链接钉 glibc 2.17)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: zig,cargo-zigbuild
+      - name: Build(x86_64 gnu / zigbuild)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17 -p rh-server -p rh-client
+          # zigbuild 的产物目录可能带或不带 .2.17 后缀,统一归位到打包步骤
+          # 期望的 target/<triple>/release/
+          mkdir -p "target/${{ matrix.target }}/release"
+          for d in "target/x86_64-unknown-linux-gnu.2.17/release" "target/${{ matrix.target }}/release"; do
+            for b in rh-server rh-client; do
+              [ -x "$d/$b" ] && cp -f "$d/$b" "target/${{ matrix.target }}/release/$b"
+            done
+          done
       - name: Build(native)
-        if: runner.os != 'Linux' || matrix.target == 'x86_64-unknown-linux-gnu'
+        if: runner.os != 'Linux'
         run: cargo build --release --target ${{ matrix.target }} -p rh-server -p rh-client
 
       - name: 打包 tar.gz
