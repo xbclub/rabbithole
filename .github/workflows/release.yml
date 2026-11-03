@@ -2,7 +2,8 @@
 # 1) console/ 构建前端产物(供 rust-embed 内嵌,一次构建全矩阵复用)
 # 2) 6 目标矩阵编译 rh-server + rh-client(Windows zip,其余 tar.gz)
 # 3) rhctl CLI 六平台交叉编译(Go,单 runner;独立 job,不碰 Rust 矩阵)
-# 4) linux musl 静态二进制打包多架构 Docker 镜像(免 QEMU:每架构单平台构建 + manifest 合并),推 ghcr.io
+# 4) linux gnu 二进制打包多架构 Docker 镜像(debian-slim 基座;免 QEMU:每架构单平台构建 + manifest 合并),推 ghcr.io
+#    (2026-11-03 起弃 musl:三机实测 musl 产物单流比 gnu 慢 ~7-9%,性能优先)
 # 5) 全部归档 + sha256 发布到 GitHub Release
 name: release
 
@@ -52,8 +53,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
           - { os: windows-latest, target: aarch64-pc-windows-msvc }
           - { os: macos-latest, target: x86_64-apple-darwin }
@@ -75,12 +76,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: 安装 cross(musl 交叉编译)
+      # gnu 目标统一走 cross:镜像自带老 glibc 基线工具链,产物兼容面比
+      # runner 原生构建更宽(旧发行版也能跑),且 aarch64 本就需要交叉编译
+      - name: 安装 cross(linux gnu 交叉编译)
         if: runner.os == 'Linux'
         uses: taiki-e/install-action@v2
         with:
           tool: cross
-      - name: Build(Linux musl / cross)
+      - name: Build(Linux gnu / cross)
         if: runner.os == 'Linux'
         run: cross build --release --target ${{ matrix.target }} -p rh-server -p rh-client
       - name: Build(native)
@@ -201,11 +204,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          name: bin-x86_64-unknown-linux-musl
+          name: bin-x86_64-unknown-linux-gnu
           path: bin/amd64
       - uses: actions/download-artifact@v8
         with:
-          name: bin-aarch64-unknown-linux-musl
+          name: bin-aarch64-unknown-linux-gnu
           path: bin/arm64
       # artifact 传输不保留权限位,恢复可执行(Dockerfile 侧另有 COPY --chmod=755 兜底)
       - name: 恢复二进制可执行位

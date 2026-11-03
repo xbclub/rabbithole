@@ -80,7 +80,8 @@
 `cli`(rhctl 六平台,Go 交叉编译,单 ubuntu runner,不碰 Rust 矩阵)→
 `docker`(ghcr.io 多架构镜像)→ `release`(GitHub Release + 附件)。
 
-平台:`x86_64`/`aarch64` × `linux-musl`/`apple-darwin`/`pc-windows-msvc`,
+平台:`x86_64`/`aarch64` × `linux-gnu`/`apple-darwin`/`pc-windows-msvc`
+(2026-11-03 起 linux 由 musl 切 gnu:三机实测 musl 单流慢 ~7-9%,性能优先;基准拉产物用 `-p "*x86_64-unknown-linux-gnu*"`),
 每个带 `.sha256`。Windows 目标编译较慢(约 10 分钟,其余 2~3 分钟);
 rhctl 归档命名是 `rhctl-<版本>-<os>-<arch>`(Go 生态惯例,非 Rust 三元组),
 版本号由流水线 `-ldflags` 从 git 标签注入 —— **不需要第三处版本登记位**
@@ -269,7 +270,7 @@ loadgen src ───────►  转发口 20001..  ──隧道──►  
    >
    > ```bash
    > gh release download vX.Y.Z -R xbclub/rabbithole -D /tmp/rel-vX.Y.Z \
-   >   -p "*x86_64-unknown-linux-musl*"
+   >   -p "*x86_64-unknown-linux-gnu*"
    > cd /tmp/rel-vX.Y.Z && shasum -a 256 -c *.sha256 && tar xzf *.tar.gz
    > ```
    >

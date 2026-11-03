@@ -224,7 +224,7 @@ hardware_cap=… server_cap=… initial_k=… final_k=… shard_workers=…`;
 
 转发端口段(默认 20000-21000)按需追加 `-p` 映射;生产请置于反向代理 + HTTPS 之后。
 也可自行构建:`deploy/Dockerfile`(server)与 `deploy/Dockerfile.client`(client)
-(打包 musl 静态二进制,无 RUN 步骤,本地构建方式见文件头注释)。
+(打包 linux gnu 二进制,debian-slim 基座,无 RUN 步骤,本地构建方式见文件头注释)。
 
 ## CLI 控制端(rhctl)
 
@@ -253,7 +253,8 @@ git tag v0.1.0 && git push origin v0.1.0
 
 - **二进制归档**:Windows(zip)/ Linux / macOS(tar.gz)× x86_64 / arm64 共 6 目标,
   每个含 rh-server、rh-client、示例配置与 sha256,发布到 GitHub Release
-  (Linux 为 musl 静态链接,任意发行版可直接运行)
+  (Linux 为 gnu 动态链接,cross 老基线 glibc 工具链构建,主流发行版可直接运行;
+  Alpine 等 musl 发行版请用 Docker 镜像——2026-11-03 起 musl 产物因性能退役,实测慢 ~7-9%)
 - **rhctl CLI 归档**(v0.7.0 起):`rhctl-<版本>-<os>-<arch>` 六平台
   (Go 交叉编译),含单二进制、README 与面向 AI agent 的 SKILL.md
 - **Docker 镜像**:`ghcr.io/xbclub/rabbithole:<tag>` 与 `:latest`(amd64 + arm64)
