@@ -52,10 +52,13 @@
 
 **结论**:① **主路径无回归** —— new 的全部指标(吞吐/延迟 p50/p99/UDP/
 并发 64–4096 全 verified/建连/HTTP vhost)落在同二进制日方差带内(两个
-musl 轮自身在 4流上档差 7%);② 单流 +7~9% 是 **musl→gnu 工具链效应**
-(gnu 两轮都高于 musl 两轮,src 与 new 之间 ≤3% 且样本重叠 → 无代码效应)。
-附带观察:linux x86_64 的 musl Release 产物单流比 gnu 慢 ~7–9%(是否改发
-gnu 涉及静态可移植性,另行决策);③ P1 改动的五组次级路径(vhost HTTPS/
+musl 轮自身在 4流上档差 7%);② 单流 +7~9% 当时归因为 musl→gnu,**
+v0.8.1 复测推翻了 libc 归因**:cross 构建的 gnu Release 产物单流 2469/2438,
+与 cross 构建的 musl 产物(2473/2475)持平,未复现原生 gnu 构建的 2639–2711。
+修正后的判别变量是 **cross 容器构建 vs 原生构建**(同 rustc 1.98.1、运行时
+同为 ubuntu glibc,只剩 cross 容器的 gcc/ld 与原生工具链的代码布局差异)。
+v0.8.2 起 x86_64-linux-gnu 改 runner 原生构建,验证产物能否兑现该收益;③
+P1 改动的五组次级路径(vhost HTTPS/
 CONNECT/tcpmux、stcp/sudp、客户端 tcpmux)本套件无场景,套件级收益未测,
 由 9 组探针/计量等价测试背书;补测路径见
 `docs/perf-secondary-fastpath-p2p3c.md` §1.7(peer.sh `PEER_SCENARIOS` 扩展)。

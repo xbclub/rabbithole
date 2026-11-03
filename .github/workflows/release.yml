@@ -76,18 +76,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # gnu 目标统一走 cross:镜像自带老 glibc 基线工具链,产物兼容面比
-      # runner 原生构建更宽(旧发行版也能跑),且 aarch64 本就需要交叉编译
-      - name: 安装 cross(linux gnu 交叉编译)
-        if: runner.os == 'Linux'
+      # linux gnu 拆两路:aarch64 用 cross(必须交叉);x86_64 走 runner 原生
+      # 构建 —— 2026-11-03 三机实测:同 rustc(1.98.1)同 libc 下,原生构建
+      # 单流比 cross 容器构建快 ~7-9%(cross 的 gcc/ld 与原生工具链的代码
+      # 布局差异),产物性能优先,x86_64 不再过 cross。
+      - name: 安装 cross(aarch64 交叉编译)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         uses: taiki-e/install-action@v2
         with:
           tool: cross
-      - name: Build(Linux gnu / cross)
-        if: runner.os == 'Linux'
+      - name: Build(aarch64 gnu / cross)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cross build --release --target ${{ matrix.target }} -p rh-server -p rh-client
       - name: Build(native)
-        if: runner.os != 'Linux'
+        if: runner.os != 'Linux' || matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo build --release --target ${{ matrix.target }} -p rh-server -p rh-client
 
       - name: 打包 tar.gz

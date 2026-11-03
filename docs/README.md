@@ -69,7 +69,7 @@
 | [rtt-probe-boundaries.md](rtt-probe-boundaries.md) | RTT 自适应探针三个边界问题 | 已落地 |
 | [scale-inefficiency-fixes.md](scale-inefficiency-fixes.md) | `apply_sync` O(N²) 与 waiting 表 | 已落地 |
 | [visitor-mux-relay.md](visitor-mux-relay.md) | visitor 数据面零拷贝 mux 中继 | 已落地 |
-| [perf-secondary-fastpath-p2p3c.md](perf-secondary-fastpath-p2p3c.md) | P1(e476165)次日:P2 mux↔mux 零拷贝泵 / P3 通用 copy 泵升级 / 非 Linux 裸模式形态 C 三案实施设计,附 P1 三机回归基准摘要(无回归;单流差异为 musl/gnu 工具链效应) | 方案(未实施) |
+| [perf-secondary-fastpath-p2p3c.md](perf-secondary-fastpath-p2p3c.md) | P1(e476165)次日:P2 mux↔mux 零拷贝泵 / P3 通用 copy 泵升级 / 非 Linux 裸模式形态 C 三案实施设计,附 P1 三机回归基准摘要(无回归;单流差异后修正为 cross/原生构建效应,见 benchmark/README) | 方案(未实施) |
 | [pump-down-loop-gap-shadowing.md](pump-down-loop-gap-shadowing.md) | `pump_down` 变量遮蔽缺陷 | 已修 |
 | [mux-stream-limit-investigation.md](mux-stream-limit-investigation.md) | mux 并发流上限**不该**加到客户端 | 结论:不改 |
 | [single-carrier-bottleneck-summary.md](single-carrier-bottleneck-summary.md) | 单载体/多载体瓶颈实测结论:K 的最优值取决于 BDP,低延迟下 K=1 更快 | 参考 |

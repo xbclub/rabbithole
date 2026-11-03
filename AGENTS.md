@@ -81,7 +81,7 @@
 `docker`(ghcr.io 多架构镜像)→ `release`(GitHub Release + 附件)。
 
 平台:`x86_64`/`aarch64` × `linux-gnu`/`apple-darwin`/`pc-windows-msvc`
-(2026-11-03 起 linux 由 musl 切 gnu:三机实测 musl 单流慢 ~7-9%,性能优先;基准拉产物用 `-p "*x86_64-unknown-linux-gnu*"`),
+(2026-11-03 起 linux 由 musl 切 gnu,后续复测修正归因:单流差异真源是 cross 容器构建 vs 原生构建而非 libc,v0.8.2 起 x86_64-linux-gnu 走 runner 原生构建;基准拉产物用 `-p "*x86_64-unknown-linux-gnu*"`),
 每个带 `.sha256`。Windows 目标编译较慢(约 10 分钟,其余 2~3 分钟);
 rhctl 归档命名是 `rhctl-<版本>-<os>-<arch>`(Go 生态惯例,非 Rust 三元组),
 版本号由流水线 `-ldflags` 从 git 标签注入 —— **不需要第三处版本登记位**
