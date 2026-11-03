@@ -941,9 +941,9 @@ async fn serve_https(
         return Ok(()); // F2 配额超限
     };
     let sock = crate::data::CountedUserIo::user(sock, &state, Some(rt.clone()));
-    let _ =
-        crate::data::copy_bidirectional_bounded(Box::new(sock) as rh_transport::BoxedIo, channel)
-            .await;
+    // S2a:次级数据面接线 —— chunk 快路径(与主路径 assign_forward 同构),
+    // 未命中/禁用(kill-switch=0)回落 copy_bidirectional_bounded(现状行为)。
+    crate::data::relay_user_channel(&state, &rt, sock, channel).await;
     Ok(())
 }
 
@@ -1228,11 +1228,8 @@ async fn serve_tcpmux(
             return Ok(()); // F2 配额超限
         };
         let sock = crate::data::CountedUserIo::user(sock, &state, Some(rt.clone()));
-        let _ = crate::data::copy_bidirectional_bounded(
-            Box::new(sock) as rh_transport::BoxedIo,
-            channel,
-        )
-        .await;
+        // S2b:CONNECT 直通(透传模式)接线,与 serve_https(S2a)同式。
+        crate::data::relay_user_channel(&state, &rt, sock, channel).await;
         return Ok(());
     }
     // 标准模式:服务端在用户连接上终结 yamux,每个入站流 = 一次独立数据通道转发
@@ -1268,11 +1265,10 @@ async fn serve_tcpmux(
                     None => return, // F2 配额超限
                 };
                 let stream = crate::data::CountedUserIo::user(stream, &st2, Some(rt2.clone()));
-                let _ = crate::data::copy_bidirectional_bounded(
-                    Box::new(stream) as rh_transport::BoxedIo,
-                    ch,
-                )
-                .await;
+                // S3a:tcpmux 标准模式每流接线(user 位=mux 流计量包装,
+                // channel 位=签发通道)。spec 由 relay_user_channel 内部
+                // 自读 rt2.spec,上方 spec 仅继续供 send_start_forward 使用。
+                crate::data::relay_user_channel(&st2, &rt2, stream, ch).await;
             }
         });
     }
@@ -1827,5 +1823,403 @@ mod tests {
              (修前 &mut buf[read..] 会把流头写进错位位置导致返回 None)"
         );
         writer.abort();
+    }
+
+    // ================= S2/S3 调用点直驱(chunk 探针 + copy 反向)=================
+    //
+    // 复审要求:接线点必须有**调用点级**探针——data.rs relay_user_channel
+    // 入口直测复刻的包装链发现不了「生产交付链形态漂移」(如 get_channel
+    // 交付链多一层壳 → is_mux_stream 恒 miss → chunk 永不命中的静默失效)。
+    // 下面三个用例组都走**生产路径**:真 ClientHello/CONNECT 解析 → 路由表
+    // → get_channel 从池取 route_data_stream 形态的 QuotaIo 包装通道 →
+    // send_start_forward → relay_user_channel 接线点。
+
+    /// 调用点直驱共用 state(relay_mode 参数化:chunk 档 "splice" / copy 反向档 "copy")。
+    async fn call_site_state(relay_mode: &str) -> Arc<AppState> {
+        let cfg = crate::config::ServerConfig {
+            relay_mode: relay_mode.to_string(),
+            ..crate::config::ServerConfig::default()
+        };
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        Arc::new(AppState::new(cfg, db))
+    }
+
+    fn relay_path_count(state: &Arc<AppState>, path: &str) -> u64 {
+        state
+            .metrics
+            .relay_path_total
+            .with_label_values(&[path])
+            .get()
+    }
+
+    /// https 透传规则(SNI 域名路由)。
+    fn https_spec() -> rh_protocol::ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "id": 5001,
+            "name": "https-callsite",
+            "kind": "https",
+            "client_id": "cid",
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "https": { "custom_domains": ["t.example.com"] },
+        }))
+        .unwrap()
+    }
+
+    /// tcpmux 规则(CONNECT host 路由)。
+    fn tcpmux_spec(id: u64, domain: &str) -> rh_protocol::ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": "tcpmux-callsite",
+            "kind": "tcpmux",
+            "client_id": "cid",
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+            "tcpmux": { "custom_domains": [domain] },
+        }))
+        .unwrap()
+    }
+
+    /// 注册规则 + 会话 + 池内一条通道(复刻生产交付链:route_data_stream
+    /// 以 QuotaIo 包装 → tcp_on_channel 入池 → get_channel 取出)。
+    /// 返回测试持有的通道对端(mux client open 流)。
+    async fn armed_env(
+        state: &Arc<AppState>,
+        spec: rh_protocol::ProxySpec,
+    ) -> (
+        Arc<ProxyRuntime>,
+        Arc<crate::session::Session>,
+        rh_transport::BoxedIo,
+    ) {
+        let rt = Arc::new(ProxyRuntime::new(spec.id, "cid".to_string(), spec));
+        state.proxies.runtimes.insert(rt.id, rt.clone());
+        state.proxies.rebuild_vhost_routes().await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let sess = crate::session::Session::new(
+            "cid".into(),
+            "sid".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        );
+        state.sessions.register(sess.clone());
+        *rt.pool.lock().await = Some(Arc::new(crate::state::TcpPool::new(4)));
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let server = rh_transport::wrap_stream_as_server(Box::new(b), true, 64);
+        let client = rh_transport::wrap_stream_as_client(Box::new(a), true, 64);
+        let chan_peer = client.open_stream().await.unwrap();
+        let s = server.accept().await.unwrap();
+        // route_data_stream:1145 同款(计数 +1 随 QuotaIo 释放递减)
+        sess.data_conn_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pool = rt.pool.lock().await.clone().unwrap();
+        // epoch 必须等于会话 epoch(claim_pool 会按它清退旧条目)
+        pool.ready
+            .lock()
+            .await
+            .push_back((1, 7, crate::control::QuotaIo::new(s, sess.clone())));
+        (rt, sess, chan_peer)
+    }
+
+    /// 真 TCP 用户连接对(serve_https/serve_tcpmux 收 TcpStream)。
+    async fn user_tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream, SocketAddr) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let user = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server_side, peer) = listener.accept().await.unwrap();
+        (user, server_side, peer)
+    }
+
+    /// 通道对端收指派帧(START_FORWARD)并校验类型。
+    async fn expect_start_forward(chan: &mut rh_transport::BoxedIo) {
+        let mut rbuf = bytes::BytesMut::new();
+        let (fty, _payload) = rh_protocol::read_frame(chan, &mut rbuf)
+            .await
+            .expect("指派帧必须到达");
+        assert_eq!(
+            fty,
+            rh_protocol::FrameType::START_FORWARD,
+            "交付链必须先送达 START_FORWARD"
+        );
+    }
+
+    /// S2a 调用点直驱:真 ClientHello(SNI 命中 t.example.com)→ 生产
+    /// get_channel 交付链 → serve_https 接线点。返回 (chunk 增量, copy 增量)。
+    async fn https_call_site_case(relay_mode: &'static str) -> (u64, u64) {
+        let state = call_site_state(relay_mode).await;
+        let (_rt, sess, mut chan) = armed_env(&state, https_spec()).await;
+        let chunk0 = relay_path_count(&state, "chunk");
+        let copy0 = relay_path_count(&state, "copy");
+
+        let (mut user, server_side, peer) = user_tcp_pair().await;
+        let st = state.clone();
+        let mut serve = tokio::spawn(async move { serve_https(st, server_side, peer).await });
+
+        // 真 ClientHello:peek_sni 提取 SNI(不消费),字节由中继透传
+        let hello = client_hello(Some("t.example.com"));
+        user.write_all(&hello).await.unwrap();
+
+        expect_start_forward(&mut chan).await;
+        let mut got = vec![0u8; hello.len()];
+        chan.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, hello, "ClientHello 必须原样透传到通道(peek 不消费)");
+
+        // 反向:通道 → 用户
+        let down = b"S2a-down-payload";
+        chan.write_all(down).await.unwrap();
+        let mut dg = vec![0u8; down.len()];
+        user.read_exact(&mut dg).await.unwrap();
+        assert_eq!(dg, down, "down 方向必须穿透");
+
+        chan.shutdown().await.unwrap();
+        user.shutdown().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut serve)
+            .await
+            .expect("serve_https 必须随 relay 收敛返回")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sess.data_conn_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "serve 返回后 QuotaGuard 释放(调用点级 B1)"
+        );
+        (
+            relay_path_count(&state, "chunk") - chunk0,
+            relay_path_count(&state, "copy") - copy0,
+        )
+    }
+
+    /// S2b 调用点直驱:CONNECT 直通(passthrough=true)→ 生产交付链 →
+    /// serve_tcpmux 接线点。返回 (chunk 增量, copy 增量)。
+    async fn tcpmux_passthrough_call_site_case(relay_mode: &'static str) -> (u64, u64) {
+        let state = call_site_state(relay_mode).await;
+        let (_rt, sess, mut chan) = armed_env(&state, tcpmux_spec(5002, "m.example.com")).await;
+        let chunk0 = relay_path_count(&state, "chunk");
+        let copy0 = relay_path_count(&state, "copy");
+
+        let (mut user, server_side, peer) = user_tcp_pair().await;
+        let st = state.clone();
+        let mut serve =
+            tokio::spawn(async move { serve_tcpmux(st, server_side, peer, true).await });
+
+        // CONNECT + 同批 tail(生产:yamux 首帧残留,须回灌进通道)
+        let req = b"CONNECT m.example.com:443 HTTP/1.1\r\n\r\n";
+        let tail = b"TAIL-YAMUX-FIRST-BYTES";
+        let mut wire = req.to_vec();
+        wire.extend_from_slice(tail);
+        user.write_all(&wire).await.unwrap();
+
+        let ok200 = b"HTTP/1.1 200 Connection established\r\n\r\n";
+        let mut got200 = vec![0u8; ok200.len()];
+        user.read_exact(&mut got200).await.unwrap();
+        assert_eq!(got200, ok200, "CONNECT 必须应答 200");
+
+        expect_start_forward(&mut chan).await;
+        let mut t = vec![0u8; tail.len()];
+        chan.read_exact(&mut t).await.unwrap();
+        assert_eq!(t, tail, "CONNECT 后同批 tail 必须回灌进通道");
+
+        // up(续写)与 down 双向穿透
+        let up2 = b"S2b-up-after-tail";
+        user.write_all(up2).await.unwrap();
+        let mut ug = vec![0u8; up2.len()];
+        chan.read_exact(&mut ug).await.unwrap();
+        assert_eq!(ug, up2);
+        let down = b"S2b-down-payload";
+        chan.write_all(down).await.unwrap();
+        let mut dg = vec![0u8; down.len()];
+        user.read_exact(&mut dg).await.unwrap();
+        assert_eq!(dg, down);
+
+        chan.shutdown().await.unwrap();
+        user.shutdown().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut serve)
+            .await
+            .expect("serve_tcpmux passthrough 必须随 relay 收敛返回")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sess.data_conn_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "serve 返回后 QuotaGuard 释放(调用点级 B1)"
+        );
+        (
+            relay_path_count(&state, "chunk") - chunk0,
+            relay_path_count(&state, "copy") - copy0,
+        )
+    }
+
+    /// S3a 调用点直驱:tcpmux 标准模式(passthrough=false)—— 用户连接上
+    /// 终结 yamux,每流独立取池通道转发。返回 (chunk 增量, copy 增量)。
+    async fn tcpmux_per_stream_call_site_case(relay_mode: &'static str) -> (u64, u64) {
+        let state = call_site_state(relay_mode).await;
+        let (_rt, _sess, mut chan) = armed_env(&state, tcpmux_spec(5003, "m2.example.com")).await;
+        let chunk0 = relay_path_count(&state, "chunk");
+        let copy0 = relay_path_count(&state, "copy");
+
+        let (mut user, server_side, peer) = user_tcp_pair().await;
+        let st = state.clone();
+        let serve = tokio::spawn(async move { serve_tcpmux(st, server_side, peer, false).await });
+
+        let req = b"CONNECT m2.example.com:443 HTTP/1.1\r\n\r\n";
+        user.write_all(req).await.unwrap();
+        let ok200 = b"HTTP/1.1 200 Connection established\r\n\r\n";
+        let mut got200 = vec![0u8; ok200.len()];
+        user.read_exact(&mut got200).await.unwrap();
+        assert_eq!(got200, ok200);
+
+        // 用户侧在 TCP 上跑 yamux(生产:客户端 tcpmux 复用);开一条流
+        // = 服务端 accept 出一条流 → 每流 spawn 取池通道 → 接线点
+        let user_mux =
+            rh_transport::wrap_stream_as_client(Box::new(user) as rh_transport::BoxedIo, true, 64);
+        let stream = user_mux.open_stream().await.unwrap();
+        let (mut s_r, mut s_w) = tokio::io::split(stream);
+
+        expect_start_forward(&mut chan).await;
+        let up = b"S3a-per-stream-up";
+        s_w.write_all(up).await.unwrap();
+        let mut ug = vec![0u8; up.len()];
+        chan.read_exact(&mut ug).await.unwrap();
+        assert_eq!(ug, up, "每流 up 方向必须穿透");
+
+        let down = b"S3a-per-stream-down";
+        chan.write_all(down).await.unwrap();
+        let mut dg = vec![0u8; down.len()];
+        s_r.read_exact(&mut dg).await.unwrap();
+        assert_eq!(dg, down, "每流 down 方向必须穿透");
+
+        // 每流 relay 在 detached spawn 内:半关闭后按计数器收敛判定
+        s_w.shutdown().await.unwrap();
+        chan.shutdown().await.unwrap();
+        let expect_path = if relay_mode == "copy" {
+            "copy"
+        } else {
+            "chunk"
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let base = if relay_mode == "copy" { copy0 } else { chunk0 };
+        while relay_path_count(&state, expect_path) <= base {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "每流 relay 未在 5s 内完成路径计数({expect_path})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let d = (
+            relay_path_count(&state, "chunk") - chunk0,
+            relay_path_count(&state, "copy") - copy0,
+        );
+        // 用户侧 mux driver 持有载体 TCP,accept 循环不随流 EOF 退出;
+        // 断言已完成,直接拆除 serve 任务
+        serve.abort();
+        d
+    }
+
+    /// S2a:生产交付链必须命中 chunk(is_mux_stream 对 QuotaIo 剥壳后的
+    /// RhMuxStream 成立;任何交付链形态漂移都会在这里显红)。
+    #[tokio::test]
+    async fn serve_https_call_site_chunk_engages() {
+        let (chunk, copy) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            https_call_site_case("splice"),
+        )
+        .await
+        .expect("用例 deadline");
+        assert_eq!(
+            chunk, 1,
+            "S2a 接线点必须走 chunk(chunk={chunk}, copy={copy})"
+        );
+        assert_eq!(copy, 0, "S2a 不得回落 copy(chunk={chunk}, copy={copy})");
+    }
+
+    /// S2a copy 反向:relay_mode=copy 关闭 chunk(红线 1)。
+    #[tokio::test]
+    async fn serve_https_call_site_copy_mode_falls_back() {
+        let (chunk, copy) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            https_call_site_case("copy"),
+        )
+        .await
+        .expect("用例 deadline");
+        assert_eq!(
+            chunk, 0,
+            "copy 模式不得走 chunk(红线 1)(chunk={chunk}, copy={copy})"
+        );
+        assert_eq!(
+            copy, 1,
+            "copy 模式必须回落 copy(chunk={chunk}, copy={copy})"
+        );
+    }
+
+    /// S2b:CONNECT 直通接线点必须命中 chunk。
+    #[tokio::test]
+    async fn tcpmux_passthrough_call_site_chunk_engages() {
+        let (chunk, copy) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            tcpmux_passthrough_call_site_case("splice"),
+        )
+        .await
+        .expect("用例 deadline");
+        assert_eq!(
+            chunk, 1,
+            "S2b 接线点必须走 chunk(chunk={chunk}, copy={copy})"
+        );
+        assert_eq!(copy, 0, "S2b 不得回落 copy(chunk={chunk}, copy={copy})");
+    }
+
+    /// S2b copy 反向:relay_mode=copy 关闭 chunk(红线 1)。
+    #[tokio::test]
+    async fn tcpmux_passthrough_call_site_copy_mode_falls_back() {
+        let (chunk, copy) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            tcpmux_passthrough_call_site_case("copy"),
+        )
+        .await
+        .expect("用例 deadline");
+        assert_eq!(
+            chunk, 0,
+            "copy 模式不得走 chunk(红线 1)(chunk={chunk}, copy={copy})"
+        );
+        assert_eq!(
+            copy, 1,
+            "copy 模式必须回落 copy(chunk={chunk}, copy={copy})"
+        );
+    }
+
+    /// S3a:tcpmux 每流接线点必须命中 chunk(user=CountedUserIo<BoxedIo> 形态)。
+    #[tokio::test]
+    async fn tcpmux_per_stream_call_site_chunk_engages() {
+        let (chunk, copy) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            tcpmux_per_stream_call_site_case("splice"),
+        )
+        .await
+        .expect("用例 deadline");
+        assert_eq!(
+            chunk, 1,
+            "S3a 接线点必须走 chunk(chunk={chunk}, copy={copy})"
+        );
+        assert_eq!(copy, 0, "S3a 不得回落 copy(chunk={chunk}, copy={copy})");
+    }
+
+    /// S3a copy 反向:relay_mode=copy 关闭 chunk(红线 1)。
+    #[tokio::test]
+    async fn tcpmux_per_stream_call_site_copy_mode_falls_back() {
+        let (chunk, copy) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            tcpmux_per_stream_call_site_case("copy"),
+        )
+        .await
+        .expect("用例 deadline");
+        assert_eq!(
+            chunk, 0,
+            "copy 模式不得走 chunk(红线 1)(chunk={chunk}, copy={copy})"
+        );
+        assert_eq!(
+            copy, 1,
+            "copy 模式必须回落 copy(chunk={chunk}, copy={copy})"
+        );
     }
 }

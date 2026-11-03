@@ -9,6 +9,44 @@ use rh_transport::BoxedIo;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// S6 客户端半:RH_SECONDARY_FASTPATH=0 禁用 tcpmux passthrough 每流
+/// chunk 接线(S5)。与 rh-server data.rs secondary_fastpath_enabled 同
+/// 变量同语义(两 crate 各自 OnceLock,值恒一致);形态仿 rh-transport
+/// lib.rs halfclose_grace 的 RH_* 惯例。真值表由纯函数形态覆盖
+/// (OnceLock 进程内只解析一次,env 不可重置)。
+fn secondary_fastpath_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        secondary_fastpath_from_env(std::env::var("RH_SECONDARY_FASTPATH").ok().as_deref())
+    })
+}
+fn secondary_fastpath_from_env(v: Option<&str>) -> bool {
+    !v.map(|s| s.trim() == "0").unwrap_or(false)
+}
+
+/// S5 接线:tcpmux passthrough 每流中继(mux 流 ↔ 本地目标)。
+/// kill-switch 开 → relay_stream(mux 流命中 chunk 泵;relay_mode=copy
+/// 或 steal 失败时 relay_stream 自身回落 splice(peer, local, None),
+/// 与现状等价);关 → 现状 splice。enabled/relay_mode 参数化供探针测试。
+async fn relay_tcpmux_passthrough_stream(relay_mode: &str, stream: BoxedIo, local: BoxedIo) {
+    relay_tcpmux_passthrough_stream_impl(relay_mode, stream, local, secondary_fastpath_enabled())
+        .await
+}
+async fn relay_tcpmux_passthrough_stream_impl(
+    relay_mode: &str,
+    stream: BoxedIo,
+    local: BoxedIo,
+    enabled: bool,
+) {
+    if enabled {
+        // bucket=None 与现状 splice(stream, local, None) 同式:该点本就
+        // 无规则级限速,relay_stream 的 mux_relay/splice 回落恒传 None。
+        relay_stream(stream, local, relay_mode).await;
+    } else {
+        splice(stream, local, None).await;
+    }
+}
+
 /// TCP 语义数据通道:按 START_FORWARD 自包含指派桥接本地。
 pub async fn handle_start_forward(
     sess: Arc<ClientSession>,
@@ -45,7 +83,10 @@ pub async fn handle_start_forward(
                 let s2 = sess.clone();
                 tokio::spawn(async move {
                     if let Ok(local) = dial_target(&s2, &spec2, &fwd2).await {
-                        splice(stream, local, None).await;
+                        // S5:mux 流走 relay_stream 的 chunk 快路径(与
+                        // visitor_run.rs 同式访问 cfg.relay_mode);kill-switch=0
+                        // 或 relay_mode=copy 时回落现状 splice(stream, local, None)。
+                        relay_tcpmux_passthrough_stream(&s2.cfg.relay_mode, stream, local).await;
                     }
                 });
             }
@@ -1331,5 +1372,162 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), io.read_to_end(&mut buf)).await;
         assert_eq!(buf, b"FROM-SPEC");
         spec_srv.await.unwrap();
+    }
+
+    // ================= S5/S6:tcpmux passthrough 每流接线 =================
+
+    /// mux 对按 data.rs:3030-3031 两行自建(无需跨模块借 visitor_run mux_pair)。
+    async fn mux_pair() -> (
+        std::sync::Arc<rh_transport::Multiplexer>,
+        std::sync::Arc<rh_transport::Multiplexer>,
+    ) {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let client = rh_transport::wrap_stream_as_client(Box::new(a) as BoxedIo, true, 100);
+        let server = rh_transport::wrap_stream_as_server(Box::new(b) as BoxedIo, true, 100);
+        (client, server)
+    }
+
+    fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        let mut x = seed | 1;
+        for _ in 0..n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.push((x >> 24) as u8);
+        }
+        out
+    }
+
+    /// S5 探针共用:relay_tcpmux_passthrough_stream_impl(representing 生产
+    /// relay_tcpmux_passthrough_stream 的 enabled 分支)+ 双向数据穿透。
+    /// 返回探针增量 (chunk, copy);断言范式与 visitor_run.rs 探针测一致。
+    async fn passthrough_probe_case(relay_mode: &'static str, enabled: bool) -> (usize, usize) {
+        let _serial = relay_path_probe::serial().await;
+        let base = relay_path_probe::snapshot();
+        let (client, server) = mux_pair().await;
+        let stream = client.open_stream().await.expect("open_stream");
+
+        let (local_relay, mut local_app) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(relay_tcpmux_passthrough_stream_impl(
+            relay_mode,
+            stream,
+            Box::new(local_relay) as BoxedIo,
+            enabled,
+        ));
+
+        let peer = server.accept().await.expect("accept");
+        let (mut peer_r, mut peer_w) = tokio::io::split(peer);
+
+        // 方向 1:peer(通道侧)→ local(本地目标)
+        let up = pseudo_random(64 * 1024 + 17, 0x1111_2222_3333_4444);
+        let up2 = up.clone();
+        let w = tokio::spawn(async move {
+            peer_w.write_all(&up2).await.unwrap();
+            peer_w
+        });
+        let mut got = vec![0u8; up.len()];
+        tokio::io::AsyncReadExt::read_exact(&mut local_app, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(got, up, "通道→本地方向必须穿透");
+        let mut peer_w = w.await.unwrap();
+
+        // 方向 2:local(本地目标)→ peer(通道侧)
+        let down = pseudo_random(64 * 1024 + 39, 0x5555_6666_7777_8888);
+        let down2 = down.clone();
+        let w = tokio::spawn(async move {
+            local_app.write_all(&down2).await.unwrap();
+            local_app
+        });
+        let mut got = vec![0u8; down.len()];
+        tokio::io::AsyncReadExt::read_exact(&mut peer_r, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(got, down, "本地→通道方向必须穿透");
+        let mut local_app = w.await.unwrap();
+
+        // 双向半关闭收敛
+        tokio::io::AsyncWriteExt::shutdown(&mut peer_w)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut local_app)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), relay)
+            .await
+            .expect("passthrough 每流中继必须收敛")
+            .unwrap();
+
+        relay_path_probe::since(base)
+    }
+
+    /// ①-S5 探针:kill 开 + relay_mode=splice → mux 流命中 chunk 泵。
+    #[tokio::test]
+    async fn tcpmux_passthrough_stream_uses_chunk_probe() {
+        let (chunk, copy) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            passthrough_probe_case("splice", true),
+        )
+        .await
+        .expect("用例 deadline");
+        assert_eq!(
+            chunk, 1,
+            "kill 开 + mux 流必须走 chunk(chunk={chunk}, copy={copy})"
+        );
+        assert_eq!(copy, 0, "不得回落 copy(chunk={chunk}, copy={copy})");
+    }
+
+    /// ①-反向:relay_mode=copy 是 A/B 对照开关,必须回落(红线 1)。
+    #[tokio::test]
+    async fn tcpmux_passthrough_stream_copy_mode_falls_back() {
+        let (chunk, copy) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            passthrough_probe_case("copy", true),
+        )
+        .await
+        .expect("用例 deadline");
+        assert_eq!(
+            chunk, 0,
+            "copy 模式不得走 chunk(红线 1)(chunk={chunk}, copy={copy})"
+        );
+        assert_eq!(
+            copy, 1,
+            "copy 模式必须回落 copy(chunk={chunk}, copy={copy})"
+        );
+    }
+
+    /// ③-S5 kill-switch:enabled=false → 直接 splice(现状 :48 表达式),
+    /// 不进 relay_path_probe(增量 (0,0)),数据照常穿透。
+    #[tokio::test]
+    async fn tcpmux_passthrough_stream_kill_switch_off_matches_status_quo() {
+        let (chunk, copy) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            passthrough_probe_case("splice", false),
+        )
+        .await
+        .expect("用例 deadline");
+        assert_eq!(chunk, 0, "kill 关不得走 chunk(chunk={chunk}, copy={copy})");
+        assert_eq!(
+            copy, 0,
+            "kill 关不进 relay_stream 探针(现状 splice)(chunk={chunk}, copy={copy})"
+        );
+    }
+
+    /// ③-S5 kill-switch 真值表(纯函数形态;OnceLock 进程内只解析一次)。
+    #[test]
+    fn client_secondary_fastpath_env_truth_table() {
+        assert!(secondary_fastpath_from_env(None), "未设置=默认启用");
+        assert!(!secondary_fastpath_from_env(Some("0")), "仅 \"0\" 禁用");
+        assert!(
+            !secondary_fastpath_from_env(Some(" 0 ")),
+            "trim 后 \"0\" 禁用"
+        );
+        assert!(secondary_fastpath_from_env(Some("1")), "\"1\" 启用");
+        assert!(secondary_fastpath_from_env(Some("")), "空串=非 \"0\" 启用");
+        assert!(
+            secondary_fastpath_from_env(Some("off")),
+            "非 \"0\" 值不生效(默认启用)"
+        );
     }
 }

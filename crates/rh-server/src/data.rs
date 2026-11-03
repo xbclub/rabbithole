@@ -332,66 +332,26 @@ pub async fn assign_forward(
     // 转发结束,与 QuotaIo::Drop 等价,不得提前释放。
     let (channel, quota_guard) = crate::control::QuotaIo::peel(channel);
     let _quota_guard = quota_guard; // 存活至本函数(转发)结束
-    let mut channel: BoxedIo = if spec.transport.use_compression {
+
+    // 注:此绑定不可 mut —— chunk 快路径的回落(channel = fallback)已随
+    // try_chunk_relay 抽出,函数体内无再赋值;留 mut 会撞 -D warnings。
+    let channel: BoxedIo = if spec.transport.use_compression {
         compress_stream(channel).await
     } else {
         channel
     };
-    // 带宽限制(server 模式)
-    // ★解析失败要告警,不能静默关闭限速(与 rh-client 的 forward.rs 同修)。
-    //
-    // 修前 `.and_then(parse)` 失败直接得到 None:配置写错时规则级限速
-    // **完全不生效**,而运维以为已经限了 —— 没有任何信号。
-    let bucket = if matches!(
-        spec.transport.bandwidth_mode,
-        rh_protocol::BandwidthMode::Server
-    ) {
-        match spec
-            .transport
-            .bandwidth_limit
-            .as_ref()
-            .map(|s| rh_core::BandwidthQuantity::parse(s))
-        {
-            Some(Some(q)) => Some(Arc::new(TokenBucket::new(q.bytes_per_sec() as f64))),
-            Some(None) => {
-                tracing::warn!(
-                    proxy = rt.id,
-                    limit = ?spec.transport.bandwidth_limit,
-                    "带宽限速配置无法解析,规则级限速**未生效**(检查 bandwidth_limit 格式)"
-                );
-                None
-            }
-            None => None,
+    // 规则级 + 客户端级限速桶装配(主路径与次级 relay_user_channel 共用)
+    let (bucket, client_bucket) = relay_buckets(state, rt, &spec);
+    // Y1 chunk 快路径(gate:非压缩且 relay_mode != copy,B7 的 copy 对照
+    // 语义)。主路径不含 kill-switch,保持现状行为;内核见 try_chunk_relay。
+    let (user, channel) = if !spec.transport.use_compression && state.cfg.relay_mode != "copy" {
+        match try_chunk_relay(state, rt, user, channel, &bucket, &client_bucket).await {
+            Ok(()) => return,
+            Err(fb) => fb,
         }
     } else {
-        None
+        (user, channel)
     };
-    // F2 客户端级限速(服务端侧,与规则级限速叠加)
-    let client_bucket = rt.usage(state).bucket();
-    // Y1 零拷贝 mux 中继:通道为 RhMuxStream(mux 模式常态;B1 修复后
-    // QuotaIo/PrependedIo 壳已在上方剥开)时,数据以 Bytes 引用直达
-    // 帧体/内核,消除两次中间拷贝。计量经 CountedUserIo 透明进行;
-    // 限速/取消/半关闭语义与拷贝路径一致。
-    // B7:relay_mode=copy 是同二进制 A/B 开关,同样关闭 chunk 快路径
-    //(benchmark README:93 承诺的 copy 对照语义)。
-    if !spec.transport.use_compression && state.cfg.relay_mode != "copy" {
-        // B1:PrependedIo(同批抵达的残留字节)剥壳——前缀字节是
-        // 通道→用户方向的先行数据,注入读半 front 最先交付,
-        // 与 PrependedIo 读语义逐字节等价。
-        let (prefix, ch) = rh_transport::PrependedIo::peel(channel);
-        match mux_steal_or_rewrap(prefix, ch) {
-            Ok((b_r, b_w)) => {
-                state.metrics.count_relay_path("chunk");
-                debug!(proxy = rt.id, "relay path: chunk");
-                mux_forward_chunked(rt, user, b_r, b_w, &bucket, &client_bucket).await;
-                return;
-            }
-            // 非 mux / 偷取失败:prefix 已原样回包(见 mux_steal_or_rewrap),
-            // 回落下方拷贝/splice 路径——回包后的 PrependedIo 不是裸 TCP,
-            // splice 资格判定必然回落 copy,prefix 不经内核 splice 丢失
-            Err(fallback) => channel = fallback,
-        }
-    }
     // 零拷贝快路径:两端裸 TCP(裸模式明文载体)时走内核 splice。
     // 计量/限速/半关闭语义与下方用户态路径一致;资源不可用则原样回落。
     #[cfg(target_os = "linux")]
@@ -434,6 +394,173 @@ pub async fn assign_forward(
         },
     )
     .await;
+}
+
+/// 规则级(Server 带宽模式解析,失败告警不静默)+ 客户端级限速桶装配
+/// (主路径 assign_forward 与次级 relay_user_channel 共用;自 :345-370 抽出,
+/// 行为逐行等价)。
+fn relay_buckets(
+    state: &Arc<AppState>,
+    rt: &Arc<ProxyRuntime>,
+    spec: &rh_protocol::ProxySpec,
+) -> (Option<Arc<TokenBucket>>, Option<Arc<TokenBucket>>) {
+    // 带宽限制(server 模式)
+    // ★解析失败要告警,不能静默关闭限速(与 rh-client 的 forward.rs 同修)。
+    //
+    // 修前 `.and_then(parse)` 失败直接得到 None:配置写错时规则级限速
+    // **完全不生效**,而运维以为已经限了 —— 没有任何信号。
+    let bucket = if matches!(
+        spec.transport.bandwidth_mode,
+        rh_protocol::BandwidthMode::Server
+    ) {
+        match spec
+            .transport
+            .bandwidth_limit
+            .as_ref()
+            .map(|s| rh_core::BandwidthQuantity::parse(s))
+        {
+            Some(Some(q)) => Some(Arc::new(TokenBucket::new(q.bytes_per_sec() as f64))),
+            Some(None) => {
+                tracing::warn!(
+                    proxy = rt.id,
+                    limit = ?spec.transport.bandwidth_limit,
+                    "带宽限速配置无法解析,规则级限速**未生效**(检查 bandwidth_limit 格式)"
+                );
+                None
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    // F2 客户端级限速(服务端侧,与规则级限速叠加)
+    let client_bucket = rt.usage(state).bucket();
+    (bucket, client_bucket)
+}
+
+/// Y1 chunk 快路径尝试(主路径 assign_forward 与次级 relay_user_channel
+/// 共用内核,自 :377-394 抽出):PrependedIo 剥壳(空 prefix 亦同构走)→
+/// mux_steal_or_rewrap → 命中计 relay_path=chunk 并执行 mux_forward_chunked。
+/// Ok(())=已走 chunk 完成;Err((user, channel))=未命中(channel 已回包
+/// prefix),调用方按各自回落路径继续。B7 gate(!use_compression &&
+/// relay_mode != "copy")与 kill-switch 由调用方判定(主路径不含 kill-switch,
+/// 保持现状行为;次级含 S6 开关)。
+async fn try_chunk_relay(
+    state: &Arc<AppState>,
+    rt: &Arc<ProxyRuntime>,
+    user: rh_transport::BoxedIo,
+    channel: rh_transport::BoxedIo,
+    rule_bucket: &Option<Arc<TokenBucket>>,
+    client_bucket: &Option<Arc<TokenBucket>>,
+) -> Result<(), (rh_transport::BoxedIo, rh_transport::BoxedIo)> {
+    // Y1 零拷贝 mux 中继:通道为 RhMuxStream(mux 模式常态;QuotaIo/
+    // PrependedIo 壳已由调用方剥开)时,数据以 Bytes 引用直达帧体/内核,
+    // 消除两次中间拷贝。计量经 CountedUserIo 透明进行;限速/取消/半关闭
+    // 语义与拷贝路径一致。
+    // B7:relay_mode=copy 是同二进制 A/B 开关,同样关闭 chunk 快路径
+    //(benchmark README:93 承诺的 copy 对照语义;gate 在调用方)。
+    //
+    // B1:PrependedIo(同批抵达的残留字节)剥壳——前缀字节是
+    // 通道→用户方向的先行数据,注入读半 front 最先交付,
+    // 与 PrependedIo 读语义逐字节等价。
+    let (prefix, ch) = rh_transport::PrependedIo::peel(channel);
+    match mux_steal_or_rewrap(prefix, ch) {
+        Ok((b_r, b_w)) => {
+            state.metrics.count_relay_path("chunk");
+            debug!(proxy = rt.id, "relay path: chunk");
+            mux_forward_chunked(rt, user, b_r, b_w, rule_bucket, client_bucket).await;
+            Ok(())
+        }
+        // 非 mux / 偷取失败:prefix 已原样回包(见 mux_steal_or_rewrap),
+        // 调用方回落各自拷贝/splice 路径——回包后的 PrependedIo 不是裸 TCP,
+        // splice 资格判定必然回落 copy,prefix 不经内核 splice 丢失
+        Err(fallback) => Err((user, fallback)),
+    }
+}
+
+/// S6 服务端半:RH_SECONDARY_FASTPATH=0 禁用次级数据面(vhost/visitor)
+/// 的 chunk 快路径接线。形态仿 rh-transport lib.rs halfclose_grace 的
+/// RH_* env + OnceLock 惯例;默认(未设置)=true,仅 trim 后 =="0" 为 false。
+/// OnceLock 进程内只解析一次;真值表由 secondary_fastpath_from_env 纯函数
+/// 覆盖(env 不可重置,无法二次驱动)。
+pub(crate) fn secondary_fastpath_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        secondary_fastpath_from_env(std::env::var("RH_SECONDARY_FASTPATH").ok().as_deref())
+    })
+}
+
+/// 纯函数形态供真值表测试(OnceLock 进程内只解析一次,env 不可重置)。
+fn secondary_fastpath_from_env(v: Option<&str>) -> bool {
+    !v.map(|s| s.trim() == "0").unwrap_or(false)
+}
+
+/// 次级数据面快路径接线入口(S1/S2/S3):形态 A「用户计量流 ↔ mux 通道」,
+/// 与主路径 assign_forward 同构。命中 → try_chunk_relay chunk 泵(计量经
+/// CountedUserIo 透明、限速双桶、规则取消 rule_cancel、count_relay_path 全部
+/// 对齐主路径,S4);未命中/禁用 → copy_bidirectional_bounded(现状行为)。
+///
+/// 【编译期位次护栏】user 位收泛型 CountedUserIo<T>、channel 位收裸通道——
+/// 实参互换时(裸通道/计量流对调)在编译期 E0308 失败:双向中继交换实参
+/// 数据仍穿透且无任何断言红,位次错误必须靠类型系统拦截(vhost 三接线点
+/// 无端到端单测,运行时层无防护可依赖)。
+///
+/// 通道侧 QuotaIo 壳(route_data_stream 包装;主路径 assign_forward 已剥,
+/// 次级路径在此剥)剥壳后 QuotaGuard 保活至本函数返回=转发结束
+/// (B1:data_conn_count 不得提前递减)。kill-switch=0 时不计 relay_path
+/// (与现状一致)。
+pub(crate) async fn relay_user_channel<T: rh_transport::Io + 'static>(
+    state: &Arc<AppState>,
+    rt: &Arc<ProxyRuntime>,
+    user: CountedUserIo<T>,
+    channel: rh_transport::BoxedIo,
+) {
+    relay_user_channel_impl(
+        state,
+        rt,
+        Box::new(user) as rh_transport::BoxedIo,
+        channel,
+        secondary_fastpath_enabled(),
+    )
+    .await
+}
+
+/// enabled 参数化形态(kill-switch 测试注入;生产恒经 secondary_fastpath_enabled)。
+async fn relay_user_channel_impl(
+    state: &Arc<AppState>,
+    rt: &Arc<ProxyRuntime>,
+    user: rh_transport::BoxedIo,
+    channel: rh_transport::BoxedIo,
+    enabled: bool,
+) {
+    if !enabled {
+        // S6:=0 时行为与现状完全等价(同函数同参数,不计 relay_path)
+        let _ = copy_bidirectional_bounded(user, channel).await;
+        return;
+    }
+    let spec = rt.spec.read().await.clone(); // Arc<ProxySpec>
+    if !spec.transport.use_compression && state.cfg.relay_mode != "copy" {
+        // B1:剥 QuotaIo 壳(route_data_stream 包装),guard 保活至本函数
+        // 返回=转发结束,与 QuotaIo::Drop 等价,不得提前释放。非 QuotaIo
+        // 包装时 peel 为 no-op(裸通道直过)。
+        let (channel, quota_guard) = crate::control::QuotaIo::peel(channel);
+        let _quota_guard = quota_guard; // B1:保活至转发结束
+        let (bucket, client_bucket) = relay_buckets(state, rt, &spec);
+        match try_chunk_relay(state, rt, user, channel, &bucket, &client_bucket).await {
+            Ok(()) => return,
+            Err((u, ch)) => {
+                // steal 未命中(非 mux 通道/包装流):回落现状 copy。
+                // S4:对齐主路径未命中即计 copy 的口径。
+                state.metrics.count_relay_path("copy");
+                debug!(proxy = rt.id, "relay path: copy (secondary fallback)");
+                let _ = copy_bidirectional_bounded(u, ch).await;
+                return;
+            }
+        }
+    }
+    // 压缩规则/B7 copy 模式:现状行为。S4:对齐主路径 :422 的 copy 计数。
+    state.metrics.count_relay_path("copy");
+    let _ = copy_bidirectional_bounded(user, channel).await;
 }
 
 /// 规则取消后的收尾(shutdown)等待上限:poll_shutdown 可能永久 Pending
@@ -3492,6 +3619,632 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(45), &mut parent)
             .await
             .expect("数据送达后 relay 必须收敛")
+            .unwrap();
+    }
+
+    // ================= S1/S2/S3/S6:次级数据面快路径(relay_user_channel)=================
+
+    /// 次级快路径测试共用:独立 state(默认 relay_mode 非拷贝)+ 默认 spec
+    ///(非压缩、无带宽配置 → relay_buckets 双桶皆空,chunk gate 开)。
+    async fn sec_state() -> Arc<AppState> {
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        Arc::new(AppState::new(crate::config::ServerConfig::default(), db))
+    }
+
+    fn sec_tcp_spec() -> ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "name": "sec-fastpath",
+            "kind": "tcp",
+            "client_id": "cid",
+            "bind_ip": "127.0.0.1",
+            "bind_port": 0,
+            "target_host": "127.0.0.1",
+            "target_port": 9,
+        }))
+        .unwrap()
+    }
+
+    fn sec_rt(id: u64, spec: ProxySpec) -> Arc<ProxyRuntime> {
+        Arc::new(ProxyRuntime::new(id, "cid".to_string(), spec))
+    }
+
+    /// 通道侧 QuotaIo 包装所需的会话(route_data_stream 同款)。
+    fn sec_make_session() -> Arc<Session> {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        Session::new(
+            "cid".into(),
+            "sid".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        )
+    }
+
+    fn relay_path_count(state: &Arc<AppState>, path: &str) -> u64 {
+        state
+            .metrics
+            .relay_path_total
+            .with_label_values(&[path])
+            .get()
+    }
+
+    /// yamux 流对:server accept 侧(生产中由 route_data_stream 包 QuotaIo
+    /// 后交付)+ client open 侧(测试持有的通道对端)。
+    async fn sec_mux_stream_pair() -> (BoxedIo, BoxedIo) {
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let server = rh_transport::wrap_stream_as_server(Box::new(b), true, 64);
+        let client = rh_transport::wrap_stream_as_client(Box::new(a), true, 64);
+        let c = client.open_stream().await.unwrap();
+        let s = server.accept().await.unwrap();
+        // open_stream/accept 已返回 BoxedIo;不得再 Box::new(会得到
+        // Box<Box<dyn Io>>,把 RhMuxStream 藏进第二层壳,is_mux_stream
+        // 判定必 miss → 整条链静默回落 copy)。
+        (s, c)
+    }
+
+    /// 伪随机载荷(与 visitor_run.rs 同款 xorshift)。
+    fn sec_pseudo_random(n: usize, seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        let mut x = seed | 1;
+        for _ in 0..n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.push((x >> 24) as u8);
+        }
+        out
+    }
+
+    /// ①-S1/S2 路径探针:经生产同路径(泛型入口 relay_user_channel),
+    /// server 侧 accept 流包 QuotaIo(复刻 route_data_stream:1145 包装)。
+    /// 断言:chunk +1、双向穿透、relay 进行中 data_conn_count 不提前递减(B1)。
+    #[tokio::test]
+    async fn secondary_relay_user_channel_chunk_engages_through_quota_shell() {
+        let state = sec_state().await;
+        let rt = sec_rt(3001, sec_tcp_spec());
+        let chunk0 = relay_path_count(&state, "chunk");
+
+        let sess = sec_make_session();
+        let (s, c) = sec_mux_stream_pair().await;
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let channel = crate::control::QuotaIo::new(s, sess.clone());
+
+        let (mut u_peer, u_local) = tokio::io::duplex(256 * 1024);
+        let user = CountedUserIo::user(u_local, &state, Some(rt.clone()));
+        let st = state.clone();
+        let rt2 = rt.clone();
+        let relay = tokio::spawn(async move { relay_user_channel(&st, &rt2, user, channel).await });
+
+        // up:u_peer 写 → relay(user 读计 in)→ mux 通道 → c 侧收到
+        let up = sec_pseudo_random(64 * 1024 + 333, 0x1111_2222_3333_4444);
+        let (mut c_r, mut c_w) = tokio::io::split(c);
+        let up2 = up.clone();
+        let w = tokio::spawn(async move {
+            u_peer.write_all(&up2).await.unwrap();
+            u_peer
+        });
+        let mut got = vec![0u8; up.len()];
+        c_r.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, up, "up 方向数据必须穿透");
+        let mut u_peer = w.await.unwrap();
+
+        // down:c 写 → relay(mux 读)→ user 写计 out → u_peer 收到
+        let down = sec_pseudo_random(64 * 1024 + 555, 0x5555_6666_7777_8888);
+        c_w.write_all(&down).await.unwrap();
+        let mut got = vec![0u8; down.len()];
+        u_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, down, "down 方向数据必须穿透");
+
+        // B1:relay 进行中(尚未 EOF)QuotaGuard 必须保活,data_conn_count
+        // 不得提前递减(剥壳后限额占用期 = 转发期)
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "relay 进行中 data_conn_count 不得提前递减(B1/guard 保活)"
+        );
+
+        // 双向半关闭收敛
+        c_w.shutdown().await.unwrap();
+        u_peer.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), relay)
+            .await
+            .expect("双向 EOF 后 relay 必须收敛")
+            .unwrap();
+
+        assert_eq!(
+            relay_path_count(&state, "chunk"),
+            chunk0 + 1,
+            "命中 mux 通道必须计 relay_path=chunk"
+        );
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            0,
+            "relay 返回后 guard 释放,计数归零(与 QuotaIo::Drop 等价)"
+        );
+    }
+
+    /// ①-形态 A:user 用真 TcpStream(HTTPS/CONNECT 形态,
+    /// split_counted_tcp_user 命中 owned 无锁拆半)。
+    #[tokio::test]
+    async fn secondary_relay_user_channel_tcp_user_owned_halves() {
+        let state = sec_state().await;
+        let rt = sec_rt(3002, sec_tcp_spec());
+        let chunk0 = relay_path_count(&state, "chunk");
+
+        // 真 TCP 对(bind 127.0.0.1:0 + connect)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let user_tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut u_peer = listener.accept().await.unwrap().0;
+
+        let sess = sec_make_session();
+        let (s, c) = sec_mux_stream_pair().await;
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let channel = crate::control::QuotaIo::new(s, sess);
+
+        let user = CountedUserIo::user(user_tcp, &state, Some(rt.clone()));
+        let st = state.clone();
+        let rt2 = rt.clone();
+        let relay = tokio::spawn(async move { relay_user_channel(&st, &rt2, user, channel).await });
+
+        let up = sec_pseudo_random(128 * 1024, 0xaaaa_bbbb_cccc_dddd);
+        let (mut c_r, mut c_w) = tokio::io::split(c);
+        let up2 = up.clone();
+        let w = tokio::spawn(async move {
+            u_peer.write_all(&up2).await.unwrap();
+            u_peer
+        });
+        let mut got = vec![0u8; up.len()];
+        c_r.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, up, "up 方向数据必须穿透");
+        let mut u_peer = w.await.unwrap();
+
+        let down = sec_pseudo_random(128 * 1024, 0xeeee_ffff_0000_1111);
+        c_w.write_all(&down).await.unwrap();
+        let mut got = vec![0u8; down.len()];
+        u_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, down, "down 方向数据必须穿透");
+
+        c_w.shutdown().await.unwrap();
+        u_peer.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), relay)
+            .await
+            .expect("双向 EOF 后 relay 必须收敛")
+            .unwrap();
+        assert_eq!(
+            relay_path_count(&state, "chunk"),
+            chunk0 + 1,
+            "T=TcpStream 泛型实例必须命中 chunk(owned 拆半)"
+        );
+    }
+
+    /// ①-反向:B7 copy 模式必须关闭 chunk 快路径、回落 copy(红线 1)。
+    #[tokio::test]
+    async fn secondary_relay_user_channel_copy_mode_falls_back() {
+        let cfg = crate::config::ServerConfig {
+            relay_mode: "copy".to_string(),
+            ..crate::config::ServerConfig::default()
+        };
+        let db = crate::db::Db::open("sqlite::memory:").await.unwrap();
+        let state = Arc::new(AppState::new(cfg, db));
+        let rt = sec_rt(3003, sec_tcp_spec());
+        let chunk0 = relay_path_count(&state, "chunk");
+        let copy0 = relay_path_count(&state, "copy");
+
+        let sess = sec_make_session();
+        let (s, c) = sec_mux_stream_pair().await;
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let channel = crate::control::QuotaIo::new(s, sess);
+
+        let (mut u_peer, u_local) = tokio::io::duplex(256 * 1024);
+        let user = CountedUserIo::user(u_local, &state, Some(rt.clone()));
+        let st = state.clone();
+        let rt2 = rt.clone();
+        let relay = tokio::spawn(async move { relay_user_channel(&st, &rt2, user, channel).await });
+
+        let up = sec_pseudo_random(4096, 1);
+        let (mut c_r, mut c_w) = tokio::io::split(c);
+        u_peer.write_all(&up).await.unwrap();
+        let mut got = vec![0u8; up.len()];
+        c_r.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, up, "copy 模式数据必须照常穿透");
+
+        let down = sec_pseudo_random(4096, 2);
+        c_w.write_all(&down).await.unwrap();
+        let mut got = vec![0u8; down.len()];
+        u_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, down, "copy 模式 down 方向必须照常穿透");
+
+        c_w.shutdown().await.unwrap();
+        u_peer.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), relay)
+            .await
+            .expect("copy 模式 relay 必须收敛")
+            .unwrap();
+
+        assert_eq!(
+            relay_path_count(&state, "chunk"),
+            chunk0,
+            "copy 模式不得走 chunk(红线 1)"
+        );
+        assert_eq!(
+            relay_path_count(&state, "copy"),
+            copy0 + 1,
+            "copy 模式必须回落 copy(对齐主路径计数)"
+        );
+    }
+
+    /// ①-反向:压缩规则(transport.use_compression=true)一律回落(红线 4)。
+    #[tokio::test]
+    async fn secondary_relay_user_channel_compressed_spec_falls_back() {
+        let state = sec_state().await;
+        let mut spec = sec_tcp_spec();
+        spec.transport.use_compression = true;
+        let rt = sec_rt(3004, spec);
+        let chunk0 = relay_path_count(&state, "chunk");
+        let copy0 = relay_path_count(&state, "copy");
+
+        let sess = sec_make_session();
+        let (s, c) = sec_mux_stream_pair().await;
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let channel = crate::control::QuotaIo::new(s, sess);
+
+        let (mut u_peer, u_local) = tokio::io::duplex(256 * 1024);
+        let user = CountedUserIo::user(u_local, &state, Some(rt.clone()));
+        let st = state.clone();
+        let rt2 = rt.clone();
+        let relay = tokio::spawn(async move { relay_user_channel(&st, &rt2, user, channel).await });
+
+        let up = sec_pseudo_random(4096, 3);
+        let (mut c_r, mut c_w) = tokio::io::split(c);
+        u_peer.write_all(&up).await.unwrap();
+        let mut got = vec![0u8; up.len()];
+        c_r.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, up, "压缩规则数据必须照常穿透(回落 copy)");
+
+        let down = sec_pseudo_random(4096, 4);
+        c_w.write_all(&down).await.unwrap();
+        let mut got = vec![0u8; down.len()];
+        u_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, down, "压缩规则 down 方向必须照常穿透");
+
+        c_w.shutdown().await.unwrap();
+        u_peer.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), relay)
+            .await
+            .expect("压缩规则 relay 必须收敛")
+            .unwrap();
+
+        assert_eq!(
+            relay_path_count(&state, "chunk"),
+            chunk0,
+            "压缩规则不得走 chunk(红线 4)"
+        );
+        assert_eq!(
+            relay_path_count(&state, "copy"),
+            copy0 + 1,
+            "压缩规则必须回落 copy"
+        );
+    }
+
+    /// ③-kill-switch:enabled=false 经 relay_user_channel_impl 注入 ——
+    /// 行为与现状完全等价(不计 relay_path,数据照常穿透)。
+    #[tokio::test]
+    async fn secondary_relay_user_channel_kill_switch_disables() {
+        let state = sec_state().await;
+        let rt = sec_rt(3005, sec_tcp_spec());
+        let chunk0 = relay_path_count(&state, "chunk");
+        let copy0 = relay_path_count(&state, "copy");
+
+        let sess = sec_make_session();
+        let (s, c) = sec_mux_stream_pair().await;
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let channel = crate::control::QuotaIo::new(s, sess);
+
+        let (mut u_peer, u_local) = tokio::io::duplex(256 * 1024);
+        let user = CountedUserIo::user(u_local, &state, Some(rt.clone()));
+        let st = state.clone();
+        let rt2 = rt.clone();
+        let relay = tokio::spawn(async move {
+            relay_user_channel_impl(&st, &rt2, Box::new(user) as BoxedIo, channel, false).await
+        });
+
+        let up = sec_pseudo_random(4096, 5);
+        let (mut c_r, mut c_w) = tokio::io::split(c);
+        u_peer.write_all(&up).await.unwrap();
+        let mut got = vec![0u8; up.len()];
+        c_r.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, up, "kill-switch=0 数据必须照常穿透(现状等价)");
+
+        let down = sec_pseudo_random(4096, 6);
+        c_w.write_all(&down).await.unwrap();
+        let mut got = vec![0u8; down.len()];
+        u_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, down, "kill-switch=0 down 方向必须照常穿透");
+
+        c_w.shutdown().await.unwrap();
+        u_peer.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), relay)
+            .await
+            .expect("kill-switch=0 relay 必须收敛")
+            .unwrap();
+
+        assert_eq!(
+            relay_path_count(&state, "chunk"),
+            chunk0,
+            "kill-switch=0 不计 chunk(现状一致)"
+        );
+        assert_eq!(
+            relay_path_count(&state, "copy"),
+            copy0,
+            "kill-switch=0 不计 copy(现状本就不计)"
+        );
+    }
+
+    /// ③-kill-switch 真值表(纯函数形态;OnceLock 进程内只解析一次)。
+    #[test]
+    fn secondary_fastpath_env_truth_table() {
+        assert!(secondary_fastpath_from_env(None), "未设置=默认启用");
+        assert!(!secondary_fastpath_from_env(Some("0")), "仅 \"0\" 禁用");
+        assert!(
+            !secondary_fastpath_from_env(Some(" 0 ")),
+            "trim 后 \"0\" 禁用"
+        );
+        assert!(secondary_fastpath_from_env(Some("1")), "\"1\" 启用");
+        assert!(secondary_fastpath_from_env(Some("")), "空串=非 \"0\" 启用");
+        assert!(
+            secondary_fastpath_from_env(Some("false")),
+            "非 \"0\" 值不生效(默认启用)"
+        );
+    }
+
+    /// ②-计量等价:同一 up/down 载荷,新链(relay_user_channel,kill on)
+    /// 与旧链(copy_bidirectional_bounded,现状)EOF 收敛后七处读数相等:
+    /// 全局 counter、console 原子、规则 bytes_in/out、ClientUsage.bytes。
+    #[tokio::test]
+    async fn secondary_chunk_vs_copy_metering_equivalence() {
+        const UP: usize = 96 * 1024 + 11;
+        const DOWN: usize = 96 * 1024 + 77;
+
+        // 七元组读数(全局 counter / 控制台原子 / 规则 bytes / 客户端用量)
+        fn snapshot_full(
+            state: &Arc<AppState>,
+            rt: &Arc<ProxyRuntime>,
+        ) -> (u64, u64, u64, u64, u64, u64, u64) {
+            let usage = rt.usage(state);
+            (
+                state.metrics.bytes_in_total.get(),
+                state.metrics.bytes_out_total.get(),
+                state.metrics.console_bytes_in.load(Ordering::Relaxed),
+                state.metrics.console_bytes_out.load(Ordering::Relaxed),
+                rt.bytes_in.load(Ordering::Relaxed),
+                rt.bytes_out.load(Ordering::Relaxed),
+                usage.bytes.load(Ordering::Relaxed),
+            )
+        }
+
+        // 跑一条链:同一载荷双向穿透 + EOF 收敛,返回(state, rt, 基线快照)。
+        async fn run_chain(
+            new_path: bool,
+        ) -> (
+            (Arc<AppState>, Arc<ProxyRuntime>),
+            (u64, u64, u64, u64, u64, u64, u64),
+        ) {
+            let state = sec_state().await;
+            let rt = sec_rt(3100, sec_tcp_spec());
+            let sess = sec_make_session();
+            let (s, c) = sec_mux_stream_pair().await;
+            sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+            let channel = crate::control::QuotaIo::new(s, sess);
+
+            let (mut u_peer, u_local) = tokio::io::duplex(1024 * 1024);
+            let user = CountedUserIo::user(u_local, &state, Some(rt.clone()));
+            let base = snapshot_full(&state, &rt);
+            let st = state.clone();
+            let rt2 = rt.clone();
+            let relay = tokio::spawn(async move {
+                if new_path {
+                    relay_user_channel(&st, &rt2, user, channel).await;
+                } else {
+                    // 现状链:vhost 次级点修前形态(user 位计量流、channel 位通道)
+                    let _ = copy_bidirectional_bounded(Box::new(user) as BoxedIo, channel).await;
+                }
+            });
+
+            let (mut c_r, mut c_w) = tokio::io::split(c);
+            let up = sec_pseudo_random(UP, 0x0123_4567_89ab_cdef);
+            let down = sec_pseudo_random(DOWN, 0xfedc_ba98_7654_3210);
+            let up2 = up.clone();
+            let w = tokio::spawn(async move {
+                u_peer.write_all(&up2).await.unwrap();
+                u_peer
+            });
+            let mut got = vec![0u8; up.len()];
+            c_r.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, up);
+            let mut u_peer = w.await.unwrap();
+            c_w.write_all(&down).await.unwrap();
+            let mut got = vec![0u8; down.len()];
+            u_peer.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, down);
+
+            c_w.shutdown().await.unwrap();
+            u_peer.shutdown().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), relay)
+                .await
+                .expect("链必须收敛")
+                .unwrap();
+            ((state, rt), base)
+        }
+
+        let ((st_new, rt_new), b_new) = run_chain(true).await;
+        let ((st_old, rt_old), b_old) = run_chain(false).await;
+
+        let n = snapshot_full(&st_new, &rt_new);
+        let o = snapshot_full(&st_old, &rt_old);
+        // 链内增量(chunk − 基线)逐项相等
+        let d_new = (
+            n.0 - b_new.0,
+            n.1 - b_new.1,
+            n.2 - b_new.2,
+            n.3 - b_new.3,
+            n.4 - b_new.4,
+            n.5 - b_new.5,
+            n.6 - b_new.6,
+        );
+        let d_old = (
+            o.0 - b_old.0,
+            o.1 - b_old.1,
+            o.2 - b_old.2,
+            o.3 - b_old.3,
+            o.4 - b_old.4,
+            o.5 - b_old.5,
+            o.6 - b_old.6,
+        );
+        assert_eq!(
+            d_new, d_old,
+            "chunk 链与 copy 链计量必须逐字节等价:chunk={d_new:?} copy={d_old:?}"
+        );
+        // 绝对值抽查:up 全量计 in(读侧 fill 口径)、down 全量计 out(送达口径)
+        assert_eq!(d_new.0, UP as u64, "up 载荷必须全量计 in");
+        assert_eq!(d_new.1, DOWN as u64, "down 载荷必须全量计 out");
+        assert_eq!(d_new.4, UP as u64, "规则 bytes_in = up 载荷");
+        assert_eq!(d_new.5, DOWN as u64, "规则 bytes_out = down 载荷");
+        assert_eq!(d_new.6, (UP + DOWN) as u64, "客户端用量 = up + down");
+    }
+
+    /// ②-写失败:user 侧写失败注入 IO,chunk 链必须收敛返回、不 panic,
+    /// 已计字节与对向实收一致(in=实收于通道侧;out=0,写全失败)。
+    #[tokio::test]
+    async fn secondary_chunk_metering_write_failure_converges() {
+        struct WriteErrIo {
+            inner: tokio::io::DuplexStream,
+        }
+        impl tokio::io::AsyncRead for WriteErrIo {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+        impl tokio::io::AsyncWrite for WriteErrIo {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "injected write failure",
+                )))
+            }
+            fn poll_flush(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+
+        let state = sec_state().await;
+        let rt = sec_rt(3101, sec_tcp_spec());
+        let sess = sec_make_session();
+        let (s, c) = sec_mux_stream_pair().await;
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let channel = crate::control::QuotaIo::new(s, sess);
+
+        // user 侧:WriteErrIo 包 duplex(读正常、写恒失败)
+        let (mut u_peer, u_local) = tokio::io::duplex(256 * 1024);
+        let user = CountedUserIo::user(WriteErrIo { inner: u_local }, &state, Some(rt.clone()));
+        let base_in = state.metrics.bytes_in_total.get();
+        let base_out = state.metrics.bytes_out_total.get();
+        let st = state.clone();
+        let rt2 = rt.clone();
+        let relay = tokio::spawn(async move { relay_user_channel(&st, &rt2, user, channel).await });
+
+        // up 先行:u_peer 写 → relay 读(计 in)→ 通道 → c 实收
+        //(c 侧收齐 = relay 已读齐,in 计数已定格为 up 载荷)
+        let up = sec_pseudo_random(64 * 1024, 0xdead_beef_cafe_babe);
+        let (mut c_r, mut c_w) = tokio::io::split(c);
+        let up2 = up.clone();
+        let w = tokio::spawn(async move {
+            u_peer.write_all(&up2).await.unwrap();
+            u_peer
+        });
+        let mut got = vec![0u8; up.len()];
+        c_r.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, up);
+        let mut u_peer = w.await.unwrap();
+
+        // down 触发写失败:c 写 → relay 读通道 → 写 user 恒 Err → down 泵
+        // 以错误结束 → 对向(up)泵不得永存(mux_relay 收敛语义)
+        let down = sec_pseudo_random(4096, 0x1234_5678_9abc_def0);
+        let _ = c_w.write_all(&down).await;
+        let _ = c_w.shutdown().await;
+        let _ = u_peer.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(10), relay)
+            .await
+            .expect("写失败后 chunk 链必须收敛(不永存、不 panic)")
+            .unwrap();
+
+        let in_delta = state.metrics.bytes_in_total.get() - base_in;
+        let out_delta = state.metrics.bytes_out_total.get() - base_out;
+        assert_eq!(
+            in_delta,
+            up.len() as u64,
+            "in 计数必须与通道侧实收一致(不重复计量)"
+        );
+        assert_eq!(out_delta, 0, "user 侧写全失败,不得计 out");
+    }
+
+    /// ③/红线 3-收敛:转发进行中规则取消(rt.rule_cancel.cancel()),
+    /// relay_user_channel 必须在有界时间内返回(CANCEL_CLOSE_GRACE 1s +
+    /// join_relay_pumps 30s 兜底内;测试 timeout 取 35s 上界),IO 不永存。
+    /// 收敛语义不新发明,骨架由 rh-transport goal_repair_mux.rs 既有六测锁定。
+    #[tokio::test]
+    async fn secondary_relay_user_channel_rule_cancel_converges() {
+        let state = sec_state().await;
+        let rt = sec_rt(3102, sec_tcp_spec());
+        let sess = sec_make_session();
+        let (s, c) = sec_mux_stream_pair().await;
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let channel = crate::control::QuotaIo::new(s, sess);
+
+        let (mut u_peer, u_local) = tokio::io::duplex(256 * 1024);
+        let user = CountedUserIo::user(u_local, &state, Some(rt.clone()));
+        let st = state.clone();
+        let rt2 = rt.clone();
+        let mut relay =
+            tokio::spawn(async move { relay_user_channel(&st, &rt2, user, channel).await });
+
+        // 建立流:up 穿透成功 = 转发进行中
+        let up = sec_pseudo_random(4096, 0xbeef_0001);
+        let (mut c_r, mut c_w) = tokio::io::split(c);
+        let up2 = up.clone();
+        let w = tokio::spawn(async move {
+            u_peer.write_all(&up2).await.unwrap();
+            u_peer
+        });
+        let mut got = vec![0u8; up.len()];
+        c_r.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, up);
+        drop(w.await.unwrap());
+
+        // 规则禁用/删除形态:取消后 relay 必须收敛(两向泵均在等数据/EOF,
+        // 取消级联拆除;不等待对端 FIN)
+        rt.rule_cancel.cancel();
+        let _ = c_w.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(35), &mut relay)
+            .await
+            .expect("规则取消后 relay 必须在 CANCEL_CLOSE_GRACE + join 兜底内收敛")
             .unwrap();
     }
 }
