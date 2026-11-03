@@ -31,6 +31,36 @@
 
 ## 基准结果
 
+### 次级数据面快路径 P1 回归验证(2026-11-03,commit `e476165` vs v0.7.1 Release)
+
+四轮 A/B/A + 工具链对照(三机、`PROTO=tcp RELAY=splice MUX=1 THP_TOOL=loadgen`、
+每档 15s × 5 次):rel-a/rel-c = v0.7.1 **musl** Release 产物;src = v0.7.1
+**gnu** 源码构建(worktree 检出 tag);new = e476165 gnu 构建。直连基线四轮
+稳定(±2%),机器状态可比。证据:test3 `/tmp/peer-{rel-a,new-b,rel-c,src-v071}/`
+(未入库)。
+
+隧道吞吐中位数(Mbps):
+
+| 档位 | rel-a(musl) | rel-c(musl) | src(gnu v0.7.1) | new(gnu e476165) |
+|---|---:|---:|---:|---:|
+| 1流 上 | 2473 | 2475 | 2639 | 2711 |
+| 1流 下 | 2418 | 2353 | 2447 | 2599 |
+| 4流 上 | 3270 | 3053 | 3073 | 3245 |
+| 4流 下 | 3206 | 3166 | 3192 | 3076 |
+| 16流 上 | 3450 | 3450 | 3365 | 3381 |
+| 16流 下 | 3414 | 3362 | 3390 | 3448 |
+
+**结论**:① **主路径无回归** —— new 的全部指标(吞吐/延迟 p50/p99/UDP/
+并发 64–4096 全 verified/建连/HTTP vhost)落在同二进制日方差带内(两个
+musl 轮自身在 4流上档差 7%);② 单流 +7~9% 是 **musl→gnu 工具链效应**
+(gnu 两轮都高于 musl 两轮,src 与 new 之间 ≤3% 且样本重叠 → 无代码效应)。
+附带观察:linux x86_64 的 musl Release 产物单流比 gnu 慢 ~7–9%(是否改发
+gnu 涉及静态可移植性,另行决策);③ P1 改动的五组次级路径(vhost HTTPS/
+CONNECT/tcpmux、stcp/sudp、客户端 tcpmux)本套件无场景,套件级收益未测,
+由 9 组探针/计量等价测试背书;补测路径见
+`docs/perf-secondary-fastpath-p2p3c.md` §1.7(peer.sh `PEER_SCENARIOS` 扩展)。
+伪影警示照旧:直连单流 ~1.5G 为 sink cwnd 塌陷伪影,保留率 >100% 判伪。
+
 > **测量条件(2026-10-22,commit `cccc101`,rabbithole v0.5.0 vs frp v0.71.0)**
 >
 > 三机 peer 拓扑(见上文),控制面 `tcp`、`relay=splice`、`mux=1`;
