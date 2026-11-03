@@ -97,7 +97,7 @@ jobs:
           # 直接从官方 index.json 取最新稳定版:第三方镜像对旧版本 404,
           # setup-zig 的镜像重试链一次能烧掉十几分钟 CI 时间。
           curl -sS https://ziglang.org/download/index.json -o /tmp/zig-index.json
-          VER=$(jq -r 'keys | map(select(. != "master")) | .[0]' /tmp/zig-index.json)
+          VER=$(jq -r 'keys | map(select(. != "master")) | sort_by(split(".") | map(tonumber? // 0)) | last' /tmp/zig-index.json)
           URL=$(jq -r ".[\"$VER\"][\"x86_64-linux\"][\"tarball\"]" /tmp/zig-index.json)
           echo "zig $VER <- $URL"
           curl -sSL "$URL" -o /tmp/zig.tar.xz
