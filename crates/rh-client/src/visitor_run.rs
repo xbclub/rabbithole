@@ -7,31 +7,59 @@ use rh_protocol::message::{
 use rh_protocol::{VisitorKind, VisitorSpec};
 use rh_transport::BoxedIo;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+/// 单次启动的结局。
+///
+/// 修前 `start` 只返回 bool(绑定失败),调用方对**所有** false 一律重试;
+/// 但有两类 false 重试是错的(会把不该活的规则拉起来):
+/// * `Stale` —— 本次携带的 spec 已被表内更新的配置取代;
+/// * `Aborted` —— bind 窗口内 `stop` 已把本次 token cancel 掉。
+///
+/// 把它们与真正的端口占用分开,重试只剩 [`StartOutcome::BindFailed`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartOutcome {
+    /// 监听任务已 spawn。
+    Started,
+    /// 端口绑定失败(可能被占用),值得重试。
+    BindFailed,
+    /// 陈旧 start:表内当前 spec 已不是本次的 spec(或已被删除)。
+    /// **不 bind、不留登记项** —— 新一代启停已经接管这条规则。
+    Stale,
+    /// bind 窗口内被 `stop` cancel:尊重停止意图,不重试。
+    Aborted,
+}
 
 /// 启动一个 visitor 的本地监听。
 /// 带重试的启动:吃掉"旧监听器尚未释放端口"的竞态窗口。
 ///
-/// 配置变更时 `stop_visitor` 只 `cancel()`,监听任务的 listener 要等它跑到
-/// 下一次 accept 才 drop;紧接着 bind 同一端口会 `EADDRINUSE`。修前 bind
-/// 失败**只 warn 不重试**,规则从此永久失联(客户端不重启就不会恢复)。
+/// 配置变更时 `stop_visitor` 会 cancel 并**等监听任务退出**(见
+/// [`crate::session::VisitorListener::await_exit`]),同代重启时端口已经
+/// 释放;重试仍然保留,因为它挡住的是**外部**进程占端口的情形,以及
+/// `stop_visitor` 等待超时(任务卡住)的兜底路径。
+///
+/// 修前的 `stop_visitor` 只 `cancel()`,listener 要等任务跑到下一次
+/// accept 才 drop;紧接着 bind 同一端口会 `EADDRINUSE`,而 bind 失败
+/// **只 warn 不重试** —— 规则从此永久失联(客户端不重启就不会恢复)。
 pub async fn start_with_retry(sess: Arc<ClientSession>, visitor_id: u64, spec: VisitorSpec) {
-    // 总预算 ~1s:足够覆盖 cancel 到 listener drop 的调度延迟,
-    // 又不会在端口真被别人占用时无限重试。
+    // 总预算 ~1s:足够覆盖内核释放端口的延迟,又不会在端口真被别人
+    // 占用时无限重试。
     for attempt in 0..10 {
         // R1:会话正在关闭时不再重试 —— start 可能在 bind 窗口内被
-        // 关闭路径 cancel(返回 false),继续重试会把已停止的规则
-        // 重新拉起。
+        // 关闭路径 cancel,继续重试会把已停止的规则重新拉起。
         if sess.cancel.is_cancelled() {
             return;
         }
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        if start(sess.clone(), visitor_id, spec.clone()).await {
-            return;
+        match start(sess.clone(), visitor_id, spec.clone()).await {
+            // 起监听成功,或本次 start 已无意义(被取代 / 被停止):
+            // 三种都不该重试。`Stale` 的 warn 已在 start 内发出。
+            StartOutcome::Started | StartOutcome::Stale | StartOutcome::Aborted => return,
+            StartOutcome::BindFailed => {}
         }
     }
     warn!(
@@ -41,36 +69,133 @@ pub async fn start_with_retry(sess: Arc<ClientSession>, visitor_id: u64, spec: V
     );
 }
 
-/// 启动一个 visitor;返回 `false` 表示**绑定失败**(端口被占,值得重试)。
-pub async fn start(sess: Arc<ClientSession>, visitor_id: u64, spec: VisitorSpec) -> bool {
+/// 启动一个 visitor 的本地监听。
+///
+/// 落地顺序是**先校验、再 bind、再校验**:表(`sess.visitors`)是唯一由
+/// run_loop 在 dispatch 时就同步更新的真相源,启停只是排队执行,所以
+/// 「晚到的旧 start」只要拿表比一次就能认出来(见 [`StartOutcome::Stale`])。
+pub async fn start(sess: Arc<ClientSession>, visitor_id: u64, spec: VisitorSpec) -> StartOutcome {
+    // 会话已在关闭:不再起任何监听。
+    //
+    // 修前这条判断在 `start_with_retry` 的重试循环里;把它下移到 `start`
+    // 本身,是因为 `start` 现在也可是直接被调用的落地函数(测试直调、
+    // 以及链上最后一个单元)—— 只在重试侧判断会漏掉"关闭过程中恰好
+    // 执行的那一次 start",那一次会 bind 成功并 spawn 一个监听任务,
+    // 而会话收尾的 stop 名单已经取过,没人再来取消它。
+    if sess.cancel.is_cancelled() {
+        return StartOutcome::Aborted;
+    }
+
+    // R2(前置):表内当前 spec 不是本次 spec ⟹ 陈旧 start。
+    //
+    // 为什么不比登记表:登记项只说明"有谁在跑",不说明"跑的是哪一代
+    // 配置"。而这里正是失败轮的真凶 —— 覆盖前若不认这一眼,晚到的旧
+    // start 会把自己的 token 盖到新 start 的头上,旧端口的监听器从此
+    // 无人可取消(孤儿),表里却指向新端口。
+    //
+    // 先判再 bind 还有个副作用是好的:陈旧 start 不再白占端口,也就不会
+    // 因为 EADDRINUSE 被误当成"端口被占"去重试。
+    if !spec_is_current(&sess, visitor_id, &spec).await {
+        warn!(
+            visitor = %spec.name,
+            visitor_id,
+            port = spec.bind_port,
+            "stale visitor start (configuration superseded); not binding"
+        );
+        return StartOutcome::Stale;
+    }
+
     let cancel = CancellationToken::new();
-    sess.visitor_cancels
-        .lock()
-        .await
-        .insert(visitor_id, cancel.clone());
+    // R4:退出闩锁。发送端进任务,任务返回(含 panic)时 drop —— 等它的
+    // 那一刻即"listener 已 drop",不再用 connect 探针去猜。
+    let (exit_tx, exit) = watch::channel(());
+    // R2:这里是**唯一**写登记表的地方,所以覆盖防护落在这一行之前。
+    //
+    // 两种残留必须分开处理,否则会重演孤儿化:
+    // * 表内有一条**未被 cancel** 的登记项 → 上一代监听还在跑。生产路径
+    //   不会走到这里(链路先 stop 到底再 start),但"不会走到"是调度
+    //   假设,不是不变式;直接 insert 就等于制造第二个监听器。宁可放弃
+    //   本次 start,也不制造孤儿。
+    // * 表内那条**已 cancel 但还没退出** → stop 正在收尾(或等待超时)。
+    //   这里先等它退出再替换:否则它的 listener 还占着旧端口,而登记项
+    //   已经指向新代 —— 正是"表与实际监听不一致"的形态。
+    {
+        // ① 判定 + 摘条目必须是**同一次**持锁,否则并发的另一个 start
+        //    可以在两步之间插入自己的登记项,被我顺手摘掉(那是孤儿化的
+        //    另一种写法)。摘到的旧条目若是"活着的",放回原样再判陈旧。
+        let retired = {
+            let mut g = sess.visitor_listeners.lock().await;
+            match g.get(&visitor_id) {
+                // 活着的上一代:拒绝叠第二个监听器
+                Some(live) if !live.token.is_cancelled() => Err(live.port),
+                // 已 cancel(或没有):取走,腾出位置
+                _ => Ok(g.remove(&visitor_id)),
+            }
+        };
+        let retired = match retired {
+            Ok(r) => r,
+            Err(live_port) => {
+                warn!(
+                    visitor = %spec.name,
+                    visitor_id,
+                    live_port,
+                    "previous listener still registered and not cancelled; \
+                     refusing to stack a second one"
+                );
+                return StartOutcome::Stale;
+            }
+        };
+        // ② 锁外等旧任务退出(有界)。它已 cancel,这里只是等收尾;
+        //    listener 不 drop 之前不能 bind 同端口,也不能让"表里的新端口"
+        //    与实际(旧端口)不一致。
+        if let Some(mut prev) = retired {
+            if !prev.await_exit(crate::session::VISITOR_STOP_WAIT).await {
+                warn!(
+                    visitor = %spec.name,
+                    visitor_id,
+                    port = prev.port,
+                    "previous (cancelled) listener did not exit before restart; \
+                     its port may still be held"
+                );
+            }
+        }
+        // ③ 落地自己的登记项。此前的口径是"先登记再 bind":bind 窗口内
+        //    到达的 stop 必须能 cancel 到**这一个** token。
+        sess.visitor_listeners.lock().await.insert(
+            visitor_id,
+            crate::session::VisitorListener::new(cancel.clone(), spec.bind_port, exit),
+        );
+    }
+
     match spec.kind {
         VisitorKind::Stcp | VisitorKind::Xtcp => {
             let addr = format!("{}:{}", spec.bind_addr, spec.bind_port);
             let l = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
-                    // R1:bind 失败回收自己插入的 token。修前留死 token:
-                    // 后续 stop cancel 的是死 token,前一代真正活着的
-                    // 监听器永远取不到。启停已全部经 entity_ops 链
-                    // 串行化,不存在并发 start 覆盖,无条件 remove 安全。
+                    // 回收自己插入的登记项(`bind_port` 允许为 0,所以这里
+                    // 记的端口只是名义值,不能留给后来者当真)。
                     warn!(visitor = %spec.name, error = %e, "visitor bind failed");
-                    sess.visitor_cancels.lock().await.remove(&visitor_id);
-                    return false;
+                    discard_registration(&sess, visitor_id, &cancel).await;
+                    return StartOutcome::BindFailed;
                 }
             };
-            // R1:stop 在 bind 窗口内到达(token 已被取走并 cancel)→
-            // 尊重之,丢弃刚 bind 成功的 listener,不留孤儿。
-            if cancel.is_cancelled() {
-                sess.visitor_cancels.lock().await.remove(&visitor_id);
-                return false;
+            let actual_port = l.local_addr().map(|a| a.port()).unwrap_or(spec.bind_port);
+            if let Err(outcome) =
+                settle_registration(&sess, visitor_id, &cancel, &spec, actual_port).await
+            {
+                // 显式 drop:端口必须在返回前释放(调用方可能立刻换端口重试)。
+                drop(l);
+                return outcome;
             }
-            tokio::spawn(run_tcp(sess, visitor_id, spec, l, cancel));
-            true
+            tokio::spawn(async move {
+                // R4:退出信号持进任务 —— 它随任务结束 drop,等
+                // `VisitorListener::await_exit()` 的那一刻就是 listener
+                // 已 drop、端口已释放(不再用 connect 探针去猜)。
+                let _exit = exit_tx;
+                run_tcp(sess, visitor_id, spec, l, cancel).await;
+            });
+            StartOutcome::Started
         }
         VisitorKind::Sudp => {
             let addr = format!("{}:{}", spec.bind_addr, spec.bind_port);
@@ -78,18 +203,90 @@ pub async fn start(sess: Arc<ClientSession>, visitor_id: u64, spec: VisitorSpec)
                 Ok(s) => s,
                 Err(e) => {
                     warn!(visitor = %spec.name, error = %e, "visitor bind failed");
-                    sess.visitor_cancels.lock().await.remove(&visitor_id);
-                    return false;
+                    discard_registration(&sess, visitor_id, &cancel).await;
+                    return StartOutcome::BindFailed;
                 }
             };
-            if cancel.is_cancelled() {
-                sess.visitor_cancels.lock().await.remove(&visitor_id);
-                return false;
+            let actual_port = s.local_addr().map(|a| a.port()).unwrap_or(spec.bind_port);
+            if let Err(outcome) =
+                settle_registration(&sess, visitor_id, &cancel, &spec, actual_port).await
+            {
+                drop(s);
+                return outcome;
             }
-            tokio::spawn(run_udp(sess, visitor_id, Arc::new(s), cancel));
-            true
+            tokio::spawn(async move {
+                let _exit = exit_tx;
+                run_udp(sess, visitor_id, Arc::new(s), cancel).await;
+            });
+            StartOutcome::Started
         }
     }
+}
+
+/// 表内当前 spec 是否就是本次要起的这一份(表的更新在 dispatch 时同步
+/// 完成,见 `session::upsert` / `collect_sync_changes`)。
+async fn spec_is_current(sess: &Arc<ClientSession>, visitor_id: u64, spec: &VisitorSpec) -> bool {
+    sess.visitors.lock().await.get(&visitor_id) == Some(spec)
+}
+
+/// 摘掉自己插入的登记项。
+///
+/// 按 token 身份比对后只摘自己那一条:万一有并发的同 id 启动已经把
+/// 登记项换掉,这里绝不能顺手把**别人的**活登记摘掉(那也是孤儿化的
+/// 另一种写法)。
+async fn discard_registration(
+    sess: &Arc<ClientSession>,
+    visitor_id: u64,
+    cancel: &CancellationToken,
+) {
+    let mut g = sess.visitor_listeners.lock().await;
+    let mine = g
+        .get(&visitor_id)
+        .map(|e| e.token == *cancel)
+        .unwrap_or(false);
+    if mine {
+        g.remove(&visitor_id);
+    }
+}
+
+/// bind 成功后、spawn 之前的收尾:
+/// 1. stop 在 bind 窗口内到达(token 已 cancel)→ `Aborted`;
+/// 2. R2(后置):bind 期间表可能已被更新 → `Stale`(丢弃刚 bind 的
+///    listener,等价于"取消自己刚起的任务",且绝不留登记项);
+/// 3. 都没问题 → 把登记端口校正为实际 bind 端口(`bind_port = 0` 时两者
+///    不同,测试的一致性断言依赖它)。
+async fn settle_registration(
+    sess: &Arc<ClientSession>,
+    visitor_id: u64,
+    cancel: &CancellationToken,
+    spec: &VisitorSpec,
+    actual_port: u16,
+) -> Result<(), StartOutcome> {
+    if cancel.is_cancelled() {
+        discard_registration(sess, visitor_id, cancel).await;
+        return Err(StartOutcome::Aborted);
+    }
+    // 会话在 bind 窗口内开始关闭:同样按"停止意图"处理(见 `start` 开头)。
+    if sess.cancel.is_cancelled() {
+        discard_registration(sess, visitor_id, cancel).await;
+        return Err(StartOutcome::Aborted);
+    }
+    if !spec_is_current(sess, visitor_id, spec).await {
+        warn!(
+            visitor = %spec.name,
+            visitor_id,
+            "visitor spec superseded during bind; dropping the listener just bound"
+        );
+        discard_registration(sess, visitor_id, cancel).await;
+        return Err(StartOutcome::Stale);
+    }
+    let mut g = sess.visitor_listeners.lock().await;
+    if let Some(e) = g.get_mut(&visitor_id) {
+        if e.token == *cancel {
+            e.port = actual_port;
+        }
+    }
+    Ok(())
 }
 
 /// stcp/xtcp:本地 TCP 接入。xtcp 优先复用已打洞直连;否则 USER_CONNECT

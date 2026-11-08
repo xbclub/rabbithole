@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -134,8 +134,16 @@ pub struct ClientSession {
     /// 深克隆整份 ProxySpec(≈15+ 次分配)并拉长临界区。
     pub proxies: Mutex<HashMap<u64, std::sync::Arc<ProxySpec>>>,
     pub visitors: Mutex<HashMap<u64, VisitorSpec>>,
-    /// visitor 监听任务取消器。
-    pub visitor_cancels: Mutex<HashMap<u64, CancellationToken>>,
+    /// visitor 监听任务登记表:visitor_id → 取消器 + 实际端口 + 退出通知。
+    ///
+    /// 修前这里只存 `CancellationToken`(名字是 `visitor_cancels`):
+    /// `cancel()` 之后没有任何办法知道监听任务**何时**真正退出,于是
+    /// ① 产品侧同端口重启只能靠 bind 重试硬吃 EADDRINUSE;
+    /// ② 测试只能拿 connect 探针反复猜"关掉没有",而探针成功既可能来自
+    /// 旧监听器未死、也可能来自别的接受者 —— 归因不了。
+    /// 现在值里带 [端口](VisitorListener::port)与[退出通知](VisitorListener::exit),
+    /// 两条都变成可等待的事实。
+    pub visitor_listeners: Mutex<HashMap<u64, VisitorListener>>,
     /// 健康检查任务取消器。
     pub health_cancels: Mutex<HashMap<u64, CancellationToken>>,
     /// stcp/xtcp 等待配对的本地连接:user_conn_id → (连接本体, visitor_id, 登记时刻)。
@@ -154,8 +162,8 @@ pub struct ClientSession {
     pub punched_auth: Mutex<HashMap<u64, String>>,
     /// sudp 通道交付:visitor_id → sender。
     pub sudp_deliver: Mutex<HashMap<u64, mpsc::Sender<BoxedIo>>>,
-    /// R1:实体启停串行化链(见 [`spawn_entity_op`])。
-    pub entity_ops: Mutex<()>,
+    /// R1:实体启停的 FIFO 执行链(见 [`EntityOpChain`] / [`spawn_entity_op`])。
+    pub entity_ops: EntityOpChain,
     pub mux: Arc<rh_transport::Multiplexer>,
     pub conn_counter: AtomicU64,
 }
@@ -163,12 +171,167 @@ pub struct ClientSession {
 /// waiting 表条目:(本地连接, visitor_id, 登记时刻)。
 pub type WaitingEntry = (tokio::net::TcpStream, u64, std::time::Instant);
 
+/// 监听任务的退出闩锁。
+///
+/// 用 `watch` 而不是 `oneshot`:登记项在 `stop_visitor` 里被**取走**,
+/// 之后表里就没有它了;而测试往往需要在 stop 之前先克隆一个 watcher,
+/// 之后仍然等到**那一个**任务退出。`watch::Receiver` 可克隆,正好满足。
+///
+/// 信号本身就"发送端被 drop":监听任务把发送端持到函数返回(含 panic)
+/// 为止,所以 `changed()` 返回 `Err` 的那一刻 = 任务已结束、listener 已
+/// drop。不发送任何值(值类型是 `()`)。
+pub type ListenerExit = watch::Receiver<()>;
+
+/// 等一个监听任务退出,返回是否在 `budget` 内退出。
+///
+/// 语义边界:它证明的是**任务函数返回**(listener 随之 drop),不是
+/// "端口在外部观测上已不可 connect" —— 后者还受内核 accept 队列残留
+/// 影响。所以"已监听"的到达性检查仍然保留 connect 探针,但**只**做
+/// 到达性,不自称证明"已关闭"。
+pub async fn await_listener_exit(mut exit: ListenerExit, budget: Duration) -> bool {
+    // `Err(RecvError)` = 发送端已 drop = 任务已结束。
+    // 超时(`Elapsed`)→ false。任务主动发值(当前实现不发)→ `Ok(_)`,
+    // 同样说明它跑到了收尾,但这里不据此返回,交给上面的 Err 分支 ——
+    // 语义务必单一:只有"发送端消失"才算退出。
+    matches!(
+        tokio::time::timeout(budget, exit.changed()).await,
+        Ok(Err(_))
+    )
+}
+
+/// 一条 visitor 监听的登记项:取消器、**实际**监听端口、任务退出通知。
+///
+/// R4:`cancel()` 只表达意图,不保证监听器已经 drop。要断言"取消后监听
+/// 必须关闭",必须能等到任务真的退出 —— 就是 [`Self::exit`]。
+pub struct VisitorListener {
+    /// 停止这条监听(幂等)。
+    pub token: CancellationToken,
+    /// 实际 bind 到的端口(`bind_port = 0` 时与 spec 不同)。
+    /// R4 的一致性断言拿它比"表里说的端口"与"真在监听的端口"。
+    pub port: u16,
+    /// 监听任务的退出闩锁(见 [`ListenerExit`])。
+    exit: ListenerExit,
+}
+
+impl VisitorListener {
+    /// 登记一条监听(`exit` 的发送端由监听任务持有,任务结束即 drop)。
+    pub fn new(token: CancellationToken, port: u16, exit: ListenerExit) -> Self {
+        Self { token, port, exit }
+    }
+
+    /// 克隆一份退出闩锁(可在登记项被 stop 取走之后继续等待)。
+    /// 目前只有测试需要(生产侧等的是"这一条"本身)。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn exit_watcher(&self) -> ListenerExit {
+        self.exit.clone()
+    }
+
+    /// 等待**这条**监听任务退出,返回是否在 `budget` 内退出。
+    pub async fn await_exit(&mut self, budget: Duration) -> bool {
+        await_listener_exit(self.exit.clone(), budget).await
+    }
+}
+
+/// 一个已入链的实体启停操作:发起方等待它被执行(且执行完)。
+///
+/// R1:`spawn_entity_op` 的旧实现是 `spawn` + `Mutex` —— 只保证**互斥**,
+/// 不保证**顺序**:tokio 不承诺唤醒顺序,两个已 spawn 的任务谁先拿到锁
+/// 是调度器的自由。同一 visitor 的 sync 链与 update 链因此可能反序执行,
+/// 于是陈旧 start 落在新 start 之后(旧 spec 的监听器成为孤儿)。
+///
+/// 生产路径不关心单条操作的完成时刻(入链即返回),票据的存在意义是让
+/// **测试**能确定性地控制时序;故仅在测试构建里被读取。
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct EntityOpTicket {
+    /// 操作执行完毕(或链已关闭,操作被丢弃)。
+    done: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl EntityOpTicket {
+    /// 等待本操作执行完。返回 `false` 表示链已关闭、操作未被执行。
+    pub async fn wait(self) -> bool {
+        self.done.await.is_ok()
+    }
+}
+
+/// R1:实体启停的 **FIFO** 执行链。
+///
+/// 单通道 + 单 worker:`send` 的返回就是"已入队",队列是 mpsc 的先进
+/// 先出,worker 逐个 `await` 执行 —— 入链顺序严格等于执行顺序。
+/// 修前 `spawn` + `Mutex` 只互斥不保序,反序执行是常态而非极端情况。
+///
+/// worker 懒启动(首次入链时才 `spawn`):`ClientSession` 的构造有若干
+/// **非 async** 的调用点(测试里的 `bare_session`),构造期不能要求
+/// tokio runtime。
+pub struct EntityOpChain {
+    tx: std::sync::Mutex<Option<mpsc::UnboundedSender<EntityOp>>>,
+}
+
+type EntityOp = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
+impl EntityOpChain {
+    pub fn new() -> Self {
+        Self {
+            tx: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// 入链并拿到票据。票据 `wait()` 返回 `false` = 链已关闭、操作未执行。
+    fn enqueue<F>(&self, op: F) -> EntityOpTicket
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (done_tx, done) = tokio::sync::oneshot::channel();
+        let boxed: EntityOp = Box::pin(async move {
+            op.await;
+            // 操作体跑完即通知(先发信号,再让局部变量自然 drop)
+            let _ = done_tx.send(());
+        });
+        let mut slot = match self.tx.lock() {
+            Ok(g) => g,
+            // 毒化的锁:链本身没有跨 await 的不变式,取回内层即可。
+            Err(p) => p.into_inner(),
+        };
+        let tx = slot.get_or_insert_with(|| {
+            let (tx, mut rx) = mpsc::unbounded_channel::<EntityOp>();
+            tokio::spawn(async move {
+                // `recv` 逐个按入队顺序返回;执行期间的 await 天然把后续
+                // 操作挡在队列里(不需要也不允许并行)。
+                while let Some(op) = rx.recv().await {
+                    op.await;
+                }
+            });
+            tx
+        });
+        // 发送失败 → worker 已退出 → `boxed`(连同 done_tx)在此 drop,
+        // 接收端立刻得到 Err,`wait` 返回 false。
+        let _ = tx.send(boxed);
+        EntityOpTicket { done }
+    }
+}
+
+impl Default for EntityOpChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// waiting 表 TTL:语义不变(登记后 10s 未被配对即淘汰)。
 pub const WAITING_TTL: Duration = Duration::from_secs(10);
 
 /// TTL 清理扫描周期。取 1s:相对 10s TTL 足够细,单次扫描成本与条目数
 /// 线性且无锁等待之外的额外开销。
 const WAITING_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `stop_visitor` 等监听任务退出的上界。
+///
+/// 取消后任务需要被调度到才能看到 `cancelled()`;正常情况是毫秒级。
+/// 1s 与 `start_with_retry` 的总预算(10 × 100ms)同量级:等不到就让
+/// 后续 bind 重试去兜底,而不是把启停链无限期钉住。
+///
+/// `visitor_run::start` 替换"已 cancel 但未退出"的登记项时用同一个上界。
+pub(crate) const VISITOR_STOP_WAIT: Duration = Duration::from_secs(1);
 
 /// 在真实流之前回放一段残留字节(read_frame 缓冲丢失问题)。
 pub use rh_transport::PrependedIo;
@@ -1123,14 +1286,14 @@ async fn connect_and_run_inner(
         cancel: CancellationToken::new(),
         proxies: Mutex::new(HashMap::new()),
         visitors: Mutex::new(HashMap::new()),
-        visitor_cancels: Mutex::new(HashMap::new()),
+        visitor_listeners: Mutex::new(HashMap::new()),
         health_cancels: Mutex::new(HashMap::new()),
         waiting: Mutex::new(HashMap::new()),
         punched: Mutex::new(HashMap::new()),
         nat_socks: Mutex::new(HashMap::new()),
         punched_auth: Mutex::new(HashMap::new()),
         sudp_deliver: Mutex::new(HashMap::new()),
-        entity_ops: Mutex::new(()),
+        entity_ops: EntityOpChain::new(),
         mux: mux.clone(),
         conn_counter: AtomicU64::new(0),
     });
@@ -1298,7 +1461,13 @@ async fn run_loop(
         }
     }
     // 会话结束:停全部实体任务
-    let ids: Vec<u64> = sess.visitor_cancels.lock().await.keys().copied().collect();
+    let ids: Vec<u64> = sess
+        .visitor_listeners
+        .lock()
+        .await
+        .keys()
+        .copied()
+        .collect();
     for id in ids {
         stop_visitor(&sess, id).await;
     }
@@ -1640,6 +1809,10 @@ async fn run_sync_changes(sess: &Arc<ClientSession>, c: SyncChanges) {
         // R1:与 upsert 同款带重试启动。修前裸调 start 不看返回值 ——
         // ACK 已前置,bind 失败(旧监听器尚未释放端口的 E-5 窗口)
         // 后无机制重触发,规则静默失联到下次配置变更。
+        //
+        // 这里可能返回 `Stale`:一次 SYNC 的「停」与「起」之间,链上
+        // 若已排入同一 visitor 更新的配置(表已改),本次 start 就该
+        // 让位 —— 不重试、不 warn 到"bind 失败"那一档。
         crate::visitor_run::start_with_retry(sess.clone(), id, spec).await;
     }
 }
@@ -1702,7 +1875,7 @@ async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) 
         rh_protocol::message::SyncEntity::Visitor(v) => {
             // E-4:锁内只做 changed 判定与 insert(与 proxy 分支/apply_sync
             // 的"锁内只收集、await 全在锁外"纪律对齐)——修前在持
-            // visitors 写锁期间 await stop_visitor(内部再取 visitor_cancels
+            // visitors 写锁期间 await stop_visitor(内部再取 visitor_listeners
             // 与 sudp_deliver 两把锁),期间 open_data_channel 等读者被挡。
             let changed = {
                 let mut cur = sess.visitors.lock().await;
@@ -1713,14 +1886,16 @@ async fn upsert(sess: &Arc<ClientSession>, e: rh_protocol::message::SyncEntity) 
                 changed
             };
             if changed {
-                // R1:stop + 带重试启动作为**一个**串行化链单元执行。
-                // 修前 stop 同步、start spawn:与在途 SYNC 启停半部并发
-                // 时,两个 start 的 cancel token 在 visitor_cancels 里
-                // 互相覆盖 —— 先完成者的监听器从此无人能取消(孤儿
-                // 监听器按旧 spec 持续服务),stop 取消的可能是 bind
-                // 失败残留的死 token。链恢复修前全序,且保留 E-4/E-5
-                // 的全部收益:锁内仍只做判定与 insert,ACK 语义仍是
-                // 「配置已应用」。
+                // R1:stop + 带重试启动作为**一个**链单元执行,链按到达
+                // 顺序执行(见 `spawn_entity_op`)。
+                //
+                // 修前这一段的理由是"启停已串行化,不存在并发 start
+                // 覆盖" —— **那条理由不成立**:`spawn` + `Mutex` 只互斥
+                // 不保序,同步链的陈旧 start 完全可能后于 update 链的
+                // 新 start 执行,把新 token 覆盖掉、把旧端口的监听器
+                // 孤儿化。保序由 FIFO 链提供,陈旧 start 的兜底由
+                // `visitor_run::start` 的表内 spec 校验提供(它不依赖
+                // 链的正确性)。
                 let sess2 = sess.clone();
                 spawn_entity_op(sess, async move {
                     stop_visitor(&sess2, v.id).await;
@@ -1749,24 +1924,44 @@ async fn remove_entity(sess: &Arc<ClientSession>, entity_type: &str, id: u64) {
     }
 }
 
-/// R1:实体启停操作的串行化链。
+/// R1:实体启停操作的 **FIFO** 执行链。
 ///
 /// E-5 把 ServiceSync 的启停 spawn 化后引入了并发窗口:SYNC 的启停
 /// 半部与紧随其后的 ServiceUpdate / ServiceRemove 可并发对同一实体
 /// stop/start —— visitor 侧两个 start 的 cancel token 互相覆盖,
 /// 先完成者的监听器孤儿化(旧 spec 持续服务到会话结束);stop 取消
-/// 的可能是 bind 失败残留的死 token。所有启停(ServiceSync 启停半部
-/// / upsert / remove_entity)统一经本链按到达顺序执行,恢复修前
-/// 全序;链在后台排队,不阻塞 run_loop,E-5 的「ACK 前置」保持。
+/// 的可能是 bind 失败残留的死 token。
+///
+/// **修前的实现(`spawn` + `Mutex`)并不兑现"按到达顺序执行"**:互斥只
+/// 排除了并行,没排除反序 —— tokio 不保证同一批 `spawn` 的唤醒顺序,
+/// 先 spawn 的操作完全可能后拿到锁。修复分两层:
+///
+/// * 本函数改用 [`EntityOpChain`](mpsc 先进先出 + 单 worker),入链顺序
+///   即执行顺序;
+/// * `visitor_run::start` 在落地前后各校验一次表内 spec(表由 dispatch
+///   同步更新,是真正的配置真相源),即便链本身出问题,陈旧 start 也
+///   不会被当成新配置的监听器 —— 见 `StartOutcome::Stale`。
+///
+/// 链在后台排队,不阻塞 run_loop,E-5 的「ACK 前置」保持。
 fn spawn_entity_op<F>(sess: &Arc<ClientSession>, op: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let s = sess.clone();
-    tokio::spawn(async move {
-        let _guard = s.entity_ops.lock().await;
-        op.await;
-    });
+    // 票据被丢弃是允许的(生产路径不关心单条操作的完成时刻);
+    // 需要确定性时序的调用方(测试)用 `enqueue_entity_op` 拿票据 await。
+    let _ = sess.entity_ops.enqueue(op);
+}
+
+/// 同 [`spawn_entity_op`],但返回票据供调用方等待"本操作已执行完"。
+///
+/// 生产路径不用票据(入链即返回),存在意义是让测试能确定性控制时序;
+/// 故仅在测试构建里被调用。
+#[cfg_attr(not(test), allow(dead_code))]
+fn enqueue_entity_op<F>(sess: &Arc<ClientSession>, op: F) -> EntityOpTicket
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    sess.entity_ops.enqueue(op)
 }
 
 async fn stop_proxy(sess: &Arc<ClientSession>, id: u64) {
@@ -1776,8 +1971,31 @@ async fn stop_proxy(sess: &Arc<ClientSession>, id: u64) {
 }
 
 async fn stop_visitor(sess: &Arc<ClientSession>, id: u64) {
-    if let Some(c) = sess.visitor_cancels.lock().await.remove(&id) {
-        c.cancel();
+    // R4:取走登记项 → cancel → **等监听任务退出**。
+    //
+    // 修前只 `cancel()` 就返回:listener 要等任务被调度到下一次 accept
+    // 分支才发现取消,端口在那之前一直占着(同端口重启只能靠 bind 重试
+    // 硬吃 EADDRINUSE)。等退出还让"stop 之后端口已释放"成为可依赖的
+    // 事实,而不是靠 connect 探针去猜。
+    //
+    // 等待有上界:任务卡在用户连接的 accept 分支之外(极端情况)时不能
+    // 把整条启停链钉死 —— 超时后照常继续,端口由 bind 重试兜底。
+    // 注意:`if let` 的临时 guard 会活到整个块末,所以先把登记项取出来
+    // (`let` 语句末尾就释放锁),再 await 退出 —— 否则那 1s 等待期间整张
+    // 登记表都被锁着,任何 start / stop 都进不来。
+    let retired = sess.visitor_listeners.lock().await.remove(&id);
+    if let Some(mut entry) = retired {
+        // 端口先记下来:等退出之后登记项就没了,告警必须自带定位信息。
+        let port = entry.port;
+        entry.token.cancel();
+        if !entry.await_exit(VISITOR_STOP_WAIT).await {
+            warn!(
+                visitor_id = id,
+                port,
+                "visitor listener did not exit within the stop budget; \
+                 its port may still be held until the task is scheduled"
+            );
+        }
     }
     sess.sudp_deliver.lock().await.remove(&id);
     // ★打洞直连的 mux 与其凭据必须随 visitor 一起释放。
@@ -2828,14 +3046,14 @@ mod control_frame_tests {
             cancel: CancellationToken::new(),
             proxies: Mutex::new(HashMap::new()),
             visitors: Mutex::new(HashMap::new()),
-            visitor_cancels: Mutex::new(HashMap::new()),
+            visitor_listeners: Mutex::new(HashMap::new()),
             health_cancels: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             punched: Mutex::new(HashMap::new()),
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
-            entity_ops: Mutex::new(()),
+            entity_ops: EntityOpChain::new(),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -2914,14 +3132,14 @@ mod control_frame_tests {
             cancel: CancellationToken::new(),
             proxies: Mutex::new(HashMap::new()),
             visitors: Mutex::new(HashMap::new()),
-            visitor_cancels: Mutex::new(HashMap::new()),
+            visitor_listeners: Mutex::new(HashMap::new()),
             health_cancels: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             punched: Mutex::new(HashMap::new()),
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
-            entity_ops: Mutex::new(()),
+            entity_ops: EntityOpChain::new(),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -2959,14 +3177,14 @@ mod waiting_ttl_tests {
             cancel: CancellationToken::new(),
             proxies: Mutex::new(HashMap::new()),
             visitors: Mutex::new(HashMap::new()),
-            visitor_cancels: Mutex::new(HashMap::new()),
+            visitor_listeners: Mutex::new(HashMap::new()),
             health_cancels: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             punched: Mutex::new(HashMap::new()),
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
-            entity_ops: Mutex::new(()),
+            entity_ops: EntityOpChain::new(),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -3255,14 +3473,14 @@ mod apply_sync_lock_tests {
             cancel: CancellationToken::new(),
             proxies: Mutex::new(HashMap::new()),
             visitors: Mutex::new(HashMap::new()),
-            visitor_cancels: Mutex::new(HashMap::new()),
+            visitor_listeners: Mutex::new(HashMap::new()),
             health_cancels: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             punched: Mutex::new(HashMap::new()),
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
-            entity_ops: Mutex::new(()),
+            entity_ops: EntityOpChain::new(),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -3540,14 +3758,14 @@ mod upsert_retry_blocking_tests {
             cancel: CancellationToken::new(),
             proxies: Mutex::new(HashMap::new()),
             visitors: Mutex::new(HashMap::new()),
-            visitor_cancels: Mutex::new(HashMap::new()),
+            visitor_listeners: Mutex::new(HashMap::new()),
             health_cancels: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             punched: Mutex::new(HashMap::new()),
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
-            entity_ops: Mutex::new(()),
+            entity_ops: EntityOpChain::new(),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -3562,6 +3780,35 @@ mod upsert_retry_blocking_tests {
     fn hold_port() -> (u16, std::net::TcpListener) {
         let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         (l.local_addr().unwrap().port(), l)
+    }
+
+    /// R5:循环探针必须给每次 connect 带上界。
+    ///
+    /// 裸 `connect().await` 对"已 bind、内核 accept 队列满"的端口会被
+    /// 丢弃重传,macOS 下单次可挂 75s 量级 —— 外层的迭代次数预算因此
+    /// 完全失效。这里的 500ms 只用于**到达性**判断(端口上有人在
+    /// accept),不用来判定"已关闭"(那种断言要用监听任务的退出闩锁)。
+    async fn probe_listening(port: u16) -> bool {
+        matches!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await,
+            Ok(Ok(_))
+        )
+    }
+
+    /// 有界等待监听可达(到达性检查)。
+    async fn wait_listening(port: u16, budget: Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            if probe_listening(port).await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
     }
 
     /// `upsert` 执行期间,发送队列必须仍可投递。
@@ -3660,12 +3907,11 @@ mod upsert_retry_blocking_tests {
     /// 第二次 upsert 可能在第一次的重试还没结束时进来。两次都会
     /// `stop_visitor` + spawn 重试,可能互相把对方的 listener 取消掉。
     ///
-    /// 实测结论(本测试固化):**不会死锁、最终仍能起来、cancel 表不泄漏**。
-    /// 机制:第二次的 `stop_visitor` 取消的是第一次插入的 cancel token,
-    /// 第一次的重试循环继续跑(它只关心 bind 是否成功);两个重试循环
-    /// 竞争同一个端口,先成功的那个起监听,后成功的因 EADDRINUSE 继续
-    /// 重试直到超时。`visitor_cancels` 按 visitor_id 作 key,两次 insert
-    /// 互相覆盖,所以表里恰好一条(测试里断言了)。
+    /// 实测结论(本测试固化):**不会死锁、最终仍能起来、登记表不泄漏**。
+    /// 机制:两次 upsert 的 stop+start 作为两个链单元**顺序**执行(见
+    /// `EntityOpChain`),第二个 stop 等第一个监听任务退出后才 bind 同端口,
+    /// 所以不存在"两个重试循环抢同一个端口"的旧形态。登记表按 visitor_id
+    /// 作 key,任一时刻只有一条(测试里断言了)。
     ///
     /// ★这条不是缺陷修复的证明,而是**边界行为固化** —— 我原本担心
     /// spawn 会让两次更新互相拆台,实测确认不会。
@@ -3681,22 +3927,30 @@ mod upsert_retry_blocking_tests {
             upsert(&sess, SyncEntity::Visitor(visitor_spec(11, port))).await;
         }
         // 最终必须能连上(至少一条 listener 活着)
-        let mut ok = false;
-        for _ in 0..100 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                ok = true;
+        assert!(
+            wait_listening(port, Duration::from_secs(5)).await,
+            "重复更新后 visitor 最终必须监听可达"
+        );
+        // 探针:最终登记表里必须**恰好** 1 条(同一 visitor 只有一个监听
+        // 登记项,旧条目在 stop 时被取走)。
+        //
+        // 注意不能直接读:`stop` 摘条目与 `start` 重新登记之间有一个
+        // 瞬时空窗(链上两个动作之间)。所以先等到"登记项存在且未
+        // cancel",再断言条数 —— 否则这条断言会随机看到 0。
+        let mut registered = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let g = sess.visitor_listeners.lock().await;
+            if g.get(&11).map(|e| !e.token.is_cancelled()).unwrap_or(false) {
+                registered = true;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(g);
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(ok, "重复更新后 visitor 最终必须监听可达");
-        // 探针:最终 cancel 表里有几条?（应恰好 1 条 —— 两次 upsert 各 insert
-        // 一次,第二次覆盖第一次的 key)
-        let n = sess.visitor_cancels.lock().await.len();
-        assert_eq!(n, 1, "同一 visitor 只应有一个 cancel token,实际 {n}");
+        assert!(registered, "重复更新后必须最终留下一条活的监听登记项");
+        let n = sess.visitor_listeners.lock().await.len();
+        assert_eq!(n, 1, "同一 visitor 只应有一个监听登记项,实际 {n}");
         sess.cancel.cancel();
     }
 
@@ -3714,19 +3968,11 @@ mod upsert_retry_blocking_tests {
         let spec = visitor_spec(9, port);
         upsert(&sess, SyncEntity::Visitor(spec)).await;
 
-        // 等它 bind 成功(轮询连接,不引用内部常量)
-        let mut ok = false;
-        for _ in 0..100 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                ok = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(ok, "端口空闲时 visitor 必须最终监听可达");
+        // 等它 bind 成功(有界轮询,每次 connect 带超时)
+        assert!(
+            wait_listening(port, Duration::from_secs(5)).await,
+            "端口空闲时 visitor 必须最终监听可达"
+        );
         // 收尾:取消,避免测试结束后 listener 泄漏
         sess.cancel.cancel();
     }
@@ -3772,14 +4018,14 @@ mod upsert_proxy_lock_tests {
             cancel: CancellationToken::new(),
             proxies: Mutex::new(HashMap::new()),
             visitors: Mutex::new(HashMap::new()),
-            visitor_cancels: Mutex::new(HashMap::new()),
+            visitor_listeners: Mutex::new(HashMap::new()),
             health_cancels: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             punched: Mutex::new(HashMap::new()),
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
-            entity_ops: Mutex::new(()),
+            entity_ops: EntityOpChain::new(),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -3959,14 +4205,14 @@ mod heartbeat_try_send_tests {
             cancel: CancellationToken::new(),
             proxies: Mutex::new(HashMap::new()),
             visitors: Mutex::new(HashMap::new()),
-            visitor_cancels: Mutex::new(HashMap::new()),
+            visitor_listeners: Mutex::new(HashMap::new()),
             health_cancels: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             punched: Mutex::new(HashMap::new()),
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
-            entity_ops: Mutex::new(()),
+            entity_ops: EntityOpChain::new(),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -4088,14 +4334,14 @@ mod run_loop_heartbeat_no_lockup_tests {
             cancel: CancellationToken::new(),
             proxies: Mutex::new(HashMap::new()),
             visitors: Mutex::new(HashMap::new()),
-            visitor_cancels: Mutex::new(HashMap::new()),
+            visitor_listeners: Mutex::new(HashMap::new()),
             health_cancels: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             punched: Mutex::new(HashMap::new()),
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
-            entity_ops: Mutex::new(()),
+            entity_ops: EntityOpChain::new(),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -4209,14 +4455,14 @@ mod dispatch_frame_try_send_tests {
             cancel: CancellationToken::new(),
             proxies: Mutex::new(HashMap::new()),
             visitors: Mutex::new(HashMap::new()),
-            visitor_cancels: Mutex::new(HashMap::new()),
+            visitor_listeners: Mutex::new(HashMap::new()),
             health_cancels: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             punched: Mutex::new(HashMap::new()),
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
-            entity_ops: Mutex::new(()),
+            entity_ops: EntityOpChain::new(),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -4307,14 +4553,14 @@ mod ack_bounded_send_tests {
             cancel: CancellationToken::new(),
             proxies: Mutex::new(HashMap::new()),
             visitors: Mutex::new(HashMap::new()),
-            visitor_cancels: Mutex::new(HashMap::new()),
+            visitor_listeners: Mutex::new(HashMap::new()),
             health_cancels: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             punched: Mutex::new(HashMap::new()),
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
-            entity_ops: Mutex::new(()),
+            entity_ops: EntityOpChain::new(),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -4425,18 +4671,29 @@ mod ack_bounded_send_tests {
 
 #[cfg(test)]
 mod r1_sync_update_race_tests {
-    //! R1 回归:ServiceSync 的启停半部(E-5 起 spawn 化)与紧随的
-    //! ServiceUpdate 对同一 visitor 并发时的全序性。
+    //! R1 回归:同一 visitor 的 sync 链与 update 链的全序性,以及"取消
+    //! 后监听必须关闭"这类断言的**可证性**。
     //!
-    //! 修前的攻击面(交错时序自证):
-    //!  * SYNC spawn 的 T1 与 UPDATE 的 upsert(T2)并发对同一 visitor
-    //!    start —— 两个 cancel token 在 `visitor_cancels` 互相覆盖,
-    //!    先完成者的监听器从此无人能取消(孤儿监听器按旧 spec 持续
-    //!    服务到会话结束);stop 取消的可能是 bind 失败残留的死 token;
-    //!  * sync 侧裸调 `start` 不看返回值、无重试,bind 失败后规则
-    //!    静默失联(ACK 已前置,无机制重触发)。
+    //! 修前的攻击面(三条,均已由读取源码 + 实测复核确认):
+    //!  * `spawn_entity_op` 只有 `spawn` + `Mutex`:互斥 ≠ 保序,tokio 不
+    //!    承诺唤醒顺序,陈旧 start 完全可能后于新 start 执行;
+    //!  * `start` 对同一 visitor_id 用 `insert` 直接覆盖旧 token 且不
+    //!    cancel 旧任务 ⟹ 旧端口的监听器孤儿化(表指向新端口、监听留在
+    //!    旧端口,或相反);
+    //!  * 测试用 connect 探针判断"监听已关闭"。这条**根本不成立**:
+    //!    `kern.ipc.somaxconn=128`,无人 accept 的 listening socket 第
+    //!    129 次 connect 起必被重置 —— 反复 connect 全成功恰恰说明
+    //!    "有一个活的 accept 在排空 backlog",而不是"还没关"。
     //!
-    //! 修后:所有启停经 `entity_ops` 链串行,sync 侧改 `start_with_retry`。
+    //! 修后的判据:
+    //!  * 顺序:FIFO 链(`EntityOpChain`);
+    //!  * 覆盖:`start` 落地前后各校验一次表内 spec,陈旧 start 返回
+    //!    `Stale` 且不留登记项;
+    //!  * 关闭:等监听任务的退出闩锁(`await_listener_exit`),connect
+    //!    探针只保留"已监听"的到达性检查,且每次带超时。
+    //!
+    //! 另外新增表/监听一致性断言(登记端口 == 实际监听端口),专门防
+    //! "反转序下测试静默通过而实际端口与表不一致"的假绿。
     use super::*;
     use rh_protocol::message::SyncEntity;
 
@@ -4463,14 +4720,14 @@ mod r1_sync_update_race_tests {
             cancel: CancellationToken::new(),
             proxies: Mutex::new(HashMap::new()),
             visitors: Mutex::new(HashMap::new()),
-            visitor_cancels: Mutex::new(HashMap::new()),
+            visitor_listeners: Mutex::new(HashMap::new()),
             health_cancels: Mutex::new(HashMap::new()),
             waiting: Mutex::new(HashMap::new()),
             punched: Mutex::new(HashMap::new()),
             nat_socks: Mutex::new(HashMap::new()),
             punched_auth: Mutex::new(HashMap::new()),
             sudp_deliver: Mutex::new(HashMap::new()),
-            entity_ops: Mutex::new(()),
+            entity_ops: EntityOpChain::new(),
             mux: rh_transport::mux::wrap_stream_as_client(
                 Box::new(tokio::io::duplex(4096).0) as rh_transport::BoxedIo,
                 true,
@@ -4485,12 +4742,39 @@ mod r1_sync_update_race_tests {
         l.local_addr().unwrap().port()
     }
 
+    /// R5:单次 connect 探针的超时。
+    ///
+    /// 修前的循环体是**裸** `connect().await`:对已 bind 但内核 accept 队列
+    /// 满的端口,TCP 握手会被丢弃重传,单次 connect 在 macOS 上可以挂
+    /// 75s 量级 —— 循环的 `budget_ms` 完全失效(预算只约束迭代次数,
+    /// 不约束单次迭代耗时)。这里给每次探针一个上界。
+    const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+    /// 一次 connect 探针:成功 = 端口上有人在 accept。
+    ///
+    /// ★语义边界(必须写清,否则会重犯本次的归因错误):探针成功只能证明
+    /// "有一个接受者",**不能**证明"是我们在等的那一个监听器"。本次
+    /// flaky 的根因判定正是踩在这上面 —— "1000 次 connect 全成功"曾被
+    /// 当成"监听没关",而 `kern.ipc.somaxconn=128` 决定了第 129 次起
+    /// 未被 accept 的连接会被 RST,所以全成功实际证明了**有活的 accept
+    /// 在排空 backlog**,即"关掉没有"这条断言用探针根本不成立。
+    /// 关闭类断言一律改用 [`await_listener_exit`]。
+    async fn probe_listening(port: u16) -> bool {
+        matches!(
+            tokio::time::timeout(
+                CONNECT_PROBE_TIMEOUT,
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await,
+            Ok(Ok(_))
+        )
+    }
+
+    /// R5:仅用于**到达性**检查(监听已建立),每次 connect 带超时。
     async fn wait_listening(port: u16, budget_ms: u64) -> bool {
-        for _ in 0..(budget_ms / 10) {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
+        let deadline = std::time::Instant::now() + Duration::from_millis(budget_ms);
+        while std::time::Instant::now() < deadline {
+            if probe_listening(port).await {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4498,75 +4782,281 @@ mod r1_sync_update_race_tests {
         false
     }
 
-    /// SYNC spawn 后立刻 UPDATE 同一 visitor:最终只有一个监听器、
-    /// token 可 stop、spec 为新、旧端口无孤儿。
+    /// R4:表/监听一致性断言 —— 登记的 port 必须是**实际**监听的端口,
+    /// 且必须与 `visitors` 表内的 `bind_port` 相同。
+    ///
+    /// 这条专门挡"假绿":反转序下,覆盖式 stop 可能让测试在"新端口可达 +
+    /// 旧端口关闭"两个断言上都静默通过,而实际在跑的是旧 spec 的监听器
+    /// (表指向新端口)。所以三方(登记项 / visitors 表 / 期望端口)都要
+    /// 对齐,不能只看"某个端口能连上"。
+    ///
+    /// 返回该登记项的退出闩锁,供后续 await 任务退出。
+    async fn assert_registration_matches(
+        sess: &Arc<ClientSession>,
+        id: u64,
+        expect_port: u16,
+    ) -> ListenerExit {
+        let g = sess.visitor_listeners.lock().await;
+        let entry = g
+            .get(&id)
+            .unwrap_or_else(|| panic!("visitor {id} 必须有监听登记项"));
+        assert_eq!(
+            entry.port, expect_port,
+            "登记端口必须等于实际监听端口(表指向 {expect_port})"
+        );
+        let watcher = entry.exit_watcher();
+        drop(g);
+        // 表内 spec 也必须就是这一份配置
+        let spec = sess
+            .visitors
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| panic!("visitor {id} 必须在 visitors 表内"));
+        assert_eq!(
+            spec.bind_port, expect_port,
+            "visitors 表内的 bind_port 必须与登记端口一致"
+        );
+        watcher
+    }
+
+    /// 直接调(而非入链)执行一次 sync,并等它跑完。
+    ///
+    /// R3:修前这里用 `spawn_entity_op` 把 sync 启停半部塞进链,再靠
+    /// "链是 FIFO"假定它先于随后的 update 执行。但**测试自己制造了
+    /// 入链竞争**:`spawn_entity_op` 返回与 `upsert` 的 `enqueue` 之间
+    /// 没有顺序保证 —— 两者谁先进链取决于调度,测试于是在"sync 先"
+    /// 这个前提上做断言。现在直接 await,顺序由代码结构决定。
+    async fn run_sync_now(sess: &Arc<ClientSession>, changes: SyncChanges) {
+        run_sync_changes(sess, changes).await;
+    }
+
+    /// 等到 visitor 的**监听登记**出现且未 cancel,返回其退出闩锁。
+    ///
+    /// 比 connect 探针更可靠:探针只能证明"端口上有人在 accept",而
+    /// 测试里那个"占位 listener"本身也会让探针成功(它 bind 了同一个
+    /// 端口)。登记项 + 端口一致才是"我们的 visitor 起来了"。
+    async fn wait_registered(
+        sess: &Arc<ClientSession>,
+        id: u64,
+        port: u16,
+        budget: Duration,
+    ) -> ListenerExit {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            {
+                let g = sess.visitor_listeners.lock().await;
+                if let Some(e) = g.get(&id) {
+                    if !e.token.is_cancelled() && e.port == port {
+                        return e.exit_watcher();
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "visitor {id} 未在预算内登记到端口 {port} 上"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// 起一个 visitor 并等它真正开始监听(同时拿到退出闩锁)。
+    async fn start_and_settle(sess: &Arc<ClientSession>, id: u64, port: u16) -> ListenerExit {
+        upsert(sess, SyncEntity::Visitor(visitor_spec(id, port))).await;
+        let exit = wait_registered(sess, id, port, Duration::from_secs(10)).await;
+        // 到达性(connect 探针,带超时):登记项存在还不等于 accept 在跑
+        assert!(
+            wait_listening(port, 10_000).await,
+            "visitor {id} 必须最终监听可达(端口 {port})"
+        );
+        assert_registration_matches(sess, id, port).await;
+        exit
+    }
+
+    /// R1+R2+R3+R4 主回归。
+    ///
+    /// 时序:sync 推旧 spec(port1)并**执行完**;update 推新 spec(port2)。
+    /// 断言:
+    ///  1. 新端口可达(到达性,connect 探针带超时);
+    ///  2. 登记项、visitors 表、实际监听三者端口一致(防假绿);
+    ///  3. stop 后监听任务**退出**(等退出闩锁,不用 connect 猜);
+    ///  4. 旧端口无孤儿监听 —— 也改为"旧那代的监听任务已退出"。
+    ///
+    /// 第 3/4 条是本轮修复的核心:`cancel()` 只是意图,唯一可断言的
+    /// 事实是任务已退出、listener 已 drop。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sync_then_update_same_visitor_single_listener() {
         let sess = test_session();
         let port1 = free_port();
         let port2 = free_port();
 
-        // 模拟 run_loop 的 ServiceSync 分支:collect → spawn 启停半部
+        // SYNC:表更新 + 启停(直接 await,不再入链制造竞争)
         let changes = {
             let mut nv = HashMap::new();
             nv.insert(21u64, visitor_spec(21, port1));
             collect_sync_changes(&sess, &HashMap::new(), &nv).await
         };
-        let sess2 = sess.clone();
-        spawn_entity_op(&sess, async move {
-            run_sync_changes(&sess2, changes).await;
-        });
+        run_sync_now(&sess, changes).await;
 
-        // 紧随的 ServiceUpdate(新端口新 spec):修前与上面的 spawn 并发
+        // 第一代监听必须真的起来了,否则后面"旧端口无孤儿"是无意义的
+        let gen1_exit = wait_registered(&sess, 21, port1, Duration::from_secs(10)).await;
+        assert!(
+            wait_listening(port1, 10_000).await,
+            "sync 启动后端口 {port1} 必须监听可达"
+        );
+        assert_registration_matches(&sess, 21, port1).await;
+
+        // 紧随的 ServiceUpdate(新端口新 spec)
         upsert(&sess, SyncEntity::Visitor(visitor_spec(21, port2))).await;
 
-        // 新端口最终可达(链序:sync start(p1) → update stop+start(p2))。
-        // 预算 10s:本测试曾在并发构建/测试进程的风暴下偶发超时(3s 被
-        // 饿穿);断言本身无竞态(token 先插后 bind),加耐心不加宽松度。
+        // 1) 新端口最终可达。链序:update 的 stop(等 gen1 退出)→ start(p2)。
+        let gen2_exit = wait_registered(&sess, 21, port2, Duration::from_secs(10)).await;
         assert!(
             wait_listening(port2, 10_000).await,
             "新 spec 端口 {port2} 必须最终监听可达"
         );
-        // 表内为新 spec(表更新在锁内,同步断言)
-        assert_eq!(
-            sess.visitors.lock().await.get(&21).unwrap().bind_port,
-            port2,
-            "表内必须是新 spec"
+        // 2) 三者一致:登记端口 == 表内端口 == 实际监听端口
+        assert_registration_matches(&sess, 21, port2).await;
+        // 3) 旧那一代的监听任务必须已经退出(update 的 stop 等过它)
+        assert!(
+            await_listener_exit(gen1_exit, Duration::from_secs(10)).await,
+            "旧 spec 端口 {port1} 的监听任务必须已退出(不得残留孤儿)"
         );
-        // 恰好一个 token;cancel 它 → 新端口关闭(可 stop,不留孤儿)
+        // 4) 恰好一个登记项;cancel 它 → 新一代监听任务退出
         {
-            let m = sess.visitor_cancels.lock().await;
-            assert_eq!(m.len(), 1, "同一 visitor 只应有一个 cancel token");
-            m.get(&21).unwrap().cancel();
+            let mut m = sess.visitor_listeners.lock().await;
+            assert_eq!(m.len(), 1, "同一 visitor 只应有一个监听登记项");
+            m.get_mut(&21).unwrap().token.cancel();
         }
-        let mut closed = false;
-        for _ in 0..1000 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port2))
-                .await
-                .is_err()
-            {
-                closed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(closed, "cancel token 后监听必须关闭");
-        // 旧端口无孤儿监听(修前 T1 的监听器被覆盖 token 后会残留)。
-        // 有界重试:旧监听器的 cancel 在 update 链早已发出,但 accept
-        // 任务被调度到 drop 可能在负载下滞后。
-        let mut orphan = false;
-        for _ in 0..1000 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port1))
-                .await
-                .is_err()
-            {
-                orphan = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(orphan, "旧 spec 端口 {port1} 不得残留监听(孤儿)");
+        assert!(
+            await_listener_exit(gen2_exit, Duration::from_secs(10)).await,
+            "cancel token 后监听任务必须退出(端口 {port2})"
+        );
         sess.cancel.cancel();
+    }
+
+    /// R2 直接回归:陈旧 start 不得覆盖新一代的登记项。
+    ///
+    /// 构造方式最贴近真实缺陷 —— **让旧 start 晚于新 start 执行**:
+    /// 先把表改成新 spec(dispatch 时同步发生),再按旧 spec 调 `start`。
+    /// 修前:一次 `insert` 就把新代 token 盖掉,新端口监听从此无人能
+    /// stop(孤儿),而表与登记项都指向新端口 —— 恰好是"假绿"的形态。
+    /// 修后:`start` 认出表内不是自己这份配置,返回 `Stale` 且不 insert。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_start_does_not_overwrite_live_registration() {
+        let sess = test_session();
+        let port_old = free_port();
+        let port_new = free_port();
+
+        // 表内先落地新 spec(等价于 update 的 dispatch 半部)
+        sess.visitors
+            .lock()
+            .await
+            .insert(31, visitor_spec(31, port_new));
+        let gen_new_exit = {
+            let outcome =
+                crate::visitor_run::start(sess.clone(), 31, visitor_spec(31, port_new)).await;
+            assert_eq!(
+                outcome,
+                crate::visitor_run::StartOutcome::Started,
+                "新 spec 的 start 必须真的起监听"
+            );
+            assert!(wait_listening(port_new, 10_000).await, "新端口必须可达");
+            assert_registration_matches(&sess, 31, port_new).await
+        };
+
+        // 晚到的旧 start:表内已是新 spec → 必须判陈旧
+        let outcome = crate::visitor_run::start(sess.clone(), 31, visitor_spec(31, port_old)).await;
+        assert_eq!(
+            outcome,
+            crate::visitor_run::StartOutcome::Stale,
+            "表内 spec 已更新时,旧 spec 的 start 必须判为陈旧"
+        );
+        // 陈旧 start 不得留下任何痕迹:登记项仍指向新一代,且仍可 stop
+        let gen_after = assert_registration_matches(&sess, 31, port_new).await;
+        {
+            let mut m = sess.visitor_listeners.lock().await;
+            assert_eq!(m.len(), 1, "陈旧 start 不得新增登记项");
+            m.get_mut(&31).unwrap().token.cancel();
+        }
+        assert!(
+            await_listener_exit(gen_after, Duration::from_secs(10)).await,
+            "新一代监听必须仍可被 cancel 到并退出(未被陈旧 start 覆盖)"
+        );
+        // 旧端口从未被 bind
+        assert!(
+            !probe_listening(port_old).await,
+            "陈旧 start 不得在该端口上建立监听"
+        );
+        let _ = gen_new_exit;
+        sess.cancel.cancel();
+    }
+
+    /// R2 第二层:spec 仍是表内那一条,但已有一条**活着的**登记项。
+    ///
+    /// 这是"直接 insert 覆盖"最赤裸的形态:同 spec 并发 start 一次就会
+    /// 把上一代的 token 顶掉,旧 listener 从此无人可取消。修后必须拒绝
+    /// 叠第二个监听器,并保留原登记项(仍可 stop)。
+    ///
+    /// 生产路径不会走到这里(链上每个 start 都有配对的 stop),所以这条
+    /// 守的是"不被未来调用者误用",不是当前缺陷的直接复现。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_same_spec_start_does_not_stack_listeners() {
+        let sess = test_session();
+        let port = free_port();
+        let exit = start_and_settle(&sess, 32, port).await;
+
+        // 同 spec 再 start 一次(不先 stop)
+        let again = crate::visitor_run::start(sess.clone(), 32, visitor_spec(32, port)).await;
+        assert_eq!(
+            again,
+            crate::visitor_run::StartOutcome::Stale,
+            "已有活监听时,同 spec 的第二次 start 必须被拒绝(不得叠第二个监听器)"
+        );
+        // 原登记项原封不动,且仍可 stop
+        let watcher = assert_registration_matches(&sess, 32, port).await;
+        {
+            let mut m = sess.visitor_listeners.lock().await;
+            assert_eq!(m.len(), 1, "不得出现第二条登记项");
+            m.get_mut(&32).unwrap().token.cancel();
+        }
+        assert!(
+            await_listener_exit(watcher, Duration::from_secs(10)).await,
+            "被拒绝的 start 不得让原监听失去可停止性"
+        );
+        let _ = exit;
+        sess.cancel.cancel();
+    }
+
+    /// R1 直接回归:FIFO 链的入链顺序 == 执行顺序。
+    ///
+    /// 修前 `spawn` + `Mutex` 只互斥不保序,反序执行是调度器的自由;
+    /// 不同 visitor 的操作也被串成一条链,反序会让"先到的 stop"压住
+    /// "后到的 start"。这条用序号自证:若链保序,执行序列必须等于入链
+    /// 序列。
+    ///
+    /// 注:用 `std::sync::Mutex<Vec<_>>`(无异步)记录,避免测试自身
+    /// 引入 await 打乱时序。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn entity_ops_chain_preserves_enqueue_order() {
+        let sess = test_session();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let mut tickets = Vec::new();
+        for i in 0..16usize {
+            let seen2 = seen.clone();
+            tickets.push(enqueue_entity_op(&sess, async move {
+                // 每条都让出一次:给"乱序执行"留出发生的机会
+                tokio::task::yield_now().await;
+                seen2.lock().unwrap().push(i);
+            }));
+        }
+        for t in tickets {
+            assert!(t.wait().await, "已入链的操作必须被执行");
+        }
+        let got = seen.lock().unwrap().clone();
+        let expect: Vec<usize> = (0..16).collect();
+        assert_eq!(got, expect, "链必须按入链顺序执行(观察到的顺序见左)");
     }
 
     /// sync 侧启动必须带重试:端口被占后在释放窗口内必须最终起来
@@ -4574,8 +5064,9 @@ mod r1_sync_update_race_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sync_visitor_start_retries_until_port_released() {
         let sess = test_session();
-        // 占住端口,250ms 后释放 —— 模拟「stop cancel 后旧监听器滞后
-        // drop」的 EADDRINUSE 窗口
+        // 占住端口,250ms 后释放 —— 模拟「外部进程占端口」的
+        // EADDRINUSE 窗口(stop 已等任务退出,内部窗口基本消失,
+        // 但重试仍要挡住外部占用)
         let port = {
             let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let p = l.local_addr().unwrap().port();
@@ -4590,16 +5081,21 @@ mod r1_sync_update_race_tests {
             nv.insert(22u64, visitor_spec(22, port));
             collect_sync_changes(&sess, &HashMap::new(), &nv).await
         };
-        let sess2 = sess.clone();
-        spawn_entity_op(&sess, async move {
-            run_sync_changes(&sess2, changes).await;
-        });
+        // R3:直接 await(顺序由代码结构决定,不靠链的排程)
+        run_sync_now(&sess, changes).await;
 
-        // start_with_retry 预算 ~1s,250ms 释放后必须起来
+        // start_with_retry 预算 ~1s,250ms 释放后必须起来。
+        //
+        // 这里**不能**只用 connect 探针:占位 listener 在头 250ms 内自己
+        // 就会让探针成功 —— 探针分不清"它"和"我们的 visitor"。先等登记
+        // 项落地(登记 + 端口一致才是我们起来了),再补到达性检查。
+        let exit = wait_registered(&sess, 22, port, Duration::from_secs(5)).await;
         assert!(
-            wait_listening(port, 3000).await,
+            wait_listening(port, 5000).await,
             "sync 启动必须带重试:端口释放后 visitor 要最终监听可达"
         );
+        assert_registration_matches(&sess, 22, port).await;
+        let _ = exit;
         sess.cancel.cancel();
     }
 
@@ -4609,26 +5105,35 @@ mod r1_sync_update_race_tests {
     async fn visitor_start_does_not_revive_after_session_cancel() {
         let sess = test_session();
         let port = free_port();
-        upsert(&sess, SyncEntity::Visitor(visitor_spec(23, port))).await;
-        assert!(wait_listening(port, 2000).await, "先证明监听已建立");
+        let exit = start_and_settle(&sess, 23, port).await;
 
         // 会话关闭:cancel + 全量 stop(shutdown 路径同款)
         sess.cancel.cancel();
-        let ids: Vec<u64> = sess.visitor_cancels.lock().await.keys().copied().collect();
+        let ids: Vec<u64> = sess
+            .visitor_listeners
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .collect();
         for id in ids {
             stop_visitor(&sess, id).await;
         }
-        let mut closed = false;
-        for _ in 0..300 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_err()
-            {
-                closed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(closed, "会话关闭后监听必须关闭且不得被重试复活");
+        assert!(
+            await_listener_exit(exit, Duration::from_secs(10)).await,
+            "会话关闭后监听任务必须退出且不得被重试复活"
+        );
+        // 会话级熔断:再入链一次 start 也不得把监听拉回来
+        let retried = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::visitor_run::start(sess.clone(), 23, visitor_spec(23, port)),
+        )
+        .await
+        .expect("会话关闭后 start 必须立刻返回");
+        assert_ne!(
+            retried,
+            crate::visitor_run::StartOutcome::Started,
+            "会话已关闭,start 不得起监听"
+        );
     }
 }
