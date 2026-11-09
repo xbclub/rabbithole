@@ -479,6 +479,8 @@ loadgen 只有单向发送,B 侧 sink 读空;`download` 档实际与 `upload` �
 
 - 子 agent 之间不直接通信;由主 agent 收集中间结果并派发下一环。
 - 无依赖的子任务并行派发,有依赖的严格串行。
+- 主 agent 阻塞等待子 agent / 后台任务结果时,一律用 **TaskOutput**
+  (`block=true`)阻塞取结果,不要 `sleep` 轮询或空转重试。
 - 每个子 agent 返回后,主 agent 负责校验其产出是否符合该环节的验收标准,
   再进入下一环节。
 
