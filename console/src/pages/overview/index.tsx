@@ -1,20 +1,23 @@
 import { useQuery } from '@tanstack/react-query';
-import { ChevronDown, ChevronUp, Inbox, Waypoints } from 'lucide-react';
-import { Suspense, lazy, useState } from 'react';
-import type { ReactNode } from 'react';
+import {
+  Activity,
+  ArrowRight,
+  ArrowRightLeft,
+  ChevronDown,
+  ChevronUp,
+  Cpu,
+  Inbox,
+  Network,
+  RefreshCw,
+  Search,
+  Server,
+  Waypoints,
+} from 'lucide-react';
+import { Suspense, lazy, useMemo, useState } from 'react';
+import { Link, useNavigate } from 'react-router';
 
-import type { ServiceRow } from '@/api/rabbithole';
-
-/**
- * 图表按需加载:recharts 约 367 KB,是总览页最大的一块。
- * 指标条与事件先渲染,图表随后到(期间显示骨架),避免整页等图表库。
- */
-const TrafficRateChart = lazy(() =>
-  import('@/components/traffic-chart').then((module) => ({
-    default: module.TrafficRateChart,
-  })),
-);
 import { listEvents, listServices, statsOverview } from '@/api/rabbithole';
+import type { ServiceRow } from '@/api/rabbithole';
 import { EmptyState } from '@/components/empty-state';
 import { InfoLabel } from '@/components/info-label';
 import { Mono } from '@/components/mono';
@@ -30,35 +33,37 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import type { FieldInfoKey } from '@/features/field-info';
 import { fmtBytes, fmtTime } from '@/lib/format';
 import { qk } from '@/lib/query-keys';
+import { cn } from '@/lib/utils';
+import { ROUTES } from '@/router/paths';
 
-/** 轮询间隔:指标条 / 速率窗口 / 最近事件统一 5 秒。 */
+const TrafficRateChart = lazy(() =>
+  import('@/components/traffic-chart').then((module) => ({
+    default: module.TrafficRateChart,
+  })),
+);
+
 const POLL_MS = 5000;
-/** 最近事件拉取条数(与 qk.events 的 key 一一对应)。 */
 const EVENTS_LIMIT = 20;
-/** 事件表默认展示条数,其余点「展开全部」查看。 */
-const EVENTS_COLLAPSED = 5;
+const EVENTS_COLLAPSED = 6;
 
-/**
- * 转发规则的监听标识:TCP/UDP 是 bind_ip:bind_port;HTTP(S) 走域名/子域;
- * 其余 kind 无域名,回落到 bind 地址(旧版此处显示占位符「—」)。
- * M8:域名信息来自列表行的顶层投影(custom_domains/subdomain),
- * 列表接口不再携带整份 spec。
- */
+const KIND_ROUTE: Record<string, string> = {
+  tcp: ROUTES.tcp,
+  udp: ROUTES.udp,
+  http: ROUTES.domains,
+  https: ROUTES.domains,
+  tcpmux: ROUTES.domains,
+  stcp: ROUTES.secret,
+  sudp: ROUTES.secret,
+  xtcp: ROUTES.secret,
+};
+
 function listenAddress(rule: ServiceRow): string {
-  const bind = `${rule.bind_ip}:${rule.bind_port}`;
+  const bind = rule.bind_port === 0 ? `${rule.bind_ip}:自动` : `${rule.bind_ip}:${rule.bind_port}`;
   if (rule.kind === 'tcp' || rule.kind === 'udp') return bind;
 
   const first = rule.custom_domains?.find((d) => d.length > 0);
@@ -67,43 +72,12 @@ function listenAddress(rule: ServiceRow): string {
   return bind;
 }
 
-/** 指标条单格:名词 + 说明浮层 + mono 数值(tabular-nums,轮询刷新不抖动)。 */
-function MetricCell({
-  infoKey,
-  loading,
-  suffix,
-  title,
-  value,
-}: {
-  infoKey: FieldInfoKey;
-  loading: boolean;
-  suffix?: ReactNode;
-  title: string;
-  value: ReactNode;
-}) {
-  return (
-    <div className="bg-card px-4 py-3.5">
-      <div className="text-xs text-muted-foreground">
-        <InfoLabel infoKey={infoKey} title={title} />
-      </div>
-      {loading ? (
-        <Skeleton className="mt-2 h-7 w-24" />
-      ) : (
-        <div className="mt-2 flex items-baseline gap-1.5">
-          <Mono className="text-2xl leading-none font-semibold">{value}</Mono>
-          {suffix === undefined ? null : <Mono className="text-muted-foreground">{suffix}</Mono>}
-        </div>
-      )}
-    </div>
-  );
-}
+type TunnelHealthFilter = 'all' | 'issues' | 'ok';
+type EventLevelFilter = 'all' | 'info' | 'warn' | 'error';
 
-/**
- * 总览页:指标条 / 流量速率 + 转发规则健康 / 最近事件。
- * 三个查询都是 5 秒轮询;queryKey 稳定,失败时 TanStack Query 保留上一次成功的 data
- * (不写 placeholderData:key 不变时它不会带来额外语义,失败清空只可能由换 key 引起)。
- */
 export default function OverviewPage() {
+  const navigate = useNavigate();
+
   const statsQ = useQuery({
     queryKey: qk.stats,
     queryFn: statsOverview,
@@ -117,171 +91,488 @@ export default function OverviewPage() {
   const servicesQ = useQuery({
     queryKey: qk.services(),
     queryFn: () => listServices(),
-    // L-I a:「转发规则健康」卡与指标条/事件同源轮询(修前此查询不随
-    // 5s 刷新,池/连接数在页面上冻结,只有切页才更新)
     refetchInterval: POLL_MS,
   });
 
   const stats = statsQ.data;
-  // 失败判定:最近一次失败晚于最近一次成功 → 速率窗口在该处断线(不补零、不外推)
   const rateFailed = statsQ.errorUpdatedAt > statsQ.dataUpdatedAt;
   const { currentIn, currentOut, points } = useTrafficRateWindow(
     stats,
     statsQ.dataUpdatedAt,
     rateFailed,
   );
-  // 至少有一个真实速率点才显示速率,否则显示 `-`(不把「还没采到」伪装成 0 B/s)
   const hasRate = points.some((point) => point.in !== null);
   const rateIn = hasRate ? `${fmtBytes(currentIn)}/s` : '-';
   const rateOut = hasRate ? `${fmtBytes(currentOut)}/s` : '-';
 
-  const events = eventsQ.data ?? [];
-  const [eventsExpanded, setEventsExpanded] = useState(false);
-  const shownEvents = eventsExpanded ? events : events.slice(0, EVENTS_COLLAPSED);
+  const peakIn = useMemo(() => {
+    const vals = points.map((p) => p.in).filter((v): v is number => v !== null);
+    return vals.length > 0 ? Math.max(...vals) : null;
+  }, [points]);
+  const peakOut = useMemo(() => {
+    const vals = points.map((p) => p.out).filter((v): v is number => v !== null);
+    return vals.length > 0 ? Math.max(...vals) : null;
+  }, [points]);
 
-  // 转发规则健康面板:启用中的规则(enabled 且状态不是 disabled)
-  const tunnels = (servicesQ.data ?? []).filter(
-    (rule) => rule.enabled && rule.status !== 'disabled',
+  const allServices = useMemo(() => servicesQ.data ?? [], [servicesQ.data]);
+  const enabledTunnels = useMemo(
+    () => allServices.filter((rule) => rule.enabled && rule.status !== 'disabled'),
+    [allServices],
   );
 
+  const issueCount = useMemo(
+    () =>
+      enabledTunnels.filter(
+        (r) =>
+          r.status === 'bind_error' ||
+          r.status === 'apply_error' ||
+          r.status === 'offline' ||
+          (r.status === 'running' && !r.healthy),
+      ).length,
+    [enabledTunnels],
+  );
+
+  const totalPoolReady = useMemo(
+    () => enabledTunnels.reduce((acc, r) => acc + (r.pool_ready || 0), 0),
+    [enabledTunnels],
+  );
+
+  const [healthFilter, setHealthFilter] = useState<TunnelHealthFilter>('all');
+  const filteredTunnels = useMemo(() => {
+    if (healthFilter === 'issues') {
+      return enabledTunnels.filter((r) => r.status !== 'running' || !r.healthy);
+    }
+    if (healthFilter === 'ok') {
+      return enabledTunnels.filter((r) => r.status === 'running' && r.healthy);
+    }
+    return enabledTunnels;
+  }, [enabledTunnels, healthFilter]);
+
+  const events = useMemo(() => eventsQ.data ?? [], [eventsQ.data]);
+  const [eventLevel, setEventLevel] = useState<EventLevelFilter>('all');
+  const [eventQuery, setEventQuery] = useState('');
+  const [eventsExpanded, setEventsExpanded] = useState(false);
+
+  const filteredEvents = useMemo(() => {
+    return events.filter((ev) => {
+      if (eventLevel !== 'all') {
+        const lv = ev.level.toLowerCase();
+        if (eventLevel === 'warn' && lv !== 'warn' && lv !== 'warning') return false;
+        if (eventLevel !== 'warn' && lv !== eventLevel) return false;
+      }
+      if (eventQuery.trim()) {
+        const q = eventQuery.trim().toLowerCase();
+        return ev.message.toLowerCase().includes(q) || ev.source.toLowerCase().includes(q);
+      }
+      return true;
+    });
+  }, [events, eventLevel, eventQuery]);
+
+  const shownEvents = eventsExpanded ? filteredEvents : filteredEvents.slice(0, EVENTS_COLLAPSED);
+
   const statsLoading = statsQ.isPending;
+  const onlineRatio =
+    stats && stats.clients_total > 0
+      ? Math.round((stats.clients_online / stats.clients_total) * 100)
+      : 0;
+  const runningRatio =
+    stats && stats.services_total > 0
+      ? Math.round((stats.services_running / stats.services_total) * 100)
+      : 0;
+
+  const manualRefresh = () => {
+    void statsQ.refetch();
+    void servicesQ.refetch();
+    void eventsQ.refetch();
+  };
 
   return (
-    <div className="space-y-4">
-      <PageHeader description="服务端运行状态与转发面健康" title="总览" />
+    <div className="space-y-6">
+      <PageHeader
+        eyebrow={
+          <>
+            <span className="size-1.5 rounded-full bg-emerald-500 rh-pulse-dot" />
+            <span>REAL-TIME TELEMETRY & FABRIC MATRIX</span>
+          </>
+        }
+        title="网络态势总览"
+        description="实时监控边缘客户端在线率、隧道数据面健康度、双通道吞吐速率与控制面事件流"
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            {issueCount > 0 ? (
+              <StatusBadge signal="warn" text={`${issueCount} 条隧道需关注`} />
+            ) : (
+              <StatusBadge signal="ok" text="数据面运行健康" />
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={manualRefresh}
+              className="gap-1.5"
+              disabled={statsQ.isFetching || servicesQ.isFetching}
+            >
+              <RefreshCw
+                className={cn(
+                  'size-3.5',
+                  (statsQ.isFetching || servicesQ.isFetching) && 'animate-spin',
+                )}
+              />
+              刷新遥测
+            </Button>
+            <Button size="sm" asChild className="gap-1.5">
+              <Link to={ROUTES.tcp}>
+                <ArrowRightLeft className="size-3.5" />
+                进入隧道中枢
+              </Link>
+            </Button>
+          </div>
+        }
+      />
 
-      {/* 指标条:单卡内部分格(gap-px + bg-border 画分隔线),6 个指标 */}
-      <Card className="gap-0 overflow-hidden py-0">
-        <div className="grid grid-cols-2 gap-px bg-border sm:grid-cols-3 xl:grid-cols-6">
-          <MetricCell
-            infoKey="overview.clients_online"
-            loading={statsLoading}
-            suffix={stats ? `/ ${stats.clients_total}` : undefined}
-            title="在线客户端"
-            value={stats ? stats.clients_online : '-'}
-          />
-          <MetricCell
-            infoKey="overview.services_running"
-            loading={statsLoading}
-            suffix={stats ? `/ ${stats.services_total}` : undefined}
-            title="运行规则"
-            value={stats ? stats.services_running : '-'}
-          />
-          <MetricCell
-            infoKey="overview.conns_current"
-            loading={statsLoading}
-            title="当前连接"
-            value={stats ? stats.conns_current : '-'}
-          />
-          <MetricCell
-            infoKey="overview.rate_in"
-            loading={statsLoading}
-            title="入站速率"
-            value={rateIn}
-          />
-          <MetricCell
-            infoKey="overview.rate_out"
-            loading={statsLoading}
-            title="出站速率"
-            value={rateOut}
-          />
-          <MetricCell
-            infoKey="overview.bytes_total"
-            loading={statsLoading}
-            title="累计流量"
-            value={stats ? fmtBytes(stats.bytes_in + stats.bytes_out) : '-'}
-          />
-        </div>
-      </Card>
+      {/* 第一层:Bento 4 维核心遥测矩阵 */}
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        {/* 卡片 1:边缘客户端节点 */}
+        <Card className="rh-telemetry-card justify-between gap-4 py-5">
+          <CardHeader className="pb-0">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">
+                <InfoLabel infoKey="overview.clients_online" title="边缘节点态势" />
+              </span>
+              <span className="flex size-8 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                <Server className="size-4" />
+              </span>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {statsLoading ? (
+              <Skeleton className="h-9 w-32" />
+            ) : (
+              <div className="flex items-baseline justify-between">
+                <div className="flex items-baseline gap-1.5">
+                  <Mono className="text-3xl font-bold tracking-tight">
+                    {stats ? stats.clients_online : '-'}
+                  </Mono>
+                  <Mono className="text-sm text-muted-foreground">
+                    / {stats ? stats.clients_total : '-'} 在线
+                  </Mono>
+                </div>
+                <Mono className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                  {onlineRatio}%
+                </Mono>
+              </div>
+            )}
+            <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full rounded-full bg-emerald-500 transition-all duration-500"
+                style={{ width: `${onlineRatio}%` }}
+              />
+            </div>
+            <div className="flex items-center justify-between pt-0.5 text-xs text-muted-foreground">
+              <span>
+                离线节点:{' '}
+                <Mono className="text-foreground">
+                  {stats ? Math.max(0, stats.clients_total - stats.clients_online) : '-'}
+                </Mono>
+              </span>
+              <Link
+                to={ROUTES.clients}
+                className="inline-flex items-center gap-1 font-medium text-primary hover:underline"
+              >
+                管理节点 <ArrowRight className="size-3" />
+              </Link>
+            </div>
+          </CardContent>
+        </Card>
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
-        {/* 流量速率图:渐变填充 + 右上角当前值 mono 标注 */}
-        <Card>
+        {/* 卡片 2:隧道运行健康度 */}
+        <Card className="rh-telemetry-card justify-between gap-4 py-5">
+          <CardHeader className="pb-0">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">
+                <InfoLabel infoKey="overview.services_running" title="隧道转发健康" />
+              </span>
+              <span className="flex size-8 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+                <Waypoints className="size-4" />
+              </span>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {statsLoading ? (
+              <Skeleton className="h-9 w-32" />
+            ) : (
+              <div className="flex items-baseline justify-between">
+                <div className="flex items-baseline gap-1.5">
+                  <Mono className="text-3xl font-bold tracking-tight">
+                    {stats ? stats.services_running : '-'}
+                  </Mono>
+                  <Mono className="text-sm text-muted-foreground">
+                    / {stats ? stats.services_total : '-'} 运行中
+                  </Mono>
+                </div>
+                <Mono className="text-xs font-medium text-primary">{runningRatio}%</Mono>
+              </div>
+            )}
+            <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full rounded-full bg-primary transition-all duration-500"
+                style={{ width: `${runningRatio}%` }}
+              />
+            </div>
+            <div className="flex items-center justify-between pt-0.5 text-xs text-muted-foreground">
+              <span>
+                异常/待就绪: <Mono className="text-foreground">{issueCount}</Mono>
+              </span>
+              <Link
+                to={ROUTES.tcp}
+                className="inline-flex items-center gap-1 font-medium text-primary hover:underline"
+              >
+                编排规则 <ArrowRight className="size-3" />
+              </Link>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* 卡片 3:并发流与预热连接池 */}
+        <Card className="rh-telemetry-card justify-between gap-4 py-5">
+          <CardHeader className="pb-0">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">
+                <InfoLabel infoKey="overview.conns_current" title="活跃连接与预热池" />
+              </span>
+              <span className="flex size-8 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                <Network className="size-4" />
+              </span>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {statsLoading ? (
+              <Skeleton className="h-9 w-28" />
+            ) : (
+              <div className="flex items-baseline justify-between">
+                <div className="flex items-baseline gap-1.5">
+                  <Mono className="text-3xl font-bold tracking-tight">
+                    {stats ? stats.conns_current : '-'}
+                  </Mono>
+                  <span className="text-xs text-muted-foreground">并发通道</span>
+                </div>
+                <span className="rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                  就绪池 <Mono className="font-semibold text-foreground">{totalPoolReady}</Mono>
+                </span>
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2 rounded-lg border border-border/60 bg-muted/30 px-2.5 py-1.5 text-xs">
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">启用规则</span>
+                <Mono className="font-medium">{enabledTunnels.length}</Mono>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">总计规则</span>
+                <Mono className="font-medium">{allServices.length}</Mono>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* 卡片 4:实时吞吐与累计流量 */}
+        <Card className="rh-telemetry-card justify-between gap-4 py-5">
+          <CardHeader className="pb-0">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">
+                <InfoLabel infoKey="overview.bytes_total" title="实时吞吐与累计流量" />
+              </span>
+              <span className="flex size-8 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+                <Cpu className="size-4" />
+              </span>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {statsLoading ? (
+              <Skeleton className="h-9 w-36" />
+            ) : (
+              <div className="flex items-baseline justify-between">
+                <div>
+                  <div className="text-[11px] text-muted-foreground">累计总流量</div>
+                  <Mono className="text-2xl font-bold tracking-tight">
+                    {stats ? fmtBytes(stats.bytes_in + stats.bytes_out) : '-'}
+                  </Mono>
+                </div>
+                <div className="text-right text-xs">
+                  <div className="text-muted-foreground">
+                    入 <Mono className="font-medium text-foreground">{rateIn}</Mono>
+                  </div>
+                  <div className="text-muted-foreground">
+                    出 <Mono className="font-medium text-foreground">{rateOut}</Mono>
+                  </div>
+                </div>
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2 rounded-lg border border-border/60 bg-muted/30 px-2.5 py-1.5 text-xs">
+              <div className="flex items-center justify-between gap-1">
+                <span className="text-muted-foreground">累计入</span>
+                <Mono className="truncate font-medium">
+                  {stats ? fmtBytes(stats.bytes_in) : '-'}
+                </Mono>
+              </div>
+              <div className="flex items-center justify-between gap-1">
+                <span className="text-muted-foreground">累计出</span>
+                <Mono className="truncate font-medium">
+                  {stats ? fmtBytes(stats.bytes_out) : '-'}
+                </Mono>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* 第二层:左 7 右 5 双面板 (吞吐示波器 + 转发链路实时巡检) */}
+      <div className="grid gap-4 xl:grid-cols-12">
+        {/* 左侧 7 列:双通道实时吞吐示波器 */}
+        <Card className="rh-telemetry-card xl:col-span-7">
           <CardHeader>
-            <CardTitle>流量速率</CardTitle>
-            <CardDescription>近 5 分钟 · 每 5 秒采样</CardDescription>
+            <div className="flex items-center gap-2">
+              <Activity className="size-4 text-primary" />
+              <CardTitle>双通道实时流量速率</CardTitle>
+            </div>
+            <CardDescription>近 5 分钟滚动窗口 · 每 5 秒差分采样</CardDescription>
             <CardAction>
-              <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                <span className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center justify-start gap-2 text-xs sm:justify-end sm:gap-3">
+                <div className="flex items-center gap-1.5 rounded-lg border border-border/70 bg-muted/30 px-2.5 py-1">
                   <span
                     aria-hidden="true"
-                    className="size-2 shrink-0 rounded-[2px] bg-(--chart-1)"
+                    className="size-2 shrink-0 rounded-full bg-(--chart-1)"
                   />
-                  入<Mono className="text-sm font-medium text-foreground">{rateIn}</Mono>
-                </span>
-                <span className="flex items-center gap-1.5">
+                  <span className="text-muted-foreground">
+                    <InfoLabel infoKey="overview.rate_in" title="入站" />
+                  </span>
+                  <Mono className="font-semibold text-foreground">{rateIn}</Mono>
+                  {peakIn !== null ? (
+                    <span className="text-[11px] text-muted-foreground">
+                      (峰 {fmtBytes(peakIn)}/s)
+                    </span>
+                  ) : null}
+                </div>
+                <div className="flex items-center gap-1.5 rounded-lg border border-border/70 bg-muted/30 px-2.5 py-1">
                   <span
                     aria-hidden="true"
-                    className="size-2 shrink-0 rounded-[2px] bg-(--chart-2)"
+                    className="size-2 shrink-0 rounded-full bg-(--chart-2)"
                   />
-                  出<Mono className="text-sm font-medium text-foreground">{rateOut}</Mono>
-                </span>
+                  <span className="text-muted-foreground">
+                    <InfoLabel infoKey="overview.rate_out" title="出站" />
+                  </span>
+                  <Mono className="font-semibold text-foreground">{rateOut}</Mono>
+                  {peakOut !== null ? (
+                    <span className="text-[11px] text-muted-foreground">
+                      (峰 {fmtBytes(peakOut)}/s)
+                    </span>
+                  ) : null}
+                </div>
               </div>
             </CardAction>
           </CardHeader>
           <CardContent>
             {statsLoading ? (
-              <Skeleton className="h-[220px] w-full" />
+              <Skeleton className="h-[240px] w-full" />
             ) : (
-              <Suspense fallback={<Skeleton className="h-[220px] w-full" />}>
-                <TrafficRateChart points={points} />
+              <Suspense fallback={<Skeleton className="h-[240px] w-full" />}>
+                <TrafficRateChart points={points} className="h-[240px]" />
               </Suspense>
             )}
           </CardContent>
         </Card>
 
-        {/* 转发规则健康:每条启用中的规则一行(名称 / 监听 / 状态 / 池 / 连接) */}
-        <Card>
-          <CardHeader>
-            <CardTitle>转发规则健康</CardTitle>
+        {/* 右侧 5 列:转发规则健康巡检舱 */}
+        <Card className="rh-telemetry-card flex flex-col xl:col-span-5">
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2">
+              <Waypoints className="size-4 text-primary" />
+              转发规则健康巡检
+            </CardTitle>
             <CardDescription>
-              {servicesQ.isPending ? '加载中…' : `${tunnels.length} 条启用中的转发规则`}
+              {servicesQ.isPending
+                ? '加载中…'
+                : `共 ${enabledTunnels.length} 条启用规则 · 点击规则可直达配置`}
             </CardDescription>
+            <CardAction>
+              <div className="grid w-full grid-cols-3 rounded-lg border border-border/70 bg-muted/40 p-0.5 text-xs sm:inline-flex sm:w-auto">
+                {(
+                  [
+                    { key: 'all', label: `全部 (${enabledTunnels.length})` },
+                    { key: 'issues', label: `告警 (${issueCount})` },
+                    {
+                      key: 'ok',
+                      label: `正常 (${Math.max(0, enabledTunnels.length - issueCount)})`,
+                    },
+                  ] as const
+                ).map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => setHealthFilter(item.key)}
+                    className={cn(
+                      'rounded-md px-2 py-1 text-center text-[11px] font-medium transition-colors',
+                      healthFilter === item.key
+                        ? 'bg-background text-foreground shadow-2xs'
+                        : 'text-muted-foreground hover:text-foreground',
+                    )}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </CardAction>
           </CardHeader>
-          <CardContent className="max-h-[320px] overflow-y-auto">
+          <CardContent className="max-h-[260px] flex-1 overflow-y-auto pt-0">
             {servicesQ.isPending ? (
               <div className="space-y-2">
                 {[0, 1, 2, 3].map((index) => (
-                  <Skeleton className="h-9 w-full" key={index} />
+                  <Skeleton className="h-12 w-full" key={index} />
                 ))}
               </div>
-            ) : tunnels.length === 0 ? (
+            ) : filteredTunnels.length === 0 ? (
               <EmptyState
-                description="先到「客户端」页接入客户端,再创建转发规则;启用后这里逐条显示监听地址与运行状态。"
+                description={
+                  enabledTunnels.length === 0
+                    ? '先到「边缘节点」接入客户端,再创建转发隧道;启用后这里实时展示链路健康与连接池。'
+                    : '当前筛选条件下没有转发规则。'
+                }
                 icon={<Waypoints aria-hidden="true" className="size-4" />}
-                title="还没有启用中的转发规则"
+                title={enabledTunnels.length === 0 ? '暂无启用中的转发规则' : '无匹配规则'}
               />
             ) : (
-              <>
-                <div className="hidden gap-x-3 border-b border-border/60 pb-2 text-xs text-muted-foreground sm:grid sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1.1fr)_auto_auto_auto]">
-                  <span>规则</span>
-                  <span>监听</span>
-                  <span>
-                    <InfoLabel infoKey="service.list.status" title="状态" />
-                  </span>
-                  <span>
-                    <InfoLabel infoKey="service.list.pool" title="池" />
-                  </span>
-                  <span>
-                    <InfoLabel infoKey="service.list.conns" title="连接" />
-                  </span>
-                </div>
-                {tunnels.map((rule) => {
+              <div className="space-y-2">
+                {filteredTunnels.map((rule) => {
                   const signal = proxyStatusSignal(rule.status, rule.healthy);
+                  const targetRoute = KIND_ROUTE[rule.kind] ?? ROUTES.tcp;
                   return (
                     <div
-                      className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 border-b border-border/60 py-2.5 text-sm last:border-b-0 sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1.1fr)_auto_auto_auto]"
                       key={rule.id}
+                      onClick={() => navigate(`${targetRoute}?q=${encodeURIComponent(rule.name)}`)}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          navigate(`${targetRoute}?q=${encodeURIComponent(rule.name)}`);
+                        }
+                      }}
+                      className="group flex flex-col gap-1.5 rounded-xl border border-border/70 bg-background/60 px-3 py-2.5 text-xs transition-colors hover:border-primary/40 hover:bg-accent/30"
                     >
-                      <span className="min-w-0 truncate font-medium">{rule.name}</span>
-                      <Mono className="col-span-2 col-start-1 row-start-2 min-w-0 truncate text-muted-foreground sm:col-span-1 sm:col-start-2 sm:row-start-1">
-                        {listenAddress(rule)}
-                      </Mono>
-                      <span className="col-start-2 row-start-1 justify-self-end sm:col-start-3 sm:justify-self-start">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="rh-mono rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-primary uppercase">
+                            {rule.kind}
+                          </span>
+                          <span className="truncate font-semibold text-foreground group-hover:text-primary">
+                            {rule.name}
+                          </span>
+                        </div>
                         {rule.status_reason ? (
                           <Tooltip>
                             <TooltipTrigger asChild>
-                              <span className="inline-flex cursor-help">
+                              <span
+                                className="inline-flex cursor-help"
+                                onClick={(e) => e.stopPropagation()}
+                              >
                                 <StatusBadge signal={signal.signal} text={signal.text} />
                               </span>
                             </TooltipTrigger>
@@ -290,85 +581,147 @@ export default function OverviewPage() {
                         ) : (
                           <StatusBadge signal={signal.signal} text={signal.text} />
                         )}
-                      </span>
-                      <Mono className="col-start-1 row-start-3 text-muted-foreground sm:col-start-4 sm:row-start-1">
-                        池 {rule.pool_ready}
-                      </Mono>
-                      <Mono className="col-start-2 row-start-3 justify-self-end text-muted-foreground sm:col-start-5 sm:row-start-1 sm:justify-self-start">
-                        连接 {rule.conns_current ?? '-'}
-                      </Mono>
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-muted-foreground">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <Mono className="truncate text-xs">{listenAddress(rule)}</Mono>
+                          <ArrowRight className="size-3 shrink-0 text-primary/70" />
+                          <Mono className="truncate text-xs">
+                            {rule.plugin
+                              ? `插件:${rule.plugin}`
+                              : `${rule.target_host}:${rule.target_port}`}
+                          </Mono>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2.5 text-[11px]">
+                          <span>
+                            池 <Mono className="text-foreground">{rule.pool_ready}</Mono>
+                          </span>
+                          <span>
+                            连接{' '}
+                            <Mono className="text-foreground">{rule.conns_current ?? '-'}</Mono>
+                          </span>
+                        </div>
+                      </div>
                     </div>
                   );
                 })}
-              </>
+              </div>
             )}
           </CardContent>
         </Card>
       </div>
 
-      {/* 最近事件:默认 5 条,可展开全部 20 条 */}
-      <Card>
+      {/* 第三层:实时事件审计时间轴 (支持级别过滤与搜索) */}
+      <Card className="rh-telemetry-card">
         <CardHeader>
-          <CardTitle>最近事件</CardTitle>
-          <CardDescription>最新 {EVENTS_LIMIT} 条 · 每 5 秒刷新</CardDescription>
-          <CardAction>
-            {events.length > EVENTS_COLLAPSED ? (
-              <Button
-                aria-expanded={eventsExpanded}
-                onClick={() => setEventsExpanded((value) => !value)}
-                size="sm"
-                variant="ghost"
-              >
-                {eventsExpanded ? '收起' : `展开全部(${events.length})`}
-                {eventsExpanded ? (
-                  <ChevronUp aria-hidden="true" className="size-4" />
-                ) : (
-                  <ChevronDown aria-hidden="true" className="size-4" />
-                )}
-              </Button>
-            ) : null}
-          </CardAction>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <CardTitle>控制面事件流</CardTitle>
+              <CardDescription className="mt-1">
+                客户端上下线、隧道下发与认证审计实时日志 · 最新 {EVENTS_LIMIT} 条
+              </CardDescription>
+            </div>
+            <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
+              <div className="grid w-full grid-cols-4 rounded-lg border border-border/70 bg-muted/40 p-0.5 text-xs sm:inline-flex sm:w-auto">
+                {(
+                  [
+                    { key: 'all', label: '全部' },
+                    { key: 'info', label: 'INFO' },
+                    { key: 'warn', label: 'WARN' },
+                    { key: 'error', label: 'ERROR' },
+                  ] as const
+                ).map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => setEventLevel(item.key)}
+                    className={cn(
+                      'rounded-md px-2.5 py-1 text-center text-[11px] font-medium transition-colors',
+                      eventLevel === item.key
+                        ? 'bg-background text-foreground shadow-2xs'
+                        : 'text-muted-foreground hover:text-foreground',
+                    )}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+              <div className="relative w-full sm:w-48">
+                <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={eventQuery}
+                  onChange={(e) => setEventQuery(e.target.value)}
+                  placeholder="过滤来源或消息…"
+                  className="h-8 pl-8 text-xs"
+                  aria-label="过滤事件日志"
+                />
+              </div>
+              {filteredEvents.length > EVENTS_COLLAPSED ? (
+                <Button
+                  aria-expanded={eventsExpanded}
+                  onClick={() => setEventsExpanded((value) => !value)}
+                  size="sm"
+                  variant="ghost"
+                  className="h-8 text-xs"
+                >
+                  {eventsExpanded ? '收起' : `展开全部 (${filteredEvents.length})`}
+                  {eventsExpanded ? (
+                    <ChevronUp aria-hidden="true" className="size-3.5" />
+                  ) : (
+                    <ChevronDown aria-hidden="true" className="size-3.5" />
+                  )}
+                </Button>
+              ) : null}
+            </div>
+          </div>
         </CardHeader>
         <CardContent>
           {eventsQ.isPending ? (
             <div className="space-y-2">
               {[0, 1, 2, 3].map((index) => (
-                <Skeleton className="h-8 w-full" key={index} />
+                <Skeleton className="h-10 w-full" key={index} />
               ))}
             </div>
-          ) : events.length === 0 ? (
+          ) : filteredEvents.length === 0 ? (
             <EmptyState
-              description="客户端上下线、转发规则发布结果都会记录在这里;当前还没有任何事件。"
+              description={
+                events.length === 0
+                  ? '客户端上下线、转发规则发布结果都会记录在这里;当前还没有任何事件。'
+                  : '没有符合当前筛选级别的事件记录。'
+              }
               icon={<Inbox aria-hidden="true" className="size-4" />}
-              title="暂无事件"
+              title={events.length === 0 ? '暂无事件' : '无匹配事件'}
             />
           ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-[170px]">时间</TableHead>
-                  <TableHead className="w-[92px]">级别</TableHead>
-                  <TableHead className="hidden w-[92px] sm:table-cell">来源</TableHead>
-                  <TableHead>消息</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {shownEvents.map((event) => (
-                  <TableRow key={event.id}>
-                    <TableCell className="text-muted-foreground">
-                      <Mono>{fmtTime(event.ts)}</Mono>
-                    </TableCell>
-                    <TableCell>
-                      <StatusBadge signal={eventLevelSignal(event.level)} text={event.level} />
-                    </TableCell>
-                    <TableCell className="hidden text-muted-foreground sm:table-cell">
-                      <Mono>{event.source}</Mono>
-                    </TableCell>
-                    <TableCell className="whitespace-normal">{event.message}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+            <div className="divide-y divide-border/60">
+              {shownEvents.map((event) => {
+                const sig = eventLevelSignal(event.level);
+                return (
+                  <div
+                    key={event.id}
+                    className="flex flex-col gap-1.5 py-2.5 text-sm sm:grid sm:grid-cols-[165px_88px_110px_1fr] sm:items-center sm:gap-2"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2 sm:contents">
+                      <Mono className="text-xs text-muted-foreground">{fmtTime(event.ts)}</Mono>
+                      <div className="flex items-center gap-1.5 sm:contents">
+                        <div>
+                          <StatusBadge signal={sig} text={event.level.toUpperCase()} />
+                        </div>
+                        <div>
+                          <Mono className="rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                            {event.source}
+                          </Mono>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="min-w-0 text-xs leading-relaxed break-words text-foreground sm:text-sm">
+                      {event.message}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           )}
         </CardContent>
       </Card>

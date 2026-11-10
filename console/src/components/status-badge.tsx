@@ -1,17 +1,24 @@
 import { cn } from '@/lib/utils';
 
 /**
- * 状态徽章:8px 信号点 + 文字,四态语义(在线/离线/警告/未启用),不做大色块底。
- * 色值走 Tailwind 语义色并配 dark 变体,保证暗色主题下可读。
+ * 精密遥测状态徽章:脉冲信号点 + 胶囊边框,五态语义(在线/离线/警告/未启用/错误)。
  */
 export type RhSignal = 'ok' | 'off' | 'warn' | 'idle' | 'error';
 
-const SIGNAL_CLASS: Record<RhSignal, string> = {
-  ok: 'bg-emerald-500',
-  off: 'bg-zinc-300 dark:bg-zinc-600',
+const SIGNAL_DOT_CLASS: Record<RhSignal, string> = {
+  ok: 'bg-emerald-500 rh-pulse-dot',
+  off: 'bg-zinc-400 dark:bg-zinc-500',
   warn: 'bg-amber-500',
   idle: 'bg-zinc-400 dark:bg-zinc-500',
-  error: 'bg-red-500',
+  error: 'bg-rose-500',
+};
+
+const SIGNAL_PILL_CLASS: Record<RhSignal, string> = {
+  ok: 'border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+  off: 'border-border bg-muted/60 text-muted-foreground',
+  warn: 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+  idle: 'border-border bg-muted/40 text-muted-foreground',
+  error: 'border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300',
 };
 
 export function StatusBadge({
@@ -24,37 +31,43 @@ export function StatusBadge({
   className?: string;
 }) {
   return (
-    <span className={cn('inline-flex items-center gap-1.5 whitespace-nowrap', className)}>
+    <span
+      className={cn(
+        'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium whitespace-nowrap transition-colors',
+        SIGNAL_PILL_CLASS[signal],
+        className,
+      )}
+    >
       <span
         aria-hidden="true"
-        className={cn('inline-block size-2 shrink-0 rounded-full', SIGNAL_CLASS[signal])}
+        className={cn('inline-block size-1.5 shrink-0 rounded-full', SIGNAL_DOT_CLASS[signal])}
       />
       <span>{text}</span>
     </span>
   );
 }
 
-/** 转发规则状态 → 徽章信号(七态收敛为四态语义)。 */
+/** 转发规则状态 → 徽章信号(七态收敛为五态语义)。 */
 export function proxyStatusSignal(
   status: string,
   healthy?: boolean,
 ): { signal: RhSignal; text: string } {
   if (!healthy && status === 'running') {
-    return { signal: 'warn', text: 'running(不健康)' };
+    return { signal: 'warn', text: '运行中 · 探针异常' };
   }
   switch (status) {
     case 'running':
-      return { signal: 'ok', text: 'running' };
+      return { signal: 'ok', text: '运行中' };
     case 'pending':
-      return { signal: 'warn', text: 'pending' };
+      return { signal: 'warn', text: '待同步' };
     case 'bind_error':
-      return { signal: 'error', text: 'bind_error' };
+      return { signal: 'error', text: '端口冲突' };
     case 'apply_error':
-      return { signal: 'error', text: 'apply_error' };
+      return { signal: 'error', text: '下发异常' };
     case 'offline':
-      return { signal: 'off', text: 'offline' };
+      return { signal: 'off', text: '节点离线' };
     default:
-      return { signal: 'idle', text: '未启用' };
+      return { signal: 'idle', text: '已停用' };
   }
 }
 

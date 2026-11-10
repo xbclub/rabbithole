@@ -1,3 +1,4 @@
+import { ShieldAlert, TriangleAlert } from 'lucide-react';
 import { useState } from 'react';
 
 import {
@@ -15,14 +16,8 @@ import { buttonVariants } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
 /**
- * 破坏性操作二次确认(替代旧版 antd Popconfirm)。
- * 标题=动作动词 + 具体对象,描述写明后果;确认按钮用危险语义。
- * 确认期间保持打开直到 onConfirm 落定,避免请求未完成就关闭浮层。
- *
- * 两种用法:
- * - 非受控:传 `trigger`,点它打开(内联按钮场景);
- * - 受控:传 `open` / `onOpenChange`、不传 trigger(行操作收进 ⋯ 下拉后,
- *   由菜单项设置状态打开)。
+ * 破坏性或关键操作二次确认弹窗。
+ * 带有高辨识度语义图标徽章、磨砂毛玻璃浮层与防重提锁,确认期间保持打开直到 onConfirm 完成。
  */
 export function ConfirmDialog({
   trigger,
@@ -78,10 +73,26 @@ export function ConfirmDialog({
     >
       {trigger ? <AlertDialogTrigger asChild>{trigger}</AlertDialogTrigger> : null}
       <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>{title}</AlertDialogTitle>
-          {description ? <AlertDialogDescription>{description}</AlertDialogDescription> : null}
-        </AlertDialogHeader>
+        <div className="flex items-start gap-3.5">
+          <div
+            className={cn(
+              'mt-0.5 flex size-10 shrink-0 items-center justify-center rounded-xl border',
+              destructive
+                ? 'border-destructive/30 bg-destructive/10 text-destructive'
+                : 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
+            )}
+          >
+            {destructive ? (
+              <TriangleAlert className="size-5" aria-hidden="true" />
+            ) : (
+              <ShieldAlert className="size-5" aria-hidden="true" />
+            )}
+          </div>
+          <AlertDialogHeader className="min-w-0 flex-1">
+            <AlertDialogTitle>{title}</AlertDialogTitle>
+            {description ? <AlertDialogDescription>{description}</AlertDialogDescription> : null}
+          </AlertDialogHeader>
+        </div>
         <AlertDialogFooter>
           <AlertDialogCancel disabled={pending}>{cancelText}</AlertDialogCancel>
           <AlertDialogAction

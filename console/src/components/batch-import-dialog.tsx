@@ -38,6 +38,7 @@ export function BatchImportDialog({
 
   // 打开时清掉上一轮结果(文本保留,与抽出前行为一致)
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (open) setBatchResults(null);
   }, [open]);
 

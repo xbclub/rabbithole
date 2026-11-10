@@ -1,8 +1,22 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Activity, CircleCheck, KeyRound, RefreshCw, Server, TriangleAlert } from 'lucide-react';
+import {
+  Activity,
+  CircleCheck,
+  Gauge,
+  KeyRound,
+  Lock,
+  Network,
+  Plus,
+  RefreshCw,
+  Server,
+  Shield,
+  Sparkles,
+  Terminal,
+  TriangleAlert,
+} from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { useForm } from 'react-hook-form';
+import { useForm, useWatch } from 'react-hook-form';
 import { useNavigate, useSearchParams } from 'react-router';
 import { z } from 'zod';
 
@@ -17,13 +31,13 @@ import {
 } from '@/api/rabbithole';
 import type { ApiKeyRow, ServerConfigResult } from '@/api/rabbithole';
 import { ConfirmDialog } from '@/components/confirm-dialog';
+import { EmptyState } from '@/components/empty-state';
 import { InfoLabel } from '@/components/info-label';
 import { Mono, MonoCopy } from '@/components/mono';
 import { PageHeader } from '@/components/page-header';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
 import {
   Dialog,
@@ -42,7 +56,8 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form';
-import { Input } from '@/components/ui/input';
+import { Input, PasswordInput } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import {
   Select,
   SelectContent,
@@ -50,7 +65,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Label } from '@/components/ui/label';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
 import {
@@ -61,12 +75,12 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
-import { fmtRelative, fmtTime } from '@/lib/format';
-import { feedbackError, feedbackSuccess, feedbackWarning } from '@/lib/feedback';
-import { qk } from '@/lib/query-keys';
 import { SCOPE_BITS, scopeBadges } from '@/features/api-keys/scope';
+import { feedbackError, feedbackSuccess, feedbackWarning } from '@/lib/feedback';
+import { fmtRelative, fmtTime } from '@/lib/format';
+import { qk } from '@/lib/query-keys';
+import { cn } from '@/lib/utils';
 import { ROUTES } from '@/router/paths';
 import { useAuthStore } from '@/stores/auth';
 
@@ -112,10 +126,6 @@ function isValidIp(value: string): boolean {
 
 /**
  * ALPN 列表校验:逗号分隔的可见 ASCII,每项 1-255 字节,最多 8 项。
- *
- * 与后端校验一致(`put_server_config` 的 TlsUpdate 分支)。留空合法 ——
- * 等价于用默认值 "h2"。之所以要在这里拦一遍:ALPN 不一致会让 TLS 握手
- * 直接失败,配错了不是"性能差"而是"连不上",值得在提交前就提示。
  */
 const ALPN_INVALID_MSG = 'ALPN 须为逗号分隔的可见 ASCII,每项 1-255 字符,最多 8 项';
 
@@ -161,42 +171,55 @@ const LIMIT_FIELDS = [
   {
     name: 'limit_max_mux_streams',
     label: '复用流上限',
+    hint: '0 = 不限',
     infoKey: 'settings.limits.max_mux_streams',
   },
   {
     name: 'limit_max_data_conns_per_client',
     label: '每客户端并发通道',
+    hint: '0 = 不限',
     infoKey: 'settings.limits.max_data_conns_per_client',
   },
   {
     name: 'limit_max_udp_sessions_per_proxy',
     label: '每规则 UDP 会话',
+    hint: '0 = 不限',
     infoKey: 'settings.limits.max_udp_sessions_per_proxy',
   },
   {
     name: 'limit_unauth_conns_per_ip',
     label: '认证窗口并发/IP',
+    hint: '默认 64',
     infoKey: 'settings.limits.unauth_conns_per_ip',
   },
-  { name: 'limit_max_pool_size', label: '池深上限', infoKey: 'settings.limits.max_pool_size' },
+  {
+    name: 'limit_max_pool_size',
+    label: '池深上限',
+    hint: '0-255 (0=不限)',
+    infoKey: 'settings.limits.max_pool_size',
+  },
   {
     name: 'limit_default_pool_size',
     label: '默认池深',
+    hint: '默认 2',
     infoKey: 'settings.limits.default_pool_size',
   },
   {
     name: 'limit_control_send_queue',
     label: '控制帧队列',
+    hint: '16-65536',
     infoKey: 'settings.limits.control_send_queue',
   },
   {
     name: 'limit_udp_packet_size',
     label: 'UDP 包缓冲',
+    hint: '0 = 默认',
     infoKey: 'settings.limits.udp_packet_size',
   },
   {
     name: 'limit_pool_wait_timeout_ms',
     label: '等池超时(ms)',
+    hint: '100-600000',
     infoKey: 'settings.limits.pool_wait_timeout_ms',
   },
 ] as const;
@@ -234,7 +257,6 @@ const EMPTY_SERVER_FORM: ServerFormValues = {
   max_services_per_client: '0',
   log_level: 'info',
   authorized_keys: '',
-  // 与服务端默认一致(上游回填/提交用的同一组兜底值)
   limit_max_mux_streams: '0',
   limit_max_data_conns_per_client: '0',
   limit_max_udp_sessions_per_proxy: '0',
@@ -281,7 +303,7 @@ function ConfigResultAlert({ result }: { result: ServerConfigResult }) {
   );
 }
 
-/** 服务器配置卡:保存后立即生效并写回配置文件。 */
+/** 服务器配置矩阵:模块化分组 + 3×3 并发与限流网格,保存后立即生效并写回配置文件。 */
 function ServerConfigCard() {
   const queryClient = useQueryClient();
   const cfgQ = useQuery({ queryKey: qk.serverConfig, queryFn: getServerConfig });
@@ -291,7 +313,6 @@ function ServerConfigCard() {
     defaultValues: EMPTY_SERVER_FORM,
   });
 
-  // 加载后回填(字段常驻渲染,无 setFieldsValue 挂起风险)
   useEffect(() => {
     if (!cfgQ.data) return;
     const hot = cfgQ.data.hot;
@@ -358,8 +379,6 @@ function ServerConfigCard() {
       }),
     onSuccess: (result, values) => {
       notifyResult(result);
-      // 以已提交值作为新基准:react-query 结构共享可能保留旧 data 引用,
-      // 不能只依赖回填 effect 把「无改动时禁用保存」恢复成未改动态
       form.reset(values);
       void queryClient.invalidateQueries({ queryKey: qk.serverConfig });
     },
@@ -367,285 +386,342 @@ function ServerConfigCard() {
 
   if (cfgQ.isLoading) {
     return (
-      <Card>
-        <CardContent className="space-y-2">
-          <Skeleton className="h-9 w-full" />
-          <Skeleton className="h-9 w-full" />
-          <Skeleton className="h-9 w-full" />
-        </CardContent>
-      </Card>
+      <div className="rh-telemetry-card space-y-3 rounded-2xl border bg-card p-6">
+        <Skeleton className="h-9 w-full" />
+        <Skeleton className="h-28 w-full" />
+        <Skeleton className="h-40 w-full" />
+      </div>
     );
   }
 
-  // 加载失败不渲染表单:空表单点「保存配置」会把端口策略清空(P0 同源风险)
   if (cfgQ.isError) {
     return (
-      <Card>
-        <CardContent>
-          <Alert variant="destructive">
-            <TriangleAlert />
-            <AlertTitle>加载服务器配置失败</AlertTitle>
-            <AlertDescription>
-              <p>{cfgQ.error?.message ?? '未知错误'}</p>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={cfgQ.isFetching}
-                onClick={() => void cfgQ.refetch()}
-              >
-                {cfgQ.isFetching ? '重试中…' : '重试'}
-              </Button>
-            </AlertDescription>
-          </Alert>
-        </CardContent>
-      </Card>
+      <div className="rh-telemetry-card rounded-2xl border bg-card p-6">
+        <Alert variant="destructive">
+          <TriangleAlert />
+          <AlertTitle>加载服务器配置失败</AlertTitle>
+          <AlertDescription>
+            <p>{cfgQ.error?.message ?? '未知错误'}</p>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={cfgQ.isFetching}
+              onClick={() => void cfgQ.refetch()}
+            >
+              {cfgQ.isFetching ? '重试中…' : '重试'}
+            </Button>
+          </AlertDescription>
+        </Alert>
+      </div>
     );
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Server className="size-4" />
-          服务器配置
-        </CardTitle>
-        <CardDescription>
-          以下配置保存后立即生效并写回配置文件(原文件备份为 *.toml.bak,注释会丢失)。vhost
-          端口、主监听等其余配置仍需修改文件并重启。
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
-        <Form {...form}>
-          <form
-            className="space-y-5"
-            onSubmit={form.handleSubmit((values) => {
-              saveMut.mutate(values);
-            })}
-          >
-            <section className="space-y-4">
-              <h3 className="text-sm font-semibold">SSH 网关</h3>
+    <Form {...form}>
+      <form
+        className="space-y-5"
+        onSubmit={form.handleSubmit((values) => {
+          saveMut.mutate(values);
+        })}
+      >
+        {/* 模块 1: SSH 网关 & 公钥白名单 */}
+        <section className="rh-telemetry-card space-y-4 rounded-2xl border border-border/80 bg-card p-5 shadow-2xs">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/60 pb-3">
+            <div className="flex items-center gap-2.5">
+              <div className="flex size-8 items-center justify-center rounded-lg border border-primary/20 bg-primary/10 text-primary">
+                <Terminal className="size-4" />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold">SSH 网关</h3>
+                <p className="text-xs text-muted-foreground">
+                  免安装客户端通过 <code className="font-mono">ssh -R</code> 创建临时转发隧道
+                </p>
+              </div>
+            </div>
+            <Badge variant="outline" className="font-mono text-[11px]">
+              热生效 · 写回 TOML
+            </Badge>
+          </div>
+
+          <FormField
+            control={form.control}
+            name="ssh_enabled"
+            render={({ field }) => (
+              <FormItem className="flex flex-row items-center justify-between gap-4 rounded-xl border border-border/70 bg-muted/25 p-3.5">
+                <div className="space-y-1">
+                  <FormLabel>
+                    <InfoLabel title="启用" infoKey="settings.ssh_gateway.enabled" />
+                  </FormLabel>
+                  <FormDescription>开启后可用 ssh -R 在服务端开临时转发端口。</FormDescription>
+                </div>
+                <FormControl>
+                  <Switch checked={field.value} onCheckedChange={field.onChange} />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <FormField
+              control={form.control}
+              name="ssh_bind_addr"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>
+                    <InfoLabel title="监听地址" infoKey="settings.ssh_gateway.bind_addr" />
+                  </FormLabel>
+                  <FormControl>
+                    <Input className="font-mono" placeholder="0.0.0.0" {...field} />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="ssh_bind_port"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>
+                    <InfoLabel title="监听端口" infoKey="settings.ssh_gateway.bind_port" />
+                  </FormLabel>
+                  <FormControl>
+                    <Input className="font-mono" min={1} max={65535} type="number" {...field} />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </div>
+
+          <FormField
+            control={form.control}
+            name="authorized_keys"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>
+                  <InfoLabel title="公钥白名单" infoKey="settings.ssh_gateway.public_keys" />
+                </FormLabel>
+                <FormControl>
+                  <Textarea
+                    className="min-h-24 font-mono text-xs"
+                    placeholder={'ssh-ed25519 AAAA... client-id\nssh-ed25519 AAAA... edge-2'}
+                    rows={4}
+                    {...field}
+                  />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </section>
+
+        {/* 模块 2: 端口策略 + TLS ALPN + 日志级别 */}
+        <div className="grid gap-5 lg:grid-cols-2">
+          <section className="rh-telemetry-card space-y-4 rounded-2xl border border-border/80 bg-card p-5 shadow-2xs">
+            <div className="flex items-center gap-2.5 border-b border-border/60 pb-3">
+              <div className="flex size-8 items-center justify-center rounded-lg border border-primary/20 bg-primary/10 text-primary">
+                <Network className="size-4" />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold">端口策略</h3>
+                <p className="text-xs text-muted-foreground">公网暴露端口范围与单节点规则配额</p>
+              </div>
+            </div>
+
+            <FormField
+              control={form.control}
+              name="allow_ports"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>
+                    <InfoLabel title="允许端口" infoKey="settings.allow_ports" />
+                  </FormLabel>
+                  <FormControl>
+                    <Input className="font-mono" placeholder="10000-40000" {...field} />
+                  </FormControl>
+                  <FormDescription>
+                    逗号分隔,支持范围如 10000-20000,30000;空 = 不限制。
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="max_services_per_client"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>
+                    <InfoLabel
+                      title="每客户端最大转发规则数"
+                      infoKey="settings.max_services_per_client"
+                    />
+                  </FormLabel>
+                  <FormControl>
+                    <Input
+                      className="w-40 font-mono"
+                      min={0}
+                      max={10000}
+                      type="number"
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </section>
+
+          <section className="rh-telemetry-card space-y-4 rounded-2xl border border-border/80 bg-card p-5 shadow-2xs">
+            <div className="flex items-center justify-between gap-2 border-b border-border/60 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="flex size-8 items-center justify-center rounded-lg border border-primary/20 bg-primary/10 text-primary">
+                  <Shield className="size-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold">TLS & 日志</h3>
+                  <p className="text-xs text-muted-foreground">TLS 握手 ALPN 标识与运行日志级别</p>
+                </div>
+              </div>
+              <Badge variant="outline" className="font-mono text-[10px]">
+                ALPN 重启生效
+              </Badge>
+            </div>
+
+            <FormField
+              control={form.control}
+              name="alpn"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>
+                    <InfoLabel title="ALPN 标识" infoKey="settings.alpn" />
+                  </FormLabel>
+                  <FormControl>
+                    <Input className="font-mono" placeholder="h2" {...field} />
+                  </FormControl>
+                  <FormDescription>
+                    逗号分隔,最多 8 项;留空 = 使用默认值 <code className="font-mono">h2</code>
+                    。改动必须与客户端一致,且需<strong>重启服务端</strong>生效。
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name="log_level"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>
+                    <InfoLabel title="级别" infoKey="settings.log_level" />
+                  </FormLabel>
+                  <Select value={field.value} onValueChange={field.onChange}>
+                    <FormControl>
+                      <SelectTrigger className="w-44 font-mono">
+                        <SelectValue />
+                      </SelectTrigger>
+                    </FormControl>
+                    <SelectContent>
+                      {LOG_LEVELS.map((level) => (
+                        <SelectItem key={level} value={level} className="font-mono">
+                          {level}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </section>
+        </div>
+
+        {/* 模块 3: 并发与限流 (3×3 矩阵) */}
+        <section className="rh-telemetry-card space-y-4 rounded-2xl border border-border/80 bg-card p-5 shadow-2xs">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/60 pb-3">
+            <div className="flex items-center gap-2.5">
+              <div className="flex size-8 items-center justify-center rounded-lg border border-primary/20 bg-primary/10 text-primary">
+                <Gauge className="size-4" />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold">并发与限流</h3>
+                <p className="text-xs text-muted-foreground">
+                  默认全部不设限(0 = 不限),并发上限交由系统层(fd / 内存 / 端口)决定
+                </p>
+              </div>
+            </div>
+            <Badge variant="outline" className="font-mono text-[11px]">
+              3×3 限流矩阵
+            </Badge>
+          </div>
+
+          <div className="grid gap-3.5 sm:grid-cols-2 lg:grid-cols-3">
+            {LIMIT_FIELDS.map((item) => (
               <FormField
+                key={item.name}
                 control={form.control}
-                name="ssh_enabled"
+                name={item.name}
                 render={({ field }) => (
-                  <FormItem className="flex flex-row items-center justify-between gap-4 rounded-md border p-3">
-                    <div className="space-y-1">
-                      <FormLabel>
-                        <InfoLabel title="启用" infoKey="settings.ssh_gateway.enabled" />
+                  <FormItem className="rounded-xl border border-border/60 bg-muted/20 p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <FormLabel className="text-xs">
+                        <InfoLabel title={item.label} infoKey={item.infoKey} />
                       </FormLabel>
-                      <FormDescription>开启后可用 ssh -R 在服务端开临时转发端口。</FormDescription>
+                      <span className="font-mono text-[10px] text-muted-foreground">
+                        {item.hint}
+                      </span>
                     </div>
                     <FormControl>
-                      <Switch checked={field.value} onCheckedChange={field.onChange} />
-                    </FormControl>
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name="ssh_bind_addr"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="监听地址" infoKey="settings.ssh_gateway.bind_addr" />
-                    </FormLabel>
-                    <FormControl>
-                      <Input className="w-64" placeholder="0.0.0.0" {...field} />
+                      <Input inputMode="numeric" className="h-8 font-mono text-xs" {...field} />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
                 )}
               />
-              <FormField
-                control={form.control}
-                name="ssh_bind_port"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="监听端口" infoKey="settings.ssh_gateway.bind_port" />
-                    </FormLabel>
-                    <FormControl>
-                      <Input className="w-32" min={1} max={65535} type="number" {...field} />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name="authorized_keys"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="公钥白名单" infoKey="settings.ssh_gateway.public_keys" />
-                    </FormLabel>
-                    <FormControl>
-                      <Textarea
-                        className="min-h-24 font-mono text-xs"
-                        placeholder={'ssh-ed25519 AAAA... client-id\nssh-ed25519 AAAA... edge-2'}
-                        rows={4}
-                        {...field}
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-            </section>
+            ))}
+          </div>
+        </section>
 
-            <section className="space-y-4">
-              <h3 className="text-sm font-semibold">端口策略</h3>
-              <FormField
-                control={form.control}
-                name="allow_ports"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="允许端口" infoKey="settings.allow_ports" />
-                    </FormLabel>
-                    <FormControl>
-                      <Input className="w-64" placeholder="10000-40000" {...field} />
-                    </FormControl>
-                    <FormDescription>
-                      逗号分隔,支持范围如 10000-20000,30000;空 = 不限制。
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name="max_services_per_client"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel
-                        title="每客户端最大转发规则数"
-                        infoKey="settings.max_services_per_client"
-                      />
-                    </FormLabel>
-                    <FormControl>
-                      <Input className="w-32" min={0} max={10000} type="number" {...field} />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-            </section>
-
-            <section className="space-y-4">
-              <div className="space-y-1">
-                <h3 className="text-sm font-semibold">TLS</h3>
-                <p className="text-xs leading-relaxed text-muted-foreground">
-                  ALPN 位于 TLS 握手的 ClientHello 中且<strong>不经加密</strong>,
-                  任何抓包工具都能直接读到。用项目专属名称会被识别为 rabbithole, 故默认值用最常见的{' '}
-                  <code className="font-mono">h2</code>。 改动<strong>必须与客户端一致</strong>,否则
-                  TLS 握手直接失败。
-                </p>
-              </div>
-              <FormField
-                control={form.control}
-                name="alpn"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="ALPN 标识" infoKey="settings.alpn" />
-                    </FormLabel>
-                    <FormControl>
-                      <Input className="w-64 font-mono" placeholder="h2" {...field} />
-                    </FormControl>
-                    <FormDescription>
-                      逗号分隔,最多 8 项;留空 = 使用默认值 h2。改后需
-                      <strong>重启服务端</strong>生效(监听器构建时固化)。
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-            </section>
-
-            <section className="space-y-4">
-              <h3 className="text-sm font-semibold">日志</h3>
-              <FormField
-                control={form.control}
-                name="log_level"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="级别" infoKey="settings.log_level" />
-                    </FormLabel>
-                    <Select value={field.value} onValueChange={field.onChange}>
-                      <FormControl>
-                        <SelectTrigger className="w-40">
-                          <SelectValue />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        {LOG_LEVELS.map((level) => (
-                          <SelectItem key={level} value={level}>
-                            {level}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-            </section>
-
-            <section className="space-y-4">
-              <div className="space-y-1">
-                <h3 className="text-sm font-semibold">并发与限流</h3>
-                <p className="text-xs leading-relaxed text-muted-foreground">
-                  默认全部不设限(0 = 不限),并发上限交由系统层(fd / 内存 / 端口)决定。
-                  标「新会话生效」的项对已接入客户端在下一次重连后应用;QUIC
-                  传输的流上限需重启服务端。
-                </p>
-              </div>
-              <div className="grid gap-4 sm:grid-cols-2">
-                {LIMIT_FIELDS.map((item) => (
-                  <FormField
-                    key={item.name}
-                    control={form.control}
-                    name={item.name}
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>
-                          <InfoLabel title={item.label} infoKey={item.infoKey} />
-                        </FormLabel>
-                        <FormControl>
-                          <Input inputMode="numeric" className="w-40" {...field} />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                ))}
-              </div>
-            </section>
-
-            <div className="flex items-center gap-3">
-              <Button type="submit" disabled={!form.formState.isDirty || saveMut.isPending}>
-                {saveMut.isPending ? '保存中…' : '保存配置'}
+        {/* 底部保存操作栏 (跟随表单流式排列,不悬浮固定) */}
+        <div className="rh-telemetry-card flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border/80 bg-card px-5 py-3.5 shadow-2xs">
+          <div className="text-xs text-muted-foreground">
+            {!form.formState.isDirty ? (
+              <span>尚无改动 · 所有热更新配置与服务端保持同步</span>
+            ) : (
+              <span className="font-medium text-primary">
+                检测到未保存的配置变更，点击右侧按钮立即应用并写回配置文件
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            {form.formState.isDirty ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={saveMut.isPending}
+                onClick={() => form.reset()}
+              >
+                放弃修改
               </Button>
-              {!form.formState.isDirty ? (
-                <span className="text-xs text-muted-foreground">尚无改动</span>
-              ) : null}
-            </div>
-          </form>
-        </Form>
+            ) : null}
+            <Button type="submit" disabled={!form.formState.isDirty || saveMut.isPending}>
+              {saveMut.isPending ? '保存中…' : '保存配置'}
+            </Button>
+          </div>
+        </div>
 
         {saveMut.data ? <ConfigResultAlert result={saveMut.data} /> : null}
-      </CardContent>
-    </Card>
+      </form>
+    </Form>
   );
 }
 
 /** 监控指标卡:Prometheus 开关(热启停)与监听地址/端口(保存热重启),均写回配置文件。 */
 function MetricsCard() {
   const queryClient = useQueryClient();
-  // 与 ServerConfigCard 共用 query key:同页切 tab 不重复请求
   const cfgQ = useQuery({ queryKey: qk.serverConfig, queryFn: getServerConfig });
 
   const metrics = cfgQ.data?.hot.metrics;
@@ -658,7 +734,6 @@ function MetricsCard() {
     defaultValues: { bind_addr: '127.0.0.1', port: '9090' },
   });
 
-  // 仅在服务端值变化时回填,避免打字过程中被刷新覆盖
   useEffect(() => {
     if (metricsBindAddr === undefined || metricsPort === undefined) return;
     form.reset({ bind_addr: metricsBindAddr, port: String(metricsPort) });
@@ -680,13 +755,11 @@ function MetricsCard() {
         metrics: { bind_addr: values.bind_addr.trim(), port: Number(values.port) },
       }),
     onSuccess: (result, values) => {
-      // 以已提交值作为新基准,保证「无改动时禁用保存」
       form.reset(values);
       onSaved(result);
     },
   });
 
-  // 抓取地址:独立端口。绑定 0.0.0.0 时展示当前主机名(实际可达地址),其余原样
   const bindHost = metrics
     ? metrics.bind_addr === '0.0.0.0' || metrics.bind_addr === '::'
       ? window.location.hostname
@@ -696,73 +769,96 @@ function MetricsCard() {
 
   if (cfgQ.isLoading) {
     return (
-      <Card>
-        <CardContent className="space-y-2">
-          <Skeleton className="h-9 w-full" />
-          <Skeleton className="h-9 w-full" />
-          <Skeleton className="h-9 w-full" />
-        </CardContent>
-      </Card>
+      <div className="rh-telemetry-card space-y-2 rounded-2xl border bg-card p-6">
+        <Skeleton className="h-9 w-full" />
+        <Skeleton className="h-9 w-full" />
+        <Skeleton className="h-9 w-full" />
+      </div>
     );
   }
 
   if (cfgQ.isError) {
     return (
-      <Card>
-        <CardContent>
-          <Alert variant="destructive">
-            <TriangleAlert />
-            <AlertTitle>加载服务器配置失败</AlertTitle>
-            <AlertDescription>
-              <p>{cfgQ.error?.message ?? '未知错误'}</p>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={cfgQ.isFetching}
-                onClick={() => void cfgQ.refetch()}
-              >
-                {cfgQ.isFetching ? '重试中…' : '重试'}
-              </Button>
-            </AlertDescription>
-          </Alert>
-        </CardContent>
-      </Card>
+      <div className="rh-telemetry-card rounded-2xl border bg-card p-6">
+        <Alert variant="destructive">
+          <TriangleAlert />
+          <AlertTitle>加载服务器配置失败</AlertTitle>
+          <AlertDescription>
+            <p>{cfgQ.error?.message ?? '未知错误'}</p>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={cfgQ.isFetching}
+              onClick={() => void cfgQ.refetch()}
+            >
+              {cfgQ.isFetching ? '重试中…' : '重试'}
+            </Button>
+          </AlertDescription>
+        </Alert>
+      </div>
     );
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Activity className="size-4" />
-          监控指标
-        </CardTitle>
-        <CardDescription>
-          Prometheus 抓取端点与监听配置;保存后立即热生效并写回配置文件。
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
-        <div className="flex flex-row items-center justify-between gap-4 rounded-md border p-3">
-          <div className="space-y-1">
-            <div className="text-sm leading-none font-medium">
-              <InfoLabel title="启用 Prometheus" infoKey="settings.prometheus.enabled" />
-            </div>
-            <p className="text-xs text-muted-foreground">关闭即停止监听。</p>
+    <div className="rh-telemetry-card space-y-5 rounded-2xl border border-border/80 bg-card p-5 shadow-2xs sm:p-6">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/60 pb-4">
+        <div className="flex items-center gap-2.5">
+          <div className="flex size-9 items-center justify-center rounded-xl border border-primary/20 bg-primary/10 text-primary">
+            <Activity className="size-4" />
           </div>
-          <Switch
-            checked={metricsEnabled}
-            disabled={toggleMut.isPending || cfgQ.isFetching}
-            onCheckedChange={(checked) => toggleMut.mutate(checked)}
-          />
+          <div>
+            <h3 className="text-base font-semibold">监控指标</h3>
+            <p className="text-xs text-muted-foreground">
+              Prometheus 抓取端点与监听配置;保存后立即热生效并写回配置文件
+            </p>
+          </div>
         </div>
+        <Badge
+          variant="outline"
+          className={cn(
+            'rounded-full px-2.5 py-0.5 text-xs',
+            metricsEnabled
+              ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+              : 'text-muted-foreground',
+          )}
+        >
+          {metricsEnabled ? 'Prometheus 已启用' : 'Prometheus 已停用'}
+        </Badge>
+      </div>
 
-        <Form {...form}>
-          <form
-            className="space-y-5"
-            onSubmit={form.handleSubmit((values) => {
-              addrMut.mutate(values);
-            })}
-          >
+      <div className="flex flex-row items-center justify-between gap-4 rounded-xl border border-border/70 bg-muted/25 p-4">
+        <div className="space-y-1">
+          <div className="text-sm leading-none font-medium">
+            <InfoLabel title="启用 Prometheus" infoKey="settings.prometheus.enabled" />
+          </div>
+          <p className="text-xs text-muted-foreground">关闭即停止监听。</p>
+        </div>
+        <Switch
+          checked={metricsEnabled}
+          disabled={toggleMut.isPending || cfgQ.isFetching}
+          onCheckedChange={(checked) => toggleMut.mutate(checked)}
+        />
+      </div>
+
+      {/* Prometheus 抓取地址展示卡 */}
+      <div className="rounded-xl border border-primary/20 bg-primary/5 p-4">
+        <div className="text-[11px] font-medium tracking-wider text-muted-foreground uppercase">
+          PROMETHEUS SCRAPE ENDPOINT · 抓取地址
+        </div>
+        <div className="mt-1.5 flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-xs text-muted-foreground">Prometheus 抓取地址:</span>
+          <MonoCopy ariaLabel="复制 Prometheus 地址" full={metricsUrl} />
+        </div>
+      </div>
+
+      <Form {...form}>
+        <form
+          className="space-y-4"
+          onSubmit={form.handleSubmit((values) => {
+            addrMut.mutate(values);
+          })}
+        >
+          <div className="grid gap-4 sm:grid-cols-2">
             <FormField
               control={form.control}
               name="bind_addr"
@@ -772,7 +868,7 @@ function MetricsCard() {
                     <InfoLabel title="监听地址" infoKey="settings.prometheus.bind_addr" />
                   </FormLabel>
                   <FormControl>
-                    <Input className="w-64" placeholder="127.0.0.1" {...field} />
+                    <Input className="font-mono" placeholder="127.0.0.1" {...field} />
                   </FormControl>
                   <FormMessage />
                 </FormItem>
@@ -787,40 +883,53 @@ function MetricsCard() {
                     <InfoLabel title="监听端口" infoKey="settings.prometheus.port" />
                   </FormLabel>
                   <FormControl>
-                    <Input className="w-32" min={1} max={65535} type="number" {...field} />
+                    <Input className="font-mono" min={1} max={65535} type="number" {...field} />
                   </FormControl>
                   <FormMessage />
                 </FormItem>
               )}
             />
-            <Button
-              type="submit"
-              disabled={!metrics || !form.formState.isDirty || addrMut.isPending}
-            >
-              {addrMut.isPending ? '保存中…' : '保存监听配置'}
-            </Button>
-          </form>
-        </Form>
+          </div>
+          <Button type="submit" disabled={!metrics || !form.formState.isDirty || addrMut.isPending}>
+            {addrMut.isPending ? '保存中…' : '保存监听配置'}
+          </Button>
+        </form>
+      </Form>
 
-        <div className="flex flex-wrap items-center gap-2 text-sm">
-          <span className="text-muted-foreground">Prometheus 抓取地址:</span>
-          <MonoCopy ariaLabel="复制 Prometheus 地址" full={metricsUrl} />
-        </div>
+      <ol className="list-decimal space-y-1 rounded-xl border border-border/60 bg-muted/20 p-4 pl-8 text-[12px] leading-relaxed text-muted-foreground">
+        <li>默认仅监听 127.0.0.1:Prometheus 与服务端同机部署,或经内网 / SSH 隧道抓取;</li>
+        <li>远程直抓把上方监听地址改为 0.0.0.0 保存即可(端口无鉴权,注意防火墙);</li>
+        <li>可用指标:连接数、在线客户端、入/出站累计字节数。</li>
+      </ol>
 
-        <ol className="list-decimal space-y-1 pl-5 text-[13px] leading-relaxed text-muted-foreground">
-          <li>默认仅监听 127.0.0.1:Prometheus 与服务端同机部署,或经内网 / SSH 隧道抓取;</li>
-          <li>远程直抓把上方监听地址改为 0.0.0.0 保存即可(端口无鉴权,注意防火墙);</li>
-          <li>可用指标:连接数、在线客户端、入/出站累计字节数。</li>
-        </ol>
-
-        {toggleMut.data ? <ConfigResultAlert result={toggleMut.data} /> : null}
-        {addrMut.data ? <ConfigResultAlert result={addrMut.data} /> : null}
-      </CardContent>
-    </Card>
+      {toggleMut.data ? <ConfigResultAlert result={toggleMut.data} /> : null}
+      {addrMut.data ? <ConfigResultAlert result={addrMut.data} /> : null}
+    </div>
   );
 }
 
-/** 修改密码:成功后服务端轮换 JWT 密钥,所有会话失效需重登。 */
+/** 计算密码强度评分(0-4)与文案。 */
+function calcPasswordStrength(pw: string): { score: number; label: string; color: string } {
+  if (!pw) return { score: 0, label: '未输入', color: 'bg-muted' };
+  let score = 0;
+  if (pw.length >= 8) score += 1;
+  if (pw.length >= 12) score += 1;
+  if (/[A-Z]/.test(pw) && /[a-z]/.test(pw)) score += 1;
+  if (/\d/.test(pw) && /[^A-Za-z0-9]/.test(pw)) score += 1;
+  if (score <= 1) return { score: 1, label: '弱', color: 'bg-destructive' };
+  if (score === 2) return { score: 2, label: '中等', color: 'bg-amber-500' };
+  if (score === 3) return { score: 3, label: '强', color: 'bg-emerald-500' };
+  return { score: 4, label: '极强', color: 'bg-emerald-500' };
+}
+
+function generateStrongPassword(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*_-+=';
+  const arr = new Uint32Array(16);
+  window.crypto.getRandomValues(arr);
+  return Array.from(arr, (n) => chars[n % chars.length]).join('');
+}
+
+/** 修改密码:支持明文眼睛图标查看、随机强密码生成与强度指示。 */
 function PasswordCard() {
   const navigate = useNavigate();
 
@@ -829,108 +938,147 @@ function PasswordCard() {
     defaultValues: { oldPassword: '', newPassword: '', confirmPassword: '' },
   });
 
+  const watchedNewPassword = useWatch({ control: form.control, name: 'newPassword' });
+  const strength = calcPasswordStrength(watchedNewPassword || '');
+
   const changeMut = useMutation({
     mutationFn: (values: PasswordFormValues) =>
       changePassword(values.oldPassword, values.newPassword),
     onSuccess: () => {
       feedbackSuccess('密码已修改,所有会话已失效,请重新登录');
-      // 后端已轮换 JWT 密钥:当前令牌必然失效,清 token 并强制回登录页
       useAuthStore.getState().clear();
       navigate(ROUTES.login, { replace: true });
     },
   });
 
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <KeyRound className="size-4" />
-          修改密码
-        </CardTitle>
-        <CardDescription>修改成功后服务端轮换 JWT 密钥,所有会话立即失效。</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
-        <Alert>
-          <TriangleAlert />
-          <AlertTitle>修改成功后所有会话将立即失效,需重新登录</AlertTitle>
-          <AlertDescription>
-            服务端会轮换 JWT 签名密钥,当前令牌立即作废,必须重新登录后才能继续使用控制台。
-          </AlertDescription>
-        </Alert>
+  const handleGenerate = () => {
+    const pwd = generateStrongPassword();
+    form.setValue('newPassword', pwd, { shouldValidate: true, shouldDirty: true });
+    form.setValue('confirmPassword', pwd, { shouldValidate: true, shouldDirty: true });
+    if (navigator.clipboard && window.isSecureContext) {
+      void navigator.clipboard.writeText(pwd).then(() => {
+        feedbackSuccess('已生成 16 位强密码并复制到剪贴板');
+      });
+    } else {
+      feedbackSuccess('已自动填入随机强密码，可点击眼睛图标查看');
+    }
+  };
 
-        <Form {...form}>
-          <form
-            className="space-y-4"
-            onSubmit={form.handleSubmit((values) => {
-              changeMut.mutate(values);
-            })}
-          >
-            <FormField
-              control={form.control}
-              name="oldPassword"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>当前密码</FormLabel>
-                  <FormControl>
-                    <Input
-                      autoComplete="current-password"
-                      placeholder="输入当前密码"
-                      type="password"
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="newPassword"
-              render={({ field }) => (
-                <FormItem>
+  return (
+    <div className="rh-telemetry-card space-y-5 rounded-2xl border border-border/80 bg-card p-5 shadow-2xs sm:p-6">
+      <div className="flex items-center gap-2.5 border-b border-border/60 pb-4">
+        <div className="flex size-9 items-center justify-center rounded-xl border border-primary/20 bg-primary/10 text-primary">
+          <Lock className="size-4" />
+        </div>
+        <div>
+          <h3 className="text-base font-semibold">修改密码</h3>
+          <p className="text-xs text-muted-foreground">
+            更新管理员登录口令，修改成功后所有已登录设备将强制下线
+          </p>
+        </div>
+      </div>
+
+      <Alert>
+        <TriangleAlert />
+        <AlertTitle>修改成功后所有会话将立即失效,需重新登录</AlertTitle>
+        <AlertDescription>
+          密码更新后服务端将立即吊销全部历史登录会话，您需要使用新密码重新登录控制台。
+        </AlertDescription>
+      </Alert>
+
+      <Form {...form}>
+        <form
+          className="max-w-md space-y-4"
+          onSubmit={form.handleSubmit((values) => {
+            changeMut.mutate(values);
+          })}
+        >
+          <FormField
+            control={form.control}
+            name="oldPassword"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>当前密码</FormLabel>
+                <FormControl>
+                  <PasswordInput
+                    autoComplete="current-password"
+                    placeholder="输入当前密码"
+                    {...field}
+                  />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="newPassword"
+            render={({ field }) => (
+              <FormItem>
+                <div className="flex items-center justify-between">
                   <FormLabel>新密码</FormLabel>
-                  <FormControl>
-                    <Input
-                      autoComplete="new-password"
-                      placeholder="至少 8 位"
-                      type="password"
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="confirmPassword"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>确认新密码</FormLabel>
-                  <FormControl>
-                    <Input
-                      autoComplete="new-password"
-                      placeholder="再次输入新密码"
-                      type="password"
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <Button type="submit" disabled={changeMut.isPending}>
-              {changeMut.isPending ? '提交中…' : '修改密码'}
-            </Button>
-          </form>
-        </Form>
-      </CardContent>
-    </Card>
+                  <button
+                    type="button"
+                    onClick={handleGenerate}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-primary transition-opacity hover:opacity-80"
+                  >
+                    <Sparkles className="size-3" />
+                    随机生成强密码
+                  </button>
+                </div>
+                <FormControl>
+                  <PasswordInput autoComplete="new-password" placeholder="至少 8 位" {...field} />
+                </FormControl>
+                {watchedNewPassword ? (
+                  <div className="space-y-1 pt-0.5">
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {[1, 2, 3, 4].map((idx) => (
+                        <div
+                          key={idx}
+                          className={cn(
+                            'h-1 rounded-full transition-colors',
+                            idx <= strength.score ? strength.color : 'bg-muted',
+                          )}
+                        />
+                      ))}
+                    </div>
+                    <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                      <span>密码强度: {strength.label}</span>
+                      <Mono>{watchedNewPassword.length} 字符</Mono>
+                    </div>
+                  </div>
+                ) : null}
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="confirmPassword"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>确认新密码</FormLabel>
+                <FormControl>
+                  <PasswordInput
+                    autoComplete="new-password"
+                    placeholder="再次输入新密码"
+                    {...field}
+                  />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <Button type="submit" disabled={changeMut.isPending}>
+            {changeMut.isPending ? '提交中…' : '修改密码'}
+          </Button>
+        </form>
+      </Form>
+    </div>
   );
 }
 
-/** 一次性明文展示弹窗:轻量自写,不复用 secret-modal(那是客户端接入
- * 凭据专用,内嵌安装模板/地址选择,塞不进 Key 场景)。关闭即清空。 */
+/** 一次性明文展示弹窗:关闭即清空。 */
 function PlaintextDialog({
   open,
   onOpenChange,
@@ -954,19 +1102,23 @@ function PlaintextDialog({
             服务端只保存哈希,关闭后无法再次查看,只能重新生成(rotate)。
           </DialogDescription>
         </DialogHeader>
-        <MonoCopy full={plaintext} className="w-full" ariaLabel="复制 API 密钥" />
+        <div className="rounded-xl border border-slate-800 bg-slate-950 p-3 text-slate-100">
+          <MonoCopy
+            full={plaintext}
+            className="w-full text-emerald-300 hover:bg-slate-900"
+            ariaLabel="复制 API 密钥"
+          />
+        </div>
         <Alert>
           <TriangleAlert />
           <AlertTitle>请立即复制保存</AlertTitle>
-          <AlertDescription>
-            明文不会再次出现;泄露时先吊销再重建,不要试图找回。
-          </AlertDescription>
+          <AlertDescription>明文不会再次出现;泄露时先吊销再重建,不要试图找回。</AlertDescription>
         </Alert>
         <DialogFooter>
           <Button
             variant="outline"
             onClick={() => {
-              onOpenChange(false); // 关闭即清空 state,不留在内存里
+              onOpenChange(false);
             }}
           >
             我已保存,关闭
@@ -978,7 +1130,11 @@ function PlaintextDialog({
 }
 
 /** scope 勾选分组:每资源一行(读/写),自定义模式用。 */
-const SCOPE_GROUPS: { label: string; read: keyof typeof SCOPE_BITS; write: keyof typeof SCOPE_BITS }[] = [
+const SCOPE_GROUPS: {
+  label: string;
+  read: keyof typeof SCOPE_BITS;
+  write: keyof typeof SCOPE_BITS;
+}[] = [
   { label: '客户端', read: 'clients_r', write: 'clients_w' },
   { label: '服务规则', read: 'services_r', write: 'services_w' },
   { label: '访问器', read: 'visitors_r', write: 'visitors_w' },
@@ -1015,8 +1171,8 @@ function ApiKeysCard() {
       setPreset('readonly');
       setCustom(0);
       setDays('0');
-      setPlaintext(d.key); // 仅此一次
-      invalidate();
+      setPlaintext(d.key);
+      void invalidate();
     },
     onError: (e) => feedbackError(`创建失败:${e.message}`),
   });
@@ -1026,7 +1182,7 @@ function ApiKeysCard() {
     onSuccess: (d) => {
       feedbackSuccess('已轮换,旧密钥立即失效');
       setPlaintext(d.key);
-      invalidate();
+      void invalidate();
     },
     onError: (e) => feedbackError(`轮换失败:${e.message}`),
   });
@@ -1035,62 +1191,158 @@ function ApiKeysCard() {
     mutationFn: (id: string) => deleteApiKey(id),
     onSuccess: () => {
       feedbackSuccess('已吊销');
-      invalidate();
+      void invalidate();
     },
     onError: (e) => feedbackError(`吊销失败:${e.message}`),
   });
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <KeyRound className="size-4" />
-          API 密钥
-        </CardTitle>
-        <CardDescription>
-          服务端调用的 Bearer 凭据(rhk_ 前缀);明文仅创建/轮换时展示一次。
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="flex justify-end">
-          <Button onClick={() => setCreateOpen(true)}>新建密钥</Button>
+    <div className="rh-telemetry-card space-y-4 rounded-2xl border border-border/80 bg-card p-5 shadow-2xs sm:p-6">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 pb-4">
+        <div className="flex items-center gap-2.5">
+          <div className="flex size-9 items-center justify-center rounded-xl border border-primary/20 bg-primary/10 text-primary">
+            <KeyRound className="size-4" />
+          </div>
+          <div>
+            <h3 className="text-base font-semibold">API 密钥</h3>
+            <p className="text-xs text-muted-foreground">
+              服务端调用的 Bearer 凭据(rhk_ 前缀);明文仅创建/轮换时展示一次
+            </p>
+          </div>
         </div>
-        {listQuery.isLoading ? (
-          <Skeleton className="h-32 w-full" />
-        ) : listQuery.isError ? (
-          <Alert variant="destructive">
-            <TriangleAlert />
-            <AlertTitle>加载失败</AlertTitle>
-            <AlertDescription>{(listQuery.error as Error).message}</AlertDescription>
-          </Alert>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>名称</TableHead>
-                <TableHead>前缀</TableHead>
-                <TableHead>权限</TableHead>
-                <TableHead>创建者</TableHead>
-                <TableHead>最近使用</TableHead>
-                <TableHead>过期</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead className="text-right">操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {(listQuery.data ?? []).map((row) => (
-                <ApiKeyRowView
-                  key={row.id}
-                  row={row}
-                  onRotate={() => rotateMut.mutate(row.id)}
-                  onRevoke={() => revokeMut.mutate(row.id)}
-                  revokePending={revokeMut.isPending}
-                />
-              ))}
-            </TableBody>
-          </Table>
-        )}
-      </CardContent>
+        <Button onClick={() => setCreateOpen(true)}>
+          <Plus className="size-4" />
+          新建密钥
+        </Button>
+      </div>
+
+      {listQuery.isLoading ? (
+        <Skeleton className="h-32 w-full" />
+      ) : listQuery.isError ? (
+        <Alert variant="destructive">
+          <TriangleAlert />
+          <AlertTitle>加载失败</AlertTitle>
+          <AlertDescription>{(listQuery.error as Error).message}</AlertDescription>
+        </Alert>
+      ) : (listQuery.data ?? []).length === 0 ? (
+        <div className="space-y-4">
+          <div className="rounded-xl border border-dashed border-border/80 bg-muted/20 py-6">
+            <EmptyState
+              icon={<KeyRound className="size-6" />}
+              title="还没有 API 密钥"
+              description="创建以 rhk_ 为前缀的 Bearer 访问密钥，供 CI/CD 流水线、Terraform 或自动化运维脚本安全调用服务端接口。"
+              action={
+                <Button onClick={() => setCreateOpen(true)}>
+                  <Plus className="size-4" />
+                  新建首个密钥
+                </Button>
+              }
+            />
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border/70 bg-muted/25 px-4 py-3 text-xs text-muted-foreground">
+            <span>自动化请求认证头示例：</span>
+            <Mono className="rounded-md border border-border/70 bg-background px-2 py-1 text-foreground">
+              Authorization: Bearer rhk_xxxxxxxx...
+            </Mono>
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {/* 移动端卡片列表 (<768px) */}
+          <div className="space-y-2.5 md:hidden">
+            {(listQuery.data ?? []).map((row) => (
+              <div
+                key={row.id}
+                className="space-y-2.5 rounded-xl border border-border/70 bg-muted/20 p-3.5 text-xs"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <div className="text-sm font-semibold">{row.name}</div>
+                    <Mono className="text-muted-foreground">rhk_{row.prefix}…</Mono>
+                  </div>
+                  {row.enabled ? <Badge>正常</Badge> : <Badge variant="destructive">已吊销</Badge>}
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {scopeBadges(row.scopes).map((b) => (
+                    <Badge key={b} variant="secondary" className="font-mono text-[11px]">
+                      {b}
+                    </Badge>
+                  ))}
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-2 text-muted-foreground">
+                  <span>
+                    最近: {row.last_used_at ? fmtRelative(row.last_used_at) : '从未使用'} · 过期:{' '}
+                    {row.expires_at ? fmtTime(row.expires_at) : '永不'}
+                  </span>
+                  {row.enabled ? (
+                    <div className="flex items-center gap-1.5">
+                      <ConfirmDialog
+                        title={`轮换密钥「${row.name}」`}
+                        description="旧密钥立即失效,新明文仅展示一次。"
+                        confirmText="轮换"
+                        onConfirm={async () => rotateMut.mutate(row.id)}
+                        trigger={
+                          <Button variant="outline" size="sm">
+                            轮换
+                          </Button>
+                        }
+                      />
+                      <ConfirmDialog
+                        title={`吊销密钥「${row.name}」`}
+                        description="吊销后该密钥立即失效;记录保留用于审计,名称不可复用。"
+                        confirmText="吊销"
+                        destructive
+                        onConfirm={async () => revokeMut.mutate(row.id)}
+                        trigger={
+                          <Button variant="outline" size="sm" disabled={revokeMut.isPending}>
+                            吊销
+                          </Button>
+                        }
+                      />
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* 桌面端完整表格 (≥768px) */}
+          <div className="hidden overflow-x-auto rounded-xl border border-border/70 md:block">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>名称</TableHead>
+                  <TableHead>前缀</TableHead>
+                  <TableHead>权限</TableHead>
+                  <TableHead>创建者</TableHead>
+                  <TableHead>最近使用</TableHead>
+                  <TableHead>过期</TableHead>
+                  <TableHead>状态</TableHead>
+                  <TableHead className="text-right">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {(listQuery.data ?? []).map((row) => (
+                  <ApiKeyRowView
+                    key={row.id}
+                    row={row}
+                    onRotate={() => rotateMut.mutate(row.id)}
+                    onRevoke={() => revokeMut.mutate(row.id)}
+                    revokePending={revokeMut.isPending}
+                  />
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border/70 bg-muted/25 px-4 py-2.5 text-xs text-muted-foreground">
+            <span>在 HTTP 请求头中携带 Bearer 令牌即可调用授权范围内的 API：</span>
+            <Mono className="rounded-md border border-border/70 bg-background px-2 py-0.5 text-foreground">
+              Authorization: Bearer rhk_...
+            </Mono>
+          </div>
+        </div>
+      )}
 
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
         <DialogContent className="sm:max-w-lg">
@@ -1111,7 +1363,7 @@ function ApiKeysCard() {
             <div className="space-y-2">
               <Label>权限预设</Label>
               <Select value={preset} onValueChange={setPreset}>
-                <SelectTrigger>
+                <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1123,7 +1375,7 @@ function ApiKeysCard() {
               </Select>
             </div>
             {preset === 'custom' && (
-              <div className="grid grid-cols-2 gap-2 rounded-md border p-3">
+              <div className="grid grid-cols-2 gap-2 rounded-xl border border-border/70 bg-muted/20 p-3">
                 {SCOPE_GROUPS.map((g) => (
                   <div key={g.label} className="flex items-center gap-3 text-[13px]">
                     <span className="w-20 text-muted-foreground">{g.label}</span>
@@ -1141,7 +1393,9 @@ function ApiKeysCard() {
                         <Checkbox
                           checked={(custom & SCOPE_BITS[g.write]) !== 0}
                           onCheckedChange={(c) =>
-                            setCustom((v) => (c ? v | SCOPE_BITS[g.write] : v & ~SCOPE_BITS[g.write]))
+                            setCustom((v) =>
+                              c ? v | SCOPE_BITS[g.write] : v & ~SCOPE_BITS[g.write],
+                            )
                           }
                         />
                         写
@@ -1155,7 +1409,7 @@ function ApiKeysCard() {
             <div className="space-y-2">
               <Label>有效期</Label>
               <Select value={days} onValueChange={setDays}>
-                <SelectTrigger>
+                <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1190,7 +1444,7 @@ function ApiKeysCard() {
         }}
         plaintext={plaintext}
       />
-    </Card>
+    </div>
   );
 }
 
@@ -1208,14 +1462,14 @@ function ApiKeyRowView({
 }) {
   return (
     <TableRow>
-      <TableCell>{row.name}</TableCell>
+      <TableCell className="font-medium">{row.name}</TableCell>
       <TableCell>
         <Mono>rhk_{row.prefix}…</Mono>
       </TableCell>
       <TableCell>
         <div className="flex flex-wrap gap-1">
           {scopeBadges(row.scopes).map((b) => (
-            <Badge key={b} variant="secondary">
+            <Badge key={b} variant="secondary" className="font-mono text-[11px]">
               {b}
             </Badge>
           ))}
@@ -1267,7 +1521,48 @@ function ApiKeyRowView({
 const SETTINGS_TABS = ['server', 'metrics', 'password', 'apikeys'] as const;
 type SettingsTab = (typeof SETTINGS_TABS)[number];
 
-/** 设置页:服务器配置 / 监控指标 / 修改密码 / API 密钥 四 tab,tab 状态写 query 持久化。 */
+const CONTROL_MODULES: {
+  id: SettingsTab;
+  label: string;
+  desc: string;
+  badge: string;
+  icon: typeof Server;
+}[] = [
+  {
+    id: 'server',
+    label: '服务器配置',
+    desc: 'SSH 网关、端口策略、TLS ALPN 与 3×3 限流矩阵',
+    badge: '热生效',
+    icon: Server,
+  },
+  {
+    id: 'metrics',
+    label: '监控指标',
+    desc: 'Prometheus 独立抓取端点与热启停开关',
+    badge: 'Metrics',
+    icon: Activity,
+  },
+  {
+    id: 'apikeys',
+    label: 'API 密钥',
+    desc: 'CI / Terraform 自动化调用的 rhk_ Bearer 凭据',
+    badge: 'Bearer',
+    icon: KeyRound,
+  },
+  {
+    id: 'password',
+    label: '修改密码',
+    desc: '更新管理员登录密码与强制注销历史登录会话',
+    badge: '安全',
+    icon: Lock,
+  },
+];
+
+/**
+ * 系统控制矩阵:
+ * 桌面端左侧导览栏(含标题与四个控制模块卡片)常驻固定不动,右侧表单区独立平滑滚动;
+ * 移动端顶部展示 2×2 模块切换器,下方直接跟当前表单。
+ */
 export default function SettingsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const tabParam = searchParams.get('tab');
@@ -1275,35 +1570,95 @@ export default function SettingsPage() {
     ? (tabParam as SettingsTab)
     : 'server';
 
-  const onTabChange = (next: string) => {
+  const onTabChange = (next: SettingsTab) => {
     const params = new URLSearchParams(searchParams);
     params.set('tab', next);
     setSearchParams(params, { replace: true });
   };
 
   return (
-    <div className="space-y-6">
-      <PageHeader title="设置" description="服务器配置、监控指标、修改密码与 API 密钥" />
-      <Tabs value={tab} onValueChange={onTabChange}>
-        <TabsList>
-          <TabsTrigger value="server">服务器配置</TabsTrigger>
-          <TabsTrigger value="metrics">监控指标</TabsTrigger>
-          <TabsTrigger value="password">修改密码</TabsTrigger>
-          <TabsTrigger value="apikeys">API 密钥</TabsTrigger>
-        </TabsList>
-        <TabsContent value="server">
-          <ServerConfigCard />
-        </TabsContent>
-        <TabsContent value="metrics">
-          <MetricsCard />
-        </TabsContent>
-        <TabsContent value="password">
-          <PasswordCard />
-        </TabsContent>
-        <TabsContent value="apikeys">
-          <ApiKeysCard />
-        </TabsContent>
-      </Tabs>
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="CONTROL PLANE MATRIX · 系统控制与安全凭据"
+        title="系统控制矩阵"
+        description="服务器热更新配置、Prometheus 遥测指标、自动化 API 密钥与管理员凭据管理"
+      />
+
+      <div className="grid gap-4 sm:gap-5 lg:grid-cols-12 lg:items-start">
+        {/* 左侧控制平面分类导览轨 (桌面端与右侧卡片顶边平齐,滚动时 sticky 固定不动) */}
+        <aside className="lg:sticky lg:top-20 lg:col-span-3">
+          <div
+            role="tablist"
+            aria-label="系统控制分类"
+            className="grid grid-cols-2 gap-2 lg:grid-cols-1 lg:gap-2.5"
+          >
+            {CONTROL_MODULES.map((m) => {
+              const Icon = m.icon;
+              const active = tab === m.id;
+              return (
+                <button
+                  key={m.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => onTabChange(m.id)}
+                  className={cn(
+                    'group flex flex-col gap-1.5 rounded-xl border p-2.5 text-left transition-all sm:rounded-2xl sm:p-3.5',
+                    active
+                      ? 'border-primary/45 bg-primary/10 shadow-xs ring-1 ring-primary/20'
+                      : 'rh-telemetry-card bg-card/85 hover:border-primary/30 hover:bg-card',
+                  )}
+                >
+                  <div className="flex items-center justify-between gap-1.5 sm:gap-2">
+                    <div className="flex min-w-0 items-center gap-1.5 sm:gap-2.5">
+                      <div
+                        className={cn(
+                          'flex size-6 shrink-0 items-center justify-center rounded-lg border transition-colors sm:size-7',
+                          active
+                            ? 'border-primary/30 bg-primary text-primary-foreground shadow-2xs'
+                            : 'border-border/70 bg-muted/40 text-muted-foreground group-hover:text-foreground',
+                        )}
+                      >
+                        <Icon className="size-3.5" />
+                      </div>
+                      <span
+                        className={cn(
+                          'truncate text-xs font-semibold sm:text-sm',
+                          active ? 'text-primary' : 'text-foreground',
+                        )}
+                      >
+                        {m.label}
+                      </span>
+                    </div>
+                    <Badge
+                      variant="outline"
+                      className={cn(
+                        'shrink-0 rounded-full px-1.5 py-0 font-mono text-[10px] max-xs:hidden sm:px-2',
+                        active
+                          ? 'border-primary/35 bg-primary/15 text-primary'
+                          : 'text-muted-foreground',
+                      )}
+                    >
+                      {m.badge}
+                    </Badge>
+                  </div>
+                  <p className="pl-9 text-xs leading-relaxed text-muted-foreground max-sm:hidden">
+                    {m.desc}
+                  </p>
+                </button>
+              );
+            })}
+          </div>
+        </aside>
+
+        {/* 右侧配置内容区 (顶边与左侧导览平齐,随页面自然滚动) */}
+        <div className="min-w-0 lg:col-span-9">
+          {tab === 'server' ? <ServerConfigCard /> : null}
+          {tab === 'metrics' ? <MetricsCard /> : null}
+          {tab === 'apikeys' ? <ApiKeysCard /> : null}
+          {tab === 'password' ? <PasswordCard /> : null}
+        </div>
+      </div>
     </div>
   );
 }

@@ -242,14 +242,16 @@ export function DataTable<TData>({
     );
   }
 
+  const showColumnToggle = hideableColumns.length > 0 && !(isMobile && mobileRow);
+
   const toolbarNode =
-    toolbar || hideableColumns.length > 0 ? (
-      <div className="flex flex-wrap items-center justify-end gap-2">
-        {toolbar}
-        {hideableColumns.length > 0 ? (
+    toolbar || showColumnToggle ? (
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        {toolbar ? <div className="min-w-0 flex-1">{toolbar}</div> : <div />}
+        {showColumnToggle ? (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm" className="gap-1.5">
+              <Button variant="outline" size="sm" className="shrink-0 gap-1.5">
                 <Columns3 className="size-4" />列
               </Button>
             </DropdownMenuTrigger>
@@ -282,9 +284,9 @@ export function DataTable<TData>({
       {rows.length === 0 ? (
         emptyNode
       ) : isMobile && mobileRow ? (
-        <div className="space-y-3">
+        <div className="space-y-2.5">
           {rows.map((row) => (
-            <div key={row.id} className="rounded-lg border p-4">
+            <div key={row.id} className="rh-telemetry-card rounded-xl p-3.5">
               {mobileRow(row.original)}
             </div>
           ))}
