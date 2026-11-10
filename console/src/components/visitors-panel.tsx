@@ -1,9 +1,9 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Cable, Plus } from 'lucide-react';
+import { ArrowRight, Cable, Plus, Server } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
-import { useForm } from 'react-hook-form';
+import { useForm, useWatch } from 'react-hook-form';
 import { z } from 'zod';
 
 import {
@@ -27,14 +27,6 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
-import {
   Form,
   FormControl,
   FormField,
@@ -50,34 +42,34 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet';
 import { Switch } from '@/components/ui/switch';
 import { focusFirstControl } from '@/lib/dialog-focus';
 import { feedbackSuccess } from '@/lib/feedback';
 import { qk } from '@/lib/query-keys';
 
-/** 从规则列表「创建访问器」带入的预填(目标规则 + 类型)。 */
 export interface VisitorSeed {
   kind: 'stcp' | 'sudp' | 'xtcp';
   target: string;
 }
 
-/** 访问器类型:密钥访问的三种子协议。 */
 type VisitorKind = VisitorSeed['kind'];
 
-/** 可作为访问器目标的规则类型(与服务端「名称 + 类型」的匹配口径一致)。 */
 const VISITOR_KINDS: readonly string[] = ['stcp', 'sudp', 'xtcp'];
 
-/** 类型下拉选项(创建后不可改,故仅在新建时可选)。 */
 const KIND_OPTIONS: Array<{ label: string; value: VisitorKind }> = [
-  { label: 'STCP', value: 'stcp' },
-  { label: 'SUDP', value: 'sudp' },
-  { label: 'XTCP', value: 'xtcp' },
+  { label: 'STCP (TCP 密钥中继)', value: 'stcp' },
+  { label: 'SUDP (UDP 密钥中继)', value: 'sudp' },
+  { label: 'XTCP (P2P NAT 打洞直连)', value: 'xtcp' },
 ];
 
-/**
- * 表单校验:口径与旧版 antd rules 一致(必填 + 名称字符集 + 端口范围)。
- * 密钥字段不存在 —— 访问器密钥留空即由服务端在连接时继承目标规则的当前密钥(R23/R24)。
- */
 const visitorSchema = z.object({
   client_id: z.string().min(1, '请选择客户端'),
   name: z
@@ -97,7 +89,6 @@ const visitorSchema = z.object({
 
 type VisitorFormValues = z.infer<typeof visitorSchema>;
 
-/** 新建表单初值(等价旧版 setFieldsValue;seed 带入时预填类型与目标)。 */
 function createDefaults(seed: VisitorSeed | null, clients: ClientRow[]): VisitorFormValues {
   return {
     client_id: clients[0]?.id ?? '',
@@ -110,7 +101,6 @@ function createDefaults(seed: VisitorSeed | null, clients: ClientRow[]): Visitor
   };
 }
 
-/** 编辑回填(逐字段等价旧版 setFieldsValue;密钥不在表单,故不读取 spec.secret_key)。 */
 function rowToValues(row: VisitorRow): VisitorFormValues {
   return {
     client_id: row.client_id,
@@ -123,13 +113,6 @@ function rowToValues(row: VisitorRow): VisitorFormValues {
   };
 }
 
-/**
- * 密钥访问页「访问器」面板:STCP/SUDP/XTCP 访问端规则的 CRUD 与启停。
- *
- * 密钥不在表单出现:访问器密钥留空 = 连接时继承目标转发规则当前密钥(服务端判定),
- * 因此表单没有密钥字段、列表没有密钥列。`seed` 由规则列表行内「创建访问器」带入,
- * 经 ref 一次性消费后回调 `onSeedUsed`,避免父级清空 seed 触发表单重置。
- */
 export function VisitorsPanel({
   seed,
   onSeedUsed,
@@ -144,7 +127,6 @@ export function VisitorsPanel({
     resolver: zodResolver(visitorSchema),
     defaultValues: createDefaults(null, []),
   });
-  // 经 ref 读取一次性 seed:父级清空 seed 时不应触发表单重置
   const seedRef = useRef<VisitorSeed | null>(null);
 
   const visitorsQ = useQuery({ queryKey: qk.visitors(), queryFn: () => listVisitors() });
@@ -153,8 +135,8 @@ export function VisitorsPanel({
 
   const clients: ClientRow[] = clientsQ.data ?? [];
   const rows: VisitorRow[] = visitorsQ.data ?? [];
+  const clientMap = new Map(clients.map((c) => [c.id, c.name]));
 
-  // 目标代理候选:同类型(stcp/sudp/xtcp)规则名去重后按名称排序
   const targetOptions = Array.from(
     new Set(
       (servicesQ.data ?? [])
@@ -166,7 +148,6 @@ export function VisitorsPanel({
     .map((name) => ({ label: name, value: name }));
 
   const editRow = editId === null ? null : (rows.find((row) => row.id === editId) ?? null);
-  // 编辑中的目标规则若已不在候选里(规则被删或改名),仍作为选项展示,避免回填值不可见
   const targetSelectOptions =
     editRow &&
     editRow.target_proxy_name &&
@@ -181,7 +162,6 @@ export function VisitorsPanel({
 
   const saveMut = useMutation({
     mutationFn: ({ id, values }: { id: null | number; values: VisitorFormValues }) => {
-      // bind_port 必须是 number(后端 serde 拒绝字符串);留空按旧版回退 0
       const spec = {
         name: values.name,
         kind: values.kind,
@@ -215,19 +195,14 @@ export function VisitorsPanel({
     },
   });
 
-  // 规则页「创建访问器」跳入:记下目标与类型,打开新建弹窗。
-  // 这是 React 官方的「响应 props 变化调整状态」场景,只能放在 effect 里;
-  // set-state-in-effect 在此为误报,按旧版一次性 seed 语义显式放行。
-  /* eslint-disable react-hooks/set-state-in-effect -- 响应 seed prop 变化打开弹窗,与旧版 effect 语义一致 */
   useEffect(() => {
     if (!seed) return;
     seedRef.current = seed;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setEditId(null);
     setModalOpen(true);
   }, [seed]);
-  /* eslint-enable react-hooks/set-state-in-effect */
 
-  // 弹窗打开时重置表单并按模式回填;新建模式在此消费一次性 seed(故依赖里不含 seed)
   useEffect(() => {
     if (!modalOpen) return;
     if (editId !== null) {
@@ -258,7 +233,12 @@ export function VisitorsPanel({
     saveMut.mutate({ id: editId, values });
   };
 
-  /** 启停开关:请求未落定期间保持乐观值并禁用,落定后回到服务端值。 */
+  const watchKind = useWatch({ control: form.control, name: 'kind' });
+  const watchClientId = useWatch({ control: form.control, name: 'client_id' });
+  const watchBindAddr = useWatch({ control: form.control, name: 'bind_addr' });
+  const watchBindPort = useWatch({ control: form.control, name: 'bind_port' });
+  const watchTarget = useWatch({ control: form.control, name: 'target_proxy_name' });
+
   const renderEnabledSwitch = (row: VisitorRow) => {
     const pending = toggleMut.isPending && toggleMut.variables?.row.id === row.id;
     const checked = pending ? (toggleMut.variables?.enabled ?? row.enabled) : row.enabled;
@@ -273,7 +253,6 @@ export function VisitorsPanel({
     );
   };
 
-  /** 行内操作:编辑 + 删除(删除走二次确认,危险语义)。 */
   const renderActions = (row: VisitorRow) => (
     <div className="flex items-center gap-1">
       <Button type="button" variant="ghost" size="sm" onClick={() => openEdit(row.id)}>
@@ -298,42 +277,55 @@ export function VisitorsPanel({
           try {
             await deleteMut.mutateAsync(row.id);
           } catch {
-            // 失败提示由响应拦截器统一弹出,此处仅避免确认浮层误关
+            // 错误由拦截器弹出
           }
         }}
       />
     </div>
   );
 
-  // 表头带 InfoLabel(名词 + ℹ 说明),故不使用可排序表头:DataTableColumnHeader 的
-  // 排序按钮会与 InfoLabel 的浮层触发按钮形成嵌套 button 并互相抢点击。
   const columns: RhColumnDef<VisitorRow>[] = [
     {
       accessorKey: 'name',
       meta: { label: '名称' },
       enableHiding: false,
       header: () => <InfoLabel title="名称" infoKey="visitor.name" />,
-      cell: ({ row }) => <span className="font-medium">{row.original.name}</span>,
+      cell: ({ row }) => (
+        <div className="flex items-center gap-2">
+          <span className="rh-mono rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-bold text-primary uppercase">
+            {row.original.kind}
+          </span>
+          <span className="font-medium">{row.original.name}</span>
+        </div>
+      ),
     },
     {
-      accessorKey: 'kind',
-      meta: { label: '类型' },
-      enableHiding: false,
-      header: () => <InfoLabel title="类型" infoKey="visitor.kind" />,
-      cell: ({ row }) => <Badge variant="outline">{row.original.kind.toUpperCase()}</Badge>,
+      id: 'client',
+      meta: { label: '发起节点' },
+      header: '发起节点',
+      cell: ({ row }) => (
+        <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Server className="size-3.5 text-primary/70" />
+          <span className="font-medium text-foreground">
+            {clientMap.get(row.original.client_id) ?? row.original.client_id.slice(0, 8)}
+          </span>
+        </span>
+      ),
     },
     {
-      id: 'bind',
-      meta: { label: '本地监听' },
+      id: 'pipeline',
+      meta: { label: '本地入口 ──▶ 目标代理' },
       enableHiding: false,
-      header: () => <InfoLabel title="本地监听" infoKey="visitor.bind" />,
-      cell: ({ row }) => <Mono>{`${row.original.bind_addr}:${row.original.bind_port}`}</Mono>,
-    },
-    {
-      accessorKey: 'target_proxy_name',
-      meta: { label: '目标代理' },
-      enableHiding: false,
-      header: () => <InfoLabel title="目标代理" infoKey="visitor.target_proxy_name" />,
+      header: () => <InfoLabel title="本地监听 ──▶ 目标代理" infoKey="visitor.bind" />,
+      cell: ({ row }) => (
+        <div className="inline-flex items-center gap-2 rounded-lg border border-border/70 bg-muted/30 px-2.5 py-1 text-xs">
+          <Mono className="font-medium">{`${row.original.bind_addr}:${row.original.bind_port}`}</Mono>
+          <ArrowRight className="size-3.5 text-primary" />
+          <Mono className="font-semibold text-emerald-600 dark:text-emerald-400">
+            {row.original.target_proxy_name}
+          </Mono>
+        </div>
+      ),
     },
     {
       id: 'compress',
@@ -342,7 +334,7 @@ export function VisitorsPanel({
       header: () => <InfoLabel title="压缩" infoKey="visitor.compression" />,
       cell: ({ row }) => (
         <Badge variant={row.original.spec?.use_compression ? 'secondary' : 'outline'}>
-          {row.original.spec?.use_compression ? '是' : '否'}
+          {row.original.spec?.use_compression ? 'Snappy' : '否'}
         </Badge>
       ),
     },
@@ -362,7 +354,6 @@ export function VisitorsPanel({
     },
   ];
 
-  /** <768px 表格降级为卡片列表(设计规范 §4.6)。 */
   const mobileRow = (row: VisitorRow) => (
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-2">
@@ -396,7 +387,7 @@ export function VisitorsPanel({
         initialPageSize={50}
         getRowId={(row) => String(row.id)}
         toolbar={
-          <Button type="button" onClick={openCreate}>
+          <Button type="button" size="sm" onClick={openCreate}>
             <Plus className="size-4" aria-hidden="true" />
             新建访问器
           </Button>
@@ -406,7 +397,7 @@ export function VisitorsPanel({
           <EmptyState
             icon={<Cable className="size-6" aria-hidden="true" />}
             title="还没有访问器"
-            description="访问器在另一台机器上打开本地端口,经服务端中继或打洞直达密钥规则的目标。"
+            description="访问器在访问方节点打开本地监听端口，经服务端中继或 P2P 打洞直达私网密钥规则目标。"
             action={
               <Button type="button" onClick={openCreate}>
                 <Plus className="size-4" aria-hidden="true" />
@@ -417,216 +408,257 @@ export function VisitorsPanel({
         }
       />
 
-      <Dialog open={modalOpen} onOpenChange={setModalOpen}>
-        <DialogContent className="sm:max-w-lg" onOpenAutoFocus={focusFirstControl}>
-          <DialogHeader>
-            <DialogTitle>{editId !== null ? '编辑访问器' : '新建访问器'}</DialogTitle>
-            <DialogDescription>
-              访问器密钥不在这里填写:留空即由服务端在连接时继承目标转发规则的当前密钥。
-            </DialogDescription>
-          </DialogHeader>
-          <Form {...form}>
-            <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-              <FormField
-                control={form.control}
-                name="client_id"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="所属客户端" infoKey="visitor.form.client_id" />
-                    </FormLabel>
-                    <Select
-                      value={field.value}
-                      onValueChange={field.onChange}
-                      disabled={editId !== null}
-                    >
+      <Sheet open={modalOpen} onOpenChange={setModalOpen}>
+        <SheetContent
+          side="right"
+          className="flex w-full flex-col gap-0 p-0 sm:max-w-lg"
+          onOpenAutoFocus={focusFirstControl}
+        >
+          <SheetHeader className="border-b border-border/80 bg-muted/30 px-4 py-3.5 pr-11 sm:px-6 sm:py-4">
+            <div className="flex items-center gap-2 text-xs font-medium text-primary">
+              <Cable className="size-3.5" />
+              <span>VISITOR ENDPOINT INSPECTOR</span>
+            </div>
+            <SheetTitle>{editId !== null ? '编辑访问器' : '新建访问器'}</SheetTitle>
+            <SheetDescription className="text-xs sm:text-sm">
+              访问器密钥无需手动填写：连接时自动从服务端继承目标私网规则的当前密钥。
+            </SheetDescription>
+
+            {/* 实时访问器拓扑预览 */}
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-primary/20 bg-background/90 px-3 py-2 text-xs sm:grid sm:grid-cols-[1fr_auto_1fr_auto_1fr] sm:py-2.5">
+              <div className="min-w-0">
+                <div className="text-[10px] text-muted-foreground">本地绑定</div>
+                <Mono className="mt-0.5 block truncate font-semibold">
+                  {`${watchBindAddr || '127.0.0.1'}:${watchBindPort ?? '?'}`}
+                </Mono>
+              </div>
+              <div className="flex items-center gap-1 px-1 text-primary sm:flex-col sm:gap-0">
+                <span className="rh-mono rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-bold uppercase">
+                  {watchKind}
+                </span>
+                <ArrowRight className="size-3.5 sm:mt-0.5" />
+              </div>
+              <div className="min-w-0 rounded-lg border border-border/80 bg-muted/40 px-2 py-1">
+                <div className="text-[10px] text-muted-foreground">发起节点</div>
+                <div className="truncate font-medium">
+                  {clientMap.get(watchClientId) ?? '未选择'}
+                </div>
+              </div>
+              <ArrowRight className="size-3.5 text-muted-foreground max-sm:hidden" />
+              <div className="min-w-0 text-right max-sm:w-full max-sm:border-t max-sm:border-border/50 max-sm:pt-1.5 max-sm:text-left">
+                <div className="text-[10px] text-muted-foreground">目标私网规则</div>
+                <Mono className="mt-0.5 block truncate font-semibold text-emerald-600 dark:text-emerald-400">
+                  {watchTarget || '待选择'}
+                </Mono>
+              </div>
+            </div>
+          </SheetHeader>
+
+          <div className="flex-1 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
+            <Form {...form}>
+              <form id="visitor-form" onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+                <FormField
+                  control={form.control}
+                  name="client_id"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        <InfoLabel title="所属客户端" infoKey="visitor.form.client_id" />
+                      </FormLabel>
+                      <Select
+                        value={field.value}
+                        onValueChange={field.onChange}
+                        disabled={editId !== null}
+                      >
+                        <FormControl>
+                          <SelectTrigger className="w-full">
+                            <SelectValue placeholder="选择客户端" />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          {clients.map((client) => (
+                            <SelectItem key={client.id} value={client.id}>
+                              {client.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="name"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        <InfoLabel title="名称" infoKey="visitor.form.name" />
+                      </FormLabel>
                       <FormControl>
-                        <SelectTrigger className="w-full">
-                          <SelectValue placeholder="选择客户端" />
-                        </SelectTrigger>
+                        <Input {...field} />
                       </FormControl>
-                      <SelectContent>
-                        {clients.map((client) => (
-                          <SelectItem key={client.id} value={client.id}>
-                            {client.name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
 
-              <FormField
-                control={form.control}
-                name="name"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="名称" infoKey="visitor.form.name" />
-                    </FormLabel>
-                    <FormControl>
-                      <Input {...field} />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+                <FormField
+                  control={form.control}
+                  name="kind"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        <InfoLabel title="类型" infoKey="visitor.form.kind" />
+                      </FormLabel>
+                      <Select
+                        value={field.value}
+                        onValueChange={field.onChange}
+                        disabled={editId !== null}
+                      >
+                        <FormControl>
+                          <SelectTrigger className="w-full">
+                            <SelectValue />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          {KIND_OPTIONS.map((option) => (
+                            <SelectItem key={option.value} value={option.value}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
 
-              <FormField
-                control={form.control}
-                name="kind"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="类型" infoKey="visitor.form.kind" />
-                    </FormLabel>
-                    <Select
-                      value={field.value}
-                      onValueChange={field.onChange}
-                      disabled={editId !== null}
-                    >
-                      <FormControl>
-                        <SelectTrigger className="w-full">
-                          <SelectValue />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        {KIND_OPTIONS.map((option) => (
-                          <SelectItem key={option.value} value={option.value}>
-                            {option.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <FormField
+                    control={form.control}
+                    name="bind_addr"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>
+                          <InfoLabel title="本地监听地址" infoKey="visitor.form.bind_addr" />
+                        </FormLabel>
+                        <FormControl>
+                          <Input {...field} placeholder="127.0.0.1" />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
 
-              <FormField
-                control={form.control}
-                name="bind_addr"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="本地监听地址" infoKey="visitor.form.bind_addr" />
-                    </FormLabel>
-                    <FormControl>
-                      <Input {...field} placeholder="127.0.0.1" />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+                  <FormField
+                    control={form.control}
+                    name="bind_port"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>
+                          <InfoLabel title="本地监听端口" infoKey="visitor.form.bind_port" />
+                        </FormLabel>
+                        <FormControl>
+                          <Input
+                            type="number"
+                            min={1}
+                            max={65535}
+                            step={1}
+                            inputMode="numeric"
+                            name={field.name}
+                            ref={field.ref}
+                            onBlur={field.onBlur}
+                            value={Number.isFinite(field.value) ? String(field.value) : ''}
+                            onChange={(event) => {
+                              const raw = event.target.value;
+                              field.onChange(raw === '' ? undefined : Number(raw));
+                            }}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
 
-              <FormField
-                control={form.control}
-                name="bind_port"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="本地监听端口" infoKey="visitor.form.bind_port" />
-                    </FormLabel>
-                    <FormControl>
-                      {/* 数值字段:提交给后端的必须是 number,空输入保持 undefined 交给校验 */}
-                      <Input
-                        type="number"
-                        min={1}
-                        max={65535}
-                        step={1}
-                        inputMode="numeric"
-                        name={field.name}
-                        ref={field.ref}
-                        onBlur={field.onBlur}
-                        value={Number.isFinite(field.value) ? String(field.value) : ''}
-                        onChange={(event) => {
-                          const raw = event.target.value;
-                          field.onChange(raw === '' ? undefined : Number(raw));
-                        }}
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+                <FormField
+                  control={form.control}
+                  name="target_proxy_name"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        <InfoLabel title="目标代理名" infoKey="visitor.form.target_proxy_name" />
+                      </FormLabel>
+                      <Select
+                        value={field.value}
+                        onValueChange={field.onChange}
+                        disabled={targetSelectOptions.length === 0}
+                      >
+                        <FormControl>
+                          <SelectTrigger className="w-full">
+                            <SelectValue placeholder="选择目标规则" />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          {targetSelectOptions.map((option) => (
+                            <SelectItem key={option.value} value={option.value}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      {targetOptions.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">
+                          暂无 STCP/SUDP/XTCP 规则,请先在「私网密钥规则」页创建
+                        </p>
+                      ) : null}
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
 
-              <FormField
-                control={form.control}
-                name="target_proxy_name"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="目标代理名" infoKey="visitor.form.target_proxy_name" />
-                    </FormLabel>
-                    <Select
-                      value={field.value}
-                      onValueChange={field.onChange}
-                      disabled={targetSelectOptions.length === 0}
-                    >
-                      <FormControl>
-                        <SelectTrigger className="w-full">
-                          <SelectValue placeholder="选择目标规则" />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        {targetSelectOptions.map((option) => (
-                          <SelectItem key={option.value} value={option.value}>
-                            {option.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    {targetOptions.length === 0 ? (
-                      <p className="text-xs text-muted-foreground">
-                        暂无 STCP/SUDP/XTCP 规则,请先在「规则」页创建
-                      </p>
-                    ) : null}
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+                <FormField
+                  control={form.control}
+                  name="use_compression"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        <InfoLabel title="压缩" infoKey="visitor.compression" />
+                      </FormLabel>
+                      <div className="flex items-center gap-2 rounded-lg border border-border/70 p-3">
+                        <FormControl>
+                          <Checkbox
+                            checked={field.value}
+                            onCheckedChange={(checked) => field.onChange(checked === true)}
+                          />
+                        </FormControl>
+                        <span className="text-sm">启用 snappy 数据流压缩</span>
+                      </div>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </form>
+            </Form>
+          </div>
 
-              <FormField
-                control={form.control}
-                name="use_compression"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      <InfoLabel title="压缩" infoKey="visitor.compression" />
-                    </FormLabel>
-                    <div className="flex items-center gap-2">
-                      <FormControl>
-                        <Checkbox
-                          checked={field.value}
-                          onCheckedChange={(checked) => field.onChange(checked === true)}
-                        />
-                      </FormControl>
-                      <span className="text-sm">启用 snappy 压缩</span>
-                    </div>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-
-              <DialogFooter>
-                <Button
-                  type="button"
-                  variant="outline"
-                  disabled={saveMut.isPending}
-                  onClick={() => setModalOpen(false)}
-                >
-                  取消
-                </Button>
-                <Button type="submit" disabled={saveMut.isPending}>
-                  {saveMut.isPending ? '保存中…' : '保存'}
-                </Button>
-              </DialogFooter>
-            </form>
-          </Form>
-        </DialogContent>
-      </Dialog>
+          <SheetFooter className="flex-row items-center justify-end gap-2 border-t border-border/80 bg-card/90 px-6 py-4">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={saveMut.isPending}
+              onClick={() => setModalOpen(false)}
+            >
+              取消
+            </Button>
+            <Button type="submit" form="visitor-form" disabled={saveMut.isPending}>
+              {saveMut.isPending ? '保存中…' : '保存'}
+            </Button>
+          </SheetFooter>
+        </SheetContent>
+      </Sheet>
     </div>
   );
 }

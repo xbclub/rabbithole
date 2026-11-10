@@ -4,85 +4,84 @@
 @custom-variant dark (&:is(.dark *));
 
 /*
- * 设计 token(shadcn/ui,neutral 基色)。
- * 主色为单色(--primary 亮色近黑 / 暗色近白),仅状态语义用色;
- * 字体为纯系统字体栈(不打包字体文件),端口/IP/UUID/字节/时间戳走 --font-mono
- * 并配 tabular-nums,避免轮询刷新时数字宽度抖动。
+ * rabbithole 精密网络仪表盘设计系统 (Precision Network Telemetry)
+ * 主色:深海电光靛蓝 (Indigo) + 信号脉冲绿 (Emerald)
+ * 字体:系统无衬线字体 + 仪表盘等宽数值栈 (--font-mono tabular-nums)
  */
 :root {
-  --radius: 0.625rem;
+  --radius: 0.75rem;
 
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
+  --background: oklch(0.98 0.005 256);
+  --foreground: oklch(0.165 0.022 260);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
+  --card-foreground: oklch(0.165 0.022 260);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
+  --popover-foreground: oklch(0.165 0.022 260);
+  --primary: oklch(0.51 0.215 264);
+  --primary-foreground: oklch(0.99 0.005 264);
+  --secondary: oklch(0.952 0.012 258);
+  --secondary-foreground: oklch(0.22 0.03 262);
+  --muted: oklch(0.952 0.009 258);
+  --muted-foreground: oklch(0.47 0.026 258);
+  --accent: oklch(0.942 0.02 262);
+  --accent-foreground: oklch(0.22 0.035 262);
+  --destructive: oklch(0.577 0.235 27.325);
   --destructive-foreground: oklch(0.985 0 0);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  --border: oklch(0.9 0.012 258);
+  --input: oklch(0.89 0.014 258);
+  --ring: oklch(0.54 0.21 264);
 
-  --chart-1: oklch(0.488 0.243 264.376);
-  --chart-2: oklch(0.696 0.17 162.48);
-  --chart-3: oklch(0.769 0.188 70.08);
-  --chart-4: oklch(0.627 0.265 303.9);
-  --chart-5: oklch(0.645 0.246 16.439);
+  --chart-1: oklch(0.52 0.215 264);
+  --chart-2: oklch(0.65 0.175 162);
+  --chart-3: oklch(0.75 0.175 72);
+  --chart-4: oklch(0.61 0.23 302);
+  --chart-5: oklch(0.63 0.23 18);
 
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  --sidebar: oklch(0.985 0.004 256);
+  --sidebar-foreground: oklch(0.165 0.022 260);
+  --sidebar-primary: oklch(0.51 0.215 264);
+  --sidebar-primary-foreground: oklch(0.99 0.005 264);
+  --sidebar-accent: oklch(0.945 0.018 262);
+  --sidebar-accent-foreground: oklch(0.22 0.035 262);
+  --sidebar-border: oklch(0.9 0.012 258);
+  --sidebar-ring: oklch(0.54 0.21 264);
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.269 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.371 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
+  --background: oklch(0.13 0.018 262);
+  --foreground: oklch(0.965 0.008 256);
+  --card: oklch(0.172 0.02 262);
+  --card-foreground: oklch(0.965 0.008 256);
+  --popover: oklch(0.192 0.022 262);
+  --popover-foreground: oklch(0.965 0.008 256);
+  --primary: oklch(0.63 0.2 264);
+  --primary-foreground: oklch(0.99 0.005 264);
+  --secondary: oklch(0.225 0.024 262);
+  --secondary-foreground: oklch(0.96 0.008 256);
+  --muted: oklch(0.215 0.02 262);
+  --muted-foreground: oklch(0.68 0.022 258);
+  --accent: oklch(0.255 0.032 264);
+  --accent-foreground: oklch(0.97 0.006 256);
+  --destructive: oklch(0.66 0.2 23);
   --destructive-foreground: oklch(0.985 0 0);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
+  --border: oklch(0.96 0.01 260 / 11%);
+  --input: oklch(0.96 0.01 260 / 15%);
+  --ring: oklch(0.63 0.2 264);
 
-  --chart-1: oklch(0.488 0.243 264.376);
-  --chart-2: oklch(0.696 0.17 162.48);
-  --chart-3: oklch(0.769 0.188 70.08);
-  --chart-4: oklch(0.627 0.265 303.9);
-  --chart-5: oklch(0.645 0.246 16.439);
+  --chart-1: oklch(0.66 0.195 264);
+  --chart-2: oklch(0.72 0.17 162);
+  --chart-3: oklch(0.78 0.175 74);
+  --chart-4: oklch(0.67 0.23 302);
+  --chart-5: oklch(0.67 0.22 18);
 
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
+  --sidebar: oklch(0.165 0.02 262);
+  --sidebar-foreground: oklch(0.965 0.008 256);
+  --sidebar-primary: oklch(0.63 0.2 264);
+  --sidebar-primary-foreground: oklch(0.99 0.005 264);
+  --sidebar-accent: oklch(0.24 0.028 264);
+  --sidebar-accent-foreground: oklch(0.97 0.006 256);
+  --sidebar-border: oklch(0.96 0.01 260 / 11%);
+  --sidebar-ring: oklch(0.63 0.2 264);
 }
 
 @theme inline {
@@ -158,12 +157,91 @@
   }
 }
 
-/*
- * 小屏把默认尺寸开关放大:shadcn 默认 18.4×32,低于 WCAG 2.2 AA 的 24×24 最小目标。
- * 取 24×40 + 20px 滑块:滑块位移是 calc(100% - 2px) = 18px,正好贴右内沿(38 - 20)。
- * 钩子用组件自带的 group/switch 类而不是 data-slot="switch":
- * 在表单里 FormControl(Slot)会把子元素的 data-slot 覆盖成 form-control。
- */
+/* 精密工程点阵画布与顶部微光晕 */
+.rh-bg-canvas {
+  background-color: var(--background);
+  background-image:
+    radial-gradient(ellipse 80% 45% at 50% -15%, oklch(0.55 0.21 264 / 0.08), transparent),
+    radial-gradient(circle at 1px 1px, oklch(0.5 0.04 260 / 0.11) 1px, transparent 0);
+  background-size:
+    100% 100%,
+    22px 22px;
+}
+
+.dark .rh-bg-canvas {
+  background-image:
+    radial-gradient(ellipse 80% 45% at 50% -15%, oklch(0.6 0.22 264 / 0.14), transparent),
+    radial-gradient(circle at 1px 1px, oklch(0.85 0.02 260 / 0.07) 1px, transparent 0);
+}
+
+/* 顶部悬浮毛玻璃导航舱 */
+.rh-glass-dock {
+  background: color-mix(in oklch, var(--card) 84%, transparent);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  box-shadow:
+    0 1px 2px oklch(0.15 0.02 260 / 0.04),
+    0 8px 24px -6px oklch(0.15 0.04 260 / 0.06);
+}
+
+.dark .rh-glass-dock {
+  background: color-mix(in oklch, var(--card) 80%, transparent);
+  box-shadow:
+    inset 0 1px 0 0 oklch(1 0 0 / 0.07),
+    0 10px 30px -8px oklch(0 0 0 / 0.45);
+}
+
+/* 精密仪表卡片表面与明暗态立体投影 */
+.rh-telemetry-card {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--card);
+  border: 1px solid var(--border);
+  box-shadow:
+    0 1px 2px 0 oklch(0.15 0.02 260 / 0.05),
+    0 4px 14px -3px oklch(0.15 0.03 260 / 0.06);
+  transition:
+    border-color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.dark .rh-telemetry-card {
+  box-shadow:
+    inset 0 1px 0 0 oklch(1 0 0 / 0.06),
+    0 8px 24px -6px oklch(0 0 0 / 0.35);
+}
+
+/* 信号脉冲呼吸灯 */
+@keyframes rh-pulse-ring {
+  0% {
+    transform: scale(0.95);
+    opacity: 0.75;
+  }
+  70% {
+    transform: scale(2.15);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(2.15);
+    opacity: 0;
+  }
+}
+
+.rh-pulse-dot {
+  position: relative;
+  display: inline-flex;
+}
+
+.rh-pulse-dot::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background-color: inherit;
+  animation: rh-pulse-ring 2.2s cubic-bezier(0.24, 0, 0.38, 1) infinite;
+}
+
+/* 小屏开关触控放大 */
 @media (max-width: 767px) {
   [class~='group/switch'][data-size='default'] {
     height: 1.5rem;
@@ -195,7 +273,7 @@
   height: 28px;
   border-radius: 9999px;
   border: 2px solid var(--border);
-  border-top-color: var(--foreground);
+  border-top-color: var(--primary);
   animation: rh-boot-spin 720ms linear infinite;
 }
 
@@ -206,7 +284,8 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  #rh-boot .rh-boot-mark {
+  #rh-boot .rh-boot-mark,
+  .rh-pulse-dot::after {
     animation: none;
   }
 }

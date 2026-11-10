@@ -4,17 +4,18 @@ import {
   Globe,
   KeyRound,
   LayoutDashboard,
+  Radio,
   Search,
   Server,
   Settings,
   ShieldCheck,
-  Radio,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
 
 import { listClients, listServices } from '@/api/rabbithole';
+import { StatusBadge, proxyStatusSignal } from '@/components/status-badge';
 import { Button } from '@/components/ui/button';
 import {
   CommandDialog,
@@ -40,7 +41,7 @@ const ICONS: Record<string, LucideIcon> = {
   settings: Settings,
 };
 
-/** 转发规则 kind → 对应页面(⌘K 里点一条规则直接跳到它所属的类型页)。 */
+/** 转发规则 kind → 对应页面(⌘K 里点一条规则直接跳到它所属的协议透镜)。 */
 const KIND_ROUTE: Record<string, string> = {
   tcp: ROUTES.tcp,
   udp: ROUTES.udp,
@@ -56,18 +57,19 @@ function isMac(): boolean {
   return typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
 }
 
-/** 顶栏的 ⌘K 触发钮(快捷键监听统一在 CommandPalette 里,这里只派发开关事件)。 */
+/** 顶部导航舱的 ⌘K 搜索胶囊触发器(精简紧凑态,不挤压导航栏)。 */
 export function CommandPaletteTrigger() {
   return (
     <Button
       variant="outline"
       onClick={() => window.dispatchEvent(new CustomEvent('rh:toggle-command'))}
       aria-label="打开命令面板"
-      className="h-9 w-72 max-w-[45vw] justify-start gap-2 font-normal text-muted-foreground max-sm:w-9 max-sm:px-0"
+      title="全局命令与拓扑检索 (⌘K)"
+      className="h-8 shrink-0 gap-1.5 rounded-full border-border/80 bg-background/60 px-2.5 text-xs font-normal text-muted-foreground shadow-none hover:border-primary/35 hover:bg-accent/60 hover:text-foreground max-sm:size-8 max-sm:px-0"
     >
-      <Search className="size-4 shrink-0" />
-      <span className="truncate max-sm:hidden">搜索页面、客户端或转发规则</span>
-      <KbdGroup className="ml-auto shrink-0 max-sm:hidden">
+      <Search className="size-3.5 shrink-0 text-primary" />
+      <span className="max-sm:hidden">搜索…</span>
+      <KbdGroup className="ml-0.5 shrink-0 max-md:hidden">
         <Kbd>{isMac() ? '⌘' : 'Ctrl'}</Kbd>
         <Kbd>K</Kbd>
       </KbdGroup>
@@ -75,7 +77,7 @@ export function CommandPaletteTrigger() {
   );
 }
 
-/** ⌘K 命令面板:页面跳转 + 客户端/转发规则按名称搜索。 */
+/** ⌘K 全局命令中枢:工作台跳转 + 边缘节点检索 + 隧道规则直达。 */
 export function CommandPalette() {
   const [open, setOpen] = useState(false);
   const navigate = useNavigate();
@@ -118,12 +120,12 @@ export function CommandPalette() {
     <CommandDialog
       open={open}
       onOpenChange={setOpen}
-      title="命令面板"
-      description="跳转页面或搜索客户端与转发规则"
+      title="全局命令与拓扑检索"
+      description="快速切换工作台、检索边缘节点或定位转发隧道"
     >
-      <CommandInput placeholder="跳转页面、搜索客户端或转发规则…" />
+      <CommandInput placeholder="输入工作台名称、节点主机名、隧道名称或协议类型…" />
       <CommandList>
-        <CommandEmpty>没有匹配结果</CommandEmpty>
+        <CommandEmpty>未找到匹配的节点、隧道或命令</CommandEmpty>
         {NAV_GROUPS.map((group, index) => (
           <CommandGroup key={group.label ?? `g-${index}`} heading={group.label ?? '导航'}>
             {group.items.map((item) => {
@@ -134,8 +136,8 @@ export function CommandPalette() {
                   value={`${item.title} ${item.to}`}
                   onSelect={() => go(item.to)}
                 >
-                  <Icon className="size-4" />
-                  {item.title}
+                  <Icon className="size-4 text-primary" />
+                  <span>{item.title}</span>
                 </CommandItem>
               );
             })}
@@ -144,17 +146,25 @@ export function CommandPalette() {
         {clientsQuery.data && clientsQuery.data.length > 0 ? (
           <>
             <CommandSeparator />
-            <CommandGroup heading="客户端">
+            <CommandGroup heading="边缘节点 (点击查看该节点隧道)">
               {clientsQuery.data.slice(0, 20).map((client) => (
                 <CommandItem
                   key={client.id}
-                  value={`${client.name} ${client.id}`}
-                  onSelect={() => go(ROUTES.clients)}
+                  value={`${client.name} ${client.id} ${client.hostname ?? ''}`}
+                  onSelect={() => go(`${ROUTES.tcp}?client=${encodeURIComponent(client.id)}`)}
                 >
-                  <Server className="size-4" />
-                  <span className="truncate">{client.name}</span>
-                  <span className="rh-mono ml-auto text-xs text-muted-foreground">
-                    {client.online ? '在线' : '离线'}
+                  <Server className="size-4 text-muted-foreground" />
+                  <span className="truncate font-medium">{client.name}</span>
+                  {client.hostname ? (
+                    <span className="rh-mono truncate text-xs text-muted-foreground">
+                      ({client.hostname})
+                    </span>
+                  ) : null}
+                  <span className="ml-auto">
+                    <StatusBadge
+                      signal={client.online ? 'ok' : 'off'}
+                      text={client.online ? '在线' : '离线'}
+                    />
                   </span>
                 </CommandItem>
               ))}
@@ -164,19 +174,27 @@ export function CommandPalette() {
         {servicesQuery.data && servicesQuery.data.length > 0 ? (
           <>
             <CommandSeparator />
-            <CommandGroup heading="转发规则">
-              {servicesQuery.data.slice(0, 30).map((service) => (
-                <CommandItem
-                  key={service.id}
-                  value={`${service.name} ${service.kind}`}
-                  onSelect={() => go(KIND_ROUTE[service.kind] ?? ROUTES.tcp)}
-                >
-                  <span className="truncate">{service.name}</span>
-                  <span className="rh-mono ml-auto text-xs text-muted-foreground">
-                    {service.kind}
-                  </span>
-                </CommandItem>
-              ))}
+            <CommandGroup heading="转发隧道规则">
+              {servicesQuery.data.slice(0, 30).map((service) => {
+                const sig = proxyStatusSignal(service.status, service.healthy);
+                const route = KIND_ROUTE[service.kind] ?? ROUTES.tcp;
+                return (
+                  <CommandItem
+                    key={service.id}
+                    value={`${service.name} ${service.kind} ${service.target_host}:${service.target_port}`}
+                    onSelect={() => go(`${route}?q=${encodeURIComponent(service.name)}`)}
+                  >
+                    <ArrowRightLeft className="size-4 text-muted-foreground" />
+                    <span className="truncate font-medium">{service.name}</span>
+                    <span className="rh-mono rounded bg-muted px-1.5 py-0.5 text-[11px] uppercase">
+                      {service.kind}
+                    </span>
+                    <span className="ml-auto">
+                      <StatusBadge signal={sig.signal} text={sig.text} />
+                    </span>
+                  </CommandItem>
+                );
+              })}
             </CommandGroup>
           </>
         ) : null}

@@ -1,6 +1,6 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useQuery } from '@tanstack/react-query';
-import { ChevronDown, Loader2 } from 'lucide-react';
+import { ArrowRight, ChevronDown, Loader2, Server, Waypoints } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
@@ -9,16 +9,9 @@ import { getService } from '@/api/rabbithole';
 import type { ClientRow, ServiceRow } from '@/api/rabbithole';
 import { HeaderPairsInput } from '@/components/header-pairs-input';
 import { InfoLabel } from '@/components/info-label';
+import { Mono } from '@/components/mono';
 import { Button } from '@/components/ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
 import {
   Form,
   FormControl,
@@ -27,7 +20,7 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form';
-import { Input } from '@/components/ui/input';
+import { Input, PasswordInput } from '@/components/ui/input';
 import {
   Select,
   SelectContent,
@@ -36,6 +29,14 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Separator } from '@/components/ui/separator';
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import { FIELD_INFO } from '@/features/field-info';
@@ -71,11 +72,6 @@ const ADVANCED_GROUPS: readonly FieldGroupKey[] = [
 
 const headerPairSchema = z.object({ name: z.string(), value: z.string() });
 
-/**
- * 表单形状与格式校验。可见性相关的必填检查放在 superRefine —— 它只看表单值,
- * 不依赖编辑态,因此 resolver 在整个弹窗生命周期内稳定。
- * 依赖编辑态的业务校验(域名/端口)由 validateServiceForm 在提交时补充。
- */
 const formSchema = z
   .object({
     client_id: z.string().min(1, '请选择所属客户端'),
@@ -181,7 +177,6 @@ function infoKeyFor(name: string): FieldInfoKey | undefined {
   return key in FIELD_INFO ? (key as FieldInfoKey) : undefined;
 }
 
-/** 编辑回读:自动分配的端口(0)在界面上表达为开关打开,而不是魔法值 0。 */
 function readbackValues(row: ServiceRow): ProxyFormValues {
   const values = serviceToFormValues(row);
   return { ...values, bind_auto: row.bind_port === 0 };
@@ -205,8 +200,6 @@ function NumberControl({
 } & Omit<React.ComponentProps<'input'>, 'value' | 'onChange' | 'min' | 'max'>) {
   return (
     <Input
-      // FormControl 通过 Slot 注入 id/aria-*;自定义组件必须继续透传,否则
-      // <label htmlFor> 指不到输入框(与 Select 那次是同一类问题的不同形态)
       {...rest}
       type="number"
       inputMode="numeric"
@@ -231,9 +224,9 @@ function NumberControl({
 export interface ProxyFormModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** 页内允许的 kind;多于一个时表单顶部显示类型选择器。 */
   kinds: ProxyKind[];
   defaultKind: ProxyKind;
+  defaultClientId?: string;
   editing: ServiceRow | null;
   clients: ClientRow[];
   submitting?: boolean;
@@ -241,28 +234,21 @@ export interface ProxyFormModalProps {
 }
 
 /**
- * 新建/编辑转发规则弹窗。
- *
- * 字段矩阵不写死在这里,而是由 @/features/services/matrix 的声明式矩阵驱动渲染
- * (可见性/必填/魔法值/分组全部来自矩阵);组装与回读走 @/features/services/spec,
- * 后端契约零变更。
- *
- * 密钥(stcp/sudp/xtcp 的 secret_key)完全由服务端托管,表单零输入;
- * allow_users 已在 R32 删除,不出现。
+ * 右侧滑出式隧道配置抽屉 (Slide-over Pipeline Drawer)。
+ * 顶部常驻「实时链路拓扑预览卡」,随表单输入动态呈现 [公网入口 ──▶ 承载客户端 ──▶ 内网目标/插件]。
  */
 export function ProxyFormModal({
   open,
   onOpenChange,
   kinds,
   defaultKind,
+  defaultClientId,
   editing,
   clients,
   submitting = false,
   onSubmit,
 }: ProxyFormModalProps) {
   const multiKind = kinds.length > 1;
-  // M8:编辑回读需要完整 spec,而列表行已不带 spec —— 按 id 单条取回。
-  // 父组件按 editing.id remount 本弹窗,每次编辑重新发起;新建不查询。
   const fullRowQuery = useQuery({
     queryKey: qk.service(editing?.id ?? -1),
     queryFn: () => getService(editing!.id),
@@ -270,9 +256,13 @@ export function ProxyFormModal({
     staleTime: 5_000,
   });
   const editingRow = editing ? (fullRowQuery.data ?? null) : null;
+  const fallbackClientId =
+    defaultClientId && clients.some((c) => c.id === defaultClientId)
+      ? defaultClientId
+      : (clients[0]?.id ?? '');
   const defaultValues: ProxyFormValues = editingRow
     ? readbackValues(editingRow)
-    : defaultProxyFormValues(defaultKind, clients[0]?.id ?? '');
+    : defaultProxyFormValues(defaultKind, fallbackClientId);
 
   const form = useForm<FormSchemaValues>({
     resolver: zodResolver(formSchema),
@@ -280,21 +270,54 @@ export function ProxyFormModal({
   });
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
-  // 编辑行异步到达时(首开无缓存)把表单重置为回读值;useForm 的
-  // defaultValues 只在首渲染生效,不会随后续渲染更新。
   useEffect(() => {
     if (editingRow) form.reset(readbackValues(editingRow));
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- 只在行数据变化时重置
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editingRow]);
 
   const kind = form.watch('kind') as ProxyKind;
-  const pluginKind = form.watch('plugin_kind');
+  const clientId = form.watch('client_id');
+  const bindIp = form.watch('bind_ip');
   const bindAuto = form.watch('bind_auto');
+  const bindPort = form.watch('bind_port');
+  const customDomains = form.watch('custom_domains');
+  const subdomain = form.watch('subdomain');
+  const targetHost = form.watch('target_host');
+  const targetPort = form.watch('target_port');
+  const pluginKind = form.watch('plugin_kind');
   const hcType = form.watch('hc_type');
   const groups = fieldGroupsOf(kind);
 
+  const selectedClient = clients.find((c) => c.id === clientId);
+
+  // 计算实时链路预览文案
+  const previewIngress = (() => {
+    if (kind === 'tcp' || kind === 'udp') {
+      const ip = bindIp?.trim() || '0.0.0.0';
+      if (bindAuto) return `${ip}:自动端口`;
+      return `${ip}:${bindPort ?? '?'}`;
+    }
+    if (kind === 'http' || kind === 'https' || kind === 'tcpmux') {
+      const firstDom = customDomains
+        ?.split(',')
+        .map((s) => s.trim())
+        .find(Boolean);
+      if (firstDom) return firstDom;
+      if (subdomain?.trim()) return `${subdomain.trim()}.*`;
+      return '待填写域名';
+    }
+    return '密钥鉴权访问器';
+  })();
+
+  const previewTarget = (() => {
+    if (pluginKind !== 'none') {
+      return `插件 · ${pluginKind}`;
+    }
+    const host = targetHost?.trim() || '127.0.0.1';
+    return `${host}:${targetPort ?? '?'}`;
+  })();
+
   const visible = (rule: FieldRule): boolean => {
-    // 单 kind 页不显示类型选择器(多 kind 页才有意义)
     if (rule.name === 'kind' && !multiKind) return false;
     if (rule.createOnly && editing) return false;
     if (rule.createOnlyWhenManualBind && !editing && bindAuto) return false;
@@ -305,13 +328,11 @@ export function ProxyFormModal({
 
   const disabledFor = (rule: FieldRule): boolean => {
     if (!editing) return false;
-    // 编辑态锁定:所属客户端、类型、自动分配
     if (rule.name === 'client_id' || rule.name === 'kind' || rule.name === 'bind_auto') return true;
     return false;
   };
 
   const handleSubmit = form.handleSubmit(async (values) => {
-    // 依赖编辑态的业务校验(域名语法 / 端口 / 域名必填),错误按字段回填
     const errors = validateServiceForm(values as ProxyFormValues, { editing });
     let applied = false;
     for (const error of errors) {
@@ -321,8 +342,6 @@ export function ProxyFormModal({
     }
     if (applied) return;
 
-    // buildServiceSpec 以编辑目标的原 spec 深拷贝为底本(保留表单未覆盖
-    // 的段落),M8 起必须传**单条取回的完整行**,列表行没有 spec。
     const spec = buildServiceSpec(values as ProxyFormValues, { editing: editingRow ?? editing });
     await onSubmit(spec);
   });
@@ -332,8 +351,6 @@ export function ProxyFormModal({
     const disabled = disabledFor(rule);
     const wide = rule.input === 'textarea' || rule.input === 'header-pairs';
 
-    // 开关单独一支:FormControl 的直接子元素必须是控件本身,
-    // 否则它的 Slot 会把 id/aria 挂到包装 div 上,<label htmlFor> 指不到开关。
     if (rule.input === 'checkbox') {
       return (
         <FormField
@@ -364,16 +381,13 @@ export function ProxyFormModal({
       );
     }
 
-    // 下拉单独一支:FormControl 必须放在 Select 内部包住 SelectTrigger。
-    // Radix 的 Select.Root 不渲染 DOM,把它当 FormControl 的子元素会让 id 丢失,
-    // <label htmlFor> 便指不到触发器(shadcn 文档的写法正是下面这样)。
     if (rule.input === 'select') {
-      // client_id 的选项来自运行时客户端列表(矩阵里没有静态 options);
-      // 其余下拉的选项都在矩阵里声明。
       const options =
         rule.name === 'client_id'
           ? clients.map((client) => ({ label: client.name, value: client.id }))
-          : (rule.options ?? []);
+          : rule.name === 'kind'
+            ? (rule.options ?? []).filter((opt) => kinds.includes(opt.value as ProxyKind))
+            : (rule.options ?? []);
       return (
         <FormField
           key={rule.name}
@@ -411,8 +425,6 @@ export function ProxyFormModal({
       );
     }
 
-    // 键值对是复合编辑器,没有单一可关联的控件:不套 FormControl/FormLabel,
-    // 否则 htmlFor 会指向不存在的 id(标签点不动任何东西)。
     if (rule.input === 'header-pairs') {
       return (
         <FormField
@@ -438,6 +450,8 @@ export function ProxyFormModal({
       );
     }
 
+    const isPasswordField = rule.name === 'http_password';
+
     return (
       <FormField
         key={rule.name}
@@ -445,7 +459,6 @@ export function ProxyFormModal({
         name={rule.name}
         render={({ field }) => (
           <FormItem className={wide ? 'sm:col-span-2' : undefined}>
-            {/* ℹ 按钮放在 label 之外:label 内嵌 button 会让点按 ℹ 同时聚焦输入框 */}
             <div className="flex items-center gap-1">
               <FormLabel>{rule.label}</FormLabel>
               <InfoLabel iconOnly title={rule.label} infoKey={infoKeyFor(rule.name)} />
@@ -468,6 +481,13 @@ export function ProxyFormModal({
                   onChange={(event) => field.onChange(event.target.value)}
                   rows={4}
                 />
+              ) : isPasswordField ? (
+                <PasswordInput
+                  value={String(field.value ?? '')}
+                  disabled={disabled}
+                  placeholder={rule.placeholder}
+                  onChange={(event) => field.onChange(event.target.value)}
+                />
               ) : (
                 <Input
                   value={String(field.value ?? '')}
@@ -477,6 +497,48 @@ export function ProxyFormModal({
                 />
               )}
             </FormControl>
+            {rule.name === 'target_port' && !disabled ? (
+              <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                {[
+                  { label: '22 SSH', port: 22 },
+                  { label: '80 Web', port: 80 },
+                  { label: '443 TLS', port: 443 },
+                  { label: '3306 MySQL', port: 3306 },
+                  { label: '5432 PG', port: 5432 },
+                  { label: '6379 Redis', port: 6379 },
+                  { label: '8080 App', port: 8080 },
+                ].map((preset) => (
+                  <button
+                    key={preset.port}
+                    type="button"
+                    onClick={() => field.onChange(preset.port)}
+                    className="rh-mono rounded-md border border-border/70 bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/10 hover:text-primary"
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {rule.name === 'bandwidth_limit' && !disabled ? (
+              <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                {[
+                  { label: '不限', val: '' },
+                  { label: '1MB', val: '1MB' },
+                  { label: '5MB', val: '5MB' },
+                  { label: '10MB', val: '10MB' },
+                  { label: '50MB', val: '50MB' },
+                ].map((preset) => (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    onClick={() => field.onChange(preset.val)}
+                    className="rh-mono rounded-md border border-border/70 bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/10 hover:text-primary"
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
             {rule.magic ? <p className="text-xs text-muted-foreground">{rule.magic}</p> : null}
             <FormMessage />
           </FormItem>
@@ -485,45 +547,53 @@ export function ProxyFormModal({
     );
   };
 
-  const renderPluginField = (def: PluginFieldDef) => (
-    <FormField
-      key={def.name}
-      control={form.control}
-      name={def.name}
-      render={({ field }) => (
-        <FormItem className={def.type === 'pairs' ? 'sm:col-span-2' : undefined}>
-          <FormLabel>
-            {def.label}
-            {def.required ? <span className="ml-1 text-destructive">*</span> : null}
-          </FormLabel>
-          <FormControl>
-            {def.type === 'pairs' ? (
-              <HeaderPairsInput
-                value={(field.value ?? []) as Array<{ name: string; value: string }>}
-                onChange={(next) => field.onChange(next)}
-              />
-            ) : (
-              <Input
-                value={String(field.value ?? '')}
-                placeholder={def.placeholder}
-                onChange={(event) => field.onChange(event.target.value)}
-              />
-            )}
-          </FormControl>
-          <FormMessage />
-        </FormItem>
-      )}
-    />
-  );
+  const renderPluginField = (def: PluginFieldDef) => {
+    const isPassword = def.name.endsWith('password');
+    return (
+      <FormField
+        key={def.name}
+        control={form.control}
+        name={def.name}
+        render={({ field }) => (
+          <FormItem className={def.type === 'pairs' ? 'sm:col-span-2' : undefined}>
+            <FormLabel>
+              {def.label}
+              {def.required ? <span className="ml-1 text-destructive">*</span> : null}
+            </FormLabel>
+            <FormControl>
+              {def.type === 'pairs' ? (
+                <HeaderPairsInput
+                  value={(field.value ?? []) as Array<{ name: string; value: string }>}
+                  onChange={(next) => field.onChange(next)}
+                />
+              ) : isPassword ? (
+                <PasswordInput
+                  value={String(field.value ?? '')}
+                  placeholder={def.placeholder}
+                  onChange={(event) => field.onChange(event.target.value)}
+                />
+              ) : (
+                <Input
+                  value={String(field.value ?? '')}
+                  placeholder={def.placeholder}
+                  onChange={(event) => field.onChange(event.target.value)}
+                />
+              )}
+            </FormControl>
+            <FormMessage />
+          </FormItem>
+        )}
+      />
+    );
+  };
 
   const section = (group: FieldGroupKey) => {
     const rules = KIND_MATRIX[kind].fields.filter((rule) => rule.group === group && visible(rule));
     if (rules.length === 0) return null;
     return (
-      // 分组用带边框的容器 + 标题分隔线,否则一长串字段看不出哪些属于同一组
-      <section key={group} className="space-y-4 rounded-lg border p-4">
+      <section key={group} className="space-y-4 rounded-xl border border-border/80 bg-card/60 p-4">
         <div className="flex items-center gap-3">
-          <h3 className="text-sm font-semibold">{GROUP_LABELS[group]}</h3>
+          <h3 className="text-sm font-semibold text-foreground">{GROUP_LABELS[group]}</h3>
           <Separator className="flex-1" />
         </div>
         <div className="grid gap-4 sm:grid-cols-2">{rules.map(renderField)}</div>
@@ -534,81 +604,136 @@ export function ProxyFormModal({
   const pluginFields = pluginKind !== 'none' ? PLUGIN_FIELDS[pluginKind] : null;
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        className="max-h-[90svh] overflow-y-auto sm:max-w-3xl"
-        // 打开时聚焦第一个真实控件,而不是首个可聚焦元素(那通常是字段名旁的 ℹ 按钮)
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent
+        side="right"
+        className="flex w-full flex-col gap-0 p-0 sm:max-w-2xl"
         onOpenAutoFocus={focusFirstControl}
       >
-        <DialogHeader>
-          <DialogTitle>
-            {editing
-              ? `编辑转发规则:${editing.name}`
-              : `新建${KIND_MATRIX[defaultKind].label}转发规则`}
-          </DialogTitle>
-          <DialogDescription>
-            基础区只保留必填项;传输压缩、限速、负载均衡、健康检查与 HTTP 增强在「高级配置」里。
-          </DialogDescription>
-        </DialogHeader>
-
-        {editing && !editingRow ? (
-          // M8:编辑回读的完整 spec 异步到达前不渲染表单(避免闪出
-          // 「新建默认值」再被 reset 抹掉)
-          <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
-            <Loader2 className="size-4 animate-spin" />
-            正在读取规则配置…
+        <SheetHeader className="border-b border-border/80 bg-muted/30 px-4 py-3.5 pr-11 sm:px-6 sm:py-4">
+          <div className="flex items-center gap-2 text-xs font-medium text-primary">
+            <Waypoints className="size-3.5" />
+            <span>TUNNEL TOPOLOGY INSPECTOR</span>
           </div>
-        ) : (
-          <Form {...form}>
-            <form onSubmit={handleSubmit} className="space-y-4" id="proxy-form">
-              {groups
-                .filter((group) => !ADVANCED_GROUPS.includes(group) && group !== 'plugin')
-                .map(section)}
+          <SheetTitle className="text-base sm:text-lg">
+            {editing
+              ? `编辑转发规则: ${editing.name}`
+              : `新建 ${KIND_MATRIX[kind]?.label ?? KIND_MATRIX[defaultKind].label} 转发规则`}
+          </SheetTitle>
+          <SheetDescription className="text-xs sm:text-sm">
+            配置公网监听入口、承载客户端节点与内网转发终点，保存后实时下发同步。
+          </SheetDescription>
 
-              <section className="space-y-4 rounded-lg border p-4">
-                <div className="flex items-center gap-3">
-                  <h3 className="text-sm font-semibold">{GROUP_LABELS.plugin}</h3>
-                  <Separator className="flex-1" />
-                </div>
-                <div className="grid gap-4 sm:grid-cols-2">
-                  {KIND_MATRIX[kind].fields
-                    .filter((rule) => rule.group === 'plugin')
-                    .map(renderField)}
-                </div>
-                {pluginFields ? (
-                  <div className="space-y-4 rounded-md border border-dashed p-3">
-                    <p className="text-xs font-medium text-muted-foreground">
-                      <InfoLabel title="插件参数" infoKey="service.plugin_params" />
-                    </p>
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      {pluginFields.map(renderPluginField)}
-                    </div>
+          {/* 实时链路拓扑预览条 */}
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-primary/20 bg-background/90 px-3 py-2 text-xs shadow-2xs sm:grid sm:grid-cols-[1fr_auto_1fr_auto_1fr] sm:py-2.5">
+            <div className="min-w-0">
+              <div className="text-[10px] text-muted-foreground">公网入口</div>
+              <Mono className="mt-0.5 block truncate font-semibold text-foreground">
+                {previewIngress}
+              </Mono>
+            </div>
+            <div className="flex items-center gap-1 px-1 text-primary sm:flex-col sm:gap-0">
+              <span className="rh-mono rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-bold uppercase">
+                {kind}
+              </span>
+              <ArrowRight className="size-3.5 sm:mt-0.5" />
+            </div>
+            <div className="min-w-0 rounded-lg border border-border/80 bg-muted/40 px-2.5 py-1">
+              <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                <Server className="size-3 text-primary" />
+                <span>承载节点</span>
+              </div>
+              <div className="truncate font-medium text-foreground">
+                {selectedClient ? selectedClient.name : '未选择节点'}
+              </div>
+            </div>
+            <ArrowRight className="size-3.5 text-muted-foreground max-sm:hidden" />
+            <div className="min-w-0 text-right max-sm:w-full max-sm:border-t max-sm:border-border/50 max-sm:pt-1.5 max-sm:text-left">
+              <div className="text-[10px] text-muted-foreground">内网终点</div>
+              <Mono className="mt-0.5 block truncate font-semibold text-emerald-600 dark:text-emerald-400">
+                {previewTarget}
+              </Mono>
+            </div>
+          </div>
+        </SheetHeader>
+
+        <div className="flex-1 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
+          {editing && !editingRow ? (
+            <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" />
+              正在读取规则完整配置…
+            </div>
+          ) : (
+            <Form {...form}>
+              <form onSubmit={handleSubmit} className="space-y-4" id="proxy-form">
+                {groups
+                  .filter((group) => !ADVANCED_GROUPS.includes(group) && group !== 'plugin')
+                  .map(section)}
+
+                <section className="space-y-4 rounded-xl border border-border/80 bg-card/60 p-3.5 sm:p-4">
+                  <div className="flex items-center gap-3">
+                    <h3 className="text-sm font-semibold">{GROUP_LABELS.plugin}</h3>
+                    <Separator className="flex-1" />
                   </div>
-                ) : null}
-              </section>
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    {KIND_MATRIX[kind].fields
+                      .filter((rule) => rule.group === 'plugin')
+                      .map(renderField)}
+                  </div>
+                  {pluginFields ? (
+                    <div className="space-y-4 rounded-lg border border-dashed border-primary/30 bg-primary/5 p-3.5">
+                      <p className="text-xs font-medium text-primary">
+                        <InfoLabel title="插件参数" infoKey="service.plugin_params" />
+                      </p>
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        {pluginFields.map(renderPluginField)}
+                      </div>
+                    </div>
+                  ) : null}
+                </section>
 
-              <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
-                <Separator />
-                <div className="mt-2 flex items-center gap-1">
-                  <CollapsibleTrigger asChild>
-                    <Button type="button" variant="ghost" className="gap-2">
-                      高级配置
-                      <ChevronDown
-                        className={`size-4 transition-transform ${advancedOpen ? 'rotate-180' : ''}`}
-                      />
-                    </Button>
-                  </CollapsibleTrigger>
-                  <InfoLabel iconOnly title="高级配置" infoKey="service.advanced" />
-                </div>
-                <CollapsibleContent className="space-y-4 pt-4">
-                  {groups.filter((group) => ADVANCED_GROUPS.includes(group)).map(section)}
-                </CollapsibleContent>
-              </Collapsible>
-            </form>
-          </Form>
-        )}
+                <Collapsible
+                  open={advancedOpen}
+                  onOpenChange={setAdvancedOpen}
+                  className="rounded-xl border border-border/80 bg-muted/20 p-3"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex min-w-0 items-center gap-1">
+                      <CollapsibleTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-auto min-w-0 gap-1.5 px-2 py-1 text-left font-medium"
+                        >
+                          <span className="truncate">
+                            高级配置
+                            <span className="max-sm:hidden">
+                              {' '}
+                              (连接池 / 限速 / 健康检查 / 增强策略)
+                            </span>
+                          </span>
+                          <ChevronDown
+                            className={`size-4 shrink-0 transition-transform ${advancedOpen ? 'rotate-180' : ''}`}
+                          />
+                        </Button>
+                      </CollapsibleTrigger>
+                      <InfoLabel iconOnly title="高级配置" infoKey="service.advanced" />
+                    </div>
+                    <span className="shrink-0 text-xs text-muted-foreground">
+                      {advancedOpen ? '已展开' : '按需配置'}
+                    </span>
+                  </div>
+                  <CollapsibleContent className="space-y-4 pt-4">
+                    {groups.filter((group) => ADVANCED_GROUPS.includes(group)).map(section)}
+                  </CollapsibleContent>
+                </Collapsible>
+              </form>
+            </Form>
+          )}
+        </div>
 
-        <DialogFooter>
+        <SheetFooter className="flex-row items-center justify-end gap-2 border-t border-border/80 bg-card/90 px-4 py-3.5 sm:px-6 sm:py-4">
           <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
             取消
           </Button>
@@ -618,10 +743,10 @@ export function ProxyFormModal({
             disabled={submitting || (editing !== null && editingRow === null)}
           >
             {submitting ? <Loader2 className="size-4 animate-spin" /> : null}
-            {editing ? '保存' : '创建规则'}
+            {editing ? '保存变更' : '创建规则'}
           </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
   );
 }
