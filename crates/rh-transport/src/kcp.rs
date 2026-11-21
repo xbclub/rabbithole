@@ -247,15 +247,38 @@ impl Guarded {
     /// kcp.send 由调用方在锁外执行,N6)。游标前移消费、消费尽才弹
     /// 条目 —— 取代修前的 split_off 切尾(每片一次新分配 + 尾段
     /// memcpy,预算受限时对同一大项按每轮 1 段消费,尾拷贝平方放大)。
+    ///
+    /// pieces 容器由调用方在会话循环外创建、跨轮复用(传 &mut 进来;
+    /// 每轮 clear 后填充)—— 修前每轮新建 VecDeque,空闲会话也白付
+    /// 一次容器分配。整块消费(off==0 且预算/上限放得下整块)直接
+    /// pop_front 把 Vec move 出来,零拷贝 —— 修前常态(用户一次
+    /// poll_write 一块、预算充足整块带走)也走 [..].to_vec() 整块
+    /// memcpy,随后 kcp.send 内部还要再拷贝成 MSS 分段,同一数据
+    /// 连续拷两遍。部分消费(off>0 或预算截断)保持游标切片。
     fn take_send_pieces(
         &mut self,
         budget_segs: usize,
         mss: usize,
         piece_cap: usize,
-    ) -> std::collections::VecDeque<Vec<u8>> {
-        let mut pieces = std::collections::VecDeque::new();
+        pieces: &mut std::collections::VecDeque<Vec<u8>>,
+    ) {
         let mut budget = budget_segs;
         while budget > 0 {
+            // 整块带走:off==0 且预算与单片上限都容得下整块 → move,
+            // 不 memcpy。budget 扣减与其余分支同一算术。
+            if let Some(front) = self.write_queue.front_mut() {
+                if front.off == 0
+                    && front.remaining() <= piece_cap
+                    && front.remaining() <= budget.saturating_mul(mss)
+                {
+                    let len = front.remaining();
+                    let WriteChunk { buf, .. } = self.write_queue.pop_front().unwrap();
+                    self.write_bytes = self.write_bytes.saturating_sub(len);
+                    budget -= len.div_ceil(mss);
+                    pieces.push_back(buf);
+                    continue;
+                }
+            }
             let Some(front) = self.write_queue.front_mut() else {
                 break;
             };
@@ -274,7 +297,6 @@ impl Guarded {
             budget -= piece_len.div_ceil(mss);
             pieces.push_back(piece);
         }
-        pieces
     }
 }
 
@@ -1467,6 +1489,9 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
     // D:入站批缓冲(容量 BATCH_CAP,Vec 跨轮复用;recv_many 有 ≥1 条
     // 即返回,不凑满、不加等待 —— 低负载单包即时推进不变)。
     let mut batch: Vec<SessionCmd> = Vec::with_capacity(BATCH_CAP);
+    // 发送片容器跨轮复用(每轮 clear):修前每轮 take_send_pieces
+    // 新建一个 VecDeque,空闲会话也白付一次容器分配。
+    let mut send_pieces: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
 
     loop {
         batch.clear();
@@ -1547,8 +1572,9 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
             // piece_len ≤ 余量×mss ⇒ 该片段数 ≤ 余量。
             let mut s = shared.guarded.lock().unwrap();
             let budget = MAX_KCP_PENDING_SEGS.saturating_sub(kcp.wait_snd());
-            let pieces = s.take_send_pieces(budget, mss, SEND_PIECE);
-            let wrote = !pieces.is_empty();
+            send_pieces.clear();
+            s.take_send_pieces(budget, mss, SEND_PIECE, &mut send_pieces);
+            let wrote = !send_pieces.is_empty();
             // 仅在真正腾出前端容量时唤醒等待写者:无条件唤醒会与
             // flush/shutdown 等待者的重注册形成忙环(两者互相唤醒,
             // 运行时永不空闲,暂停时钟不再推进、CPU 空转)。
@@ -1556,7 +1582,7 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
                 s.wake_write();
             }
             drop(s);
-            for piece in pieces {
+            for piece in send_pieces.drain(..) {
                 if let Err(e) = kcp.send(&piece) {
                     error = Some(format!("kcp send: {e}"));
                     break;
@@ -1591,9 +1617,13 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
         //
         // L-D d:批内合并锁 —— 修前每条消息两次 guarded 锁(读 room /
         // extend+wake 各一次),N 条消息 = 2N 次锁往返。现一次持锁内
-        // 完成「读 room → peeksize → recv → extend」,wake 收敛到批尾
-        // 一次。kcp.peeksize/recv 是本任务私有的同步 CPU 工作(无
-        // await),持锁窗口 = 同量 CPU 但锁往返从 2N 降到 2。
+        // 完成「读 room → peeksize → recv → extend + 批尾 wake」。
+        // kcp.peeksize/recv 是本任务私有的同步 CPU 工作(无
+        // await),持锁窗口 = 同量 CPU 但锁往返从 2N 降到 1。
+        // wake_read 并入本锁作用域:与上方搬运分支锁内 wake_write 的
+        // 既有风格一致 —— Waker::wake 只把任务重新入队调度,不会在
+        // 本线程同步执行 waker,锁内调用安全,且省掉修前批尾再补的
+        // 一次锁往返。
         {
             let mut woke = false;
             {
@@ -1616,9 +1646,9 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
                         Err(_) => break,
                     }
                 }
-            }
-            if woke {
-                shared.guarded.lock().unwrap().wake_read();
+                if woke {
+                    s.wake_read();
+                }
             }
         }
         // 事件驱动 flush:有新写入 / 刚收到包(及时 ACK)/ 本轮从 kcp
@@ -1643,46 +1673,48 @@ async fn run_session_with_idle_timeout<O: std::io::Write>(
                 break;
             }
         }
-        // flush 契约记账:本轮排空了前端队列,则此前全部已接受写
-        // 已交给 kcp 输出 → 推进 flushed_seq 并唤醒 flush/shutdown 等待者。
+        // 尾部合并锁(B):flush 契约记账 / 半关闭完成判定 / 空闲进展
+        // 判定原为四段连续的 guarded 锁(记账、半关闭、read_buf 判空、
+        // consume_seq),段间没有任何耗时操作 —— 合并为每轮一次锁。
+        // 判定内容与先后顺序不变,只是把四次锁往返压成一次,并让四个
+        // 判定观察同一份一致快照(修前的四个瞬间彼此可见不同状态)。
+        // kcp.wait_snd()/peeksize() 是纯 CPU 快查,允许留在锁内;
+        // flush/send 类重活仍全部在锁外。各判定均为每轮重评估的单调
+        // 迁移(flushed_seq 只前进、write_closed 只 false→true、
+        // last_activity 只刷新),单快照不会丢任何迁移。
         {
             let mut s = shared.guarded.lock().unwrap();
+            // flush 契约记账:本轮排空了前端队列,则此前全部已接受写
+            // 已交给 kcp 输出 → 推进 flushed_seq 并唤醒 flush/shutdown 等待者。
             if s.write_queue.is_empty() && s.write_seq > s.flushed_seq {
                 s.flushed_seq = s.write_seq;
                 s.wake_write();
             }
-        }
-        // 显式半关闭完成判定(A):请求关闭 + 队列排空 + kcp 全部段已
-        // 确认(wait_snd==0,真实对端 kcp 已完整收到)→ **只关本地写
-        // 侧**:置 write_closed 并唤醒 flush/shutdown 等待者,会话循环
-        // 继续 —— 入包交付、窗口 ACK、dead_link、idle、句柄归零全部
-        // 照常(成功关写不得杀读侧)。正常路径不设超时;无 ACK 的对端
-        // 由重传 dead_link 以 Err 浮出,poll_shutdown 返回 Err。
-        {
-            let mut s = shared.guarded.lock().unwrap();
+            // 显式半关闭完成判定(A):请求关闭 + 队列排空 + kcp 全部段已
+            // 确认(wait_snd==0,真实对端 kcp 已完整收到)→ **只关本地写
+            // 侧**:置 write_closed 并唤醒 flush/shutdown 等待者,会话循环
+            // 继续 —— 入包交付、窗口 ACK、dead_link、idle、句柄归零全部
+            // 照常(成功关写不得杀读侧)。正常路径不设超时;无 ACK 的对端
+            // 由重传 dead_link 以 Err 浮出,poll_shutdown 返回 Err。
             if s.closing && !s.write_closed && s.write_queue.is_empty() && kcp.wait_snd() == 0 {
                 s.write_closed = true;
                 s.wake_write();
             }
-        }
-        // 空闲进展判定(B):读端尚有未交付数据(或 kcp rcv 队列有存货)
-        // 时,活跃证据 = 应用消费(consume_seq 变化,≤timeout 内有读的
-        // 慢消费者受保护);待交付存在时的入包(纯窗口探测/重传)不再
-        // 刷新时钟,无人消费且无消费进展按 idle 超时回收(读端存量
-        // 排空后 EOF,退出走现有 shutdown/日志可观察终态)。无待交付时
-        // 维持原语义:任何入包刷新。
-        let has_pending_delivery = {
-            let s = shared.guarded.lock().unwrap();
-            !s.read_buf.is_empty()
-        } || kcp.peeksize().is_ok();
-        if has_pending_delivery {
-            let s = shared.guarded.lock().unwrap();
-            if s.consume_seq != last_consume_seq {
-                last_consume_seq = s.consume_seq;
+            // 空闲进展判定(B):读端尚有未交付数据(或 kcp rcv 队列有存货)
+            // 时,活跃证据 = 应用消费(consume_seq 变化,≤timeout 内有读的
+            // 慢消费者受保护);待交付存在时的入包(纯窗口探测/重传)不再
+            // 刷新时钟,无人消费且无消费进展按 idle 超时回收(读端存量
+            // 排空后 EOF,退出走现有 shutdown/日志可观察终态)。无待交付时
+            // 维持原语义:任何入包刷新。
+            let has_pending_delivery = !s.read_buf.is_empty() || kcp.peeksize().is_ok();
+            if has_pending_delivery {
+                if s.consume_seq != last_consume_seq {
+                    last_consume_seq = s.consume_seq;
+                    last_activity = Instant::now();
+                }
+            } else if got_packet {
                 last_activity = Instant::now();
             }
-        } else if got_packet {
-            last_activity = Instant::now();
         }
         if last_activity.elapsed() > idle_timeout {
             tracing::debug!("kcp session idle timeout");
@@ -2046,6 +2078,10 @@ async fn demux_loop(
     ctl: Arc<DemuxCtl>,
     sessions: SessionMap,
 ) {
+    // C:最近命中单槽路由缓存 —— 同一 (conv, peer) 的报文连发给同一
+    // sender,命中即免掉每包一次的全局 sessions 锁。只在 demux 单任务
+    // 内读写,无并发,不需要任何同步原语。
+    let mut route_cache: Option<DemuxRouteCache> = None;
     loop {
         // A-4:每迭代取池槽收包,随包整槽移交消费端(drop 路径由
         // demux_route_one 统一归还)。
@@ -2091,6 +2127,7 @@ async fn demux_loop(
             &mux_streams,
             &ctl,
             &sessions,
+            &mut route_cache,
             peer,
             PooledPkt { buf, len: n },
         );
@@ -2098,7 +2135,8 @@ async fn demux_loop(
 }
 
 /// demux 单包路由(逐包与 recvmmsg 批收共用)。Skip/满/关闭路径在
-/// 内部归还池槽。
+/// 内部归还池槽。cache 是 demux 任务私有的最近命中单槽(见
+/// [`DemuxRouteCache`]):命中直接投递,零全局锁。
 #[allow(clippy::too_many_arguments)]
 fn demux_route_one(
     udp: &Arc<UdpSocket>,
@@ -2106,6 +2144,7 @@ fn demux_route_one(
     mux_streams: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ctl: &Arc<DemuxCtl>,
     sessions: &SessionMap,
+    cache: &mut Option<DemuxRouteCache>,
     peer: SocketAddr,
     pkt: PooledPkt,
 ) {
@@ -2120,6 +2159,78 @@ fn demux_route_one(
         pkt_pool_put(buf);
         return;
     }
+    let pkt = PooledPkt { buf, len };
+    // C:命中即免锁直投。投递结果先算出再 match —— 对缓存的不可变
+    // 借用到 try_send 为止,Closed 分支才能带着原包走慢路径(&mut
+    // 更新缓存,不与借用冲突)。
+    if let Some(c) = cache.as_ref().filter(|c| c.conv == conv && c.peer == peer) {
+        match c.tx.try_send(SessionCmd::Packet(pkt)) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Full(p)) => {
+                // 容量满丢包:与锁内路径对同一存活 tx 再 try_send 的
+                // 结果完全一致(kcp RTO 重传兜底),缓存保留(会话未亡,
+                // 后续包仍可命中)。
+                let SessionCmd::Packet(PooledPkt { buf, .. }) = p;
+                pkt_pool_put(buf);
+                return;
+            }
+            Err(mpsc::error::TrySendError::Closed(p)) => {
+                // 会话已关:不得静默丢包 —— 携原包回退锁内路径,退休
+                // 判定/重建决策全部由慢路径做,缓存由慢路径失效/更新。
+                let SessionCmd::Packet(pkt) = p;
+                demux_route_locked(
+                    udp,
+                    accept_tx,
+                    mux_streams,
+                    ctl,
+                    sessions,
+                    cache,
+                    conv,
+                    peer,
+                    pkt,
+                );
+                return;
+            }
+        }
+    }
+    demux_route_locked(
+        udp,
+        accept_tx,
+        mux_streams,
+        ctl,
+        sessions,
+        cache,
+        conv,
+        peer,
+        pkt,
+    );
+}
+
+/// C:demux「最近命中」单槽路由缓存条目。demux 是唯一路由方且单任务
+/// 运行,缓存无并发访问;仅命中 (conv, peer) 完全一致的报文才使用,
+/// 任何不一致都回退 [`demux_route_locked`] 并更新/失效。
+struct DemuxRouteCache {
+    conv: u32,
+    peer: SocketAddr,
+    tx: mpsc::Sender<SessionCmd>,
+}
+
+/// 锁内查找的慢路径(未命中 / 命中后发送失败回退)。查表/注册逻辑
+/// 与修前逐包路径完全一致,仅在出口维护单槽缓存:Existing/New 更新为
+/// 本次路由结果,Skip 失效。
+#[allow(clippy::too_many_arguments)]
+fn demux_route_locked(
+    udp: &Arc<UdpSocket>,
+    accept_tx: &mpsc::Sender<ReadyItem>,
+    mux_streams: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ctl: &Arc<DemuxCtl>,
+    sessions: &SessionMap,
+    cache: &mut Option<DemuxRouteCache>,
+    conv: u32,
+    peer: SocketAddr,
+    pkt: PooledPkt,
+) {
+    let PooledPkt { buf, len } = pkt;
     // 会话表锁只做查表/注册:锁内绝不 spawn/投递/清理 ——
     // spawn_server_session 在 ready 满队列/关闭分支会再次锁同一
     // 非重入 Mutex(旧实现在此自锁,demux 与全部会话清理一起卡死,
@@ -2157,6 +2268,8 @@ fn demux_route_one(
     let route = match route {
         Route::Skip => {
             pkt_pool_put(buf);
+            // 不一致(退休/关闭/伪造/满闸):缓存里那份不可再信,失效。
+            *cache = None;
             return;
         }
         // 锁已释放后再 spawn:helper 内部(含满队列/关闭失败分支、
@@ -2173,9 +2286,24 @@ fn demux_route_one(
                 mux_streams.load(std::sync::atomic::Ordering::Relaxed),
                 ctl.clone(),
             );
+            // 新会话注册:缓存指向新 sender,后续同 (conv, peer) 包
+            // 走免锁快路(若 spawn 后即被拒,tx 关闭 → 下一包 Closed
+            // 回退慢路径,语义不受影响)。
+            *cache = Some(DemuxRouteCache {
+                conv,
+                peer,
+                tx: tx.clone(),
+            });
             tx
         }
-        Route::Existing(tx) => tx,
+        Route::Existing(tx) => {
+            *cache = Some(DemuxRouteCache {
+                conv,
+                peer,
+                tx: tx.clone(),
+            });
+            tx
+        }
     };
     // 满丢包:kcp 重传兜底;两种失败都回收槽(Full = 丢包,Closed = 会话已亡)
     match route.try_send(SessionCmd::Packet(PooledPkt { buf, len })) {
@@ -3240,18 +3368,19 @@ mod kcp_regress {
         const MSS: usize = 1200;
         let mut rebuilt = Vec::with_capacity(payload.len());
         let mut rounds = 0usize;
+        let mut pieces = std::collections::VecDeque::new();
         loop {
-            let (pieces, drained) = {
+            let drained = {
                 let mut s = shared.guarded.lock().unwrap();
-                let p = s.take_send_pieces(1, MSS, SEND_PIECE);
-                let d = s.write_queue.is_empty() && s.write_bytes == 0;
-                (p, d)
+                pieces.clear();
+                s.take_send_pieces(1, MSS, SEND_PIECE, &mut pieces);
+                s.write_queue.is_empty() && s.write_bytes == 0
             };
             if pieces.is_empty() {
                 assert!(drained, "无片可取时队列与记账必须已清空");
                 break;
             }
-            for p in pieces {
+            for p in pieces.drain(..) {
                 rebuilt.extend_from_slice(&p);
             }
             rounds += 1;
@@ -3260,6 +3389,109 @@ mod kcp_regress {
         assert!(
             rounds >= payload.len() / MSS,
             "确需多轮受限消费才消费完(实际 {rounds} 轮)"
+        );
+    }
+
+    /// A(零拷贝断言):常态整块消费(off==0 且预算/单片上限放得下整块)
+    /// 必须 pop_front 直接 move 出原 Vec —— 以「数据指针不变」钉死:
+    /// move 保 allocation,memcpy 到新 Vec 必然换地址。部分消费(off>0
+    /// 或预算截断)保持切片拷贝,内容逐字节等价。
+    #[test]
+    fn a_whole_chunk_take_is_zero_copy_move() {
+        let (_io, shared) = new_io();
+        const MSS: usize = 1200;
+        // 预算充足:8KiB(7 段)整块带走,指针必须保持
+        let payload: Vec<u8> = (0..8 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let src_ptr = payload.as_ptr();
+        {
+            let mut s = shared.guarded.lock().unwrap();
+            s.write_bytes = payload.len();
+            s.write_seq = 1;
+            s.write_queue.push_back(WriteChunk::new(payload));
+        }
+        let mut pieces = std::collections::VecDeque::new();
+        {
+            let mut s = shared.guarded.lock().unwrap();
+            s.take_send_pieces(64, MSS, SEND_PIECE, &mut pieces);
+            assert!(
+                s.write_queue.is_empty() && s.write_bytes == 0,
+                "整块消费后队列与记账必须清零"
+            );
+        }
+        assert_eq!(pieces.len(), 1, "整块消费应产出恰好一片");
+        assert!(
+            pieces[0].as_ptr() == src_ptr,
+            "整块消费必须是 move(同一分配),不得 memcpy 到新 Vec"
+        );
+
+        // 预算恰好整块(2 段):仍走整块 move
+        let p2: Vec<u8> = (0..2 * MSS as u32).map(|i| (i % 7) as u8).collect();
+        let ptr2 = p2.as_ptr();
+        {
+            let mut s = shared.guarded.lock().unwrap();
+            s.write_bytes = p2.len();
+            s.write_seq = 2;
+            s.write_queue.push_back(WriteChunk::new(p2));
+        }
+        let mut pieces2 = std::collections::VecDeque::new();
+        {
+            let mut s = shared.guarded.lock().unwrap();
+            s.take_send_pieces(2, MSS, SEND_PIECE, &mut pieces2);
+        }
+        assert_eq!(pieces2.len(), 1);
+        assert!(
+            pieces2[0].as_ptr() == ptr2,
+            "预算恰好覆盖整块时同样必须零拷贝"
+        );
+
+        // 预算不足(1 段 vs 2 段块):部分消费走拷贝,尾段消费尽弹条目
+        let p3: Vec<u8> = (0..2 * MSS as u32).map(|i| (i % 11) as u8).collect();
+        let ptr3 = p3.as_ptr();
+        {
+            let mut s = shared.guarded.lock().unwrap();
+            s.write_bytes = p3.len();
+            s.write_seq = 3;
+            s.write_queue.push_back(WriteChunk::new(p3));
+        }
+        let mut pieces3 = std::collections::VecDeque::new();
+        {
+            let mut s = shared.guarded.lock().unwrap();
+            s.take_send_pieces(1, MSS, SEND_PIECE, &mut pieces3);
+            assert_eq!(s.write_queue.len(), 1, "部分消费不得弹条目");
+        }
+        assert_eq!(pieces3.len(), 1);
+        assert_ne!(
+            pieces3[0].as_ptr(),
+            ptr3,
+            "部分消费是切片拷贝,地址应不同(反证 move 与拷贝路径确有区分)"
+        );
+        assert_eq!(
+            &pieces3[0][..],
+            &(0..MSS as u32).map(|i| (i % 11) as u8).collect::<Vec<_>>()[..]
+        );
+        // 尾段:off>0,即使预算放得下剩余整段也只能切片拷贝
+        let mut pieces4 = std::collections::VecDeque::new();
+        {
+            let mut s = shared.guarded.lock().unwrap();
+            s.take_send_pieces(64, MSS, SEND_PIECE, &mut pieces4);
+            assert!(s.write_queue.is_empty() && s.write_bytes == 0);
+        }
+        assert_eq!(pieces4.len(), 1);
+        assert_eq!(
+            &pieces4[0][..],
+            &(MSS as u32..2 * MSS as u32)
+                .map(|i| (i % 11) as u8)
+                .collect::<Vec<_>>()[..]
+        );
+        // 尾段拷贝与 move 拼回必须逐字节等于原块
+        let mut rejoined = pieces3.pop_front().unwrap();
+        rejoined.extend_from_slice(&pieces4.pop_front().unwrap());
+        assert!(
+            rejoined
+                == (0..2 * MSS as u32)
+                    .map(|i| (i % 11) as u8)
+                    .collect::<Vec<_>>(),
+            "部分 + 尾段拼回必须逐字节还原"
         );
     }
 
@@ -5236,6 +5468,203 @@ mod unaccepted_tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), demux)
             .await
             .expect("demux 必须退出");
+    }
+}
+
+/// C(demux 单槽路由缓存):命中免锁投递 / 不一致回退失效 / 会话关闭
+/// 后 Closed 回退重建(红线:不得静默丢包)。直接驱动 demux_route_one
+/// (与 demux_loop 同入口),路由结果可精确控制;「命中零全局锁」用
+/// 「持 sessions 锁调用必须即时完成」钉死 —— 快路若仍取锁,同线程
+/// std Mutex 直接死锁,由 recv_timeout 判红。
+#[cfg(test)]
+mod demux_cache_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    /// 构造合法 kcp PUSH 段(24B 头 + payload):conv LE、cmd=81、
+    /// sn 递增、len=payload.len() —— 足以让会话 kcp.input 接收并交付
+    /// 到读端(格式与 independent_full_tests::kcp_ack_packet 同源)。
+    /// sn 必须逐包递增:同 sn 的后续段被 kcp 视为重复丢弃。
+    fn push_packet(conv: u32, sn: u32, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 24 + payload.len()];
+        p[..4].copy_from_slice(&conv.to_le_bytes());
+        p[4] = 81; // PUSH
+        p[6..8].copy_from_slice(&256u16.to_le_bytes());
+        p[12..16].copy_from_slice(&sn.to_le_bytes());
+        p[20..24].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        p[24..].copy_from_slice(payload);
+        p
+    }
+
+    struct Ctx {
+        udp: Arc<UdpSocket>,
+        accept_tx: mpsc::Sender<ReadyItem>,
+        accept_rx: tokio::sync::Mutex<mpsc::Receiver<ReadyItem>>,
+        mux_streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ctl: Arc<DemuxCtl>,
+        sessions: SessionMap,
+    }
+
+    async fn ctx() -> Ctx {
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (accept_tx, accept_rx) = mpsc::channel::<ReadyItem>(8);
+        let ctl = Arc::new(DemuxCtl {
+            closing: std::sync::atomic::AtomicBool::new(false),
+            wake: Notify::new(),
+            retired: Mutex::new(RetiredTable::default()),
+            gate: SessionGate::new(SessionGateConfig::default()),
+        });
+        Ctx {
+            udp,
+            accept_tx,
+            accept_rx: tokio::sync::Mutex::new(accept_rx),
+            mux_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ctl,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    impl Ctx {
+        /// 与 demux_loop 逐包同入口路由一个包(池化拷贝,不影响断言)。
+        fn route(&self, cache: &mut Option<DemuxRouteCache>, peer: SocketAddr, pkt: &[u8]) {
+            demux_route_one(
+                &self.udp,
+                &self.accept_tx,
+                &self.mux_streams,
+                &self.ctl,
+                &self.sessions,
+                cache,
+                peer,
+                PooledPkt::copy_of(pkt),
+            );
+        }
+
+        /// 取 ready 会话并读出全部已交付字节(带 2s 死线)。
+        async fn accept_read(&self, n: usize) -> Vec<u8> {
+            let mut rx = self.accept_rx.lock().await;
+            let (mut io, _peer) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("ready 超时")
+                .expect("ready channel 已关闭");
+            let mut buf = vec![0u8; n];
+            tokio::time::timeout(Duration::from_secs(2), io.read_exact(&mut buf))
+                .await
+                .expect("读超时")
+                .expect("read_exact");
+            buf
+        }
+    }
+
+    /// 命中即免全局锁:首包(慢路径)建会话并填充缓存;随后在**持有
+    /// sessions 锁**的独立线程里路由同 (conv, peer) 包 —— 快路若触碰
+    /// 全局锁必然死锁,即时完成 + 数据送达 = 零锁命中的可观察证据。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn c01_route_cache_hit_delivers_without_global_lock() {
+        let c = ctx().await;
+        let peer: SocketAddr = "127.0.0.1:39011".parse().unwrap();
+        let conv = 0xC0CA_0001u32;
+        let mut cache = None;
+        c.route(&mut cache, peer, &push_packet(conv, 0, b"one"));
+        assert!(
+            cache.as_ref().is_some_and(|x| x.conv == conv),
+            "首包慢路径必须填充缓存"
+        );
+        assert!(c.sessions.lock().unwrap().contains_key(&conv));
+
+        // 缓存移交持锁线程:命中路径若取 sessions 锁 → 同线程死锁 →
+        // recv_timeout 判红;命中则即时完成。
+        let cell = Arc::new(std::sync::Mutex::new(cache));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        {
+            let udp = c.udp.clone();
+            let accept_tx = c.accept_tx.clone();
+            let mux_streams = c.mux_streams.clone();
+            let ctl = c.ctl.clone();
+            let sessions = c.sessions.clone();
+            let cell = cell.clone();
+            std::thread::spawn(move || {
+                let _g = sessions.lock().unwrap();
+                let mut cache = cell.lock().unwrap();
+                demux_route_one(
+                    &udp,
+                    &accept_tx,
+                    &mux_streams,
+                    &ctl,
+                    &sessions,
+                    &mut cache,
+                    peer,
+                    PooledPkt::copy_of(&push_packet(conv, 1, b"two")),
+                );
+                done_tx.send(()).ok();
+            });
+        }
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "命中路径不得触碰全局 sessions 锁(持锁调用必须即时完成)"
+        );
+        assert_eq!(
+            c.accept_read(6).await,
+            b"onetwo".to_vec(),
+            "两包(慢路 + 命中快路)都必须送达同一会话"
+        );
+    }
+
+    /// 同 conv 不同 peer:锁内 Skip(伪造包不得注入既有会话/建新会话),
+    /// 缓存失效;原 (conv, peer) 后续包走慢路径 Existing 重填缓存并
+    /// 照常送达 —— 伪造 payload 不得出现在读端。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn c02_route_cache_peer_mismatch_skips_and_invalidates() {
+        let c = ctx().await;
+        let peer1: SocketAddr = "127.0.0.1:39021".parse().unwrap();
+        let peer2: SocketAddr = "127.0.0.1:39022".parse().unwrap();
+        let conv = 0xC0CA_0002u32;
+        let mut cache = None;
+        c.route(&mut cache, peer1, &push_packet(conv, 0, b"legit"));
+        assert!(cache.is_some());
+
+        c.route(&mut cache, peer2, &push_packet(conv, 0, b"spoof"));
+        assert!(cache.is_none(), "不一致(Skip)必须失效缓存");
+        assert_eq!(
+            c.sessions.lock().unwrap().len(),
+            1,
+            "同 conv 异源包不得新建会话(仍只有原会话)"
+        );
+
+        c.route(&mut cache, peer1, &push_packet(conv, 1, b"-ok"));
+        assert!(cache.is_some(), "Existing 路由应重填缓存");
+        assert_eq!(
+            c.accept_read(8).await,
+            b"legit-ok".to_vec(),
+            "原会话照常送达,伪造 payload 不得混入"
+        );
+    }
+
+    /// 红线:缓存指向的 sender 已关闭(会话退出)时,命中路径
+    /// try_send 失败必须**携原包回退锁内路径** —— 重建会话并投递,
+    /// 不得静默丢包;缓存更新为新会话 sender。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn c03_route_cache_closed_sender_falls_back_and_rebuilds() {
+        let c = ctx().await;
+        let peer: SocketAddr = "127.0.0.1:39031".parse().unwrap();
+        let conv = 0xC0CA_0003u32;
+        // 种入「指向已关闭 sender」的缓存:模拟会话退出后、缓存尚未
+        // 经失效路径刷新的窗口。
+        let (tx, rx) = mpsc::channel::<SessionCmd>(256);
+        drop(rx);
+        let mut cache = Some(DemuxRouteCache { conv, peer, tx });
+
+        c.route(&mut cache, peer, &push_packet(conv, 0, b"reborn"));
+        assert!(
+            c.sessions.lock().unwrap().contains_key(&conv),
+            "Closed 回退必须走锁内路径重建会话"
+        );
+        assert!(cache.is_some(), "慢路径应把缓存更新为新会话 sender");
+        assert_eq!(
+            c.accept_read(6).await,
+            b"reborn".to_vec(),
+            "包必须送达重建后的会话,不得静默丢弃"
+        );
     }
 }
 
