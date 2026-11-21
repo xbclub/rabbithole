@@ -1109,11 +1109,17 @@ mod halves {
         /// 被对端持有则把当前 waker 存入锁共享状态并返回 Pending——
         /// waker 在锁里,对端释放([`SplitBiLockGuard::drop`])时唤醒,
         /// 最坏情形只是多余虚假唤醒,无丢失唤醒路径(BiLock 语义)。
-        fn poll_lock(&self, cx: &mut Context<'_>) -> Poll<SplitBiLockGuard<T>> {
+        ///
+        /// 守卫借用而非克隆 `shared`(修前成功路径每次 `Arc::clone`,
+        /// 守卫 Drop 再减一——TLS/WS/KCP 载体每次 IO 白付一对原子引用
+        /// 计数):守卫生命周期只在单次 poll 栈帧内,五个调用点
+        /// (SplitSocket 的 poll_read/poll_flush/poll_close/poll_write2/
+        /// poll_writev)取锁后当即委托内层载体,无跨 poll 存储。
+        fn poll_lock(&self, cx: &mut Context<'_>) -> Poll<SplitBiLockGuard<'_, T>> {
             let mut st = self.shared.lock();
             match st.value.take() {
                 Some(value) => Poll::Ready(SplitBiLockGuard {
-                    shared: self.shared.clone(),
+                    shared: &self.shared,
                     value: Some(value),
                 }),
                 None => {
@@ -1133,27 +1139,29 @@ mod halves {
         }
     }
 
-    /// `SplitSocket` 底层锁守卫:Deref 到载体;drop 即释放(value 放回
-    /// + 唤醒等待者)。临界区内只做单次载体 IO,不做 IO 之外的等待。
-    struct SplitBiLockGuard<T> {
-        shared: Arc<Mutex<BiLockState<T>>>,
+    /// `SplitSocket` 底层锁守卫:Deref 到载体;drop 即释放(把 value 放
+    /// 回并唤醒等待者)。临界区内只做单次载体 IO,不做 IO 之外的等待。
+    /// 守卫持 `&Mutex` 借用而非 `Arc` 克隆(生命周期仅在单次 poll 栈帧
+    /// 内,借用足以把载体带回锁),省掉每次 IO 的一对原子引用计数增减。
+    struct SplitBiLockGuard<'a, T> {
+        shared: &'a Mutex<BiLockState<T>>,
         value: Option<T>,
     }
 
-    impl<T> std::ops::Deref for SplitBiLockGuard<T> {
+    impl<T> std::ops::Deref for SplitBiLockGuard<'_, T> {
         type Target = T;
         fn deref(&self) -> &T {
             self.value.as_ref().expect("bilock guard holds the carrier")
         }
     }
 
-    impl<T> std::ops::DerefMut for SplitBiLockGuard<T> {
+    impl<T> std::ops::DerefMut for SplitBiLockGuard<'_, T> {
         fn deref_mut(&mut self) -> &mut T {
             self.value.as_mut().expect("bilock guard holds the carrier")
         }
     }
 
-    impl<T> Drop for SplitBiLockGuard<T> {
+    impl<T> Drop for SplitBiLockGuard<'_, T> {
         fn drop(&mut self) {
             let mut st = self.shared.lock();
             debug_assert!(st.value.is_none(), "bilock invariant: one guard at a time");
@@ -5027,5 +5035,408 @@ mod tests {
         assert_eq!(hdr.tag(), Tag::Data);
         assert_eq!(hdr.stream_id(), StreamId::new(1));
         assert_eq!(body, &tail, "tail frame body must be intact");
+    }
+
+    // ===== SplitSocket / BiLock 守卫(借用化)的并发行为锁 =====
+    // 守卫从 `Arc` 克隆改为 `&Mutex` 借用后,状态迁移与释放/唤醒路径必须
+    // 逐字节等价;以下两条测试在真线程上锁定:一次恰一个守卫、释放即
+    // 唤醒等待者、载体字节不重不漏、单个载体 poll 调用不被对端插入。
+
+    /// 唤醒计数 waker:poll_lock Pending 时注册进锁共享状态,对端释放
+    /// 守卫时触发——验证「waker 在锁里、释放即唤醒」跨线程成立。
+    struct CountingWaker(AtomicUsize);
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 线程 unpark waker:压力测试的等待侧用它真实地 park/被唤醒
+    /// (unpark 令牌语义保证「注册 waker 后、park 前」的唤醒不丢失)。
+    struct ThreadWaker(std::thread::Thread);
+
+    impl std::task::Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    /// 慢写载体:进入载体写即置 `started`(供对端观测「此刻守卫必被写半
+    /// 持有」),持守卫睡 50ms 再落账——制造确定性的跨线程持锁窗口。
+    struct SlowWriteSocket {
+        started: Arc<AtomicBool>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl crate::Writev2 for SlowWriteSocket {
+        fn poll_write2(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            a: &[u8],
+            b: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.started.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut w = self.written.lock().unwrap();
+            w.extend_from_slice(a);
+            w.extend_from_slice(b);
+            Poll::Ready(Ok(a.len() + b.len()))
+        }
+    }
+
+    impl futures::io::AsyncRead for SlowWriteSocket {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            buf[..4].copy_from_slice(b"data");
+            Poll::Ready(Ok(4))
+        }
+    }
+
+    impl futures::io::AsyncWrite for SlowWriteSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            crate::Writev2::poll_write2(self, cx, &[], buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 守卫释放必须唤醒跨线程等待者:写半持守卫(载体写内睡眠)期间,
+    /// 读半 poll 必须 Pending 且 waker 已入锁;守卫 Drop(借用化后走同一
+    /// 释放路径)必须令唤醒计数 +1;唤醒后读半随即拿到锁读到数据。
+    #[test]
+    fn split_socket_bilock_wakes_waiter_on_release_across_threads() {
+        use super::halves::split_socket;
+        let started = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let sock = SlowWriteSocket {
+            started: started.clone(),
+            written: written.clone(),
+        };
+        let mut reader = split_socket(sock);
+        let mut writer = reader.clone();
+
+        let w_thread = std::thread::spawn(move || {
+            let w = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&w);
+            // 载体写永远一次 Ready;Pending 只可能来自锁(本线程无需真 waker)
+            match crate::Writev2::poll_write2(Pin::new(&mut writer), &mut cx, b"", b"slow") {
+                Poll::Ready(Ok(n)) => n,
+                other => panic!("writer must complete in one poll, got {other:?}"),
+            }
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // 等写半真正进入载体写:started 置位发生在守卫内的载体调用里,
+        // 此刻守卫必被写半持有(50ms 窗口,轮询 1ms 粒度观测绰绰有余)
+        while !started.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer never entered its critical section"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let cw = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(cw.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut buf = [0u8; 8];
+        // 守卫被占:读半必须 Pending(载体读永远 Ready,Pending 只可能
+        // 来自 poll_lock),且 waker 已注册进锁共享状态
+        match futures::io::AsyncRead::poll_read(Pin::new(&mut reader), &mut cx, &mut buf) {
+            Poll::Pending => {}
+            other => panic!("reader must pend while the writer holds the guard, got {other:?}"),
+        }
+        let wakes_before = cw.0.load(Ordering::SeqCst);
+        // 守卫 Drop(写完即释放)必须唤醒等待者——这是 BiLock 语义的核心,
+        // 借用化守卫走同一 Drop 路径,不得丢失该唤醒
+        while cw.0.load(Ordering::SeqCst) == wakes_before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guard drop never woke the waiter"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // 唤醒后重试:锁已空闲,读半立即读到数据
+        match futures::io::AsyncRead::poll_read(Pin::new(&mut reader), &mut cx, &mut buf) {
+            Poll::Ready(Ok(4)) => assert_eq!(&buf[..4], b"data"),
+            other => panic!("reader must take the free lock after wake, got {other:?}"),
+        }
+        assert_eq!(w_thread.join().expect("writer thread"), 4);
+        assert_eq!(*written.lock().unwrap(), b"slow".to_vec());
+    }
+
+    /// 压力测试载体状态:读脚本 + 写落账。写侧每段独立加锁落账——
+    /// 若守卫互斥被破坏(两写半同时进载体),段与段之间会被对端记录
+    /// 插入,记录解析立即失败;这是对「守卫覆盖整个载体 poll 调用」
+    /// 的直接探测(状态锁刻意不覆盖整条记录)。
+    struct StressState {
+        read_rest: Vec<u8>,
+        read_off: usize,
+        written: Vec<u8>,
+        closed: bool,
+    }
+
+    /// 载体写并发探针:进出临界区 ±1,峰值即「同时处于载体写的调用数」,
+    /// BiLock 互斥下必须恒 ≤ 1(原子量放在状态锁外,重叠才会可见)。
+    struct StressProbe {
+        in_write: AtomicUsize,
+        max_in_write: AtomicUsize,
+    }
+
+    impl StressProbe {
+        fn enter(&self) {
+            let now = self.in_write.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_write.fetch_max(now, Ordering::SeqCst);
+        }
+        fn leave(&self) {
+            self.in_write.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct StressSocket {
+        state: Arc<Mutex<StressState>>,
+        probe: Arc<StressProbe>,
+    }
+
+    impl crate::Writev2 for StressSocket {
+        fn poll_write2(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            a: &[u8],
+            b: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let me = self.get_mut();
+            me.probe.enter();
+            me.state.lock().unwrap().written.extend_from_slice(a);
+            me.state.lock().unwrap().written.extend_from_slice(b);
+            me.probe.leave();
+            Poll::Ready(Ok(a.len() + b.len()))
+        }
+        fn poll_writev(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let me = self.get_mut();
+            me.probe.enter();
+            // 每段独立锁:守卫若失效,另一写半的段可插进本批中间
+            let mut n = 0;
+            for b in bufs {
+                me.state.lock().unwrap().written.extend_from_slice(&b[..]);
+                n += b.len();
+            }
+            me.probe.leave();
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    impl futures::io::AsyncRead for StressSocket {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let me = self.get_mut();
+            let mut st = me.state.lock().unwrap();
+            if st.read_off < st.read_rest.len() {
+                let n = (st.read_rest.len() - st.read_off).min(buf.len());
+                buf[..n].copy_from_slice(&st.read_rest[st.read_off..st.read_off + n]);
+                st.read_off += n;
+                Poll::Ready(Ok(n))
+            } else {
+                // 脚本耗尽:等待侧据此收工(不会再有人唤醒它)
+                Poll::Pending
+            }
+        }
+    }
+
+    impl futures::io::AsyncWrite for StressSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            crate::Writev2::poll_write2(self, cx, &[], buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.get_mut().state.lock().unwrap().closed = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// park 型单步推进:Pending 只可能来自锁竞争(载体永远一次 Ready),
+    /// park_timeout 兜底防挂(唤醒路径另有上一条测试严格锁定)。
+    fn park_until_ready<T>(
+        mut f: impl FnMut(&mut Context<'_>) -> Poll<std::io::Result<T>>,
+    ) -> std::io::Result<T> {
+        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match f(&mut cx) {
+                Poll::Ready(r) => return r,
+                Poll::Pending => std::thread::park_timeout(std::time::Duration::from_millis(5)),
+            }
+        }
+    }
+
+    /// 双半并发压力:读半 + 两个写半(三个真线程)同时 poll 同一把
+    /// BiLock。锁定四件事:(1) 探针峰值 ≤ 1(一次恰一个守卫,借用化
+    /// 不得破坏互斥);(2) 载体字节不重不漏(两写半各 N 条自描述记录,
+    /// id 恰好遍历);(3) 单个载体 poll 调用不被对端插入(记录段间
+    /// 插入即解析失败);(4) 读半按序读尽脚本。覆盖 SplitSocket 全部
+    /// 五个取锁调用点(poll_read/poll_write2/poll_writev/poll_flush/
+    /// poll_close)。
+    #[test]
+    fn split_socket_dual_half_concurrent_stress() {
+        use super::halves::split_socket;
+        use std::collections::HashSet;
+        const N_RECORDS: usize = 1200;
+        // 记录:pattern 填充,字节 [4..8] 为 id(LE);首字节即 pattern,
+        // 解析侧凭它区分两个写半。A5 记录 64B(write2 两段),C3 记录
+        // 128B(writev 四段)。
+        let record = |pat: u8, total: usize, id: usize| {
+            let mut r = vec![pat; total];
+            r[4..8].copy_from_slice(&(id as u32).to_le_bytes());
+            r
+        };
+        let script = vec![0x5Au8; 128 * 1024];
+        let script_len = script.len();
+        let state = Arc::new(Mutex::new(StressState {
+            read_off: 0,
+            read_rest: script.clone(),
+            written: Vec::new(),
+            closed: false,
+        }));
+        let probe = Arc::new(StressProbe {
+            in_write: AtomicUsize::new(0),
+            max_in_write: AtomicUsize::new(0),
+        });
+        let make = || StressSocket {
+            state: state.clone(),
+            probe: probe.clone(),
+        };
+        // 三个句柄必须克隆自同一 SplitSocket:split_socket() 每次调用都
+        // 建一把全新的 BiLock,分开建则三把锁互不争抢,互斥探针会测到
+        // 假阳性重叠(首版实测即踩中)
+        let mut reader = split_socket(make());
+        let mut writer_a = reader.clone(); // write2 + flush + close
+        let mut writer_b = reader.clone(); // writev
+
+        let reader_state = state.clone();
+        let reader_thread = std::thread::spawn(move || {
+            let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+            let mut cx = Context::from_waker(&waker);
+            let mut buf = [0u8; 256];
+            let mut total = 0usize;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while total < script_len {
+                assert!(std::time::Instant::now() < deadline, "reader stalled");
+                match futures::io::AsyncRead::poll_read(Pin::new(&mut reader), &mut cx, &mut buf) {
+                    Poll::Ready(Ok(0)) => panic!("carrier never returns EOF"),
+                    Poll::Ready(Ok(n)) => total += n,
+                    Poll::Ready(Err(e)) => panic!("reader error: {e}"),
+                    Poll::Pending => {
+                        // 区分锁竞争(会有人唤醒)与脚本耗尽(无人再唤醒)
+                        let exhausted = { reader_state.lock().unwrap().read_off == script_len };
+                        if exhausted {
+                            break;
+                        }
+                        std::thread::park_timeout(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
+            total
+        });
+
+        let writer_a_thread = std::thread::spawn(move || {
+            for i in 0..N_RECORDS {
+                let rec = record(0xA5, 64, i);
+                let (head, tail) = rec.split_at(32);
+                let n = park_until_ready(|cx| {
+                    crate::Writev2::poll_write2(Pin::new(&mut writer_a), cx, head, tail)
+                })
+                .expect("write2");
+                assert_eq!(n, 64);
+            }
+            park_until_ready(|cx| futures::io::AsyncWrite::poll_flush(Pin::new(&mut writer_a), cx))
+                .expect("flush");
+            park_until_ready(|cx| futures::io::AsyncWrite::poll_close(Pin::new(&mut writer_a), cx))
+                .expect("close");
+        });
+
+        let writer_b_thread = std::thread::spawn(move || {
+            for i in 0..N_RECORDS {
+                let rec = record(0xC3, 128, i);
+                let segs: Vec<std::io::IoSlice<'_>> =
+                    rec.chunks(32).map(std::io::IoSlice::new).collect();
+                let n = park_until_ready(|cx| {
+                    crate::Writev2::poll_writev(Pin::new(&mut writer_b), cx, &segs)
+                })
+                .expect("writev");
+                assert_eq!(n, 128);
+            }
+        });
+
+        let read_total = reader_thread.join().expect("reader thread");
+        writer_a_thread.join().expect("writer a thread");
+        writer_b_thread.join().expect("writer b thread");
+
+        // (1) 互斥:载体写峰值必须 ≤ 1(BiLock 一次恰一个守卫)
+        assert_eq!(
+            probe.max_in_write.load(Ordering::SeqCst),
+            1,
+            "carrier writes must never overlap (borrowed guard keeps BiLock mutual exclusion)"
+        );
+        // (4) 读侧按序读尽
+        assert_eq!(read_total, script_len);
+        // (2)+(3) 落账解析:记录边界完整(段间被插入即解析失败)、
+        // id 恰好遍历(不重不漏)
+        let st = state.lock().unwrap();
+        assert!(st.closed, "poll_close must reach the carrier");
+        let wire = &st.written;
+        assert_eq!(wire.len(), N_RECORDS * (64 + 128));
+        let mut ids_a = HashSet::new();
+        let mut ids_b = HashSet::new();
+        let mut off = 0usize;
+        while off < wire.len() {
+            let (len, ids, pat) = match wire[off] {
+                0xA5 => (64usize, &mut ids_a, 0xA5u8),
+                0xC3 => (128usize, &mut ids_b, 0xC3u8),
+                other => panic!("torn record boundary at {off}: marker {other:#x}"),
+            };
+            let rec = &wire[off..off + len];
+            let id = u32::from_le_bytes(rec[4..8].try_into().unwrap());
+            assert!(ids.insert(id), "duplicate record id {id} (pat {pat:#x})");
+            for (i, b) in rec.iter().enumerate() {
+                // [4..8] 是 id、其余必须纯 pattern:任何段间插入/撕裂即红
+                if !(4..8).contains(&i) {
+                    assert_eq!(*b, pat, "record {id} byte {i} corrupted (pat {pat:#x})");
+                }
+            }
+            off += len;
+        }
+        let want: HashSet<u32> = (0..N_RECORDS as u32).collect();
+        assert_eq!(ids_a, want, "write2 half: every record exactly once");
+        assert_eq!(ids_b, want, "writev half: every record exactly once");
     }
 }

@@ -287,16 +287,22 @@ impl AsyncWrite for WsIo {
     ) -> Poll<io::Result<usize>> {
         let mut this = self.project();
         if !*this.send_queued {
+            // 先确认 sink 就绪、再拷载荷:poll_ready Pending 的窗口内零拷贝
+            // 零分配。修前顺序先 split().freeze() 再 poll_ready,Pending 时
+            // 该 Bytes 直接作废,下次唤醒重试重拷整批。契约不变:send_queued
+            // 仍只在 start_send Ok 后置位;就绪后再 start_send 同样满足
+            // Sink 契约(poll_ready Ready 与 start_send 之间无其他 poll)。
+            match futures::ready!(this.ws.as_mut().poll_ready(cx)) {
+                Ok(()) => {}
+                Err(e) => return Poll::Ready(Err(io::Error::other(format!("ws: {e}")))),
+            }
             this.scratch.clear();
             this.scratch.extend_from_slice(buf);
             let msg = Message::Binary(this.scratch.split().freeze());
-            match futures::ready!(this.ws.as_mut().poll_ready(cx)) {
-                Ok(()) => match this.ws.as_mut().start_send(msg) {
-                    // start_send 返回 Ok 即消息已被 tungstenite 接受并入队
-                    //(WouldBlock 内部已被映射为 Ok),绝不重发
-                    Ok(()) => *this.send_queued = true,
-                    Err(e) => return Poll::Ready(Err(io::Error::other(format!("ws: {e}")))),
-                },
+            match this.ws.as_mut().start_send(msg) {
+                // start_send 返回 Ok 即消息已被 tungstenite 接受并入队
+                //(WouldBlock 内部已被映射为 Ok),绝不重发
+                Ok(()) => *this.send_queued = true,
                 Err(e) => return Poll::Ready(Err(io::Error::other(format!("ws: {e}")))),
             }
         }
@@ -322,18 +328,21 @@ impl AsyncWrite for WsIo {
         let mut this = self.project();
         let total: usize = bufs.iter().map(|b| b.len()).sum();
         if !*this.send_queued {
+            // 与标量写同序(见 poll_write):先 poll_ready、后拷贝拼接,
+            // Pending 窗口内不做整批拷贝与 Bytes 分配;send_queued 语义不变。
+            match futures::ready!(this.ws.as_mut().poll_ready(cx)) {
+                Ok(()) => {}
+                Err(e) => return Poll::Ready(Err(io::Error::other(format!("ws: {e}")))),
+            }
             this.scratch.clear();
             for b in bufs {
                 this.scratch.extend_from_slice(b);
             }
             let msg = Message::Binary(this.scratch.split().freeze());
-            match futures::ready!(this.ws.as_mut().poll_ready(cx)) {
-                Ok(()) => match this.ws.as_mut().start_send(msg) {
-                    // start_send 返回 Ok 即消息已被 tungstenite 接受并入队,
-                    // 绝不重发(与标量写同契约)
-                    Ok(()) => *this.send_queued = true,
-                    Err(e) => return Poll::Ready(Err(io::Error::other(format!("ws: {e}")))),
-                },
+            match this.ws.as_mut().start_send(msg) {
+                // start_send 返回 Ok 即消息已被 tungstenite 接受并入队,
+                // 绝不重发(与标量写同契约)
+                Ok(()) => *this.send_queued = true,
                 Err(e) => return Poll::Ready(Err(io::Error::other(format!("ws: {e}")))),
             }
         }
@@ -603,6 +612,78 @@ mod tests {
         let mut want = header.to_vec();
         want.extend_from_slice(&body);
         assert_eq!(frames.concat(), want);
+    }
+
+    /// A 优化(先 poll_ready 后拷贝)的向量写行为锁:duplex(64) 强制
+    /// 两条向量写都经历「start_send 已入队、flush 反复 Pending、同缓冲
+    /// 重试续冲」。调序只挪拷贝时机、不动 send_queued 语义,线上必须
+    /// 仍恰好两条 binary 帧、逐字节一致。标量同型场景由
+    /// ws_send_queued_backpressure_no_dup_no_loss 覆盖,此处补向量写
+    /// 背压路径的缺口(修前只有 happy path 的 ws_vectored_write_single_frame)。
+    #[tokio::test]
+    async fn ws_vectored_write_backpressure_no_dup_no_loss() {
+        use std::time::Duration;
+        let (a, b) = tokio::io::duplex(64);
+        let ws = tokio_tungstenite::WebSocketStream::from_partially_read(
+            Box::new(a) as BoxedIo,
+            vec![],
+            Role::Client,
+            None,
+        )
+        .await;
+        let mut c = WsIo::new(ws);
+        let reader = tokio::spawn(async move {
+            let mut b = b;
+            let mut out = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(5), b.read_to_end(&mut out)).await;
+            out
+        });
+
+        let header = [0x11u8; 12];
+        let body = vec![0xA5u8; 8 * 1024];
+        let tail = vec![0x3Cu8; 1024];
+        // poll_fn 提供真实 waker:Pending 后由 duplex 可写唤醒重试
+        //(AsyncWrite 契约:重试同一缓冲)
+        let n1 = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                Pin::new(&mut c).poll_write_vectored(
+                    cx,
+                    &[std::io::IoSlice::new(&header), std::io::IoSlice::new(&body)],
+                )
+            }),
+        )
+        .await
+        .expect("deadline: vectored write 1")
+        .expect("vectored write 1");
+        assert_eq!(n1, header.len() + body.len());
+        let n2 = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                Pin::new(&mut c).poll_write_vectored(cx, &[std::io::IoSlice::new(&tail)])
+            }),
+        )
+        .await
+        .expect("deadline: vectored write 2")
+        .expect("vectored write 2");
+        assert_eq!(n2, tail.len());
+
+        drop(c);
+        let wire = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("deadline: reader join")
+            .unwrap();
+        let frames = parse_client_frames(&wire);
+        assert_eq!(
+            frames.len(),
+            2,
+            "两次向量写在背压重试下各恰好一帧(重复入队会使帧数变多)"
+        );
+        assert_eq!(frames[0].len(), 12 + 8 * 1024);
+        let mut want = header.to_vec();
+        want.extend_from_slice(&body);
+        want.extend_from_slice(&tail);
+        assert_eq!(frames.concat(), want, "背压重试不得重复或丢失载荷");
     }
 
     /// R5 不变量锁(修前即绿):手动 poll 级观察——poll_write 在 flush
