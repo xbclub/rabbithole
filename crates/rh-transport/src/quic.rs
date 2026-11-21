@@ -487,6 +487,19 @@ pub struct BiStream {
     recv: quinn::RecvStream,
 }
 
+impl BiStream {
+    /// 按方向拆出两个独立半(供 [`crate::split_boxed_io`] 消费)。
+    ///
+    /// quinn 的 `SendStream`/`RecvStream` 本就是两个互不共享的对象
+    /// (各持连接句柄与自身状态),拆分只是把它们交出来——不像
+    /// `tokio::io::split` 那样用一把同步 Mutex 把整个 BiStream 锁住。
+    /// 修前 QUIC 数据转发(data.rs copy_relay_pair / forward.rs splice)
+    /// 100% 落在同步锁上,原因就是 split_boxed_io 只识别裸 TcpStream。
+    pub(crate) fn into_halves(self) -> (quinn::RecvStream, quinn::SendStream) {
+        (self.recv, self.send)
+    }
+}
+
 impl AsyncRead for BiStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -597,6 +610,81 @@ mod tests {
         let mut back = [0u8; 8];
         s.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"quic-ok!");
+        srv.await.unwrap();
+    }
+
+    /// split_boxed_io 对 BiStream 的识别与拆分:QUIC 数据转发的 channel 侧
+    /// 100% 是 BiStream(rh-server data.rs copy_relay_pair / rh-client
+    /// forward.rs splice),修前一律回落 `tokio::io::split` 的同步锁
+    /// (round-69 的 futex 病灶)。拆出的读/写半独立可用(双向收发),
+    /// 不可达方向按 HalfRead/HalfWrite 同款返回 Unsupported。
+    #[tokio::test]
+    async fn bistream_split_two_way_traffic() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (cert, key) = crate::tls::auto_cert(&Default::default()).unwrap();
+        let server_cfg = ServerTransportConfig {
+            protocol: Protocol::Quic,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            multiplex: true,
+            tls: crate::TlsServerOptions {
+                cert_pem: Some(cert),
+                key_pem: Some(key),
+                ..Default::default()
+            },
+            alpn: vec![crate::DEFAULT_ALPN.into()],
+        };
+        let mut listener = listen(
+            &server_cfg,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr;
+
+        // 服务端:accept 出的流(BiStream)直接 echo
+        let srv = tokio::spawn(async move {
+            let inc = listener.accept().await.unwrap();
+            let mut s = inc.mux.accept().await.unwrap();
+            let mut buf = [0u8; 9];
+            s.read_exact(&mut buf).await.unwrap();
+            s.write_all(&buf).await.unwrap();
+        });
+
+        let client = ClientTransportConfig {
+            protocol: Protocol::Quic,
+            server_addr: addr,
+            multiplex: true,
+            tls: crate::TlsClientOptions {
+                insecure_skip_verify: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mux = crate::connect(&client).await.unwrap();
+        let s = mux.open_stream().await.unwrap();
+        let (mut r, mut w) = match crate::split_boxed_io(s) {
+            Ok(pair) => pair,
+            Err(_) => panic!("BiStream 必须命中无锁拆分(修前 QUIC 转发 100% 回落同步锁)"),
+        };
+        // 写半写 → 服务端 echo → 读半读回:两半各走各的方向
+        w.write_all(b"quic-half").await.unwrap();
+        let mut back = [0u8; 9];
+        r.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"quic-half");
+
+        // 不可达方向:读半写、写半读都返回 Unsupported(单向补齐契约;
+        // Unsupported 立即就绪,不会挂起)
+        assert_eq!(
+            r.write(b"x").await.unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        let mut sink = [0u8; 1];
+        assert_eq!(
+            w.read(&mut sink).await.unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+
         srv.await.unwrap();
     }
 

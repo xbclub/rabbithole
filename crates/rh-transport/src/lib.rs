@@ -57,11 +57,24 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Io for T {
 
 pub type BoxedIo = Box<dyn Io>;
 
-/// 把 `BoxedIo` 无锁拆成独立读写半(round-69);不支持时返回 `None`。
+/// 把 `BoxedIo` 无锁拆成独立读写半(round-69);不支持时把 IO 原样还回
+/// `Err`,调用方回落 [`tokio::io::split`]。
 ///
-/// 仅裸 `TcpStream` 支持(`into_split` 产出两个独立 fd,各有一条 tokio
-/// IO 注册,读写之间无共享锁)。任何包装类型返回 `None`,调用方回落到
-/// [`tokio::io::split`]。
+/// 支持三类具体类型(探测顺序 RhMuxStream → BiStream → TcpStream,
+/// 类型互斥,顺序只影响探测成本):
+///
+/// * [`mux::RhMuxStream`](`steal_halves` 产出天然独立的读/写半;
+///   命中场景:use_compression=true 且 multiplex=true 时
+///   [`compress_stream`] 的 inner —— 修前 compress_pump 与
+///   decompress_pump 抢同一把同步锁);
+/// * [`quic::BiStream`](内部本就是 `(quinn::SendStream, quinn::RecvStream)`
+///   两个独立对象;命中场景:QUIC 数据转发的 channel 侧 —— 修前 100%
+///   落在同步锁上);
+/// * 裸 `TcpStream`(`into_split` 产出两个独立 fd,各有一条 tokio
+///   IO 注册,读写之间无共享锁)。
+///
+/// 其余包装类型(QuotaIo/PrependedIo/压缩产物 JoinDuplex/计量壳等)
+/// 一律 `Err` 归还,调用方回落 [`tokio::io::split`]。
 ///
 /// # 为什么必须存在(tokio::io::split 的代价)
 ///
@@ -82,13 +95,37 @@ pub type BoxedIo = Box<dyn Io>;
 /// 上调用,无法从 `Box<dyn Io>` 直接透传到具体类型。
 /// 探测 + 拆分(round-69)。不支持时把 IO 原样还回 `Err`。
 pub fn split_boxed_io(io: BoxedIo) -> Result<(BoxedIo, BoxedIo), BoxedIo> {
-    // 先探测(GET 语义,不消费):`as_any` 落到 `dyn Io` 的 vtable,
-    // 对 `TcpStream` 返回 Some。
-    let is_tcp = {
-        let dynio: &dyn Io = &*io;
-        dynio.as_any().is::<tokio::net::TcpStream>()
-    };
-    if !is_tcp {
+    // 先探测(GET 语义,不消费):`as_any` 必须经 `&dyn Io` 接收者派发到
+    // 具体类型的 vtable(直接对 Box 调用会命中 blanket impl 的转发,
+    // 返回的是 Box 层的 Any,见 PrependedIo::peel 的取证注释)。
+    let dynio: &dyn Io = &*io;
+    if dynio.as_any().is::<mux::RhMuxStream>() {
+        let any = io.into_any_box();
+        let mut s = *any
+            .downcast::<mux::RhMuxStream>()
+            .expect("probed above: concrete type is RhMuxStream");
+        // 半已被偷取过(零拷贝路径先消费):壳按原样归还回落,
+        // 读侧 EOF、写侧 WriteZero,语义与壳自身的行为一致。
+        let Some((r, w)) = s.steal_halves() else {
+            return Err(Box::new(s));
+        };
+        return Ok((
+            Box::new(MuxHalfRead(r)) as BoxedIo,
+            Box::new(MuxHalfWrite(w)) as BoxedIo,
+        ));
+    }
+    if dynio.as_any().is::<quic::BiStream>() {
+        let any = io.into_any_box();
+        let s = *any
+            .downcast::<quic::BiStream>()
+            .expect("probed above: concrete type is BiStream");
+        let (recv, send) = s.into_halves();
+        return Ok((
+            Box::new(QuicHalfRead(recv)) as BoxedIo,
+            Box::new(QuicHalfWrite(send)) as BoxedIo,
+        ));
+    }
+    if !dynio.as_any().is::<tokio::net::TcpStream>() {
         return Err(io);
     }
     let any = io.into_any_box();
@@ -1878,5 +1915,181 @@ impl tokio::io::AsyncWrite for HalfWrite {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+// ===== mux 流 / QUIC 双向流的半连接包装(split_boxed_io 扩展) =====
+//
+// 与上方 HalfRead/HalfWrite 同款"单向补齐":真实方向转发到各传输层
+// 拆出的半,不可用方向返回 `Unsupported` —— 它们**永远不会被调用**
+// (消费方只用读半读、写半写),存在只为满足 `Io` 的 supertrait 约束。
+
+/// mux 流(`RhMuxStream::steal_halves` 产物)的读半。
+pub struct MuxHalfRead(mux::RhMuxStreamRead);
+
+impl tokio::io::AsyncRead for MuxHalfRead {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // 转发 mux.rs 的兼容字节路径(pending 先行 + poll_read_chunk)
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for MuxHalfRead {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "read half cannot write",
+        )))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// mux 流(`RhMuxStream::steal_halves` 产物)的写半。
+pub struct MuxHalfWrite(mux::RhMuxStreamWrite);
+
+impl tokio::io::AsyncRead for MuxHalfWrite {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "write half cannot read",
+        )))
+    }
+}
+
+impl tokio::io::AsyncWrite for MuxHalfWrite {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    // 向量写不覆写:yamux 写半没有向量接口(poll_write_chunk 只收单个
+    // Bytes 块),没有可透传的内层实现,能力位落到默认 false(如实上报)
+    // —— 与壳 RhMuxStream 的行为一致(它也未覆写)。消费方的
+    // writev 批量自动退化为逐段标量写,数据完整性不受影响。
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+/// QUIC 双向流(`BiStream::into_halves` 产物)的读半。
+pub struct QuicHalfRead(quinn::RecvStream);
+
+impl tokio::io::AsyncRead for QuicHalfRead {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // quinn RecvStream 原生实现 tokio AsyncRead;不 map_err,
+        // 与 BiStream::poll_read 的转发口径一致
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for QuicHalfRead {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "read half cannot write",
+        )))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// QUIC 双向流(`BiStream::into_halves` 产物)的写半。
+pub struct QuicHalfWrite(quinn::SendStream);
+
+impl tokio::io::AsyncRead for QuicHalfWrite {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "write half cannot read",
+        )))
+    }
+}
+
+impl tokio::io::AsyncWrite for QuicHalfWrite {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0)
+            .poll_write(cx, buf)
+            .map_err(|e| other_err(format!("quic write: {e}")))
+    }
+    // 向量写不覆写:quinn 0.11.12 的 SendStream tokio impl 没有
+    // poll_write_vectored / is_write_vectored(见 quic.rs BiStream 的
+    // 同款注释),无可透传的内层实现,能力位落到默认 false(如实上报)。
+    // 若未来 quinn 补上向量写,BiStream 与本包装应一起改为透传。
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // QUIC 无应用层 flush(与 BiStream::poll_flush、quinn 自身的
+        // poll_flush 同口径:立即 Ok)
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.0.finish() {
+            Ok(()) => std::task::Poll::Ready(Ok(())),
+            Err(e) => std::task::Poll::Ready(Err(other_err(format!("quic finish: {e}")))),
+        }
     }
 }

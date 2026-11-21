@@ -227,6 +227,69 @@ impl RhMuxStreamWrite {
     }
 }
 
+// 两个半的 tokio 字节接口(split_boxed_io 拆半后的兼容路径):
+// 读半/写半原本只有 chunk 级 async 方法(零拷贝消费者专用);compress
+// pump 这类按字节流消费的场景经 [`crate::split_boxed_io`] 拆半后拿到
+// 的是 BoxedIo,必须有 AsyncRead/AsyncWrite 实现才能工作。语义与壳
+// [`RhMuxStream`] 的字节路径完全一致(pending 先行、池化拷贝入帧),
+// 零拷贝消费者(mux pump)不经此处。
+impl tokio::io::AsyncRead for RhMuxStreamRead {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(b) = this.pending.pop_front() {
+                if b.is_empty() {
+                    continue;
+                }
+                let k = b.len().min(buf.remaining());
+                buf.put_slice(&b[..k]);
+                if k < b.len() {
+                    // 截断余量放回队首:FIFO 先行交付的顺序不变
+                    this.pending.push_front(b.slice(k..));
+                }
+                return Poll::Ready(Ok(()));
+            }
+            match this.inner.poll_read_chunk(cx) {
+                Poll::Ready(Ok(Some(b))) => this.pending.push_back(b),
+                Poll::Ready(Ok(None)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for RhMuxStreamWrite {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        // 池化拷贝入帧(与 vendor Stream 的 futures 字节路径同款:
+        // pool::get + put_slice + freeze,不走零拷贝队列)。部分写/
+        // Pending 时未消费字节由调用方按标准 AsyncWrite 契约重发。
+        let mut bm = pool_get(buf.len());
+        bm.put_slice(buf);
+        let mut chunk = Some(bm.freeze());
+        this.inner.poll_write_chunk(cx, &mut chunk)
+    }
+    /// yamux 无应用层 flush:帧已入连接发送队列,由 FlushTask 统一写出。
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.get_mut().inner.poll_close_half(cx)
+    }
+}
+
 fn pool_get(cap: usize) -> bytes::BytesMut {
     yamux::pool::get(cap)
 }
@@ -615,8 +678,10 @@ pub async fn mux_relay(
     // 也就是说进程绝大多数时间在**等锁**,不是在收发数据。
     //
     // 裸 TCP 可拆成两个独立 fd(`into_split`),各有独立的 tokio IO 注册,
-    // 读写之间没有任何共享锁。包装类型(CountedUserIo/QuotaIo/
-    // PrependedIo/压缩流/mux 流)不支持,回落到 `tokio::io::split`。
+    // 读写之间没有任何共享锁。mux 流(steal_halves)与 QUIC BiStream
+    // (天然两独立半)同样被 `split_boxed_io` 识别;包装类型
+    // (CountedUserIo/QuotaIo/PrependedIo/压缩流)不支持,回落到
+    // `tokio::io::split`。
     // 两种拆分方式产出不同类型,统一擦除成 trait object 供泵使用。
     let (a_r, a_w): (
         Box<dyn tokio::io::AsyncRead + Send + Unpin>,
@@ -5142,6 +5207,123 @@ mod tests {
         assert!(!is_mux_stream(&io));
         let mut io = io;
         assert!(steal_mux_halves(&mut io).is_none());
+    }
+
+    // ===== split_boxed_io 对 mux 流的识别与拆分(round-69 扩展)=====
+    //
+    // 修前 split_boxed_io 只识别裸 TcpStream,mux 流一律回落
+    // tokio::io::split 的同步锁;命中场景是 compress_stream 的 mux 内层
+    // (use_compression=true 且 multiplex=true,compress_pump 与
+    // decompress_pump 抢同一把锁)。
+
+    /// RhMuxStream 必须命中 split_boxed_io;拆出的读/写半独立可用
+    /// (双向收发),不可达方向按 HalfRead/HalfWrite 同款返回 Unsupported。
+    #[tokio::test]
+    async fn split_boxed_io_splits_mux_stream_two_way() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = wrap_stream_as_server(Box::new(b), true, MUX_STREAMS_UNLIMITED);
+        let client = wrap_stream_as_client(Box::new(a), true, MUX_STREAMS_UNLIMITED);
+
+        let srv = server.clone();
+        tokio::spawn(async move {
+            let mut s = srv.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 16];
+            let n = s.read(&mut buf).await.unwrap();
+            s.write_all(&buf[..n]).await.unwrap();
+        });
+
+        let boxed = client.open_stream().await.unwrap();
+        let (mut r, mut w) = match crate::split_boxed_io(boxed) {
+            Ok(pair) => pair,
+            Err(_) => panic!("RhMuxStream 必须命中无锁拆分(修前回落 tokio::io::split 同步锁)"),
+        };
+        // 写半写 → 对端读到并回显 → 读半读回:两半各走各的方向
+        w.write_all(b"half-ping").await.unwrap();
+        let mut back = [0u8; 9];
+        r.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"half-ping");
+
+        // 不可达方向:读半写、写半读都返回 Unsupported(单向补齐契约,
+        // 防止将来被误当全双工用;Unsupported 立即就绪,不会挂起)
+        assert_eq!(
+            r.write(b"x").await.unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        let mut sink = [0u8; 1];
+        assert_eq!(
+            w.read(&mut sink).await.unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
+
+    /// 壳读侧滞留的 pending 余块必须前传到拆出的读半,先于新数据交付
+    /// (split 路径与 steal_mux_halves 的兼容读余量契约一致,不丢数据)。
+    #[tokio::test]
+    async fn split_boxed_io_carries_mux_pending_leftover() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let server = wrap_stream_as_server(Box::new(b), true, MUX_STREAMS_UNLIMITED);
+        let client = wrap_stream_as_client(Box::new(a), true, MUX_STREAMS_UNLIMITED);
+
+        let mut boxed = client.open_stream().await.unwrap();
+        let mut s = server.accept().await.unwrap();
+
+        // 服务端写 64KiB;客户端壳只读 8 字节 → poll_read_chunk 取回的
+        // 首块(16KiB,DEFAULT_SPLIT_SEND_SIZE)余量滞留壳 pending
+        let blob = vec![0xAAu8; 64 * 1024];
+        s.write_all(&blob).await.unwrap();
+        let mut first8 = [0u8; 8];
+        boxed.read_exact(&mut first8).await.unwrap();
+        assert!(first8.iter().all(|&x| x == 0xAA));
+
+        let (mut r, mut w) = match crate::split_boxed_io(boxed) {
+            Ok(pair) => pair,
+            Err(_) => panic!("RhMuxStream 必须命中无锁拆分"),
+        };
+        // 余量(含后续块)先于一切新数据交付,一字节不丢
+        let mut rest = vec![0u8; 64 * 1024 - 8];
+        r.read_exact(&mut rest).await.unwrap();
+        assert!(rest.iter().all(|&x| x == 0xAA), "pending 余量不得丢失");
+
+        // 之后的新数据正常衔接
+        s.write_all(&[0xBBu8; 64]).await.unwrap();
+        let mut tail = [0u8; 64];
+        r.read_exact(&mut tail).await.unwrap();
+        assert!(tail.iter().all(|&x| x == 0xBB), "余量之后的新数据不得错位");
+
+        // 写半独立可用
+        w.write_all(b"from-write-half").await.unwrap();
+        let mut got = [0u8; 15];
+        s.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"from-write-half");
+    }
+
+    /// 偷取后的壳再读必须按 EOF 立即返回(不得永久 Pending 拖死调用方)。
+    /// split_boxed_io 消费壳的前提是壳语义有界:这里手工走同一条
+    /// downcast → steal 路径并保留壳,直接锁住该契约。
+    #[tokio::test]
+    async fn mux_stream_shell_reads_eof_after_steal() {
+        use tokio::io::AsyncReadExt;
+
+        let (a, b) = tokio::io::duplex(4096);
+        let server = wrap_stream_as_server(Box::new(b), true, MUX_STREAMS_UNLIMITED);
+        let client = wrap_stream_as_client(Box::new(a), true, MUX_STREAMS_UNLIMITED);
+
+        let boxed = client.open_stream().await.unwrap();
+        let _ = server.accept().await.unwrap();
+
+        let mut shell = *boxed
+            .into_any_box()
+            .downcast::<RhMuxStream>()
+            .expect("open_stream 产物是 RhMuxStream");
+        let _ = shell.steal_halves().expect("首次偷取必须成功");
+        let mut buf = [0u8; 4];
+        let n = shell.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "偷取后的壳按 EOF,不得永久 Pending");
     }
 
     #[tokio::test]

@@ -50,15 +50,18 @@ pub async fn compress_stream(inner: BoxedIo) -> BoxedIo {
     // 天然无锁。用户侧两个半端由 [`JoinDuplex`] 拼成单一字节流对象。
     let (user_w, pump_r) = tokio::io::duplex(64 * 1024); // 上行:用户 → 压泵
     let (pump_w, user_r) = tokio::io::duplex(64 * 1024); // 下行:解泵 → 用户
-                                                         // B4:底层是裸 TcpStream(multiplex=false 的 tcp 载体)时优先无锁
-                                                         // 拆半(into_split 两个独立 fd);包装类型回落 `tokio::io::split`
+                                                         // B4:底层可无锁拆半时(裸 TcpStream / mux 流 / QUIC BiStream,
+                                                         // 见 split_boxed_io)优先走独立半;包装类型回落 `tokio::io::split`
                                                          //(与 A2 同机理,round-69 实测 futex 占 75% syscall 时间)。
+                                                         // mux 流命中场景:use_compression=true 且 multiplex=true,
+                                                         // 修前 compress_pump 与 decompress_pump 抢同一把同步锁。
     let (inner_r, inner_w): (
         Box<dyn tokio::io::AsyncRead + Send + Unpin>,
         Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
     ) = match crate::split_boxed_io(inner) {
         Ok((r, w)) => (Box::new(r), Box::new(w)),
         Err(io) => {
+            note_split_fallback();
             let (r, w) = tokio::io::split(io);
             (Box::new(r), Box::new(w))
         }
@@ -122,6 +125,28 @@ impl tokio::io::AsyncWrite for JoinDuplex {
         Pin::new(&mut self.w).poll_shutdown(cx)
     }
 }
+
+// 测试探针:compress_stream 对 inner 回落 `tokio::io::split` 的次数。
+// 仅测试读取(断言 mux 内层命中无锁拆分);生产路径零开销。
+//
+// thread_local 而非全局原子:split 发生在 compress_stream 调用者线程
+// (pump 才是 spawn 的),`#[tokio::test]` 的 current_thread 语义下
+// 读写都落在测试自己的线程 —— 并行跑的其它 compress 测试(它们也走
+// 回落分支)不会污染本计数,无需串行化。与下方 COUNTING 探针同款。
+//(`thread_local!` 是宏,`///` 文档注释无法附加到展开项,用普通注释。)
+#[cfg(test)]
+thread_local! {
+    static SPLIT_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 回落计数(测试观测点)。生产编译为空函数——不改任何行为,只保证
+/// 调用点在两个 cfg 下都存在,避免代码路径分叉。
+#[cfg(test)]
+fn note_split_fallback() {
+    SPLIT_FALLBACKS.with(|c| c.set(c.get() + 1));
+}
+#[cfg(not(test))]
+fn note_split_fallback() {}
 
 fn varint_len(mut v: usize) -> usize {
     let mut n = 1;
@@ -839,6 +864,60 @@ mod tests {
         let mut sink = VecSink::default();
         decompress_pump(&mut r, &mut sink).await;
         assert_eq!(sink.0.len(), 0, "超过 4MiB 上限的帧不得写出任何字节");
+    }
+
+    // ---- 新增:mux 内层无锁拆分(round-69 扩展)--------------------------
+
+    /// compress_stream 对 RhMuxStream 内层必须命中 split_boxed_io
+    /// (use_compression=true 且 multiplex=true 的组合),不得回落
+    /// `tokio::io::split` 的同步锁;且拆半后压缩数据面仍双向可用。
+    /// 修前该组合下 compress_pump 与 decompress_pump 抢同一把锁
+    /// (round-69 futex 病灶在压缩路径上的具体形态)。
+    #[tokio::test]
+    async fn mux_inner_splits_lockfree_and_roundtrips() {
+        use crate::{wrap_stream_as_client, wrap_stream_as_server, MUX_STREAMS_UNLIMITED};
+
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let server = wrap_stream_as_server(Box::new(b), true, MUX_STREAMS_UNLIMITED);
+        let client = wrap_stream_as_client(Box::new(a), true, MUX_STREAMS_UNLIMITED);
+
+        // 对端:accept 出的 mux 流原样回显(压缩字节层面的 echo)
+        let srv = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = server.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let inner: crate::BoxedIo = client.open_stream().await.unwrap();
+        let before = SPLIT_FALLBACKS.with(|c| c.get());
+        let mut s = compress_stream(inner).await;
+        assert_eq!(
+            SPLIT_FALLBACKS.with(|c| c.get()),
+            before,
+            "RhMuxStream 内层必须命中 split_boxed_io,不得回落 tokio::io::split"
+        );
+
+        // 拆半后的数据面仍双向可用:用户写 → 压缩 → mux 帧 → echo →
+        // 解压 → 用户读
+        s.write_all(b"mux+compress").await.unwrap();
+        let mut back = [0u8; 12];
+        tokio::time::timeout(std::time::Duration::from_secs(5), s.read_exact(&mut back))
+            .await
+            .expect("echo deadline")
+            .unwrap();
+        assert_eq!(&back, b"mux+compress");
+        drop(s);
+        let _ = srv.await;
     }
 
     // ---- 新增:JoinDuplex 向量写透传 --------------------------------------
