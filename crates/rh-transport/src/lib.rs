@@ -1618,6 +1618,48 @@ mod vectored_tests {
         assert_eq!(log.scalar, 0, "不得退化为标量写");
         assert_eq!(log.last_total, offered);
     }
+
+    // 回归:HalfWrite 修前只覆写标量 poll_write,向量写落到 tokio 默认
+    // 实现(每次只写第一个非空段),mux pump_down 聚合好的批量 writev
+    // 退化成逐段标量写。OwnedWriteHalf 只能从真实 TCP 拆出,VectoredSink
+    // 注入不进去 —— 以环回连接 + 对端读回为等价手段:能力位为 true、
+    // 单次向量写带走全部段(退化成首段写会在这里只写 8 字节)、字节序
+    // 保持段序。负向验证过:摘掉覆写后本测试在能力位断言处变红。
+    #[tokio::test]
+    async fn half_write_forwards_vectored_write() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (_r, w) = client.into_split();
+        let mut hw = HalfWrite(w);
+
+        assert!(
+            AsyncWrite::is_write_vectored(&hw),
+            "能力位必须为 true(OwnedWriteHalf 原生走 writev)"
+        );
+
+        let a = [0x11u8; 8];
+        let b = [0x22u8; 2048];
+        // 总量 2056B,低于任何平台的环回 TCP 发送缓冲下限,单次 writev
+        // 必然全量成功;若实现退化为「只写第一个非空段」,这里只会拿到 8。
+        let noop = std::task::Waker::noop();
+        let mut cx = Context::from_waker(noop);
+        let n = match Pin::new(&mut hw)
+            .poll_write_vectored(&mut cx, &[IoSlice::new(&a), IoSlice::new(&b)])
+        {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("unexpected poll result: {other:?}"),
+        };
+        assert_eq!(n, a.len() + b.len(), "一次向量写应带走全部段");
+
+        let mut got = vec![0u8; a.len() + b.len()];
+        peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got[..a.len()], &a, "首段字节必须先行");
+        assert_eq!(&got[a.len()..], &b, "次段字节必须按段序跟上");
+    }
 }
 
 #[cfg(test)]
@@ -1806,6 +1848,24 @@ impl tokio::io::AsyncWrite for HalfWrite {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    // 向量写透传:OwnedWriteHalf 原生支持(tokio split_owned.rs 覆写了
+    // poll_write_vectored,TcpStream 走 writev)。漏掉会落到 tokio 默认
+    // 实现(每次只写第一个非空段),mux pump_down 预取聚合好的最多 128
+    // 段批量 writev 就退化成逐段标量写 + 每段重拼 IoSlice——与
+    // rh-server CountedTcpWriteHalf(data.rs)显式覆写是同一个理由。
+    // 部分写/WriteZero 语义靠委托保持原生行为,不自己实现。
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        // OwnedWriteHalf 支持(TcpStream 走 writev);显式声明,
+        // 不让默认 false 退化批量写。
+        true
     }
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,

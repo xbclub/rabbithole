@@ -98,6 +98,23 @@ impl tokio::io::AsyncWrite for JoinDuplex {
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.w).poll_write(cx, buf)
     }
+    // 向量写透传:tokio DuplexStream 原生支持(io/util/mem.rs 覆写了
+    // poll_write_vectored,能力位恒 true)。漏掉会让 compress 流用户侧的
+    // 批量 writev 落到 tokio 默认实现(每次只写第一个非空段),退化成
+    // 逐段标量写——与 HalfWrite / rh-server CountedTcpWriteHalf 同因。
+    // 部分写/WriteZero 语义靠委托保持原生行为,不自己实现。
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.w).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        // DuplexStream 恒 true;透传而不是写死字面量,与 PrependedIo/
+        // QuotaIo 的「能力位跟随内层」语义一致。
+        self.w.is_write_vectored()
+    }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.w).poll_flush(cx)
     }
@@ -822,5 +839,56 @@ mod tests {
         let mut sink = VecSink::default();
         decompress_pump(&mut r, &mut sink).await;
         assert_eq!(sink.0.len(), 0, "超过 4MiB 上限的帧不得写出任何字节");
+    }
+
+    // ---- 新增:JoinDuplex 向量写透传 --------------------------------------
+
+    // 回归:JoinDuplex 修前只覆写标量 poll_write,向量写落到 tokio 默认
+    // 实现(每次只写第一个非空段),compress 流用户侧的批量 writev 退化
+    // 成逐段标量写。两层断言:公开 API 能力位为 true(透过 BoxedIo 的
+    // 转发层);绕开 pump 直接构造 JoinDuplex,单次向量写带走全部段、
+    // 字节按段序落在 pump 侧半端。
+    #[tokio::test]
+    async fn join_duplex_forwards_vectored_write() {
+        use std::io::IoSlice;
+        use tokio::io::AsyncReadExt;
+
+        // 公开 API:compress_stream 产物必须如实上报向量写能力
+        let (net_a, net_b) = tokio::io::duplex(1024);
+        let s = compress_stream(Box::new(net_a)).await;
+        assert!(
+            AsyncWrite::is_write_vectored(&s),
+            "compress 流用户侧必须透传 DuplexStream 的向量写能力位"
+        );
+        drop(s);
+        drop(net_b);
+
+        // 单元级:与 compress_stream 同构的两条单向 duplex,不经 pump
+        let (pump_r, user_w) = tokio::io::duplex(64 * 1024);
+        let (user_r, _pump_w) = tokio::io::duplex(64 * 1024);
+        let mut j = JoinDuplex {
+            r: user_r,
+            w: user_w,
+        };
+
+        let a = [0x33u8; 8];
+        let b = [0x44u8; 4096];
+        let noop = std::task::Waker::noop();
+        let mut cx = Context::from_waker(noop);
+        // 4104B 远小于 duplex 缓冲(64KiB),单次向量写必然全量成功;
+        // 若退化为「只写第一个非空段」,这里只会拿到 8。
+        let n = match Pin::new(&mut j)
+            .poll_write_vectored(&mut cx, &[IoSlice::new(&a), IoSlice::new(&b)])
+        {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("unexpected poll result: {other:?}"),
+        };
+        assert_eq!(n, a.len() + b.len(), "一次向量写应带走全部段");
+
+        let mut pump_r = pump_r;
+        let mut got = vec![0u8; a.len() + b.len()];
+        pump_r.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got[..a.len()], &a, "首段字节必须先行");
+        assert_eq!(&got[a.len()..], &b, "次段字节必须按段序跟上");
     }
 }

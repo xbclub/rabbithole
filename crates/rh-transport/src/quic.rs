@@ -497,6 +497,14 @@ impl AsyncRead for BiStream {
     }
 }
 
+// 向量写:quinn 0.11.12 的 `SendStream` tokio AsyncWrite impl
+// (src/send_stream.rs `impl tokio::io::AsyncWrite for SendStream`)只实现
+// poll_write/flush/shutdown,没有 poll_write_vectored / is_write_vectored
+// —— 没有可透传的内层实现,这里**不覆写**,能力位落到默认 false(如实
+// 上报)。上层(write_vectored 调用方,如 mux pump_down)会退化成逐首段
+// 写,数据完整性不受影响(回归测试 bistream_writev_degrades_but_stays_intact
+// 锁住这两点)。若未来 quinn 补上向量写,应在此透传并把能力位改为跟随
+// 内层(与 HalfWrite / JoinDuplex 同因)。
 impl AsyncWrite for BiStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -984,5 +992,111 @@ mod tests {
         };
         crate::connect(&client).await.unwrap();
         srv.abort();
+    }
+
+    /// BiStream 向量写语义(见 impl AsyncWrite for BiStream 上方注释):
+    /// quinn SendStream 无向量写支持,能力位必须**如实**上报 false ——
+    /// 虚报 true 会让 mux pump_down 之类的批量写调用方一次只带走一个段
+    /// 还自以为在批量写(与 db52603 修的 write_dup 条件反写同一类病)。
+    /// 退化路径本身不得破坏数据:多段 write_vectored 烧穿写完后,
+    /// 对端必须按段序收到逐字节一致的内容。
+    #[tokio::test]
+    async fn bistream_writev_degrades_but_stays_intact() {
+        use std::io::IoSlice;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (cert, key) = crate::tls::auto_cert(&Default::default()).unwrap();
+        let server_cfg = ServerTransportConfig {
+            protocol: Protocol::Quic,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            multiplex: true,
+            tls: crate::TlsServerOptions {
+                cert_pem: Some(cert),
+                key_pem: Some(key),
+                ..Default::default()
+            },
+            alpn: vec![crate::DEFAULT_ALPN.into()],
+        };
+        let mut listener = listen(
+            &server_cfg,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr;
+
+        // 三段不等长、字节模式互不相同,错位立刻可见
+        let segs: [&[u8]; 3] = [&[0x55u8; 300], &[0x66u8; 17], &[0x77u8; 4096]];
+        let total: usize = segs.iter().map(|s| s.len()).sum();
+
+        let srv = tokio::spawn(async move {
+            let inc = listener.accept().await.unwrap();
+            let conn = match &inc.mux.inner {
+                crate::MultiplexerInner::Quic(c) => c,
+                _ => panic!("quic listen 产出的 mux 必须是 Quic 变体"),
+            };
+            let mut s = conn.accept_stream().await.unwrap();
+            let mut got = vec![0u8; total];
+            s.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got[..300], segs[0], "段 0 错位");
+            assert_eq!(&got[300..317], segs[1], "段 1 错位");
+            assert_eq!(&got[317..], segs[2], "段 2 错位");
+            s.write_all(b"ok").await.unwrap();
+        });
+
+        let client = ClientTransportConfig {
+            protocol: Protocol::Quic,
+            server_addr: addr,
+            multiplex: true,
+            tls: crate::TlsClientOptions {
+                insecure_skip_verify: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mux = crate::connect(&client).await.unwrap();
+        let mut s = match &mux.inner {
+            crate::MultiplexerInner::Quic(c) => c.open_stream().await.unwrap(),
+            _ => panic!("quic connect 产出的 mux 必须是 Quic 变体"),
+        };
+
+        // 能力位如实上报:quinn SendStream 无向量写,不得虚报 true
+        assert!(
+            !tokio::io::AsyncWrite::is_write_vectored(&*s),
+            "BiStream 未透传向量写,能力位必须如实为 false"
+        );
+
+        // 默认实现每次只写第一个非空段:按 pump_down 的跨段烧穿方式推进,
+        // 验证退化路径不丢字节、不乱序
+        let mut seg = 0usize;
+        let mut off = 0usize;
+        let mut written = 0usize;
+        while written < total {
+            let mut slices = Vec::new();
+            for (i, c) in segs[seg..].iter().enumerate() {
+                let s = if i == 0 { &c[off..] } else { &c[..] };
+                slices.push(IoSlice::new(s));
+            }
+            let k = s.write_vectored(&slices).await.unwrap();
+            assert!(k > 0, "WriteZero:写侧不可用");
+            written += k;
+            let mut rem = k;
+            while rem > 0 {
+                let left = segs[seg].len() - off;
+                if rem >= left {
+                    seg += 1;
+                    off = 0;
+                    rem -= left;
+                } else {
+                    off += rem;
+                    rem = 0;
+                }
+            }
+        }
+
+        let mut back = [0u8; 2];
+        s.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"ok", "服务端校验完成后必须回执");
+        srv.await.unwrap();
     }
 }
