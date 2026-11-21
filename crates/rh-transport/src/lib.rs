@@ -1900,9 +1900,11 @@ impl tokio::io::AsyncWrite for HalfWrite {
         std::pin::Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
     }
     fn is_write_vectored(&self) -> bool {
-        // OwnedWriteHalf 支持(TcpStream 走 writev);显式声明,
-        // 不让默认 false 退化批量写。
-        true
+        // 透传而不是写死 true:tokio 的 OwnedWriteHalf 覆写了本方法
+        // (net/tcp/split_owned.rs 委托 TcpStream,恒 true),行为不变;
+        // 口径与 JoinDuplex / PrependedIo 的「能力位跟随内层」一致——
+        // 写死字面量的话,内层一旦换成不支持 writev 的类型就是虚报。
+        self.0.is_write_vectored()
     }
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,

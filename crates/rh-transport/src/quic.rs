@@ -495,6 +495,24 @@ impl BiStream {
     /// `tokio::io::split` 那样用一把同步 Mutex 把整个 BiStream 锁住。
     /// 修前 QUIC 数据转发(data.rs copy_relay_pair / forward.rs splice)
     /// 100% 落在同步锁上,原因就是 split_boxed_io 只识别裸 TcpStream。
+    ///
+    /// drop 时机语义(拆分带来的行为差异,评审补记):修前 BiStream
+    /// 整体由 `tokio::io::split` 的两个锁半共享,对端的取消信号要等
+    /// 双侧泵都结束才随整体 drop 发出;拆分后各半随所在泵独立 drop,
+    /// 取消传播提前到「单侧结束」。已核 quinn 0.11.12 源码,无数据风险:
+    /// - `SendStream` 的 Drop(send_stream.rs `impl Drop for SendStream`)
+    ///   优先 `finish()` 优雅收尾,已写数据照常交付,不 reset;reset 仅
+    ///   出现在对端先 STOP_SENDING 的分支(修前同样会发生)。且真实
+    ///   调用方写侧的所有结束路径都先显式 shutdown → finish
+    ///   (data.rs copy_relay_pair 取消/错误路径的有界收尾与正常 EOF 的
+    ///   完整半关闭),drop 只是幂等兜底。
+    /// - `RecvStream` 的 Drop(recv_stream.rs `impl Drop for RecvStream`)
+    ///   在读尽(FIN)时 `all_data_read` 已置位,直接返回、**不发
+    ///   STOP_SENDING**,正常 EOF 路径零变化;仅「未读完即 drop」
+    ///   (规则取消 / 对向错误级联中止本向)才提前向对端发
+    ///   STOP_SENDING(0)——这是取消的更快传播,方向良性:本端已放弃
+    ///   该流的读方向,早通知对端停发,少写白数据。与裸 TcpStream
+    ///   `into_split` 后单侧 drop 关单侧方向的语义同构(round-69 起)。
     pub(crate) fn into_halves(self) -> (quinn::RecvStream, quinn::SendStream) {
         (self.recv, self.send)
     }
