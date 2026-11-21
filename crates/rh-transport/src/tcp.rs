@@ -171,15 +171,24 @@ async fn verify(
     // round-41:载体发送缓冲调优(默认 0 = 不触碰,零漂移)
     apply_carrier_sndbuf(&stream);
     // round-E2:裸 TCP 分支(tls.is_none() && !ws_upgrade)产生写侧 fd
-    // 副本,供 accept 交付时走 duplex mux。写侧绝不读(halves 方向纪律,
-    // 见 vendor Connection::into_halves_duplex),无消费冲突。try_clone
-    // 失败 → None → 锁路径。multiplex 监听才需要副本(非 mux 监听永不
-    // 消费,避免每连接白开一个 fd)。
+    // 副本,供 accept 交付时走 duplex mux。消费方向看 accept 的 match:
+    // (true, Some(dup)) → wrap_stream_as_server_duplex —— **副本恰恰是
+    // 给 yamux 连接的**;RHTP 裸流/非 mux 交付不消费。写侧绝不读
+    // (halves 方向纪律,见 vendor Connection::into_halves_duplex),
+    // 无消费冲突。try_clone 失败 → None → 锁路径。multiplex 监听才
+    // 需要副本(非 mux 监听永不消费,避免每连接白开一个 fd)。
     //
-    // L-E b:dup 推迟到 peek 判定**之后** —— 修前在 peek 前 dup,
-    // yamux 连接(副本永远不被消费,装箱即弃)每连接白开一个 fd +
-    // 一次 dup syscall。明文裸流在下方专属分支里先 peek 再按需 dup;
-    // TLS/WS 会话层载体本就不可 fd 复制,恒 None。
+    // L-E b:dup 推迟到 peek 判定**之后** —— 修前(71bc2d7)在 peek 前
+    // dup,RHTP 裸流的副本无人消费,每连接白开一个 fd + 一次 dup
+    // syscall。但 2fbd207 判错了:它断言「yamux 连接的副本永远不被
+    // 消费,装箱即弃」,与 accept() 的 (true, Some(dup)) 分支直接矛盾。
+    // 条件写反的双重后果:1) yamux 连接的 write_dup 恒 None →
+    // wrap_stream_as_server_duplex 成死代码,明文 TCP 多路(默认
+    // PROTO=tcp + MUX=1 主路径)100% 退回 SplitSocket 串行锁;2) RHTP
+    // 裸流反而白做一次 try_dup_tcp(F_DUPFD_CLOEXEC + from_std 注册
+    // epoll)后即弃 —— 正是该提交想省、却省错了分支的那次开销。
+    // 推迟本身保留,只纠正方向:yamux 才 dup,RHTP 恒 None。TLS/WS
+    // 会话层载体本就不可 fd 复制,恒 None。
     match tls {
         Some(acceptor) => {
             let tls_stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
@@ -188,11 +197,13 @@ async fn verify(
             post_tls(Box::new(tls_stream), None, ws_upgrade, multiplex).await
         }
         None if !ws_upgrade && multiplex => {
-            // 明文 + 多路复用监听:先窥探分类(yamux=对端自带多路,
-            // 无需副本;RHTP 裸流才 dup 写侧)
+            // 明文 + 多路复用监听:先窥探分类再按需 dup —— yamux 连接
+            // (accept 的 (true, Some(dup)) 分支消费副本,走 duplex mux
+            // 零锁读∥写)才 dup 写侧;RHTP 裸流走 wrap_stream_as_server
+            // (io, false),不消费副本,恒 None。
             let (prefix, stream) = peek_prefix_tcp(stream).await?;
             let yamux = prefix != *b"RHTP";
-            let write_dup = if yamux { None } else { try_dup_tcp(&stream) };
+            let write_dup = if yamux { try_dup_tcp(&stream) } else { None };
             Ok((
                 crate::PrependedIo::wrap(Box::new(stream) as crate::BoxedIo, prefix.to_vec()),
                 write_dup,
@@ -1231,5 +1242,61 @@ mod handshake_backpressure_tests {
             .expect("归还许可后应立即恢复 accept(不得因预条件不唤醒而停摆)");
         assert!(inc.is_ok());
         drop(cli);
+    }
+}
+
+#[cfg(test)]
+mod verify_write_dup_tests {
+    use super::*;
+
+    /// L-E b 条件方向回归锁:明文 mux 监听上,yamux 前缀的连接必须拿到
+    /// 写侧 fd 副本 —— accept() 的 (true, Some(dup)) 分支靠它走
+    /// wrap_stream_as_server_duplex(零锁读∥写)。2fbd207 把条件写反后
+    /// 此处恒 None,明文 TCP 多路(默认 PROTO=tcp + MUX=1 主路径)100%
+    /// 退回 SplitSocket 串行锁,duplex 包装成死代码。
+    ///
+    /// 仅 Unix:Some 断言依赖 fd 复制(round-80:非 Unix try_dup_tcp
+    /// 恒 None 是既定降级,不是缺陷)。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plaintext_mux_yamux_prefix_produces_write_dup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let mut cli = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::AsyncWriteExt as _;
+        // 真 yamux 首帧形态:帧头 version=0、tag=WindowUpdate(1)、
+        // flags=SYN(vendor connection.rs 测试注释锁定的"流 1 首帧必须
+        // WindowUpdate 且携带 SYN")。分类契约只看首 4 字节是否等于
+        // b"RHTP",取帧头前 4 字节即行使 yamux 分支。
+        cli.write_all(&[0x00, 0x01, 0x00, 0x01]).await.unwrap();
+        let (server, _) = accept.await.unwrap().unwrap();
+
+        let (_io, write_dup, yamux) = verify(server, None, false, true).await.unwrap();
+        assert!(yamux, "非 RHTP 前缀必须判为 yamux");
+        assert!(
+            write_dup.is_some(),
+            "yamux 连接必须持写侧 fd 副本,否则 accept() 退回锁路径\
+             (wrap_stream_as_server_duplex 成死代码)"
+        );
+    }
+
+    /// 对照面:RHTP 裸流走 wrap_stream_as_server(io, false),不消费
+    /// 副本,verify 不得白做一次 dup(F_DUPFD_CLOEXEC + from_std 注册
+    /// epoll 后即弃,正是 2fbd207 想省、却省错了分支的那次开销)。
+    /// 期望 None,不依赖 fd 复制能力,跨平台可跑。
+    #[tokio::test]
+    async fn plaintext_mux_rhtp_prefix_has_no_write_dup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let mut cli = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::AsyncWriteExt as _;
+        cli.write_all(b"RHTP").await.unwrap();
+        let (server, _) = accept.await.unwrap().unwrap();
+
+        let (_io, write_dup, yamux) = verify(server, None, false, true).await.unwrap();
+        assert!(!yamux, "RHTP 魔数必须判为裸流(非 yamux)");
+        assert!(write_dup.is_none(), "RHTP 裸流不消费写侧副本,不得白开 fd");
     }
 }
