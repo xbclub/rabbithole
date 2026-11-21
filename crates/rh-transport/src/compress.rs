@@ -2,7 +2,7 @@
 //!
 //! 实现:pump 任务 + duplex 管道 —— 用户侧拿到一条普通字节流,
 //! 两个后台任务分别负责「压缩写」与「解压读」,压缩逻辑全部是
-//! async fn 循环(read_exact/write_all),不手写任何 poll 状态机。
+//! async fn 循环(read/read_buf/write_all),不手写任何 poll 状态机。
 //!
 //! 帧格式:`varint(压缩块长) + snappy raw 块`,单块未压缩 ≤64KiB。
 //! 流损坏/截断时 pump 退出,上层表现为连接断开。
@@ -15,15 +15,17 @@
 //! * 压侧:`buf`(未压缩输入)与 `wire`(输出帧)复用。`wire` 预留 5 字节
 //!   varint 占位,snappy 直接写进 `wire` 的 spare 区,回填长度后一次
 //!   `write_all` —— 省掉旧实现「comp 分配 → append 拷进 wire」的整块拷贝。
-//! * 解侧:`comp`(压缩帧)、`out`(解压结果)、`Decoder` 全部复用;varint
-//!   一次 `read` 取回已到达的字节在本地解析,不再逐字节 `read_exact`
-//!   (旧实现最坏 5 次独立 await,每次都可能在 reactor 上让出)。
+//! * 解侧:`rbuf`(持久大读缓冲)、`out`(解压结果)、`Decoder` 全部复用。
+//!   一次 `read` 尽量填满 128KiB 缓冲,帧在缓冲内连续解析(varint + 帧体
+//!   直接切片解压),缺字节才回到读端续读 —— 取代旧的「Stash 逐字节补
+//!   varint + read_exact 帧体」(每帧至少 2 次读 await,小帧密集场景下
+//!   读调用数是帧数的两倍,syscall 同比;旧实现已随之删除)。
 //!
-//! 稳态每块:压侧 0 次堆分配 + 1 次写 await;解侧 0 次堆分配 + 2 次读 await
-//! (varint 1 次、帧体 1 次)。改前是 2~3 次分配 + 1 次写、3 次分配 + 6 次读。
+//! 稳态:压侧每块 0 次堆分配 + 1 次写 await;解侧每块 0 次堆分配,读 await
+//! 摊薄到约每 128KiB 缓冲一次(小帧串一次读可覆盖数十帧)。
 
 use crate::BoxedIo;
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -33,8 +35,11 @@ const MAX_UNCOMPRESSED_CHUNK: usize = 64 * 1024;
 const MAX_DECOMPRESSED_CHUNK: usize = 4 * 1024 * 1024;
 /// varint 长度前缀的字节上限(协议约定,见模块文档)。
 const MAX_VARINT_LEN: usize = 5;
-/// 跨帧回退区容量:至多 `MAX_VARINT_LEN - 1` 个帧体前缀 + 一次补读。
-const STASH_CAP: usize = MAX_VARINT_LEN * 2;
+/// 解侧持久读缓冲容量:一次 `read` 尽量填满,缓冲内连续解析多帧。
+/// 协议单帧上限 = `max_frame_len()` ≈ 76.5KiB,128KiB 既保证半截的最大帧
+/// 也装得下(容量即硬上界,解析残余恒小于单帧、永不触发扩容),又让
+/// 小帧密集场景一次读覆盖数十帧。
+const READ_CHUNK: usize = 128 * 1024;
 
 /// 单块压缩帧的缓冲上限:5 字节 varint + snappy 最坏膨胀。
 fn max_frame_len() -> usize {
@@ -244,105 +249,78 @@ fn parse_varint(bytes: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// 跨帧保留的小回退区:装「读过 varint 之后、本帧还没用掉」的字节。
-///
-/// 一次 `read` 能取回的字节数由内核决定,可能比 varint 多。多出来的属于
-/// 帧体甚至下一帧的 varint,必须存住,否则流会错位。
-struct Stash {
-    buf: [u8; STASH_CAP],
-    len: usize,
-}
-
-impl Stash {
-    fn new() -> Self {
-        Self {
-            buf: [0u8; STASH_CAP],
-            len: 0,
-        }
-    }
-}
-
-/// 读一帧的长度前缀。`stash` 里已有的字节优先参与解析,读进来但用不完的
-/// 也留在 `stash` 里供下一帧或本帧帧体取用。
-///
-/// 返回 `Some(帧长)`;`None` 表示 EOF 或坏帧。
-///
-/// 之所以不是字面意义的 `read_exact(&mut [0u8; 5])`:varint 绝大多数只有
-/// 1~3 字节,一次读满 5 字节必然多读进本帧帧体的开头几位(`read_exact`
-/// 在流尾不足 5 字节时还会直接报 UnexpectedEof)。这里用一次 `read`
-/// 取回「已到达的」字节,解析出 varint 后把多读部分留在 `stash`,
-/// 由调用方先取帧体前缀再补读剩余部分 —— 既只花一次 await,
-/// 又不丢字节、不额外复制帧体。
-async fn read_frame_len<R>(src: &mut R, stash: &mut Stash) -> Option<usize>
-where
-    R: AsyncReadExt + Unpin,
-{
-    loop {
-        if let Some((v, used)) = parse_varint(&stash.buf[..stash.len]) {
-            // 前移剩余字节,保持 `buf[..len]` 始终是「还没消费的数据」。
-            stash.buf.copy_within(used..stash.len, 0);
-            stash.len -= used;
-            return Some(v);
-        }
-        if stash.len >= MAX_VARINT_LEN {
-            return None; // 第 5 字节仍带 continuation:非法长度前缀
-        }
-        match src.read(&mut stash.buf[stash.len..]).await {
-            Ok(0) => return None, // EOF:正常结束;半截 = 上层连接错误
-            Ok(n) => stash.len += n,
-            Err(_) => return None,
-        }
-    }
-}
+// (旧实现的跨帧回退区 `Stash` 与 `read_frame_len` —— 逐帧「varint 补读 +
+// read_exact 帧体」—— 已被下方持久大读缓冲方案整体取代:每帧至少 2 次读
+// await/syscall,小帧密集场景读调用数是帧数的两倍。新实现不再引用它们,
+// 单测也不依赖,直接删除;边界行为由缓冲内解析统一覆盖。)
 
 async fn decompress_pump<R, W>(mut src: R, mut dst: W)
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    // 逐帧复用:压缩帧缓冲、解压输出缓冲、Decoder 都只建一次。
-    // comp 需容纳「帧体 + 与之同时到达的 varint」,故比单块上限多留几个字节。
-    let mut comp = vec![0u8; MAX_VARINT_LEN + snap::raw::max_compress_len(MAX_UNCOMPRESSED_CHUNK)];
+    // 持久大读缓冲:一次 read 尽量填满(容量即上界,见 READ_CHUNK),帧在
+    // 缓冲内连续解析,稳态读 await 从「每帧 2 次」摊薄到「每 128KiB 一次」。
+    // 缓冲有界且零搬运:解析消费用 advance 归还头部,未解析残余恒为单帧
+    // 前缀(< max_frame_len()),补读需求 ≤ 单帧上限 < 初始容量,reserve
+    // 永远走 no-op 分支 —— 不扩容、不随帧大小或流量增长。
+    // 逐帧复用的解压输出缓冲与 Decoder 与旧实现相同。
+    let mut rbuf = BytesMut::with_capacity(READ_CHUNK);
     let mut out = vec![0u8; MAX_UNCOMPRESSED_CHUNK];
     let mut dec = snap::raw::Decoder::new();
-    let mut stash = Stash::new();
-    loop {
-        let len = match read_frame_len(&mut src, &mut stash).await {
-            Some(v) => v,
-            None => break,
-        };
-        if len == 0 || len > snap::raw::max_compress_len(MAX_UNCOMPRESSED_CHUNK) {
-            break;
-        }
-        // 回退区里可能已有本帧帧体的开头几个字节,先搬进 comp 再补读剩余。
-        let carried = stash.len.min(len);
-        if carried > 0 {
-            comp[..carried].copy_from_slice(&stash.buf[..carried]);
-            stash.buf.copy_within(carried..stash.len, 0);
-            stash.len -= carried;
-        }
-        if src.read_exact(&mut comp[carried..len]).await.is_err() {
-            break;
-        }
-        let body = &comp[..len];
-        let expected = match snap::raw::decompress_len(body) {
-            Ok(e) => e,
-            Err(_) => break,
-        };
-        if expected > MAX_DECOMPRESSED_CHUNK {
-            break;
-        }
-        // 常态 ≤64KiB,永远走不到扩容;只有对端发来 >64KiB 的单块才会长一次。
-        if out.len() < expected {
-            out.resize(expected, 0);
-        }
-        match dec.decompress(body, &mut out[..expected]) {
-            Ok(n) => {
-                if dst.write_all(&out[..n]).await.is_err() {
-                    break;
-                }
+    let max_body = snap::raw::max_compress_len(MAX_UNCOMPRESSED_CHUNK);
+    'pump: loop {
+        // ---- 解析:连续消化缓冲内所有完整帧,直到缺字节或坏帧 ----
+        // `want` 是「至少还要补多少字节才能继续解析」:半截帧补完一帧,
+        // 半截 varint 补满 5 字节。实际单次读入量不受它限制 —— read_buf
+        // 总是尽量填满剩余容量(≈READ_CHUNK),一次读可带回多帧。
+        let mut want = MAX_VARINT_LEN;
+        loop {
+            let (len, used) = match parse_varint(&rbuf) {
+                Some(v) => v,
+                // 第 5 字节仍带 continuation:非法长度前缀,拒绝整条流
+                None if rbuf.len() >= MAX_VARINT_LEN => break 'pump,
+                None => break, // varint 未读满,补读后再解析
+            };
+            if len == 0 || len > max_body {
+                break 'pump; // 零长 / 超单块压缩上限:非法帧长,拒绝
             }
-            Err(_) => break,
+            let total = used + len;
+            if rbuf.len() < total {
+                want = total - rbuf.len(); // 半截帧体:补完这一帧
+                break;
+            }
+            // 帧体直接在缓冲内切片,不再拷进独立的 comp 缓冲。
+            let body = &rbuf[used..total];
+            let expected = match snap::raw::decompress_len(body) {
+                Ok(e) => e,
+                Err(_) => break 'pump,
+            };
+            if expected > MAX_DECOMPRESSED_CHUNK {
+                break 'pump;
+            }
+            // 常态 ≤64KiB,永远走不到扩容;只有对端发来 >64KiB 的单块才会长一次。
+            if out.len() < expected {
+                out.resize(expected, 0);
+            }
+            match dec.decompress(body, &mut out[..expected]) {
+                Ok(n) => {
+                    if dst.write_all(&out[..n]).await.is_err() {
+                        break 'pump;
+                    }
+                }
+                Err(_) => break 'pump,
+            }
+            rbuf.advance(total);
+        }
+        // ---- 补读 ----
+        rbuf.reserve(want);
+        match src.read_buf(&mut rbuf).await {
+            // EOF:缓冲已空 = 对端正常收尾;还挂着字节 = 半截帧中止。
+            // 两者对上层同貌(pump 退出、读端见 EOF),与旧实现语义一致。
+            Ok(0) => break 'pump,
+            Ok(_) => {}
+            Err(_) => break 'pump,
         }
     }
     // 显式关闭:上层 read 将收到 EOF 而非永久 Pending
@@ -495,6 +473,25 @@ mod tests {
         }
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 计数读端:统计 poll_read 调用次数。本文件的测试源都立即就绪,
+    /// 每次 poll_read 即一次真实读,可用来断言「读次数与帧数解耦」。
+    /// 计数用 Rc 句柄共享:pump 拿走读端所有权后测试侧仍能读数。
+    struct CountingSrc<S> {
+        inner: S,
+        reads: std::rc::Rc<Cell<usize>>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for CountingSrc<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.reads.set(self.reads.get() + 1);
+            Pin::new(&mut self.inner).poll_read(cx, buf)
         }
     }
 
@@ -736,6 +733,123 @@ mod tests {
             let mut got = VecSink::default();
             decompress_pump(&mut r, &mut got).await;
             assert_eq!(got.0, expect, "src_chunk={src_chunk}: 小帧串解码错位");
+        }
+    }
+
+    // ---- 新增:持久大读缓冲 —— 多帧连解与拒绝路径 ------------------------
+
+    /// 一次读入多帧:整条 wire(< READ_CHUNK)单次 read 给足,解泵必须在
+    /// 缓冲内连解完全部帧,读端只被碰 2 次(1 次数据读 + 1 次 EOF 探测)。
+    /// 旧实现每帧「varint 补读 + read_exact 帧体」至少 2 次读,8 帧至少
+    /// 16 次 —— 读次数与帧数解耦正是本次改造的目标行为。
+    #[tokio::test]
+    async fn single_read_parses_multiple_frames() {
+        let frames = 8usize;
+        let per = 9 * 1024;
+        let mut data = Vec::with_capacity(frames * per);
+        for i in 0..frames {
+            data.extend_from_slice(&pseudo_random(per, 0x7000_0000 + i as u64));
+        }
+        // 9KiB 一读一块 → 每块一帧,共 8 帧;随机数据几乎不压缩,总 wire
+        // 仍 < 128KiB,保证单次 read 能整条带回(下面有断言守住这个前提)。
+        let mut sink = VecSink::default();
+        let mut src = SliceSrc::new(data.clone(), per);
+        futures::executor::block_on(compress_pump(&mut src, &mut sink));
+        let wire = sink.0;
+        assert!(
+            wire.len() < READ_CHUNK,
+            "测试前提:整条 wire({}) 应小于读缓冲 {}",
+            wire.len(),
+            READ_CHUNK
+        );
+
+        let reads = std::rc::Rc::new(Cell::new(0usize));
+        let mut r = CountingSrc {
+            inner: SliceSrc::new(wire, usize::MAX),
+            reads: reads.clone(),
+        };
+        let mut got = VecSink::default();
+        decompress_pump(&mut r, &mut got).await;
+        assert_eq!(got.0, data, "多帧一次读入解码不一致");
+        assert_eq!(
+            reads.get(),
+            2,
+            "应为「1 次数据读 + 1 次 EOF 探测」,实际 {} 次 —— 多帧未在缓冲内连解",
+            reads.get()
+        );
+    }
+
+    /// 半截帧中止:EOF 落在帧体中间或 varint 中间,前序完整帧必须照常写出,
+    /// 半截帧不得产出任何字节、不得错位、不得永久 Pending。
+    #[tokio::test]
+    async fn truncated_frame_at_eof_keeps_prior_frames_only() {
+        // 3 帧:每块 200B 随机数据一次给足(压缩后 ≈200+B,varint 2 字节)
+        let payload = pseudo_random(200, 0xABCD_1234);
+        let mut data = payload.clone();
+        data.extend_from_slice(&payload);
+        data.extend_from_slice(&payload);
+        let mut sink = VecSink::default();
+        let mut src = SliceSrc::new(data.clone(), 200);
+        futures::executor::block_on(compress_pump(&mut src, &mut sink));
+        let wire = sink.0;
+
+        // 逐帧走 varint 定位第 3 帧起点
+        let mut pos = 0usize;
+        for _ in 0..2 {
+            let (len, used) = parse_varint(&wire[pos..]).unwrap();
+            pos += used + len;
+        }
+        let third = pos;
+        let (len3, used3) = parse_varint(&wire[third..]).unwrap();
+        assert!(
+            used3 >= 2 && wire[third] & 0x80 != 0,
+            "测试前提:第 3 帧 varint ≥ 2 字节且首字节带 continuation"
+        );
+        assert!(len3 > 2, "测试前提:帧体截在 2 字节处仍是半截帧");
+
+        // (a) EOF 落在第 3 帧帧体中间:varint 完整 + 帧体只到 2 字节
+        // (b) EOF 落在第 3 帧第 1 个 varint 字节之后(半截 varint)
+        for (name, cut) in [("帧体中间", third + used3 + 2), ("varint 中间", third + 1)] {
+            let mut r = SliceSrc::new(wire[..cut].to_vec(), usize::MAX);
+            let mut got = VecSink::default();
+            decompress_pump(&mut r, &mut got).await;
+            assert_eq!(got.0, &data[..400], "EOF 截在 {name}:只应写出前两帧");
+        }
+    }
+
+    /// 非法帧长拒绝:len = 0 与 len = max_compress_len(64KiB)+1 都是坏帧,
+    /// pump 在该位置整流退出;此前已完整到达的合法帧必须照常写出。
+    /// (5 字节 continuation 的非法 varint 由上方 overlong_varint_is_rejected
+    /// 覆盖;解压超限由 oversized_decompressed_chunk_is_rejected 覆盖。)
+    #[tokio::test]
+    async fn zero_and_oversized_frame_len_are_rejected() {
+        let payload = pseudo_random(64, 0x0F0F_0F0F);
+        let mut enc = snap::raw::Encoder::new();
+        let body = enc.compress_vec(&payload).unwrap();
+        let mut wire = Vec::with_capacity(MAX_VARINT_LEN + body.len());
+        let k = varint_len(body.len());
+        let mut hdr = [0u8; MAX_VARINT_LEN];
+        let start = MAX_VARINT_LEN - k;
+        write_varint(&mut hdr[start..], body.len());
+        wire.extend_from_slice(&hdr[start..]);
+        wire.extend_from_slice(&body);
+
+        let max_body = snap::raw::max_compress_len(MAX_UNCOMPRESSED_CHUNK);
+        for bad_len in [0usize, max_body + 1] {
+            let mut bad = wire.clone();
+            let k = varint_len(bad_len);
+            let start = MAX_VARINT_LEN - k;
+            let mut hdr = [0u8; MAX_VARINT_LEN];
+            write_varint(&mut hdr[start..], bad_len);
+            bad.extend_from_slice(&hdr[start..]);
+
+            let mut r = SliceSrc::new(bad, usize::MAX);
+            let mut got = VecSink::default();
+            decompress_pump(&mut r, &mut got).await;
+            assert_eq!(
+                got.0, payload,
+                "bad_len={bad_len}:前序合法帧必须完整写出,坏帧不得产出字节"
+            );
         }
     }
 
