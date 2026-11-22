@@ -239,10 +239,14 @@ jobs:
             local IMGS=("$@")
             local TAG_ARGS=()
             for IMG in "${IMGS[@]}"; do TAG_ARGS+=(-t "$IMG:tmp-amd64"); done
-            docker build --platform linux/amd64 -f "$DF" --build-arg BIN_DIR=bin/amd64 "${TAG_ARGS[@]}" .
+            # --provenance=false --sbom=false:runner 镜像 2026-11 升级 buildx 后,
+            # docker build 默认附 attestation manifest,tmp-* 标签因此成为 manifest list,
+            # 下方 docker manifest annotate 拒绝 list 源(v0.8.6 首次发版实测失败)。
+            # 二进制-only 镜像不需要产物清单,显式关闭让 tmp-* 回到单清单。
+            docker build --provenance=false --sbom=false --platform linux/amd64 -f "$DF" --build-arg BIN_DIR=bin/amd64 "${TAG_ARGS[@]}" .
             local TAG_ARGS_ARM=()
             for IMG in "${IMGS[@]}"; do TAG_ARGS_ARM+=(-t "$IMG:tmp-arm64"); done
-            docker build --platform linux/arm64 -f "$DF" --build-arg BIN_DIR=bin/arm64 "${TAG_ARGS_ARM[@]}" .
+            docker build --provenance=false --sbom=false --platform linux/arm64 -f "$DF" --build-arg BIN_DIR=bin/arm64 "${TAG_ARGS_ARM[@]}" .
             for IMG in "${IMGS[@]}"; do
               docker push "$IMG:tmp-amd64"
               docker push "$IMG:tmp-arm64"
