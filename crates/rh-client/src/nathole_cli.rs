@@ -102,8 +102,60 @@ fn build_candidates(
     addrs.into_iter().map(|a| a.to_string()).collect()
 }
 
+/// 打洞 socket 槽位的残留回收时限(自事务首槽预留起算)。
+const NAT_SOCK_RETENTION: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// 为一条 NatHolePrepare 按到达顺序预留 socket 槽位,返回槽位下标。
+///
+/// 必须在 run_loop 的消息分支里同步调用(spawn 处理任务之前):服务端按
+/// 「先 visitor 后 proxy」下发两条 prepare,同一条控制流保证到达序即角色序;
+/// 而两个 on_prepare 任务并发执行,谁先完成不确定。事务首槽预留时挂一次
+/// 延时回收,上报失败或对端超时后槽位不会永久残留。
+pub(crate) async fn reserve_nat_slot(sess: &Arc<ClientSession>, txid: &str) -> usize {
+    let mut guard = sess.nat_socks.lock().await;
+    let q = guard.entry(txid.to_string()).or_default();
+    let slot = q.len();
+    q.push_back(None);
+    if slot == 0 {
+        let sess = Arc::clone(sess);
+        let txid = txid.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(NAT_SOCK_RETENTION).await;
+            sess.nat_socks.lock().await.remove(&txid);
+        });
+    }
+    slot
+}
+
+/// 回填(或以 `None` 归还)事务槽位;下标越界时先补齐占位。
+fn set_nat_slot(
+    q: &mut std::collections::VecDeque<Option<Arc<tokio::net::UdpSocket>>>,
+    slot: usize,
+    sock: Option<Arc<tokio::net::UdpSocket>>,
+) {
+    if q.len() <= slot {
+        q.resize(slot + 1, None);
+    }
+    q[slot] = sock;
+}
+
+/// 按角色从槽位队列取走 socket:dial 取首个已就绪槽位(visitor 上报源),
+/// listen 取末个(proxy)。取走即置 `None`,同一槽位不会被两个角色重复取用。
+fn take_nat_sock(
+    q: &mut std::collections::VecDeque<Option<Arc<tokio::net::UdpSocket>>>,
+    role: &str,
+) -> Option<Arc<tokio::net::UdpSocket>> {
+    let idx = if role == "listen" {
+        q.iter().rposition(Option::is_some)
+    } else {
+        q.iter().position(Option::is_some)
+    };
+    idx.and_then(|i| q[i].take())
+}
+
 /// NAT_HOLE_PREPARE:绑定 socket → STUN(可选)→ 候选上报。socket 保留至 CONNECT。
-pub async fn on_prepare(sess: Arc<ClientSession>, m: NatHolePrepare) {
+/// `slot` 是 run_loop 为本条 prepare 预留的槽位(见 [`reserve_nat_slot`])。
+pub async fn on_prepare(sess: Arc<ClientSession>, m: NatHolePrepare, slot: usize) {
     let bind_local = "0.0.0.0:0";
     let Ok(sock) = tokio::net::UdpSocket::bind(bind_local).await else {
         return;
@@ -163,6 +215,17 @@ pub async fn on_prepare(sess: Arc<ClientSession>, m: NatHolePrepare) {
         candidates,
         nat_behavior: behavior,
     };
+    // 先回填槽位再上报:服务端收到双端 report 即下发 CONNECT(同机房实测两件
+    // 事只隔 0.85ms),socket 必须先于 report 对 on_connect 可见。修前是
+    // 「发 report → 入池」,CONNECT 处理任务可能先于入池执行。
+    {
+        let mut guard = sess.nat_socks.lock().await;
+        set_nat_slot(
+            guard.entry(m.transaction_id.clone()).or_default(),
+            slot,
+            Some(sock.clone()),
+        );
+    }
     // 有界发送(2s):send_tx 的唯一消费者是 run_loop,队列满时无界
     // send 会 park 在"等自己消费"上(A1 同形)。超时放弃本次上报,
     // 服务端按事务超时回收。
@@ -172,42 +235,30 @@ pub async fn on_prepare(sess: Arc<ClientSession>, m: NatHolePrepare) {
     )
     .await
     .unwrap_or(false);
-    if sent {
-        sess.nat_socks
-            .lock()
-            .await
-            .entry(m.transaction_id.clone())
-            .or_default()
-            .push_back(sock);
-        // 事务残留清理
-        let s2 = sess.clone();
-        let txid = m.transaction_id;
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-            s2.nat_socks.lock().await.remove(&txid);
-        });
+    if !sent {
+        // 上报未送达:服务端与对端并不知情这个候选,归还槽位,不得被 CONNECT 取用
+        let mut guard = sess.nat_socks.lock().await;
+        set_nat_slot(
+            guard.entry(m.transaction_id.clone()).or_default(),
+            slot,
+            None,
+        );
     }
 }
 
 /// NAT_HOLE_CONNECT:执行打洞;visitor 侧成功后直连开流,proxy 侧服务直连。
 pub async fn on_connect(sess: Arc<ClientSession>, m: NatHoleConnect, shutdown: CancellationToken) {
-    // socket 池按 prepare 到达顺序排列:首 = visitor 侧上报源,次 = proxy 侧。
-    // dial 取首、listen 取尾,与两条指令的到达顺序无关。
-    let pop_back = m.role == "listen";
+    // 槽位按 prepare 到达顺序预留:首 = visitor 侧,次 = proxy 侧。dial 取首、
+    // listen 取尾,与两条 CONNECT 指令的到达顺序、处理任务的调度先后都无关。
+    //
+    // 修前按「入池先后 + 队列长度 ≤1 取队首」分配:双端同进程时 listen 指令
+    // 先到而池中只有 visitor 的 socket,被 listen 取走 → 角色互换,dial 拿着
+    // proxy 的 socket 对自己上报的端口「打洞成功」(2026-11-23 e2e XTCP 回归)。
     let sock = {
         let mut guard = sess.nat_socks.lock().await;
-        match guard.get_mut(&m.transaction_id) {
-            Some(q) => {
-                if q.len() <= 1 {
-                    q.pop_front()
-                } else if pop_back {
-                    q.pop_back()
-                } else {
-                    q.pop_front()
-                }
-            }
-            None => None,
-        }
+        guard
+            .get_mut(&m.transaction_id)
+            .and_then(|q| take_nat_sock(q, &m.role))
     };
     let sock = match sock {
         Some(s) => s,
@@ -495,5 +546,65 @@ mod tests {
         // 结果必须去重
         let unique: std::collections::HashSet<_> = ips.iter().copied().collect();
         assert_eq!(unique.len(), ips.len());
+    }
+
+    async fn loopback_sock() -> Arc<tokio::net::UdpSocket> {
+        Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn take_nat_sock_assigns_by_slot_order_not_instruction_order() {
+        let visitor = loopback_sock().await;
+        let proxy = loopback_sock().await;
+        // 双端同进程:槽位按 prepare 到达顺序 [visitor, proxy];服务端先发
+        // listen 指令,且此刻两个槽位都已就绪(回填先于 report 上报)。
+        let mut q = std::collections::VecDeque::from([Some(visitor.clone()), Some(proxy.clone())]);
+        let got_listen = take_nat_sock(&mut q, "listen").unwrap();
+        assert!(Arc::ptr_eq(&got_listen, &proxy), "listen 必须取 proxy 槽位");
+        let got_dial = take_nat_sock(&mut q, "dial").unwrap();
+        assert!(Arc::ptr_eq(&got_dial, &visitor), "dial 必须取 visitor 槽位");
+        assert!(
+            take_nat_sock(&mut q, "dial").is_none(),
+            "槽位取走后不得重复分配"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_nat_sock_single_slot_serves_either_role() {
+        // 双端分属两个进程:每边只有一个槽位,哪个角色先到都取它
+        let only = loopback_sock().await;
+        for role in ["dial", "listen"] {
+            let mut q = std::collections::VecDeque::from([Some(only.clone())]);
+            let got = take_nat_sock(&mut q, role).unwrap();
+            assert!(
+                Arc::ptr_eq(&got, &only),
+                "单槽位下 {role} 必须取到唯一 socket"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_nat_slot_extends_queue_and_take_skips_unready_slots() {
+        let mut q: std::collections::VecDeque<Option<Arc<tokio::net::UdpSocket>>> =
+            std::collections::VecDeque::from([None, None]);
+        assert!(
+            take_nat_sock(&mut q, "listen").is_none(),
+            "未就绪槽位不得被取用"
+        );
+
+        let late = loopback_sock().await;
+        set_nat_slot(&mut q, 2, Some(late.clone()));
+        assert_eq!(q.len(), 3, "回填越界下标应先补齐占位");
+        let got = take_nat_sock(&mut q, "dial").unwrap();
+        assert!(
+            Arc::ptr_eq(&got, &late),
+            "应跳过未就绪槽位取到唯一就绪的 socket"
+        );
+
+        // 上报失败归还:空队列上归还不得 panic
+        let mut empty = std::collections::VecDeque::new();
+        set_nat_slot(&mut empty, 0, None);
+        assert_eq!(empty.len(), 1);
+        assert!(take_nat_sock(&mut empty, "dial").is_none());
     }
 }

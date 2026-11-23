@@ -155,8 +155,13 @@ pub struct ClientSession {
     pub waiting: Mutex<HashMap<u64, WaitingEntry>>,
     /// XTCP 打洞成功后的直连多路复用:visitor_id → mux。
     pub punched: Mutex<HashMap<u64, Arc<rh_transport::Multiplexer>>>,
-    /// 打洞事务保留 socket(候选与打洞同源;双端各自入队)。
-    pub nat_socks: Mutex<HashMap<String, std::collections::VecDeque<Arc<tokio::net::UdpSocket>>>>,
+    /// 打洞事务保留 socket(候选与打洞同源)。每事务一个槽位队列:槽位在
+    /// run_loop 收到 NatHolePrepare 时按到达顺序预留(先 visitor 后 proxy),
+    /// on_prepare 就绪后回填;`None` = 该侧未就绪或上报失败。
+    /// 角色由槽位序决定而非入池先后 —— 双端同进程时两个 prepare 并发处理,
+    /// 完成顺序与 CONNECT 指令的到达顺序都不确定。
+    pub nat_socks:
+        Mutex<HashMap<String, std::collections::VecDeque<Option<Arc<tokio::net::UdpSocket>>>>>,
     /// A7:打洞成功的直连首帧凭据(visitor_id → auth)。与 `punched`
     /// (visitor_id → mux)同生命周期:每次打洞成功写入,替换 mux 时一并更新。
     pub punched_auth: Mutex<HashMap<u64, String>>,
@@ -1564,9 +1569,12 @@ pub async fn dispatch_frame(
                 // bind + STUN(最长 5s),修前内联 await 在 run_loop 的
                 // select 读分支里 —— STUN 不可达时读帧/写帧/心跳/cancel
                 // 四条分支全部轮不到,会话停摆 5s。
+                // 槽位必须在 spawn 之前按 prepare 到达顺序同步预留:处理任务并发
+                // 执行,完成先后不定;服务端收到双端 report 即下发 CONNECT。
+                let slot = crate::nathole_cli::reserve_nat_slot(sess, &p.transaction_id).await;
                 let s2 = sess.clone();
                 tokio::spawn(async move {
-                    crate::nathole_cli::on_prepare(s2, p).await;
+                    crate::nathole_cli::on_prepare(s2, p, slot).await;
                 });
             }
             ServerMessage::NatHoleConnect(c) => {

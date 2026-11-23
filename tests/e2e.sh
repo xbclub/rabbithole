@@ -725,6 +725,7 @@ kill "$HCPID" 2>/dev/null
 mk_svc "{\"client_id\":\"$CID\",\"name\":\"xsvc\",\"kind\":\"xtcp\",\"target_host\":\"127.0.0.1\",\"target_port\":$ECHO_TCP,\"enabled\":true,\"xtcp\":{}}" >/dev/null
 mk_vis "{\"client_id\":\"$CID\",\"name\":\"xsvc-v\",\"kind\":\"xtcp\",\"bind_port\":$V_XTCP,\"target_proxy_name\":\"xsvc\",\"enabled\":true}" >/dev/null
 sleep 2
+XTCP_LOG_FROM=$(( $(wc -l < "$WORK/client.log") + 1 ))
 python3 - "$V_XTCP" <<'EOF' && ok "XTCP 打洞直连" || bad "XTCP 打洞直连"
 import socket, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=20)
@@ -738,6 +739,11 @@ try:
 except Exception: pass
 sys.exit(0 if g == b"xtcp\n" else 1)
 EOF
+# 回显通过 ≠ 打洞直连:回退中继同样能回显。本用例双端同机、无 NAT,打洞必然
+# 成功,proxy 侧必记 "serving direct"。只验回显时「socket 槽位角色互换」这类
+# 缺陷可以被静默的中继回退掩盖(2026-11-23 e2e 实测)。
+tail -n +"$XTCP_LOG_FROM" "$WORK/client.log" | grep -aq "serving direct"
+check $? "XTCP 打洞直连走的是直连而非中继"
 
 # ---------- 端口冲突 ----------
 python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('0.0.0.0',19999)); s.listen(1); time.sleep(30)" &

@@ -184,7 +184,9 @@ BYTES=$(python3 -c 'import json;print(json.load(open("'$WORK'/gwa.json"))["relay
 #   1) STUN 映射地址确实进了候选且排在首位(否则跨 NAT 永远打不通);
 #   2) 网关确实收到了打洞包(packets_in > 0),证明 mapped 路径被尝试过。
 if [ "$STRICT" = "1" ]; then
-  CAND=$(grep -o 'candidates=\[[^]]*\]' "$WORK/v.log" | head -1)
+  # 客户端日志文件带 ANSI 颜色码,字段名/等号/方括号之间夹着转义序列,
+  # 先剥离再匹配(修前 grep 恒取空,该断言在新旧版本上一律 FAIL)。
+  CAND=$(sed 's/\x1b\[[0-9;]*m//g' "$WORK/v.log" | grep -o 'candidates=\[[^]]*\]' | head -1)
   case "$CAND" in
     *"$NATGW_BIND_IP:"*) ok "STUN 映射地址进入候选且优先($CAND)" ;;
     *) bad "候选里没有 STUN 映射地址($CAND)" ;;
