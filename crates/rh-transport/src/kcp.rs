@@ -2495,7 +2495,48 @@ pub async fn connect(cfg: &ClientTransportConfig) -> std::io::Result<Arc<Multipl
 
 // ---------------- NAT 打洞 ----------------
 
-/// 打洞 listen 角色:在已绑定 socket 上被动接受首个 kcp 会话。
+/// 将 IPv4-mapped IPv6 (`[::ffff:a.b.c.d]:port`) 规范化为对应 IPv4 地址,
+/// 供双栈 IPv6 socket 上的候选比对使用(保留精确 `(ip, port)` A7 匹配语义)。
+fn canonical_addr(a: SocketAddr) -> SocketAddr {
+    SocketAddr::new(a.ip().to_canonical(), a.port())
+}
+
+/// 若本端为 IPv6(双栈)socket 且目标为 IPv4,转换为 IPv4-mapped IPv6,
+/// 避免 `send_to` 在 AF_INET6 socket 上因地址族不匹配返回 EINVAL;
+/// 若本端为纯 IPv4 socket,则先规整 IPv4-mapped IPv6 为 IPv4,并过滤无法发送的纯 IPv6 目标。
+fn adapt_send_addr(local_is_v6: bool, dest: SocketAddr) -> Option<SocketAddr> {
+    if local_is_v6 {
+        match dest {
+            SocketAddr::V4(v4) => Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                v4.ip().to_ipv6_mapped(),
+                v4.port(),
+                0,
+                0,
+            ))),
+            SocketAddr::V6(_) => Some(dest),
+        }
+    } else {
+        match canonical_addr(dest) {
+            v4 @ SocketAddr::V4(_) => Some(v4),
+            SocketAddr::V6(_) => None,
+        }
+    }
+}
+
+/// 发送单次 `RHPUNCH` 原始打洞包:优先非阻塞快路径;若 `try_send_to` 命中
+/// `WouldBlock`,Tokio 会清掉内部的 `WRITABLE` 就绪缓存,必须通过带短超时的
+/// `send_to().await` 重新武装就绪态,避免后续周期性探测永久短路停发。
+async fn send_punch_probe(udp: &UdpSocket, dest: SocketAddr) {
+    if let Err(e) = udp.try_send_to(b"RHPUNCH", dest) {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            let _ = tokio::time::timeout(Duration::from_millis(20), udp.send_to(b"RHPUNCH", dest))
+                .await;
+        }
+    }
+}
+
+/// 打洞 listen 角色:在已绑定 socket 上等待首个 kcp 会话,同时向候选地址发送
+/// 原始打洞探测包(`RHPUNCH`)以打开本端 NAT/状态防火墙洞口。
 /// 首个 kcp 消息约定为打洞哨兵(dial 侧重传它作为打洞包),此处剥离。
 ///
 /// A7:`allowed` 是服务端下发的对端候选地址集合。打洞窗口内只有来自该集合
@@ -2509,18 +2550,49 @@ pub async fn punch_listen(
     if allowed.is_empty() {
         tracing::warn!("punch listen: empty candidate set, source pinning disabled");
     }
-    // 1. 等待首个合法 kcp 包(来源必须属于候选集合)
+    let local_is_v6 = udp.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+    let allowed_canonical: Vec<SocketAddr> = allowed.iter().copied().map(canonical_addr).collect();
+    let probe_targets: Vec<SocketAddr> = allowed
+        .iter()
+        .copied()
+        .filter_map(|c| adapt_send_addr(local_is_v6, c))
+        .collect();
+    // 1. 等待首个合法 kcp 包(来源必须属于候选集合),同时在单循环内周期性
+    //    向候选发送 RHPUNCH 原始包(7B < KCP_OVERHEAD,dial 侧静默丢弃),
+    //    让 listen 侧在 Address/Port-Restricted NAT 后也能主动打通洞口。
+    //    不 spawn 后台任务:调用方经 timeout/drop 取消时不会泄漏任务或 socket 引用。
     let mut buf = vec![0u8; 65536];
+    let mut probe_tick = tokio::time::interval(Duration::from_millis(300));
+    probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let (n, peer) = loop {
-        let (n, from) = udp.recv_from(&mut buf).await?;
-        if n >= KCP_OVERHEAD
-            && (81..=84).contains(&buf[4])
-            && (allowed.is_empty() || allowed.contains(&from))
-        {
-            break (n, from);
-        }
-        if !allowed.is_empty() && n >= KCP_OVERHEAD && (81..=84).contains(&buf[4]) {
-            tracing::debug!(%from, "punch listen: drop non-candidate source");
+        tokio::select! {
+            r = udp.recv_from(&mut buf) => {
+                let (n, from) = match r {
+                    Ok(v) => v,
+                    // Windows 上向不可达候选发 UDP 探测会触发 ICMP Port Unreachable,
+                    // 下一次 recv_from 返回 WSAECONNRESET(ConnectionReset),必须忽略继续。
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                    Err(e) => return Err(e),
+                };
+                if n >= KCP_OVERHEAD
+                    && (81..=84).contains(&buf[4])
+                    && (allowed_canonical.is_empty()
+                        || allowed_canonical.contains(&canonical_addr(from)))
+                {
+                    break (n, from);
+                }
+                if !allowed_canonical.is_empty()
+                    && n >= KCP_OVERHEAD
+                    && (81..=84).contains(&buf[4])
+                {
+                    tracing::debug!(%from, "punch listen: drop non-candidate source");
+                }
+            }
+            _ = probe_tick.tick(), if !probe_targets.is_empty() => {
+                for dest in &probe_targets {
+                    send_punch_probe(&udp, *dest).await;
+                }
+            }
         }
     };
     let conv = kcp::get_conv(&buf[..n]);
@@ -2560,7 +2632,17 @@ pub async fn punch_listen(
                 let mut b = pkt_pool_get();
                 tokio::select! {
                     r = udp.recv_from(&mut b) => {
-                        let Ok((n, from)) = r else { break };
+                        let (n, from) = match r {
+                            Ok(v) => v,
+                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                                pkt_pool_put(b);
+                                continue;
+                            }
+                            Err(_) => {
+                                pkt_pool_put(b);
+                                break;
+                            }
+                        };
                         bump_counter!(recvfrom_calls);
                         if from != pinned {
                             pkt_pool_put(b);
@@ -2743,8 +2825,19 @@ pub async fn punch_dial(
     if candidates.is_empty() {
         return Err(other_err("no punch candidates"));
     }
+    let local_is_v6 = udp.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+    let send_cands: Vec<SocketAddr> = candidates
+        .iter()
+        .copied()
+        .filter_map(|c| adapt_send_addr(local_is_v6, c))
+        .collect();
+    if send_cands.is_empty() {
+        return Err(other_err(
+            "no compatible punch candidates for local socket family",
+        ));
+    }
     let conv = (CONV_COUNTER.fetch_add(1, Ordering::Relaxed) as u32) ^ rand_u32();
-    let peer = Arc::new(PunchPeer::new(candidates[0]));
+    let peer = Arc::new(PunchPeer::new(send_cands[0]));
     let (io, shared) = new_io();
     // C:打洞输出接入同一积压队列 + 错误桥(idle 会话也能及时收到
     // 真实输出错误,与 connect/listen 接线一致)
@@ -2769,7 +2862,8 @@ pub async fn punch_dial(
     // 与 connect(send().await 背压)/demux(丢包不断流)语义对齐。
     let inbound = Arc::new(tokio::sync::Notify::new());
     let learned = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let cands_for_inbound = candidates.to_vec();
+    let cands_for_inbound: Vec<SocketAddr> =
+        candidates.iter().copied().map(canonical_addr).collect();
     // 两个独立 abort 通道 + notify_one(permit 语义):notify_waiters 无
     // permit,任务处于「检查后、select 注册前」执行段时通知永久丢失,
     // 轮询任务将永生并每 800ms 向全部候选发包(结构性泄漏)。
@@ -2789,12 +2883,25 @@ pub async fn punch_dial(
                 let mut buf = pkt_pool_get();
                 tokio::select! {
                     r = udp.recv_from(&mut buf) => {
-                        let Ok((n, from)) = r else { break };
+                        let (n, from) = match r {
+                            Ok(v) => v,
+                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                                pkt_pool_put(buf);
+                                continue;
+                            }
+                            Err(_) => {
+                                pkt_pool_put(buf);
+                                break;
+                            }
+                        };
                         bump_counter!(recvfrom_calls);
-                        if n >= KCP_OVERHEAD && (81..=84).contains(&buf[4]) {
+                        if n >= KCP_OVERHEAD
+                            && (81..=84).contains(&buf[4])
+                            && kcp::get_conv(&buf[..n]) == conv
+                        {
                             // A7:只接受服务端下发的候选来源,拒绝打洞窗口内
                             // 第三方注入(否则首个合法包即可劫持 dial 侧)。
-                            if !cands_for_inbound.iter().any(|c| c == &from) {
+                            if !cands_for_inbound.contains(&canonical_addr(from)) {
                                 tracing::debug!(%from, "punch dial: drop non-candidate source");
                                 pkt_pool_put(buf);
                                 continue;
@@ -2829,7 +2936,7 @@ pub async fn punch_dial(
         let peer = peer.clone();
         let learned = learned.clone();
         let abort = abort_poll.clone();
-        let candidates = candidates.to_vec();
+        let candidates = send_cands;
         tokio::spawn(async move {
             let mut i = 0usize;
             loop {
@@ -2837,7 +2944,7 @@ pub async fn punch_dial(
                     break;
                 }
                 for c in &candidates {
-                    let _ = udp.try_send_to(b"RHPUNCH", *c);
+                    send_punch_probe(&udp, *c).await;
                 }
                 peer.rotate(candidates[i % candidates.len()]);
                 i += 1;
@@ -7212,5 +7319,226 @@ mod c84_closure_tests {
             .expect("listen task")
             .expect("punch listen");
         drop(mux);
+    }
+
+    /// Issue #1:模拟 Port-Restricted NAT 代理 —— 在观测到 listen 侧主动向对端
+    /// 发出至少 1 个出站打洞包之前,丢弃全部 dial -> listen 入站报文。
+    /// 验证 punch_listen 主动发送 RHPUNCH 打通洞口并完成数据回显。
+    #[tokio::test]
+    async fn punch_listen_opens_port_restricted_nat_pinhole() {
+        use std::sync::atomic::AtomicBool;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listen_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let listen_inner = listen_sock.local_addr().unwrap();
+        let dial_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dial_addr = dial_sock.local_addr().unwrap();
+        let nat_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let nat_addr = nat_sock.local_addr().unwrap();
+
+        let pinhole_open = Arc::new(AtomicBool::new(false));
+        let dropped_inbound = Arc::new(AtomicUsize::new(0));
+        let stop_nat = Arc::new(Notify::new());
+
+        let nat_task = {
+            let nat_sock = nat_sock.clone();
+            let pinhole_open = pinhole_open.clone();
+            let dropped_inbound = dropped_inbound.clone();
+            let stop_nat = stop_nat.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    tokio::select! {
+                        r = nat_sock.recv_from(&mut buf) => {
+                            let Ok((n, from)) = r else { break };
+                            if from == listen_inner {
+                                pinhole_open.store(true, Ordering::SeqCst);
+                                let _ = nat_sock.send_to(&buf[..n], dial_addr).await;
+                            } else if from == dial_addr {
+                                if pinhole_open.load(Ordering::SeqCst) {
+                                    let _ = nat_sock.send_to(&buf[..n], listen_inner).await;
+                                } else {
+                                    dropped_inbound.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                        _ = stop_nat.notified() => break,
+                    }
+                }
+            })
+        };
+
+        // 先启动 dial:listen 未发包前,全部入站均应被 Port-Restricted NAT 拦截
+        let dialer = tokio::spawn(async move { punch_dial(dial_sock, &[nat_addr], 8).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            dropped_inbound.load(Ordering::SeqCst) > 0,
+            "listen 启动前 dial 报文必须被 Port-Restricted NAT 丢弃"
+        );
+        assert!(
+            !pinhole_open.load(Ordering::SeqCst),
+            "listen 启动前洞口必须保持关闭"
+        );
+
+        // 启动 listen:发送 RHPUNCH 打开洞口,双向打洞成功并回显数据
+        let listener = tokio::spawn(async move { punch_listen(listen_sock, &[nat_addr]).await });
+        let mux_l = tokio::time::timeout(Duration::from_secs(10), listener)
+            .await
+            .expect("listen join")
+            .expect("listen task")
+            .expect("punch listen");
+        let mux_d = tokio::time::timeout(Duration::from_secs(10), dialer)
+            .await
+            .expect("dial join")
+            .expect("dial task")
+            .expect("punch dial");
+        assert!(
+            pinhole_open.load(Ordering::SeqCst),
+            "punch_listen 必须通过出站探测打开 NAT 洞口"
+        );
+
+        let echo = tokio::spawn(async move {
+            let mut ss = mux_l.accept().await.expect("accept");
+            let mut b = [0u8; 10];
+            ss.read_exact(&mut b).await.unwrap();
+            ss.write_all(&b).await.unwrap();
+        });
+        let mut cs = mux_d.open_stream().await.expect("open");
+        cs.write_all(b"nat-pin-ok").await.unwrap();
+        let mut back = [0u8; 10];
+        tokio::time::timeout(Duration::from_secs(10), cs.read_exact(&mut back))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&back, b"nat-pin-ok");
+        echo.await.unwrap();
+
+        stop_nat.notify_one();
+        let _ = nat_task.await;
+    }
+
+    /// Issue #1:punch_listen 被调用方 timeout/drop 取消时,不得泄漏后台探测任务
+    /// 或持有 Arc<UdpSocket> 引用。
+    #[tokio::test]
+    async fn punch_listen_cancel_drops_socket_immediately() {
+        let listen_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+
+        let res = tokio::time::timeout(
+            Duration::from_millis(200),
+            punch_listen(listen_sock.clone(), &[peer_addr]),
+        )
+        .await;
+        assert!(res.is_err(), "无响应时应按超时取消");
+        assert_eq!(
+            Arc::strong_count(&listen_sock),
+            1,
+            "取消 punch_listen 后必须立即释放全部 socket 引用(无后台任务泄漏)"
+        );
+
+        // 确认取消前至少发出过一次 RHPUNCH 探测包
+        let mut buf = [0u8; 32];
+        let n = tokio::time::timeout(Duration::from_millis(200), peer_sock.recv(&mut buf))
+            .await
+            .expect("peer 应在超时内收到至少一次 RHPUNCH 探测")
+            .expect("peer recv");
+        assert_eq!(&buf[..n], b"RHPUNCH");
+    }
+
+    #[test]
+    fn adapt_send_addr_handles_v4_and_dual_stack_families() {
+        let v4: SocketAddr = "192.0.2.10:40000".parse().unwrap();
+        let v4_mapped: SocketAddr = "[::ffff:192.0.2.10]:40000".parse().unwrap();
+        let pure_v6: SocketAddr = "[2001:db8::1]:40000".parse().unwrap();
+
+        // 纯 IPv4 socket:还原 IPv4-mapped IPv6,过滤不可发送的纯 IPv6
+        assert_eq!(adapt_send_addr(false, v4), Some(v4));
+        assert_eq!(adapt_send_addr(false, v4_mapped), Some(v4));
+        assert_eq!(adapt_send_addr(false, pure_v6), None);
+
+        // 双栈 IPv6 socket:IPv4 映射为 IPv4-mapped IPv6,纯 IPv6 原样保留
+        assert_eq!(adapt_send_addr(true, v4), Some(v4_mapped));
+        assert_eq!(adapt_send_addr(true, v4_mapped), Some(v4_mapped));
+        assert_eq!(adapt_send_addr(true, pure_v6), Some(pure_v6));
+    }
+
+    /// 跨平台双栈 IPv6 UDP socket 构造(仅使用 socket2,不依赖 std::os::unix)。
+    /// 若宿主机禁用 IPv6 则返回 None,由调用方优雅跳过。
+    fn try_bind_dual_stack_v6() -> Option<Arc<UdpSocket>> {
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .ok()?;
+        sock.set_only_v6(false).ok()?;
+        sock.set_nonblocking(true).ok()?;
+        let bind_addr = std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+        sock.bind(&socket2::SockAddr::from(bind_addr)).ok()?;
+        let std_udp: std::net::UdpSocket = sock.into();
+        let tokio_udp = UdpSocket::from_std(std_udp).ok()?;
+        Some(Arc::new(tokio_udp))
+    }
+
+    /// Issue #4(已确认部分):双栈 IPv6 socket 收到 IPv4-mapped IPv6 (`[::ffff:127.0.0.1]:port`)
+    /// 时必须与 IPv4 候选规范化比对并成功回显,同时保留 A7 精确端口校验(同 IP 不同端口仍被拒绝)。
+    #[tokio::test]
+    async fn punch_dual_stack_v4_mapped_v6_canonicalizes_and_keeps_a7_port_check() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let Some(listen_sock) = try_bind_dual_stack_v6() else {
+            return;
+        };
+        let listen_port = listen_sock.local_addr().unwrap().port();
+        let listen_v4_addr = SocketAddr::from(([127, 0, 0, 1], listen_port));
+
+        let dial_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dial_v4_addr = dial_sock.local_addr().unwrap();
+        let attacker = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let ls = listen_sock.clone();
+        let listener = tokio::spawn(async move { punch_listen(ls, &[dial_v4_addr]).await });
+
+        // 同 IP (127.0.0.1) 不同端口的攻击者经双栈到达为 [::ffff:127.0.0.1]:other_port:
+        // A7 端口约束必须继续拒绝。
+        let mut bogus = vec![0u8; KCP_OVERHEAD + 4];
+        bogus[0..4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        bogus[4] = 81;
+        let _ = attacker.send_to(&bogus, listen_v4_addr).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !listener.is_finished(),
+            "双栈下同 IP 不同端口来源仍必须被 A7 拒绝"
+        );
+
+        // 合法 IPv4 候选 dial 拨向双栈 listen:规范化比对放行并完成回显
+        let dialer = tokio::spawn(async move { punch_dial(dial_sock, &[listen_v4_addr], 8).await });
+        let mux_l = tokio::time::timeout(Duration::from_secs(10), listener)
+            .await
+            .expect("listen join")
+            .expect("listen task")
+            .expect("punch listen");
+        let mux_d = tokio::time::timeout(Duration::from_secs(10), dialer)
+            .await
+            .expect("dial join")
+            .expect("dial task")
+            .expect("punch dial");
+
+        let echo = tokio::spawn(async move {
+            let mut ss = mux_l.accept().await.expect("accept");
+            let mut b = [0u8; 8];
+            ss.read_exact(&mut b).await.unwrap();
+            ss.write_all(&b).await.unwrap();
+        });
+        let mut cs = mux_d.open_stream().await.expect("open");
+        cs.write_all(b"v4mapv6!").await.unwrap();
+        let mut back = [0u8; 8];
+        tokio::time::timeout(Duration::from_secs(10), cs.read_exact(&mut back))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&back, b"v4mapv6!");
+        echo.await.unwrap();
     }
 }

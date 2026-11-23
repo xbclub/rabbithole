@@ -677,15 +677,25 @@ fn shutdown_rdwr(s: &SpliceSock) {
     }
 }
 
+fn teardown(s1: &SpliceSock, s2: &SpliceSock) {
+    shutdown_rdwr(s1);
+    shutdown_rdwr(s2);
+}
+
 /// 单向泵(旧控制流,`RH_SPLICE_PUMP=legacy` 臂):每次 fill 前建立
 /// readable/select future,然后排空管道;每次 drain 前建立 writable/
 /// select future。相对批次化臂**无协作让步**(coop_yields 恒 0)与
 /// 非阻塞快试——保留用于同树同计数对照(G1-A),行为与 g1 输入基线
 /// 的旧泵一致,仅插入计数点。
 ///
-/// 退出路径(EOF/读错误/写错误 → shutdown out 写侧;中止/取消 → 断连),
-/// 与用户态 copy 循环「循环结束即 shutdown 写端」语义对齐(B5:写错误
-/// 分支同样 shutdown 写侧,不再与 copy 口径分叉)。
+/// 退出路径:
+/// * clean EOF(`Ok(0)`)→ 仅 `shutdown_wr(&out_sock)`(半关闭传递,`errored`
+///   保持 false,由父任务经 `join_relay_pumps` 等待对向自然结束);
+/// * 读/写硬 I/O 错误与 `abort` → 双向 `teardown`(`SHUT_RDWR`,包含 B5
+///   写侧关闭)+ 置 `errored = true`,父任务立即终止对向泵释放 fd;
+/// * `cancel` → 双向 `teardown`,双泵共享同一 `CancelFuture` 各自就地完成
+///   A6 计量/预留退还后收敛。
+///
 /// 计量(B6):up(fill 口径,fill 完成即计、先于限速等待)与
 /// down(送达口径,排空后按实际送达字节计)由 DirHook 装配决定。
 /// 限速(A5):预留式等待与取消信号竞争;down 按实际送达消费,
@@ -700,6 +710,7 @@ async fn pump_legacy(
     hook: Option<DirHook>,
     abort: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     cancel: Option<CancelFuture>,
+    errored: Arc<AtomicBool>,
     dir: &'static str,
     obs: PumpObs,
 ) {
@@ -717,15 +728,11 @@ async fn pump_legacy(
     };
     tokio::pin!(cancel_wait);
 
-    fn teardown(s1: &SpliceSock, s2: &SpliceSock) {
-        shutdown_rdwr(s1);
-        shutdown_rdwr(s2);
-    }
-
     loop {
         if let Some(f) = &abort {
             if f() {
                 teardown(&in_sock, &out_sock);
+                errored.store(true, Ordering::SeqCst);
                 return;
             }
         }
@@ -741,7 +748,8 @@ async fn pump_legacy(
             } {
                 Ok(g) => g,
                 Err(_) => {
-                    shutdown_wr(&out_sock);
+                    teardown(&in_sock, &out_sock);
+                    errored.store(true, Ordering::SeqCst);
                     return;
                 }
             };
@@ -769,7 +777,8 @@ async fn pump_legacy(
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => {
-                    shutdown_wr(&out_sock);
+                    teardown(&in_sock, &out_sock);
+                    errored.store(true, Ordering::SeqCst);
                     return;
                 }
             }
@@ -804,42 +813,40 @@ async fn pump_legacy(
             if f() {
                 drop(reservation); // 未消费预留退还
                 teardown(&in_sock, &out_sock);
+                errored.store(true, Ordering::SeqCst);
                 return;
             }
         }
         // 排空管道到对端(对端拥塞时管道有界积压 → 背压到来源)。
         // 单次 ≤ DRAIN_SLICE:突发尺寸与拷贝路径一致。
         let mut delivered: usize = 0;
-        loop {
-            let mut guard = match tokio::select! {
-                g = watch_ready(&obs, out_sock.fd.writable(), WaitDir::Write) => g,
-                _ = &mut cancel_wait => {
-                    // A6:排空中取消——已送达字节先计量再退出
-                    if delivered > 0 {
-                        if let Some(h) = &hook {
-                            if !h.meter_on_fill {
-                                if let Some(c) = &h.on_bytes {
-                                    c(delivered as u64);
-                                }
+        // 写侧就绪返回 Err 时退出循环,先完成 A6 送达计量与预留退还,再由 delivered < n 收尾 teardown
+        while let Ok(mut guard) = tokio::select! {
+            g = watch_ready(&obs, out_sock.fd.writable(), WaitDir::Write) => g,
+            _ = &mut cancel_wait => {
+                // A6:排空中取消——已送达字节先计量再退出
+                if delivered > 0 {
+                    if let Some(h) = &hook {
+                        if !h.meter_on_fill {
+                            if let Some(c) = &h.on_bytes {
+                                c(delivered as u64);
                             }
                         }
-                        if let Some(r) = reservation.as_mut() {
-                            r.consume(delivered);
-                        }
                     }
-                    drop(reservation); // 未消费预留退还
-                    teardown(&in_sock, &out_sock);
-                    return;
+                    if let Some(r) = reservation.as_mut() {
+                        r.consume(delivered);
+                    }
                 }
-            } {
-                Ok(g) => g,
-                Err(_) => {
-                    // 写侧死亡:送达部分仍计量;B5:同样收尾 shutdown 写侧
-                    shutdown_wr(&out_sock);
+                drop(reservation); // 未消费预留退还
+                teardown(&in_sock, &out_sock);
+                return;
+            }
+        } {
+            match splice_sys(pr, out_sock.raw_fd(), (n - delivered).min(DRAIN_SLICE)) {
+                Ok(0) => {
+                    // 管道空但块未排空:保守跳出防零进展自旋,由 delivered < n 收尾
                     break;
                 }
-            };
-            match splice_sys(pr, out_sock.raw_fd(), (n - delivered).min(DRAIN_SLICE)) {
                 Ok(m) => {
                     delivered += m;
                     stat_bump!(obs, drain_calls, 1);
@@ -858,8 +865,7 @@ async fn pump_legacy(
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => {
-                    // B5:写错误分支与 copy 路径一致地收尾 shutdown 写侧
-                    shutdown_wr(&out_sock);
+                    // 写错误:先跳出完成 A6 送达计量与预留退还,再由 delivered < n 收尾 teardown
                     break;
                 }
             }
@@ -882,7 +888,9 @@ async fn pump_legacy(
         }
         drop(reservation); // down 部分送达:未消费预留退还
         if delivered < n {
-            // 未排空即退出:写侧已不可用
+            // 未排空即退出:写侧已不可用,双向 teardown 并通知父任务立即终止对向泵
+            teardown(&in_sock, &out_sock);
+            errored.store(true, Ordering::SeqCst);
             return;
         }
     }
@@ -913,9 +921,10 @@ async fn pump_legacy(
 ///
 /// 严格保持(与 legacy 逐点一致):每 fill 块完成即 up 计量、先于限速
 /// 等待(B6);限速预留/消费/退还三态(A5);abort 检查粒度=每块两次
-/// (批首 + fill/限速后);读 EOF 半关闭;写错误/读错误收尾 shutdown 写侧
-/// (B5);排空中取消的已送达计量(A6——本臂逐 drain 进展即计量,取消
-/// 窗口更小);管道有界;任何 drain 返回零即停止而非自旋。
+/// (批首 + fill/限速后);读 clean EOF 仅半关闭(`shutdown_wr`);读/写硬
+/// 错误与 `abort` 双向 `teardown`(包含 B5 写侧关闭)+ 置 `errored`
+/// 立即终止对向;排空中取消的已送达计量(A6——本臂逐 drain 进展即计量,
+/// 取消窗口更小);管道有界;任何 drain 返回零即停止而非自旋。
 /// 观测(A):`obs` 全 None 时热循环零统计;开启时 EAGAIN 后的就绪等待
 /// 经 [`watch_ready`] 包装记录真实挂起(口径与 legacy 臂一致)。
 #[allow(clippy::too_many_arguments)]
@@ -926,6 +935,7 @@ async fn pump_batched(
     hook: Option<DirHook>,
     abort: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     cancel: Option<CancelFuture>,
+    errored: Arc<AtomicBool>,
     dir: &'static str,
     obs: PumpObs,
 ) {
@@ -941,11 +951,6 @@ async fn pump_batched(
     };
     tokio::pin!(cancel_wait);
 
-    fn teardown(s1: &SpliceSock, s2: &SpliceSock) {
-        shutdown_rdwr(s1);
-        shutdown_rdwr(s2);
-    }
-
     let mut batch_bytes = 0usize;
     let mut batch_ops = 0u32;
     loop {
@@ -953,6 +958,7 @@ async fn pump_batched(
         if let Some(f) = &abort {
             if f() {
                 teardown(&in_sock, &out_sock);
+                errored.store(true, Ordering::SeqCst);
                 return;
             }
         }
@@ -1003,7 +1009,8 @@ async fn pump_batched(
                 } {
                     Ok(g) => g,
                     Err(_) => {
-                        shutdown_wr(&out_sock);
+                        teardown(&in_sock, &out_sock);
+                        errored.store(true, Ordering::SeqCst);
                         return;
                     }
                 };
@@ -1019,7 +1026,8 @@ async fn pump_batched(
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => {
-                shutdown_wr(&out_sock);
+                teardown(&in_sock, &out_sock);
+                errored.store(true, Ordering::SeqCst);
                 return;
             }
         };
@@ -1052,6 +1060,7 @@ async fn pump_batched(
             if f() {
                 drop(reservation); // 未消费预留退还
                 teardown(&in_sock, &out_sock);
+                errored.store(true, Ordering::SeqCst);
                 return;
             }
         }
@@ -1063,8 +1072,7 @@ async fn pump_batched(
             match splice_sys(pr, out_sock.raw_fd(), (n - delivered).min(DRAIN_SLICE)) {
                 Ok(0) => {
                     // 管道空但块未排空:状态错乱(本泵独占管道,不应发生),
-                    // 保守收尾防零进展自旋
-                    shutdown_wr(&out_sock);
+                    // 跳出以退还未消费预留并由 delivered < n 触发双向 teardown
                     break;
                 }
                 Ok(m) => {
@@ -1101,8 +1109,7 @@ async fn pump_batched(
                     } {
                         Ok(g) => g,
                         Err(_) => {
-                            // 写侧死亡:B5 收尾 shutdown 写侧
-                            shutdown_wr(&out_sock);
+                            // 写侧死亡:跳出先退还未消费预留,再由 delivered < n 触发 teardown
                             break;
                         }
                     };
@@ -1116,8 +1123,7 @@ async fn pump_batched(
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => {
-                    // B5:写错误分支与 copy 路径一致地收尾 shutdown 写侧
-                    shutdown_wr(&out_sock);
+                    // 写错误:跳出先退还未消费预留,再由 delivered < n 触发 teardown
                     break;
                 }
             }
@@ -1127,7 +1133,9 @@ async fn pump_batched(
         }
         drop(reservation); // down 未消费部分(块中断)退还
         if delivered < n {
-            // 未排空即退出:写侧已不可用
+            // 未排空即退出:写侧已不可用,双向 teardown 并通知父任务立即终止对向泵
+            teardown(&in_sock, &out_sock);
+            errored.store(true, Ordering::SeqCst);
             return;
         }
         batch_bytes += n;
@@ -1209,20 +1217,25 @@ pub(crate) async fn splice_relay_with_stats(
     let sb = Arc::new(SpliceSock::dup(b)?);
     let p_ab = Pipe::new()?;
     let p_ba = Pipe::new()?;
+    // 本向以硬 I/O 错误或 abort(非 clean EOF)结束时置位:对向数据通路已死,
+    // 父任务必须立即终止对向泵并释放 pipe/socket fd,不得等待 halfclose_grace。
+    let up_errored = Arc::new(AtomicBool::new(false));
+    let dn_errored = Arc::new(AtomicBool::new(false));
     let spawn = |in_sock: Arc<SpliceSock>,
                  out_sock: Arc<SpliceSock>,
                  pipe: Pipe,
                  hook: Option<DirHook>,
                  abort: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
                  cancel: Option<CancelFuture>,
+                 errored: Arc<AtomicBool>,
                  dir: &'static str,
                  obs: PumpObs| {
         match mode {
             PumpMode::Legacy => crate::AbortOnDropHandle::new(tokio::spawn(pump_legacy(
-                in_sock, out_sock, pipe, hook, abort, cancel, dir, obs,
+                in_sock, out_sock, pipe, hook, abort, cancel, errored, dir, obs,
             ))),
             PumpMode::Batched => crate::AbortOnDropHandle::new(tokio::spawn(pump_batched(
-                in_sock, out_sock, pipe, hook, abort, cancel, dir, obs,
+                in_sock, out_sock, pipe, hook, abort, cancel, errored, dir, obs,
             ))),
         }
     };
@@ -1233,6 +1246,7 @@ pub(crate) async fn splice_relay_with_stats(
         hooks.up,
         hooks.abort.clone(),
         hooks.cancel.clone(),
+        up_errored.clone(),
         "up",
         obs(up_stats),
     );
@@ -1243,16 +1257,28 @@ pub(crate) async fn splice_relay_with_stats(
         hooks.down,
         hooks.abort,
         hooks.cancel,
+        dn_errored.clone(),
         "down",
         obs(down_stats),
     );
-    // final-gaps 补修:单泵 panic 时对向泵立即终止(不永存)。修前
-    // `tokio::join!` 等双泵——panic 泵不做 teardown,对向阻塞在
-    // readable() 永不结束,relay 卡死扣住 socket(与 mux/copy 路径的
-    // panic 收敛缺口同款;写错误路径无此问题:B5 shutdown_wr 经 EOF
-    // 链唤醒对向,见 splice_write_error_shutdown_parity)。
-    // join_relay_pumps:先完成侧 panic → 立即返回(守卫 Drop → abort
-    // 对向,fd 随 Arc 释放关闭);正常 EOF → 等对向自然结束(半关闭)。
+    // 收敛保证(与 mux_relay_split / copy_relay_pair / forward::relay 对齐):
+    // * 父取消(本 future 被 drop)→ 守卫 Drop → abort 双向子泵;
+    // * 单向 panic、硬 I/O 错误(读/写)或 abort → 立即返回(守卫 Drop → abort
+    //   对向子泵,防止静默/限速阻塞中的对向泵滞留至 halfclose_grace);
+    // * 单向 clean EOF → 交由 join_relay_pumps 等待对向自然结束(半关闭 +
+    //   halfclose_grace 有界兜底);cancel 由双泵共享同一 CancelFuture,各自
+    //   完成 A6 计量/预留退还后即刻收敛。
+    let first = tokio::select! {
+        _ = &mut g1 => 1,
+        _ = &mut g2 => 2,
+    };
+    let abnormal = match first {
+        1 => g1.panicked() || up_errored.load(Ordering::SeqCst),
+        _ => g2.panicked() || dn_errored.load(Ordering::SeqCst),
+    };
+    if abnormal {
+        return Ok(());
+    }
     crate::join_relay_pumps(&mut g1, &mut g2).await;
     Ok(())
 }
@@ -2602,5 +2628,161 @@ mod tests {
         assert_eq!(got.len(), payload.len());
         assert!(got.iter().all(|&b| b == 0xc1));
         relay.await.unwrap();
+    }
+
+    /// 读侧硬错误(ECONNRESET)必须双向 teardown 并立即终止静默对向泵,
+    /// 不得滞留至 30s halfclose_grace(覆盖 Batched 与 Legacy 双臂)。
+    #[tokio::test]
+    async fn splice_read_rst_aborts_silent_sibling() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for mode in [PumpMode::Batched, PumpMode::Legacy] {
+            let (mut a_cli, a_srv) = tcp_pair().await;
+            let (mut b_cli, b_srv) = tcp_pair().await;
+            let relay = tokio::spawn(async move {
+                splice_relay_inner(&a_srv, &b_srv, SpliceHooks::default(), mode)
+                    .await
+                    .unwrap();
+            });
+            // 先搬运 1 字节确认双泵已运行,随后 b 侧保持静默(不发数据、不发 FIN)
+            a_cli.write_u8(0x42).await.unwrap();
+            assert_eq!(b_cli.read_u8().await.unwrap(), 0x42);
+
+            // a 侧以 SO_LINGER=0 关闭触发 TCP RST → up 泵读侧 ECONNRESET
+            let std_a = a_cli.into_std().unwrap();
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            unsafe {
+                let rc = libc::setsockopt(
+                    std_a.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    &linger as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                );
+                assert_eq!(rc, 0, "SO_LINGER setsockopt failed (mode={mode:?})");
+            }
+            drop(std_a);
+
+            // 修复前 up 只做单向 shutdown_wr(&b_srv),静默的 down 泵会滞留 30s grace
+            tokio::time::timeout(Duration::from_secs(2), relay)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("读侧 RST 后 relay 必须在 2s 内收敛并终止静默对向泵(mode={mode:?})")
+                })
+                .unwrap();
+
+            // b 侧必须迅速观测到断连(EOF 或错误)
+            let mut buf = [0u8; 16];
+            let b_res = tokio::time::timeout(Duration::from_secs(2), b_cli.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("b 侧必须在 2s 内观测到断连(mode={mode:?})"));
+            assert!(
+                matches!(b_res, Ok(0) | Err(_)),
+                "b 侧应观测到 EOF 或断连错误,实际={b_res:?} (mode={mode:?})"
+            );
+        }
+    }
+
+    /// 写侧硬错误(EPIPE/ECONNRESET)必须立即终止阻塞在 ChunkLimiter::reserve
+    /// 的对向泵,无需触发 cancel 也不得滞留至 30s halfclose_grace(覆盖 Batched 与 Legacy 双臂)。
+    #[tokio::test]
+    async fn splice_write_error_aborts_rate_limited_sibling() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct PendingLimiter {
+            entered: Arc<AtomicUsize>,
+        }
+        impl crate::ChunkLimiter for PendingLimiter {
+            fn reserve(
+                &self,
+                _n: usize,
+            ) -> futures::future::BoxFuture<'static, Box<dyn crate::ChunkReservation>> {
+                let entered = self.entered.clone();
+                Box::pin(async move {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<Box<dyn crate::ChunkReservation>>().await
+                })
+            }
+        }
+        for mode in [PumpMode::Batched, PumpMode::Legacy] {
+            let (a_cli, a_srv) = tcp_pair().await;
+            let (mut b_cli, b_srv) = tcp_pair().await;
+            let (mut a_r, mut a_w) = a_cli.into_split();
+            let entered = Arc::new(AtomicUsize::new(0));
+            let hooks = SpliceHooks {
+                up: None,
+                down: Some(DirHook {
+                    on_bytes: None,
+                    meter_on_fill: false,
+                    limiter: Some(Arc::new(PendingLimiter {
+                        entered: entered.clone(),
+                    }) as Arc<dyn ChunkLimiter>),
+                }),
+                abort: None,
+                cancel: None,
+            };
+            let relay = tokio::spawn(async move {
+                splice_relay_inner(&a_srv, &b_srv, hooks, mode)
+                    .await
+                    .unwrap();
+            });
+            // 让 down 泵 fill 后永久阻塞在限速预留等待中
+            b_cli.write_u8(0x99).await.unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while entered.load(Ordering::SeqCst) < 1 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "down 泵未进入限速预留等待(mode={mode:?})"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // b 侧以 SO_LINGER=0 关闭触发 RST → up 泵向 b_srv 写入时命中硬错误
+            let std_b = b_cli.into_std().unwrap();
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            unsafe {
+                let rc = libc::setsockopt(
+                    std_b.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    &linger as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                );
+                assert_eq!(rc, 0, "SO_LINGER setsockopt failed (mode={mode:?})");
+            }
+            drop(std_b);
+
+            // 持续分段写入直到对端断开,避免高负载下 RST 晚于单次写入到达造成偶发超时
+            let writer = tokio::spawn(async move {
+                let payload = vec![7u8; 64 * 1024];
+                while a_w.write_all(&payload).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+
+            // 无需 cancel:up 写错误必须立即终止阻塞在 reserve 中的 down 泵
+            tokio::time::timeout(Duration::from_secs(2), relay)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("写侧错误后 relay 必须在 2s 内收敛并终止限速阻塞的对向泵(mode={mode:?})")
+                })
+                .unwrap();
+            writer.abort();
+
+            // up teardown 已对 a_srv SHUT_RDWR,a 侧应迅速观测到断连
+            let mut buf = [0u8; 16];
+            let a_res = tokio::time::timeout(Duration::from_secs(2), a_r.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("a 侧必须在 2s 内观测到断连(mode={mode:?})"));
+            assert!(
+                matches!(a_res, Ok(0) | Err(_)),
+                "a 侧应观测到 EOF 或断连错误,实际={a_res:?} (mode={mode:?})"
+            );
+        }
     }
 }

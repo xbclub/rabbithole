@@ -10,11 +10,97 @@ use rh_protocol::message::{
     ClientMessage, NatHoleConnect, NatHolePrepare, NatHoleReport, StartForward,
 };
 use rh_protocol::{frame, FrameType, ProxySpec};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+/// 默认路由探测目标(RFC 5737 TEST-NET-1,仅触发内核路由表查询,不发任何报文)。
+const DEFAULT_ROUTE_PROBE: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 9));
+
+/// 判定本机 IPv4 是否可作为局域网直连候选:排除未指定/环回/多播/链路本地/广播地址。
+fn is_usable_lan_ipv4(ip: Ipv4Addr) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !ip.is_link_local()
+        && !ip.is_broadcast()
+}
+
+/// 通过临时 UDP socket `connect` 查询内核路由表选出的本机源 IPv4(0 发包,
+/// 跨 Linux/macOS/Windows 零额外依赖、无 unsafe)。
+fn route_probe_ipv4(target: SocketAddr) -> Option<Ipv4Addr> {
+    let canon = SocketAddr::new(target.ip().to_canonical(), target.port());
+    let SocketAddr::V4(v4_target) = canon else {
+        return None;
+    };
+    if v4_target.ip().is_unspecified()
+        || v4_target.ip().is_loopback()
+        || v4_target.ip().is_multicast()
+    {
+        return None;
+    }
+    let s = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    s.connect(SocketAddr::V4(v4_target)).ok()?;
+    match s.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if is_usable_lan_ipv4(ip) => Some(ip),
+        _ => None,
+    }
+}
+
+/// 探测本机可用于局域网直连的 IPv4 地址(按 STUN → 服务端 → 默认路由 顺序去重)。
+fn discover_local_ipv4s(
+    stun_addr: Option<SocketAddr>,
+    server_addr: Option<SocketAddr>,
+) -> Vec<Ipv4Addr> {
+    let mut ips = Vec::new();
+    for target in [stun_addr, server_addr, Some(DEFAULT_ROUTE_PROBE)]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(ip) = route_probe_ipv4(target) {
+            if !ips.contains(&ip) {
+                ips.push(ip);
+            }
+        }
+    }
+    ips
+}
+
+/// 组装上报给服务端的候选地址列表:
+/// 1. STUN 映射地址优先(跨 NAT 最可能连通);
+/// 2. 探测到的本机非环回 LAN IPv4(同 NAT 下内网直连,去重);
+/// 3. 仅当无任何可用 LAN IPv4 或服务端本身解析为环回地址(本机自测场景)时,
+///    附加 `127.0.0.1:<port>` 兜底,避免跨主机部署在不可达环回地址上浪费拨号轮询槽位。
+fn build_candidates(
+    bound_port: u16,
+    mapped: Option<SocketAddr>,
+    lan_ips: &[Ipv4Addr],
+    server_is_loopback: bool,
+) -> Vec<String> {
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    let mut push_unique = |addr: SocketAddr| {
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    };
+    if let Some(m) = mapped {
+        push_unique(m);
+    }
+    let mut has_lan = false;
+    for &ip in lan_ips {
+        if is_usable_lan_ipv4(ip) {
+            push_unique(SocketAddr::new(IpAddr::V4(ip), bound_port));
+            has_lan = true;
+        }
+    }
+    if !has_lan || server_is_loopback {
+        push_unique(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound_port));
+    }
+    addrs.into_iter().map(|a| a.to_string()).collect()
+}
 
 /// NAT_HOLE_PREPARE:绑定 socket → STUN(可选)→ 候选上报。socket 保留至 CONNECT。
 pub async fn on_prepare(sess: Arc<ClientSession>, m: NatHolePrepare) {
@@ -23,46 +109,55 @@ pub async fn on_prepare(sess: Arc<ClientSession>, m: NatHolePrepare) {
         return;
     };
     let sock = Arc::new(sock);
-    // 通配绑定在本机报 0.0.0.0(不可拨):以 127.0.0.1 代替本机候选
-    let local = sock
-        .local_addr()
-        .ok()
-        .map(|a| {
-            if a.ip().is_unspecified() {
-                std::net::SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), a.port())
-            } else {
-                a
-            }
-        })
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-    let mut candidates = vec![local.clone()];
+    let Ok(bound_addr) = sock.local_addr() else {
+        return;
+    };
+    let stun_addr = sess
+        .cfg
+        .stun_server
+        .as_deref()
+        .and_then(|s| s.parse::<SocketAddr>().ok());
+    let server_addr = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        sess.cfg.resolve_server_addr(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map(|r| r.addr);
+    let server_is_loopback = server_addr
+        .map(|a| a.ip().to_canonical().is_loopback())
+        .unwrap_or(false);
+
+    let mut mapped: Option<SocketAddr> = None;
     let mut behavior = String::new();
-    if let Some(stun) = sess.cfg.stun_server.clone() {
-        if let Ok(server) = stun.parse::<SocketAddr>() {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(m.timeout_seconds.clamp(2, 5)),
-                rh_core::stun::stun_binding(&sock, server),
-            )
-            .await
-            {
-                Ok(Ok(mapped)) => {
-                    // ★保留本机候选,把映射地址放在最先尝试。
-                    //
-                    // 修前直接 `candidates = vec![mapped]` —— 把 lan 候选丢了。
-                    // 同 NAT 后的双端本可以走内网直连(延迟远低于打洞-中继),
-                    // 丢了这个候选就只剩公网路径。
-                    // 顺序:映射地址优先(跨 NAT 最可能通),本机地址兜底。
-                    if !candidates.contains(&mapped.to_string()) {
-                        candidates.insert(0, mapped.to_string());
-                    }
-                    behavior = format!("mapped={mapped}");
-                }
-                Ok(Err(e)) => behavior = format!("stun error: {e}"),
-                Err(_) => behavior = "stun timeout".into(),
+    if let Some(server) = stun_addr {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(m.timeout_seconds.clamp(2, 5)),
+            rh_core::stun::stun_binding(&sock, server),
+        )
+        .await
+        {
+            Ok(Ok(addr)) => {
+                mapped = Some(addr);
+                behavior = format!("mapped={addr}");
             }
+            Ok(Err(e)) => behavior = format!("stun error: {e}"),
+            Err(_) => behavior = "stun timeout".into(),
         }
     }
+    let lan_ips = if bound_addr.ip().is_unspecified() {
+        discover_local_ipv4s(stun_addr, server_addr)
+    } else if let IpAddr::V4(v4) = bound_addr.ip().to_canonical() {
+        if is_usable_lan_ipv4(v4) {
+            vec![v4]
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let candidates = build_candidates(bound_addr.port(), mapped, &lan_ips, server_is_loopback);
     let report = NatHoleReport {
         transaction_id: m.transaction_id.clone(),
         candidates,
@@ -321,4 +416,84 @@ fn direct_auth_ok(got: &str, expect_auth: &str, nonce: &str) -> bool {
         return false;
     }
     rh_transport::constant_time_eq(got.as_bytes(), expect_auth.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_candidates_orders_mapped_first_and_omits_loopback_for_remote_server() {
+        let mapped: SocketAddr = "203.0.113.10:50000".parse().unwrap();
+        let lan = [Ipv4Addr::new(192, 168, 1, 20)];
+        let got = build_candidates(40000, Some(mapped), &lan, false);
+        assert_eq!(got, vec!["203.0.113.10:50000", "192.168.1.20:40000"]);
+    }
+
+    #[test]
+    fn build_candidates_dedups_and_filters_unusable_lan_ips() {
+        let mapped: SocketAddr = "192.168.1.20:40000".parse().unwrap();
+        let lan = [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(169, 254, 10, 2),
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(192, 168, 1, 20),
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(10, 0, 0, 5),
+        ];
+        let got = build_candidates(40000, Some(mapped), &lan, false);
+        assert_eq!(got, vec!["192.168.1.20:40000", "10.0.0.5:40000"]);
+    }
+
+    #[test]
+    fn build_candidates_falls_back_to_loopback_when_no_lan_ip_found() {
+        let got_no_stun = build_candidates(40000, None, &[], false);
+        assert_eq!(got_no_stun, vec!["127.0.0.1:40000"]);
+
+        let mapped: SocketAddr = "203.0.113.10:50000".parse().unwrap();
+        let got_with_stun = build_candidates(40000, Some(mapped), &[], false);
+        assert_eq!(got_with_stun, vec!["203.0.113.10:50000", "127.0.0.1:40000"]);
+    }
+
+    #[test]
+    fn build_candidates_keeps_loopback_when_server_is_loopback() {
+        let mapped: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let lan = [Ipv4Addr::new(192, 168, 1, 20)];
+        let got = build_candidates(40000, Some(mapped), &lan, true);
+        assert_eq!(
+            got,
+            vec!["127.0.0.1:50000", "192.168.1.20:40000", "127.0.0.1:40000"]
+        );
+
+        // 映射地址与环回同端口时必须去重
+        let same_mapped: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let got_dedup = build_candidates(40000, Some(same_mapped), &lan, true);
+        assert_eq!(got_dedup, vec!["127.0.0.1:40000", "192.168.1.20:40000"]);
+    }
+
+    #[test]
+    fn discover_local_ipv4s_filters_invalid_and_skips_loopback_targets() {
+        assert_eq!(
+            route_probe_ipv4("127.0.0.1:7100".parse().unwrap()),
+            None,
+            "环回目标不得用于探测局域网 IP"
+        );
+        assert_eq!(
+            route_probe_ipv4("[::1]:7100".parse().unwrap()),
+            None,
+            "IPv6 环回目标应跳过"
+        );
+        let ips = discover_local_ipv4s(None, None);
+        for ip in &ips {
+            assert!(
+                is_usable_lan_ipv4(*ip),
+                "探测结果不得包含未指定/环回/多播/链路本地地址: {ip}"
+            );
+        }
+        // 结果必须去重
+        let unique: std::collections::HashSet<_> = ips.iter().copied().collect();
+        assert_eq!(unique.len(), ips.len());
+    }
 }

@@ -194,8 +194,10 @@ async fn decide(state: &Arc<AppState>, txid: &str) {
                 nonce: nonce.clone(),
                 auth: auth.clone(),
             });
-            let _ = v_sess.send_bounded(connect_v, CONTROL_SEND_TIMEOUT).await;
+            // 先通知 proxy(listen)开始监听并主动探测,再通知 visitor(dial)拨号,
+            // 让 listen 侧的 NAT 洞口不晚于 dial 开启。
             let _ = p_sess.send_bounded(connect_p, CONTROL_SEND_TIMEOUT).await;
+            let _ = v_sess.send_bounded(connect_v, CONTROL_SEND_TIMEOUT).await;
             info!(tx = txid, "nathole connect instructions sent");
         }
         _ => {
