@@ -1,11 +1,10 @@
+use crate::connection::cmd_queue::CmdGroup;
 use crate::connection::stream::Shared;
 use crate::connection::StreamCommand;
 use crate::frame::Frame;
-use crate::tagged_stream::TaggedStream;
 use crate::Result;
 use crate::{frame, StreamId};
-use futures::channel::mpsc;
-use futures::stream::{Fuse, SelectAll};
+use futures::stream::Fuse;
 use futures::{ready, AsyncRead, AsyncWrite, SinkExt, StreamExt};
 use nohash_hasher::IntMap;
 use parking_lot::Mutex;
@@ -19,7 +18,7 @@ use std::task::{Context, Poll};
 #[must_use]
 pub struct Closing<T> {
     state: State,
-    stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
+    stream_receivers: CmdGroup<StreamCommand>,
     pending_frames: VecDeque<Frame<()>>,
     socket: Fuse<frame::Io<T>>,
     /// C3:进入 Closing 时驻留流的共享状态。关闭完成/丢弃时先断开
@@ -33,7 +32,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     pub(crate) fn new(
-        stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
+        stream_receivers: CmdGroup<StreamCommand>,
         pending_frames: VecDeque<Frame<()>>,
         socket: Fuse<frame::Io<T>>,
         streams: IntMap<StreamId, Arc<Mutex<Shared>>>,
@@ -70,7 +69,7 @@ impl<T> Drop for Closing<T> {
         // 再唤醒:被唤醒的任务重新 poll 时通道已关闭,窗口更新的
         // `poll_ready` 立即报错,任务以错误终结,不会重挂 waker 死等;
         // 已缓冲数据仍可读(读路径缓冲优先,见 stream.rs C3 配套)。
-        self.stream_receivers = SelectAll::new();
+        self.stream_receivers.clear();
         self.wake_all_streams();
     }
 }
@@ -87,9 +86,7 @@ where
         loop {
             match this.state {
                 State::ClosingStreamReceiver => {
-                    for stream in this.stream_receivers.iter_mut() {
-                        stream.inner_mut().close();
-                    }
+                    this.stream_receivers.close_receivers();
                     this.state = State::DrainingStreamReceiver;
                 }
 
@@ -360,33 +357,32 @@ mod tests {
         encode(&mut expected_written, &frame_close_ack);
         encode(&mut expected_written, &frame_term);
 
-        let receiver = |frame: &Frame<_>, command: StreamCommand| {
-            TaggedStream::new(frame.header().stream_id(), {
-                let (mut tx, rx) = mpsc::channel(1);
-                tx.try_send(command).unwrap();
-                rx
-            })
-        };
+        use crate::connection::cmd_queue;
 
-        let mut stream_receivers: SelectAll<_> = Default::default();
-        stream_receivers.push(receiver(
+        let mut stream_receivers = CmdGroup::new();
+        let mut push_cmd = |frame: &Frame<_>, command: StreamCommand| {
+            let (mut tx, rx) = cmd_queue::channel(frame.header().stream_id(), 1);
+            tx.try_send(command).unwrap();
+            stream_receivers.push(rx);
+        };
+        push_cmd(
             &frame_data,
             StreamCommand::SendFrame(frame_data.clone().into_data().left()),
-        ));
-        stream_receivers.push(receiver(
+        );
+        push_cmd(
             &frame_close,
             StreamCommand::CloseStream {
                 ack: false,
                 syn: false,
             },
-        ));
-        stream_receivers.push(receiver(
+        );
+        push_cmd(
             &frame_close_ack,
             StreamCommand::CloseStream {
                 ack: true,
                 syn: false,
             },
-        ));
+        );
         let pending_frames = vec![frame_pending];
         let mut socket = Socket {
             written: vec![],

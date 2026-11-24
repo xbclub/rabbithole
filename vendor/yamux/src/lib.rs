@@ -33,7 +33,6 @@ pub mod pool;
 pub mod sched_diag;
 
 pub(crate) mod connection;
-mod tagged_stream;
 
 // Packet / Sequential 为上游 parity 导出(rabbithole crates/ 内零使用,
 // 保留以贴近上游结构,勿在生产代码新增引用 —— C8/D5 口径)。

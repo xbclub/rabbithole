@@ -14,12 +14,12 @@
 
 mod cleanup;
 mod closing;
+mod cmd_queue;
 mod rtt;
 mod stream;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::tagged_stream::TaggedStream;
 use crate::{
     error::ConnectionError,
     frame::header::{self, Data, GoAway, Header, Ping, StreamId, Tag, WindowUpdate, CONNECTION_ID},
@@ -29,7 +29,6 @@ use crate::{
 use crate::{Result, MAX_ACK_BACKLOG};
 use cleanup::Cleanup;
 use closing::Closing;
-use futures::stream::SelectAll;
 use futures::{channel::mpsc, future::Either, prelude::*, sink::SinkExt, stream::Fuse};
 use nohash_hasher::IntMap;
 use parking_lot::Mutex;
@@ -335,7 +334,7 @@ struct Active<T> {
     next_id: u32,
 
     streams: IntMap<StreamId, Arc<Mutex<stream::Shared>>>,
-    stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
+    stream_receivers: cmd_queue::CmdGroup<StreamCommand>,
     no_streams_waker: Option<Waker>,
 
     pending_read_frame: Option<Frame<()>>,
@@ -429,7 +428,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
             config: Arc::new(cfg),
             socket,
             streams: IntMap::default(),
-            stream_receivers: SelectAll::default(),
+            stream_receivers: cmd_queue::CmdGroup::new(),
             no_streams_waker: None,
             next_id: match mode {
                 Mode::Client => 1,
@@ -962,21 +961,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin + crate::Writev2> Active<T> {
     fn make_new_inbound_stream(&mut self, id: StreamId, credit: u32) -> Stream {
         let config = self.config.clone();
 
-        let (sender, receiver) = mpsc::channel(STREAM_COMMAND_CAP);
-        self.stream_receivers.push(TaggedStream::new(id, receiver));
+        let (sender, receiver) = cmd_queue::channel(id, STREAM_COMMAND_CAP);
+        self.stream_receivers.push(receiver);
         if let Some(waker) = self.no_streams_waker.take() {
             waker.wake();
         }
 
-        // 未拆分路径无 ConnShared:conn_shared = None,WU 恒走流级 mpsc。
+        // 未拆分路径无 ConnShared:conn_shared = None,WU 恒走流级 cmd_queue。
         Stream::new_inbound(id, self.id, config, credit, sender, None)
     }
 
     fn make_new_outbound_stream(&mut self, id: StreamId) -> Stream {
         let config = self.config.clone();
 
-        let (sender, receiver) = mpsc::channel(STREAM_COMMAND_CAP);
-        self.stream_receivers.push(TaggedStream::new(id, receiver));
+        let (sender, receiver) = cmd_queue::channel(id, STREAM_COMMAND_CAP);
+        self.stream_receivers.push(receiver);
         if let Some(waker) = self.no_streams_waker.take() {
             waker.wake();
         }
@@ -1287,7 +1286,7 @@ mod halves {
 
     /// 命令接收器注册条目(round-6 D4):流 id + 其命令通道接收端,
     /// 压入 `send_regs[k]` 由 SendWorker k 收编。
-    type SendRegistration = (StreamId, mpsc::Receiver<StreamCommand>);
+    type SendRegistration = (StreamId, cmd_queue::CmdReceiver<StreamCommand>);
 
     /// halves 四元组(round-6 D7):接收半(Framer)、发送半(FlushTask)、
     /// N 个接收侧分片 Worker、N 个发送侧分片 Worker——四者由调用方
@@ -1488,7 +1487,7 @@ mod halves {
         /// D4 正确性:出站流首命令缓冲在通道 cap `STREAM_COMMAND_CAP` 内,
         /// Worker 收编早晚不影响——命令不丢、SYN 在首帧自带 flag,顺序由
         /// 通道 FIFO 保证。
-        fn push_new_receiver(&self, id: StreamId, r: mpsc::Receiver<StreamCommand>) {
+        fn push_new_receiver(&self, id: StreamId, r: cmd_queue::CmdReceiver<StreamCommand>) {
             // round-33:与帧路由同式(剥奇偶位),否则 N=4 时 Worker 0/2
             // 永远收不到任何流命令——即"偶数 Worker 终生闲置"的另一半。
             // R1(P1):长度读取与入队合并进同一 guard(修前同一把锁连取两次,
@@ -2629,7 +2628,7 @@ mod halves {
         }
 
         fn make_new_outbound_stream(&mut self, id: StreamId) -> Stream {
-            let (sender, receiver) = mpsc::channel(STREAM_COMMAND_CAP);
+            let (sender, receiver) = cmd_queue::channel(id, STREAM_COMMAND_CAP);
             // round-6 D4:注册路由改经 push_new_receiver(压 send_regs[k] +
             // 唤醒 SendWorker k;出站流首命令缓冲在通道 cap
             // `STREAM_COMMAND_CAP` 内,Worker 收编早晚不影响正确性——命令

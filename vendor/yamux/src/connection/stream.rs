@@ -23,12 +23,12 @@ use bytes::BufMut;
 use flow_control::FlowController;
 // WU 快车道(round-9 §2):流持连接级共享状态句柄,纯 WU 帧直压 to_send。
 // halves 是 connection 的私有子模块,stream 同为其后代,可见性成立。
+use super::cmd_queue::CmdSender;
 use super::halves::ConnShared;
 use futures::{
-    channel::mpsc,
     future::Either,
     io::{AsyncRead, AsyncWrite},
-    ready, SinkExt,
+    ready,
 };
 use parking_lot::{Mutex, MutexGuard};
 use std::{
@@ -100,15 +100,13 @@ pub struct Stream {
     conn: connection::Id,
     config: Arc<Config>,
     /// Sends the commands of the writing side of this stream to the connection.
-    sender: mpsc::Sender<StreamCommand>,
+    sender: CmdSender<StreamCommand>,
     /// Sends the window updates of the reading side of this stream to the connection.
     ///
-    /// This is a second handle to the same channel as [`Stream::sender`]. A
-    /// [`mpsc::Sender`] has room for exactly one waker, which it overwrites whenever the
-    /// channel is full. Sharing a single handle between the two halves of a split stream
-    /// therefore makes the half polled last discard the waker of the other one, which is then
-    /// never woken again.
-    window_update_sender: mpsc::Sender<StreamCommand>,
+    /// This is a second handle to the same channel as [`Stream::sender`]. Each
+    /// handle tracks its own waker slot so the read and write halves never overwrite
+    /// each other's waker when the channel is full.
+    window_update_sender: CmdSender<StreamCommand>,
     flag: Flag,
     shared: Arc<Mutex<Shared>>,
     /// 连接级共享状态(round-9 WU 快车道):Some = halves 路径,无 flag 的
@@ -141,7 +139,7 @@ impl Stream {
         conn: connection::Id,
         config: Arc<Config>,
         send_window: u32,
-        sender: mpsc::Sender<StreamCommand>,
+        sender: CmdSender<StreamCommand>,
         conn_shared: Option<Arc<ConnShared>>,
     ) -> Self {
         let mut stream = Self {
@@ -162,7 +160,7 @@ impl Stream {
         id: StreamId,
         conn: connection::Id,
         config: Arc<Config>,
-        sender: mpsc::Sender<StreamCommand>,
+        sender: CmdSender<StreamCommand>,
         conn_shared: Option<Arc<ConnShared>>,
     ) -> Self {
         let mut stream = Self {
@@ -507,8 +505,8 @@ pub struct StreamReadHalf {
     id: StreamId,
     conn: connection::Id,
     config: Arc<Config>,
-    sender: mpsc::Sender<StreamCommand>,
-    window_update_sender: mpsc::Sender<StreamCommand>,
+    sender: CmdSender<StreamCommand>,
+    window_update_sender: CmdSender<StreamCommand>,
     shared: Arc<Mutex<Shared>>,
     /// 同 [`Stream::conn_shared`]:读半是运行期 WU 帧的唯一产生侧。
     conn_shared: Option<Arc<ConnShared>>,
@@ -772,7 +770,7 @@ pub struct StreamWriteHalf {
     id: StreamId,
     conn: connection::Id,
     config: Arc<Config>,
-    sender: mpsc::Sender<StreamCommand>,
+    sender: CmdSender<StreamCommand>,
     flag: Flag,
     shared: Arc<Mutex<Shared>>,
     /// 同 [`Stream::conn_shared`]:写半不产生 WU 帧,仅为 halves 形态
@@ -1095,7 +1093,7 @@ impl AsyncWrite for Stream {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         self.sender
-            .poll_flush_unpin(cx)
+            .poll_flush(cx)
             .map_err(|_| self.write_zero_err())
     }
 
@@ -1307,6 +1305,7 @@ impl Drop for Shared {
 
 #[cfg(test)]
 mod tests {
+    use super::super::cmd_queue;
     use super::*;
     use futures::task::{waker, ArcWake};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1334,9 +1333,8 @@ mod tests {
     /// See https://github.com/libp2p/rust-yamux/issues/232.
     #[test]
     fn read_half_does_not_steal_the_write_half_wakeup() {
-        // A channel accepts `buffer + num_senders` commands before the sending handle parks
-        // itself, so with a buffer of zero a single frame suffices to fill it up.
-        let (sender, mut receiver) = mpsc::channel(0);
+        // With cap=0 clamped to 1 slot, a single frame suffices to fill it up.
+        let (sender, mut receiver) = cmd_queue::channel(StreamId::new(1), 0);
 
         let mut stream = Stream::new_outbound(
             StreamId::new(1),
@@ -1385,7 +1383,7 @@ mod tests {
     /// 同时锁定 R7:该外发帧的 header 经 encode/decode 往返保持合法。
     #[test]
     fn split_before_ack_emits_standard_ack() {
-        let (sender, mut receiver) = mpsc::channel(10);
+        let (sender, mut receiver) = cmd_queue::channel(StreamId::new(2), 10);
         let stream = Stream::new_inbound(
             StreamId::new(2),
             connection::Id::next(),
@@ -1447,9 +1445,9 @@ mod tests {
     fn split_inbound() -> (
         StreamReadHalf,
         StreamWriteHalf,
-        mpsc::Receiver<StreamCommand>,
+        cmd_queue::CmdReceiver<StreamCommand>,
     ) {
-        let (sender, receiver) = mpsc::channel(10);
+        let (sender, receiver) = cmd_queue::channel(StreamId::new(2), 10);
         let stream = Stream::new_inbound(
             StreamId::new(2),
             connection::Id::next(),
@@ -1511,8 +1509,8 @@ mod tests {
     /// 期间待发 ACK 保持;容量释放后读半被唤醒重试并发出。
     #[test]
     fn ack_flushes_after_backpressure_clears() {
-        // buffer=0:首条消息入队即触发发送 handle park(背压语义)
-        let (sender, mut receiver) = mpsc::channel(0);
+        // cap=0 clamped to 1 slot:首条消息入队即触发发送 handle park(背压语义)
+        let (sender, mut receiver) = cmd_queue::channel(StreamId::new(2), 0);
         let stream = Stream::new_inbound(
             StreamId::new(2),
             connection::Id::next(),
@@ -1641,8 +1639,12 @@ mod tests {
     /// 消费 Ack flag,后续运行期 WU 即为纯 WU。
     fn inbound_with_shared(
         config: Arc<Config>,
-    ) -> (Stream, Arc<ConnShared>, mpsc::Receiver<StreamCommand>) {
-        let (sender, receiver) = mpsc::channel(10);
+    ) -> (
+        Stream,
+        Arc<ConnShared>,
+        cmd_queue::CmdReceiver<StreamCommand>,
+    ) {
+        let (sender, receiver) = cmd_queue::channel(StreamId::new(2), 10);
         let conn_shared = Arc::new(ConnShared::new_for_test(
             connection::Id::next(),
             crate::Mode::Server,
@@ -1672,7 +1674,7 @@ mod tests {
     }
 
     /// 取出建流授信帧(6MiB 配置下 queue_creation_grant 必然排队)。
-    fn take_creation_grant(receiver: &mut mpsc::Receiver<StreamCommand>) {
+    fn take_creation_grant(receiver: &mut cmd_queue::CmdReceiver<StreamCommand>) {
         match receiver.try_recv().expect("creation grant queued via mpsc") {
             StreamCommand::SendFrame(f) => {
                 assert_eq!(f.header().tag(), crate::frame::header::Tag::WindowUpdate);
@@ -1787,8 +1789,8 @@ mod tests {
         let mut streams = Vec::new();
         let mut receivers = Vec::new();
         for i in 0..N {
-            let (sender, mut receiver) = mpsc::channel(10);
             let sid = StreamId::new(1 + 2 * i);
+            let (sender, mut receiver) = cmd_queue::channel(sid, 10);
             let mut stream = Stream::new_inbound(
                 sid,
                 connection::Id::next(),

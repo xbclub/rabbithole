@@ -8,7 +8,9 @@
 //! 连接/流分离见 [`Multiplexer`]:客户端 `open_stream`,服务端 `accept`,
 //! 与设计 §10 的预留边界一致(QUIC 场景一连接多流,裸 TCP 场景一流一连接)。
 
+pub mod chunk_relay;
 pub mod compress;
+pub mod copy;
 pub mod kcp;
 pub mod mux;
 pub use mux::{
@@ -71,10 +73,13 @@ pub type BoxedIo = Box<dyn Io>;
 /// * [`quic::BiStream`](内部本就是 `(quinn::SendStream, quinn::RecvStream)`
 ///   两个独立对象;命中场景:QUIC 数据转发的 channel 侧 —— 修前 100%
 ///   落在同步锁上);
+/// * [`compress::JoinDuplex`](内部本就是 `(user_r, user_w)` 两条独立单向
+///   `DuplexStream`;命中场景:`use_compression=true` 的压缩流用户侧,无需
+///   再落入 `tokio::io::split` 的同步互斥锁);
 /// * 裸 `TcpStream`(`into_split` 产出两个独立 fd,各有一条 tokio
 ///   IO 注册,读写之间无共享锁)。
 ///
-/// 其余包装类型(QuotaIo/PrependedIo/压缩产物 JoinDuplex/计量壳等)
+/// 其余包装类型(QuotaIo/计量壳/第三方封装等)
 /// 一律 `Err` 归还,调用方回落 [`tokio::io::split`]。
 ///
 /// # 为什么必须存在(tokio::io::split 的代价)
@@ -168,6 +173,17 @@ pub fn split_boxed_io(io: BoxedIo) -> Result<(BoxedIo, BoxedIo), BoxedIo> {
             Box::new(UnixHalfWrite(w)) as BoxedIo,
         ));
     }
+    if dynio.as_any().is::<compress::JoinDuplex>() {
+        let any = io.into_any_box();
+        let j = *any
+            .downcast::<compress::JoinDuplex>()
+            .expect("probed above: concrete type is JoinDuplex");
+        let (r, w) = j.into_halves();
+        return Ok((
+            Box::new(DuplexHalfRead(r)) as BoxedIo,
+            Box::new(DuplexHalfWrite(w)) as BoxedIo,
+        ));
+    }
     if !dynio.as_any().is::<tokio::net::TcpStream>() {
         return Err(io);
     }
@@ -182,6 +198,13 @@ pub fn split_boxed_io(io: BoxedIo) -> Result<(BoxedIo, BoxedIo), BoxedIo> {
         Box::new(HalfRead(r)) as BoxedIo,
         Box::new(HalfWrite(w)) as BoxedIo,
     ))
+}
+
+/// `BoxedIo` 是否裸 tokio TCP(可 splice / `chunk_relay`);
+/// TLS/WS/yamux/压缩/计量等包装均返回 `None`。
+pub fn plain_tcp(io: &BoxedIo) -> Option<&tokio::net::TcpStream> {
+    let dynio: &dyn Io = &**io;
+    dynio.as_any().downcast_ref::<tokio::net::TcpStream>()
 }
 
 /// 取消信号(共享):完成即结束转发。规则禁用/删除级联用;
@@ -2215,6 +2238,92 @@ impl tokio::io::AsyncRead for UnixHalfWrite {
 
 #[cfg(unix)]
 impl tokio::io::AsyncWrite for UnixHalfWrite {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+/// 压缩双工流(`compress::JoinDuplex::into_halves` 产物)的读半。
+pub struct DuplexHalfRead(tokio::io::DuplexStream);
+
+impl tokio::io::AsyncRead for DuplexHalfRead {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for DuplexHalfRead {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "read half cannot write",
+        )))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// 压缩双工流(`compress::JoinDuplex::into_halves` 产物)的写半。
+pub struct DuplexHalfWrite(tokio::io::DuplexStream);
+
+impl tokio::io::AsyncRead for DuplexHalfWrite {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "write half cannot read",
+        )))
+    }
+}
+
+impl tokio::io::AsyncWrite for DuplexHalfWrite {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,

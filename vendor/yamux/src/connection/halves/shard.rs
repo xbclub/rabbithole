@@ -19,13 +19,13 @@
 //!
 //! 本模块是 halves 的子模块,可直接触达 [`super::ConnShared`] 的私有字段。
 
+use crate::connection::cmd_queue::{self, CmdGroup};
 use crate::connection::{Id, Mode, State, StreamCommand, STREAM_COMMAND_CAP};
 use crate::frame::header::{self, Header, StreamId, Tag};
 use crate::frame::Frame;
-use crate::tagged_stream::TaggedStream;
 use crate::{Config, ConnectionError, Stream, DEFAULT_CREDIT};
 use futures::channel::mpsc;
-use futures::stream::{SelectAll, StreamExt};
+use futures::stream::StreamExt;
 use nohash_hasher::IntMap;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -495,7 +495,7 @@ impl ShardWorker {
     }
 
     fn make_new_inbound_stream(&self, id: StreamId, credit: u32) -> Stream {
-        let (sender, receiver) = mpsc::channel(STREAM_COMMAND_CAP);
+        let (sender, receiver) = cmd_queue::channel(id, STREAM_COMMAND_CAP);
         self.shared.push_new_receiver(id, receiver);
         // round-9:halves 路径传入 ConnShared,纯 WU 帧走 to_send 快车道
         Stream::new_inbound(
@@ -1036,7 +1036,7 @@ pub struct SendWorker {
     /// Remove 恰路由到**同一个** RecvWorker,零额外路由表)。
     index: usize,
     shared: Arc<ConnShared>,
-    streams: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
+    streams: CmdGroup<StreamCommand>,
     /// send_out[k] 生产句柄(本分片流全部产出帧的唯一出口,顺序契约)。
     out: ShardProducer<Frame<()>>,
     /// ctrl Remove 投递句柄(构造时预存 workers[k].1,D1 保证 k 即目标
@@ -1069,7 +1069,7 @@ impl SendWorker {
         SendWorker {
             index,
             shared,
-            streams: SelectAll::default(),
+            streams: CmdGroup::new(),
             out,
             ctrl_tx,
             pending_frame: None,
@@ -1240,8 +1240,8 @@ impl Future for SendWorker {
             {
                 let mut regs = this.shared.send_regs.lock();
                 if !regs[this.index].is_empty() {
-                    for (id, r) in regs[this.index].drain(..) {
-                        this.streams.push(TaggedStream::new(id, r));
+                    for (_id, r) in regs[this.index].drain(..) {
+                        this.streams.push(r);
                     }
                     progress = true;
                 }

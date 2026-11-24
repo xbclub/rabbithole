@@ -12,7 +12,7 @@ perf-counters = []
 
 # 跨 crate 单元测试观测探针(仅 rh-server / rh-client dev-dependencies 启用;
 # 生产构建关闭,探针调用点编译期为空函数,零开销)。
-test-probes = []
+test-probes = ["yamux/test-probes"]
 
 [dependencies]
 rh-protocol = { workspace = true }
@@ -49,6 +49,7 @@ libc = "0.2"
 [dev-dependencies]
 # kcp 回归测试用 start_paused(可控时钟)
 tokio = { workspace = true, features = ["test-util"] }
+yamux = { workspace = true, features = ["test-probes"] }
 
 # compress_bench 例子的 RSS 探针(仅诊断,不进产品路径)
 [target.'cfg(unix)'.dev-dependencies]

@@ -557,9 +557,7 @@ pub struct DirHook {
 }
 
 /// BoxedIo 是否裸 tokio TCP(可 splice);TLS/WS/yamux/压缩包装均返回 None。
-pub fn plain_tcp(io: &BoxedIo) -> Option<&tokio::net::TcpStream> {
-    io.as_any().downcast_ref::<tokio::net::TcpStream>()
-}
+pub use crate::plain_tcp;
 
 #[derive(Clone, Default)]
 pub struct SpliceHooks {

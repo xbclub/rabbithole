@@ -83,9 +83,15 @@ pub async fn compress_stream(inner: BoxedIo) -> BoxedIo {
 /// DuplexStream 自身就是"读写两半 + 内部双通道"的拼合体,这里同型:
 /// poll_read 委托 r,poll_write/flush/shutdown 委托 w;drop 时两半
 /// 各自关闭对应方向,pump 侧按 EOF/写失败收敛(与修前语义一致)。
-struct JoinDuplex {
+pub(crate) struct JoinDuplex {
     r: tokio::io::DuplexStream,
     w: tokio::io::DuplexStream,
+}
+
+impl JoinDuplex {
+    pub(crate) fn into_halves(self) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        (self.r, self.w)
+    }
 }
 
 impl tokio::io::AsyncRead for JoinDuplex {

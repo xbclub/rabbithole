@@ -732,110 +732,96 @@ pub async fn mux_relay(
     mux_relay_split(a_r, a_w, b_read, b_write, limiter, cancel).await;
 }
 
-/// A2:中继主体,接收**已拆好**的 a 侧读写半。
-///
-/// 服务端用户侧恒为 `CountedUserIo<TcpStream>` 包装,`split_boxed_io` 的
-/// 精确类型探测永远 miss → 修前 100% 回落 `tokio::io::split`(读写泵
-/// 份属不同 task 却共享一把 `std::sync::Mutex`,即 round-69 修的 futex
-/// 病灶在服务端主路径上从未生效)。调用方(rh-server data.rs)先剥壳、
-/// `into_split` 无锁拆半、按方向重包计量后从本函数进入。
-pub async fn mux_relay_split(
-    mut a_r: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-    mut a_w: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-    b_read: RhMuxStreamRead,
-    b_write: RhMuxStreamWrite,
-    limiter: Option<std::sync::Arc<dyn crate::ChunkLimiter>>,
+/// 单方向中继子泵任务:运行 `pump`,与 `cancel` 竞争,按 clean/errored
+/// 语义执行有界或无界(可被迟到取消打断)的写侧关闭。
+async fn pump_task<W, F, C>(
+    mut w: W,
+    pump: F,
+    close: C,
     cancel: Option<crate::CancelFuture>,
-) {
-    use tokio::io::AsyncWriteExt as _;
+    errored: Arc<AtomicBool>,
+) where
+    W: Send + 'static,
+    F: for<'a> FnOnce(&'a mut W) -> futures::future::BoxFuture<'a, bool> + Send + 'static,
+    C: for<'a> FnOnce(&'a mut W) -> futures::future::BoxFuture<'a, io::Result<()>> + Send + 'static,
+{
+    let cancel_tail = cancel.clone();
+    let (by_cancel, clean) = {
+        let fut = pump(&mut w);
+        let cancel_wait = async {
+            match cancel {
+                Some(c) => c.await,
+                None => std::future::pending().await,
+            }
+        };
+        // clean=true:泵以 EOF 干净结束(半关闭语义,等完整 close/shutdown);
+        // clean=false:读/写已 Err 或 abort(连接已坏,有界收尾);
+        // by_cancel:规则取消(有界收尾)。
+        tokio::select! {
+            clean = fut => (false, clean),
+            _ = cancel_wait => (true, false),
+        }
+    };
+    if !clean {
+        errored.store(true, Ordering::SeqCst);
+    }
+    // 取消/错误路径有界等待:poll_close/poll_shutdown 永久 Pending 时
+    // 不得卡死收尾、不得扣住 IO;clean EOF 保持完整半关闭语义,同时
+    // 监听收尾期间抵达的迟到取消。
+    if by_cancel || !clean {
+        let _ = tokio::time::timeout(CANCEL_CLOSE_GRACE, close(&mut w)).await;
+    } else {
+        let cancel_tail_wait = async {
+            match cancel_tail {
+                Some(c) => c.await,
+                None => std::future::pending().await,
+            }
+        };
+        close_with_late_cancel(close(&mut w), cancel_tail_wait).await;
+    }
+}
 
-    // 本向以错误(非 EOF、非取消)结束时置位:对向数据通路已死
-    //(mux 连接断 / 用户侧错误),继续等对向只会在已死的通路上永存。
+/// 双向中继共享收敛骨架(`mux_relay_split` / `mux_relay_mux` / `chunk_relay` 共用):
+/// 双向 spawn + `select!(clean = pump, _ = cancel)` + `errored` 标志 +
+/// `CANCEL_CLOSE_GRACE` / `close_with_late_cancel` + `AbortOnDropHandle`
+/// 立即中止异常对向 + `join_relay_pumps` 30s 半关闭兜底。
+pub(crate) async fn run_relay_pair<W1, F1, C1, W2, F2, C2>(
+    w1: W1,
+    pump1: F1,
+    close1: C1,
+    w2: W2,
+    pump2: F2,
+    close2: C2,
+    cancel: Option<crate::CancelFuture>,
+) where
+    W1: Send + 'static,
+    F1: for<'a> FnOnce(&'a mut W1) -> futures::future::BoxFuture<'a, bool> + Send + 'static,
+    C1: for<'a> FnOnce(&'a mut W1) -> futures::future::BoxFuture<'a, io::Result<()>>
+        + Send
+        + 'static,
+    W2: Send + 'static,
+    F2: for<'a> FnOnce(&'a mut W2) -> futures::future::BoxFuture<'a, bool> + Send + 'static,
+    C2: for<'a> FnOnce(&'a mut W2) -> futures::future::BoxFuture<'a, io::Result<()>>
+        + Send
+        + 'static,
+{
+    // 本向以错误/取消/abort 结束时置位:对向数据通路已死,不得永存。
     let up_errored = Arc::new(AtomicBool::new(false));
     let dn_errored = Arc::new(AtomicBool::new(false));
 
-    let lim_up = limiter.clone();
-    let c1_tail = cancel.clone();
-    let c1 = cancel.clone();
-    let up_err = up_errored.clone();
-    let t1 = tokio::spawn(async move {
-        let mut b_write = b_write;
-        let up = pump_up(&mut a_r, &mut b_write, &lim_up);
-        let cancel_wait = async {
-            match c1 {
-                Some(c) => c.await,
-                None => std::future::pending().await,
-            }
-        };
-        // clean=true:up 泵以 EOF 干净结束(半关闭语义,等完整 FIN);
-        // clean=false:读/写已 Err(连接已坏,有界收尾);
-        // by_cancel:规则取消(有界收尾)。
-        let (by_cancel, clean) = tokio::select! {
-            clean = up => (false, clean),
-            _ = cancel_wait => (true, false),
-        };
-        if !clean {
-            up_err.store(true, Ordering::SeqCst);
-        }
-        // EOF 传 FIN(对端读侧收敛)。取消/错误路径有界等待:
-        // poll_close 永久 Pending(含 yamux 命令队列满)时不得卡死收尾、
-        // 不得扣住 IO(rule-cancel 复现:join 永不完成、io_dropped=false)。
-        if by_cancel || !clean {
-            let _ = tokio::time::timeout(CANCEL_CLOSE_GRACE, b_write.close()).await;
-        } else {
-            // clean EOF:无界等完整 FIN(红线,不加硬超时防截断);但收尾
-            // 期间规则取消仍必须被听见(cancel-after-eof 复现:EOF 进入
-            // close 后取消永不再被监听 → relay 卡死、IO 不释放)。
-            let cancel_tail = async {
-                match c1_tail {
-                    Some(c) => c.await,
-                    None => std::future::pending().await,
-                }
-            };
-            close_with_late_cancel(b_write.close(), cancel_tail).await;
-        }
-    });
-
-    let lim_dn = limiter;
-    let c2 = cancel.clone();
-    let c2_tail = c2.clone();
-    let dn_err = dn_errored.clone();
-    let t2 = tokio::spawn(async move {
-        let mut b_read = b_read;
-        let down = pump_down(&mut a_w, &mut b_read, &lim_dn);
-        let cancel_wait = async {
-            match c2 {
-                Some(c) => c.await,
-                None => std::future::pending().await,
-            }
-        };
-        let (by_cancel, clean) = tokio::select! {
-            clean = down => (false, clean),
-            _ = cancel_wait => (true, false),
-        };
-        if !clean {
-            dn_err.store(true, Ordering::SeqCst);
-        }
-        // 同上:取消/错误路径 shutdown 有界等待,clean EOF 路径保持
-        // 完整半关闭语义(红线);收尾期间取消仍要被听见
-        if by_cancel || !clean {
-            let _ = tokio::time::timeout(CANCEL_CLOSE_GRACE, a_w.shutdown()).await;
-        } else {
-            let cancel_tail = async {
-                match c2_tail {
-                    Some(c) => c.await,
-                    None => std::future::pending().await,
-                }
-            };
-            close_with_late_cancel(a_w.shutdown(), cancel_tail).await;
-        }
-    });
+    let t1 = tokio::spawn(pump_task(
+        w1,
+        pump1,
+        close1,
+        cancel.clone(),
+        up_errored.clone(),
+    ));
+    let t2 = tokio::spawn(pump_task(w2, pump2, close2, cancel, dn_errored.clone()));
 
     // 收尾 join(A1a + 收敛保证):
     // * 父取消(本 future 被 drop)→ 守卫 Drop → abort 双向子泵;
-    // * 单向 panic 或单向错误退出 → 立即终止对向(对向可能在等一个
-    //   永远不来的数据/EOF,不得永存);
-    // * 单向 clean EOF → 等对向自然结束(半关闭语义,红线)。
+    // * 单向 panic 或单向错误退出 → 立即终止对向(不得永存);
+    // * 单向 clean EOF → 等对向自然结束(半关闭语义,30s 有界兜底)。
     let mut g1 = crate::AbortOnDropHandle::new(t1);
     let mut g2 = crate::AbortOnDropHandle::new(t2);
     let first = tokio::select! {
@@ -849,9 +835,260 @@ pub async fn mux_relay_split(
     if abnormal {
         return; // 守卫 Drop → abort 对向(及未完成侧)
     }
-    // round-40:clean EOF 的半关闭等待加**有界兜底**。对端永不回 FIN 时
-    // 不再永久钉在 FIN-WAIT-2(实测 10 轮累积 22 条,吞吐 2.4G→0.5G)。
     crate::join_relay_pumps(&mut g1, &mut g2).await;
+}
+
+/// A2:中继主体,接收**已拆好**的 a 侧读写半。
+///
+/// 服务端用户侧恒为 `CountedUserIo<TcpStream>` 包装,`split_boxed_io` 的
+/// 精确类型探测永远 miss → 修前 100% 回落 `tokio::io::split`(读写泵
+/// 份属不同 task 却共享一把 `std::sync::Mutex`,即 round-69 修的 futex
+/// 病灶在服务端主路径上从未生效)。调用方(rh-server data.rs)先剥壳、
+/// `into_split` 无锁拆半、按方向重包计量后从本函数进入。
+pub async fn mux_relay_split(
+    mut a_r: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    a_w: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    mut b_read: RhMuxStreamRead,
+    b_write: RhMuxStreamWrite,
+    limiter: Option<std::sync::Arc<dyn crate::ChunkLimiter>>,
+    cancel: Option<crate::CancelFuture>,
+) {
+    use tokio::io::AsyncWriteExt as _;
+
+    let lim_up = limiter.clone();
+    let lim_dn = limiter;
+
+    run_relay_pair(
+        b_write,
+        move |bw: &mut RhMuxStreamWrite| {
+            Box::pin(async move { pump_up(&mut a_r, bw, &lim_up).await })
+        },
+        |bw: &mut RhMuxStreamWrite| Box::pin(bw.close()),
+        a_w,
+        move |aw: &mut Box<dyn tokio::io::AsyncWrite + Send + Unpin>| {
+            Box::pin(async move { pump_down(aw, &mut b_read, &lim_dn).await })
+        },
+        |aw: &mut Box<dyn tokio::io::AsyncWrite + Send + Unpin>| Box::pin(aw.shutdown()),
+        cancel,
+    )
+    .await;
+}
+
+/// P2-5 `mux_relay_mux` 单方向钩子(形态对齐 `splice::DirHook`)。
+#[derive(Clone, Default)]
+pub struct MuxDirHook {
+    pub on_bytes: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    pub meter_on_fill: bool,
+    pub limiter: Option<std::sync::Arc<dyn crate::ChunkLimiter>>,
+}
+
+/// P2-5 `mux_relay_mux` 双向钩子(形态对齐 `splice::SpliceHooks`)。
+#[derive(Clone, Default)]
+pub struct MuxRelayHooks {
+    pub up: Option<MuxDirHook>,
+    pub down: Option<MuxDirHook>,
+    pub abort: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    pub cancel: Option<crate::CancelFuture>,
+}
+
+const MUX_TO_MUX_BATCH_BYTES: usize = 1024 * 1024;
+const MUX_TO_MUX_BATCH_SEGS: usize = 64;
+
+/// P2-5 单方向零拷贝 mux↔mux 泵:`read_chunk`/`try_read_chunk` 取出的 `Bytes`
+/// 直接通过 `write_chunk` 转交目标 yamux 流(零拷贝、零 `yamux::pool` 分配),
+/// 写期间持续预取,写错立即返回 `false` 而不 join 读。
+async fn pump_mux_to_mux(
+    r: &mut RhMuxStreamRead,
+    w: &mut RhMuxStreamWrite,
+    hook: &Option<MuxDirHook>,
+    abort: &Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> bool {
+    let meter_on_fill = hook.as_ref().is_some_and(|h| h.meter_on_fill);
+    let on_bytes = hook.as_ref().and_then(|h| h.on_bytes.clone());
+    let limiter = hook.as_ref().and_then(|h| h.limiter.clone());
+    let has_limiter = limiter.is_some();
+    let max_segs = if has_limiter {
+        1
+    } else {
+        MUX_TO_MUX_BATCH_SEGS
+    };
+
+    let mut pending: std::collections::VecDeque<Bytes> = std::collections::VecDeque::new();
+    let mut pending_bytes: usize = 0;
+    let mut batch: Vec<Bytes> = Vec::with_capacity(max_segs);
+    let mut eof_seen = false;
+    let mut read_err = false;
+
+    loop {
+        if abort.as_ref().is_some_and(|f| f()) {
+            return false;
+        }
+
+        batch.clear();
+        let mut batch_bytes = 0usize;
+
+        while let Some(c) = pending.pop_front() {
+            if batch_bytes >= MUX_TO_MUX_BATCH_BYTES || batch.len() >= max_segs {
+                pending.push_front(c);
+                break;
+            }
+            pending_bytes = pending_bytes.saturating_sub(c.len());
+            batch_bytes += c.len();
+            batch.push(c);
+        }
+
+        while batch_bytes < MUX_TO_MUX_BATCH_BYTES && batch.len() < max_segs {
+            match r.try_read_chunk().await {
+                Ok(Some(c)) if !c.is_empty() => {
+                    batch_bytes += c.len();
+                    batch.push(c);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    read_err = true;
+                    break;
+                }
+            }
+        }
+
+        if batch.is_empty() {
+            if read_err {
+                return false;
+            }
+            loop {
+                match r.read_chunk().await {
+                    Ok(Some(c)) if c.is_empty() => continue,
+                    Ok(Some(c)) => {
+                        batch_bytes += c.len();
+                        batch.push(c);
+                        break;
+                    }
+                    Ok(None) => return true,
+                    Err(_) => return false,
+                }
+            }
+        }
+
+        if meter_on_fill {
+            if let Some(cb) = &on_bytes {
+                cb(batch_bytes as u64);
+            }
+        }
+        let mut reservation = match &limiter {
+            Some(l) => Some(l.reserve(batch_bytes).await),
+            None => None,
+        };
+        if meter_on_fill {
+            if let Some(res) = reservation.as_mut() {
+                res.consume(batch_bytes);
+            }
+        }
+
+        if abort.as_ref().is_some_and(|f| f()) {
+            return false;
+        }
+
+        let can_prefetch = prefetch_enabled()
+            && !has_limiter
+            && batch_bytes < MUX_TO_MUX_BATCH_BYTES
+            && !eof_seen
+            && !read_err;
+
+        let ok = {
+            let write_fut = async {
+                for c in batch.drain(..) {
+                    let len = c.len();
+                    if w.write_chunk(c).await.is_err() {
+                        return false;
+                    }
+                    if !meter_on_fill {
+                        if let Some(res) = reservation.as_mut() {
+                            res.consume(len);
+                        }
+                        if let Some(cb) = &on_bytes {
+                            cb(len as u64);
+                        }
+                    }
+                }
+                true
+            };
+            if can_prefetch {
+                futures::pin_mut!(write_fut);
+                loop {
+                    if pending_bytes >= MUX_TO_MUX_BATCH_BYTES
+                        || pending.len() >= MUX_TO_MUX_BATCH_SEGS
+                    {
+                        break write_fut.await;
+                    }
+                    let read_fut = r.read_chunk();
+                    futures::pin_mut!(read_fut);
+                    match futures::future::select(read_fut, write_fut.as_mut()).await {
+                        futures::future::Either::Left((nr, _)) => match nr {
+                            Ok(Some(c)) if !c.is_empty() => {
+                                pending_bytes += c.len();
+                                pending.push_back(c);
+                            }
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                eof_seen = true;
+                                break write_fut.await;
+                            }
+                            Err(_) => {
+                                read_err = true;
+                                break write_fut.await;
+                            }
+                        },
+                        futures::future::Either::Right((ok, _)) => break ok,
+                    }
+                }
+            } else {
+                write_fut.await
+            }
+        };
+
+        if !ok {
+            return false;
+        }
+        if read_err {
+            return false;
+        }
+        if eof_seen && pending.is_empty() {
+            return true;
+        }
+    }
+}
+
+/// P2-5:两端均为 yamux 流的零拷贝双向中继。
+/// 直接以 `Bytes` 所有权在 `RhMuxStreamRead` 与 `RhMuxStreamWrite` 之间直通,
+/// 消除用户态池化拷贝与 `tokio::io::split` 互斥锁,恢复下行批写与 `writev` 聚合;
+/// 收尾共享 [`run_relay_pair`] 收敛骨架。
+pub async fn mux_relay_mux(
+    mut a_read: RhMuxStreamRead,
+    a_write: RhMuxStreamWrite,
+    mut b_read: RhMuxStreamRead,
+    b_write: RhMuxStreamWrite,
+    hooks: MuxRelayHooks,
+) {
+    let up_hook = hooks.up;
+    let dn_hook = hooks.down;
+    let abort_up = hooks.abort.clone();
+    let abort_dn = hooks.abort;
+
+    run_relay_pair(
+        b_write,
+        move |bw: &mut RhMuxStreamWrite| {
+            Box::pin(async move { pump_mux_to_mux(&mut a_read, bw, &up_hook, &abort_up).await })
+        },
+        |bw: &mut RhMuxStreamWrite| Box::pin(bw.close()),
+        a_write,
+        move |aw: &mut RhMuxStreamWrite| {
+            Box::pin(async move { pump_mux_to_mux(&mut b_read, aw, &dn_hook, &abort_dn).await })
+        },
+        |aw: &mut RhMuxStreamWrite| Box::pin(aw.close()),
+        hooks.cancel,
+    )
+    .await;
 }
 
 /// up 侧搬运:a 读 → mux 帧体。限速=读侧计费:fill 完成即预留并即时消费
@@ -5761,6 +5998,662 @@ mod tests {
             (lockless0 + 1, fallback0 + 1),
             "DuplexStream 应命中回落拆半探针"
         );
+    }
+
+    // ===== P2-5: mux_relay_mux 零拷贝 mux↔mux 泵测试 =====
+
+    struct TestCountingLimiter {
+        charged: AtomicUsize,
+        refunded: Arc<AtomicUsize>,
+    }
+
+    impl TestCountingLimiter {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                charged: AtomicUsize::new(0),
+                refunded: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+        fn net_consumed(&self) -> usize {
+            self.charged.load(Ordering::SeqCst) - self.refunded.load(Ordering::SeqCst)
+        }
+    }
+
+    struct TestRefundingRes {
+        remaining: usize,
+        refunded: Arc<AtomicUsize>,
+    }
+
+    impl crate::ChunkReservation for TestRefundingRes {
+        fn consume(&mut self, n: usize) {
+            self.remaining = self.remaining.saturating_sub(n);
+        }
+    }
+
+    impl Drop for TestRefundingRes {
+        fn drop(&mut self) {
+            if self.remaining > 0 {
+                self.refunded.fetch_add(self.remaining, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl crate::ChunkLimiter for TestCountingLimiter {
+        fn reserve(
+            &self,
+            n: usize,
+        ) -> futures::future::BoxFuture<'static, Box<dyn crate::ChunkReservation>> {
+            self.charged.fetch_add(n, Ordering::SeqCst);
+            let refunded = self.refunded.clone();
+            Box::pin(async move {
+                Box::new(TestRefundingRes {
+                    remaining: n,
+                    refunded,
+                }) as Box<dyn crate::ChunkReservation>
+            })
+        }
+    }
+
+    struct WedgeableMuxCarrier {
+        inner: tokio::io::DuplexStream,
+        wedged: Arc<AtomicBool>,
+    }
+
+    impl tokio::io::AsyncRead for WedgeableMuxCarrier {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for WedgeableMuxCarrier {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.wedged.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn mux_relay_mux_transfers_and_halfcloses_both_directions() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (ua_cli, ua_srv) = tokio::io::duplex(256 * 1024);
+        let (cb_cli, cb_srv) = tokio::io::duplex(256 * 1024);
+        let user_cli = wrap_stream_as_client(Box::new(ua_cli), true, MUX_STREAMS_UNLIMITED);
+        let user_srv = wrap_stream_as_server(Box::new(ua_srv), true, MUX_STREAMS_UNLIMITED);
+        let chan_cli = wrap_stream_as_client(Box::new(cb_cli), true, MUX_STREAMS_UNLIMITED);
+        let chan_srv = wrap_stream_as_server(Box::new(cb_srv), true, MUX_STREAMS_UNLIMITED);
+
+        let mut c_a = user_cli.open_stream().await.unwrap();
+        let c_b = chan_cli.open_stream().await.unwrap();
+        let mut c_b_box: BoxedIo = c_b;
+        let (b_read, b_write) = steal_mux_halves(&mut c_b_box).expect("steal b");
+        drop(c_b_box);
+
+        // 先写 1 字节驱动 c_a 的 lazy SYN,让 user_srv.accept() 立即就绪
+        c_a.write_u8(0xAA).await.unwrap();
+        let mut s_a = user_srv.accept().await.unwrap();
+        let (a_read, a_write) = steal_mux_halves(&mut s_a).expect("steal a");
+        drop(s_a);
+
+        let relay = tokio::spawn(mux_relay_mux(
+            a_read,
+            a_write,
+            b_read,
+            b_write,
+            MuxRelayHooks::default(),
+        ));
+
+        let payload_up: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+        let payload_dn: Vec<u8> = (0..150 * 1024).map(|i| ((i * 5 + 1) % 243) as u8).collect();
+        let mut expected_up = Vec::with_capacity(1 + payload_up.len());
+        expected_up.push(0xAA);
+        expected_up.extend_from_slice(&payload_up);
+        let expected_dn = payload_dn.clone();
+
+        let peer_b = tokio::spawn(async move {
+            let mut s_b = chan_srv.accept().await.unwrap();
+            let mut got = Vec::new();
+            s_b.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, expected_up, "up 方向数据及半关闭 EOF 必须完整");
+            s_b.write_all(&payload_dn).await.unwrap();
+            s_b.shutdown().await.unwrap();
+        });
+
+        c_a.write_all(&payload_up).await.unwrap();
+        c_a.shutdown().await.unwrap();
+        let mut got_dn = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            c_a.read_to_end(&mut got_dn),
+        )
+        .await
+        .expect("down half-close read timeout")
+        .unwrap();
+        assert_eq!(got_dn, expected_dn, "down 方向数据及半关闭 EOF 必须完整");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), peer_b)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+            .await
+            .expect("mux_relay_mux must finish cleanly")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mux_relay_mux_rule_cancel_converges_bounded() {
+        use futures::FutureExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        // 1) 载体写楔死(close 命令队列满 → poll_close_half 永久 Pending)时取消必须有界收敛
+        let (ua_cli, ua_srv) = tokio::io::duplex(256 * 1024);
+        let (cb_cli, cb_srv) = tokio::io::duplex(256 * 1024);
+        let wedged = Arc::new(AtomicBool::new(false));
+        let user_cli = wrap_stream_as_client(Box::new(ua_cli), true, MUX_STREAMS_UNLIMITED);
+        let user_srv = wrap_stream_as_server(Box::new(ua_srv), true, MUX_STREAMS_UNLIMITED);
+        let chan_cli = wrap_stream_as_client(
+            Box::new(WedgeableMuxCarrier {
+                inner: cb_cli,
+                wedged: wedged.clone(),
+            }),
+            true,
+            MUX_STREAMS_UNLIMITED,
+        );
+        let chan_srv = wrap_stream_as_server(Box::new(cb_srv), true, MUX_STREAMS_UNLIMITED);
+
+        let mut c_a = user_cli.open_stream().await.unwrap();
+        let mut c_b = chan_cli.open_stream().await.unwrap();
+        c_a.write_u8(1).await.unwrap();
+        c_b.write_u8(2).await.unwrap();
+        let mut s_a = user_srv.accept().await.unwrap();
+        let mut s_b = chan_srv.accept().await.unwrap();
+        use tokio::io::AsyncReadExt as _;
+        assert_eq!(s_a.read_u8().await.unwrap(), 1);
+        assert_eq!(s_b.read_u8().await.unwrap(), 2);
+
+        let (a_read, a_write) = steal_mux_halves(&mut s_a).unwrap();
+        let (b_read, b_write) = steal_mux_halves(&mut c_b).unwrap();
+        drop(s_a);
+        drop(c_b);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel: crate::CancelFuture = async move {
+            let _ = rx.await;
+        }
+        .boxed()
+        .shared();
+
+        let mut relay = tokio::spawn(mux_relay_mux(
+            a_read,
+            a_write,
+            b_read,
+            b_write,
+            MuxRelayHooks {
+                cancel: Some(cancel),
+                ..Default::default()
+            },
+        ));
+
+        wedged.store(true, Ordering::SeqCst);
+        for _ in 0..256 {
+            c_a.write_all(&[7u8; 100]).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx.send(()).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), &mut relay)
+            .await
+            .expect("规则取消后 mux_relay_mux 必须在 CANCEL_CLOSE_GRACE 内收敛")
+            .unwrap();
+        drop(s_b);
+
+        // 2) clean EOF 进入 close_with_late_cancel 后抵达取消也必须收敛
+        let (ua2_cli, ua2_srv) = tokio::io::duplex(256 * 1024);
+        let (cb2_cli, cb2_srv) = tokio::io::duplex(256 * 1024);
+        let wedged2 = Arc::new(AtomicBool::new(false));
+        let user2_cli = wrap_stream_as_client(Box::new(ua2_cli), true, MUX_STREAMS_UNLIMITED);
+        let user2_srv = wrap_stream_as_server(Box::new(ua2_srv), true, MUX_STREAMS_UNLIMITED);
+        let chan2_cli = wrap_stream_as_client(
+            Box::new(WedgeableMuxCarrier {
+                inner: cb2_cli,
+                wedged: wedged2.clone(),
+            }),
+            true,
+            MUX_STREAMS_UNLIMITED,
+        );
+        let chan2_srv = wrap_stream_as_server(Box::new(cb2_srv), true, MUX_STREAMS_UNLIMITED);
+
+        let mut c2_a = user2_cli.open_stream().await.unwrap();
+        let mut c2_b = chan2_cli.open_stream().await.unwrap();
+        c2_a.write_u8(1).await.unwrap();
+        c2_b.write_u8(2).await.unwrap();
+        let mut s2_a = user2_srv.accept().await.unwrap();
+        let mut s2_b = chan2_srv.accept().await.unwrap();
+        assert_eq!(s2_a.read_u8().await.unwrap(), 1);
+        assert_eq!(s2_b.read_u8().await.unwrap(), 2);
+
+        let (a2_read, a2_write) = steal_mux_halves(&mut s2_a).unwrap();
+        let (b2_read, b2_write) = steal_mux_halves(&mut c2_b).unwrap();
+        drop(s2_a);
+        drop(c2_b);
+
+        let (tx2, rx2) = tokio::sync::oneshot::channel::<()>();
+        let cancel2: crate::CancelFuture = async move {
+            let _ = rx2.await;
+        }
+        .boxed()
+        .shared();
+
+        let mut relay2 = tokio::spawn(mux_relay_mux(
+            a2_read,
+            a2_write,
+            b2_read,
+            b2_write,
+            MuxRelayHooks {
+                cancel: Some(cancel2),
+                ..Default::default()
+            },
+        ));
+        wedged2.store(true, Ordering::SeqCst);
+        for _ in 0..256 {
+            c2_a.write_all(&[9u8; 100]).await.unwrap();
+        }
+        c2_a.shutdown().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx2.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), &mut relay2)
+            .await
+            .expect("EOF 收尾期间的迟到取消必须收敛")
+            .unwrap();
+        drop(s2_b);
+    }
+
+    #[tokio::test]
+    async fn mux_relay_mux_abort_cuts_immediately() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (ua_cli, ua_srv) = tokio::io::duplex(256 * 1024);
+        let (cb_cli, cb_srv) = tokio::io::duplex(256 * 1024);
+        let user_cli = wrap_stream_as_client(Box::new(ua_cli), true, MUX_STREAMS_UNLIMITED);
+        let user_srv = wrap_stream_as_server(Box::new(ua_srv), true, MUX_STREAMS_UNLIMITED);
+        let chan_cli = wrap_stream_as_client(Box::new(cb_cli), true, MUX_STREAMS_UNLIMITED);
+        let chan_srv = wrap_stream_as_server(Box::new(cb_srv), true, MUX_STREAMS_UNLIMITED);
+
+        let mut c_a = user_cli.open_stream().await.unwrap();
+        let mut c_b = chan_cli.open_stream().await.unwrap();
+        c_a.write_u8(1).await.unwrap();
+        c_b.write_u8(2).await.unwrap();
+        let mut s_a = user_srv.accept().await.unwrap();
+        let mut s_b = chan_srv.accept().await.unwrap();
+        assert_eq!(s_a.read_u8().await.unwrap(), 1);
+        assert_eq!(s_b.read_u8().await.unwrap(), 2);
+
+        let (a_read, a_write) = steal_mux_halves(&mut s_a).unwrap();
+        let (b_read, b_write) = steal_mux_halves(&mut c_b).unwrap();
+        drop(s_a);
+        drop(c_b);
+
+        let cut = Arc::new(AtomicBool::new(false));
+        let cut_flag = cut.clone();
+        let mut relay = tokio::spawn(mux_relay_mux(
+            a_read,
+            a_write,
+            b_read,
+            b_write,
+            MuxRelayHooks {
+                abort: Some(Arc::new(move || cut_flag.load(Ordering::SeqCst))),
+                ..Default::default()
+            },
+        ));
+
+        // 确认流路已通,且 s_b 保持静默(不发数据也不关闭)
+        c_a.write_u8(0x5A).await.unwrap();
+        assert_eq!(s_b.read_u8().await.unwrap(), 0x5A);
+
+        // 置 abort 并在边界投喂 1 字节触发检查 → 立即断连并中止静默对向泵
+        cut.store(true, Ordering::SeqCst);
+        let _ = c_a.write_u8(0x7F).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut relay)
+            .await
+            .expect("abort 返回 true 后 mux_relay_mux 必须立即收敛(不得等 30s halfclose_grace)")
+            .unwrap();
+
+        let mut tail = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            s_b.read_to_end(&mut tail),
+        )
+        .await
+        .expect("对端必须观测到流关闭")
+        .unwrap();
+        assert!(
+            !tail.contains(&0x7F),
+            "abort 触发后新字节不得再被转发,实际={tail:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mux_relay_mux_meter_hooks_fill_vs_delivery() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // 1) up (meter_on_fill=true): 限速器阻塞写侧前 on_bytes 已立刻计满;
+        //    down (meter_on_fill=false): 送达后才计费
+        struct GateLimiter {
+            entered: Arc<AtomicUsize>,
+            release: Arc<tokio::sync::Notify>,
+            inner: Arc<TestCountingLimiter>,
+        }
+        impl crate::ChunkLimiter for GateLimiter {
+            fn reserve(
+                &self,
+                n: usize,
+            ) -> futures::future::BoxFuture<'static, Box<dyn crate::ChunkReservation>> {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                let release = self.release.clone();
+                let fut = self.inner.reserve(n);
+                Box::pin(async move {
+                    release.notified().await;
+                    fut.await
+                })
+            }
+        }
+
+        let (ua_cli, ua_srv) = tokio::io::duplex(256 * 1024);
+        let (cb_cli, cb_srv) = tokio::io::duplex(256 * 1024);
+        let user_cli = wrap_stream_as_client(Box::new(ua_cli), true, MUX_STREAMS_UNLIMITED);
+        let user_srv = wrap_stream_as_server(Box::new(ua_srv), true, MUX_STREAMS_UNLIMITED);
+        let chan_cli = wrap_stream_as_client(Box::new(cb_cli), true, MUX_STREAMS_UNLIMITED);
+        let chan_srv = wrap_stream_as_server(Box::new(cb_srv), true, MUX_STREAMS_UNLIMITED);
+
+        let mut c_a = user_cli.open_stream().await.unwrap();
+        let mut c_b = chan_cli.open_stream().await.unwrap();
+        c_a.write_u8(1).await.unwrap();
+        c_b.write_u8(2).await.unwrap();
+        let mut s_a = user_srv.accept().await.unwrap();
+        let mut s_b = chan_srv.accept().await.unwrap();
+        assert_eq!(s_a.read_u8().await.unwrap(), 1);
+        assert_eq!(s_b.read_u8().await.unwrap(), 2);
+
+        let (a_read, a_write) = steal_mux_halves(&mut s_a).unwrap();
+        let (b_read, b_write) = steal_mux_halves(&mut c_b).unwrap();
+        drop(s_a);
+        drop(c_b);
+
+        let up_bytes = Arc::new(AtomicUsize::new(0));
+        let dn_bytes = Arc::new(AtomicUsize::new(0));
+        let up_entered = Arc::new(AtomicUsize::new(0));
+        let up_release = Arc::new(tokio::sync::Notify::new());
+        let up_lim_inner = TestCountingLimiter::new();
+        let dn_lim = TestCountingLimiter::new();
+
+        let up_b2 = up_bytes.clone();
+        let dn_b2 = dn_bytes.clone();
+        let up_gate = Arc::new(GateLimiter {
+            entered: up_entered.clone(),
+            release: up_release.clone(),
+            inner: up_lim_inner.clone(),
+        });
+
+        let relay = tokio::spawn(mux_relay_mux(
+            a_read,
+            a_write,
+            b_read,
+            b_write,
+            MuxRelayHooks {
+                up: Some(MuxDirHook {
+                    on_bytes: Some(Arc::new(move |n| {
+                        up_b2.fetch_add(n as usize, Ordering::SeqCst);
+                    })),
+                    meter_on_fill: true,
+                    limiter: Some(up_gate),
+                }),
+                down: Some(MuxDirHook {
+                    on_bytes: Some(Arc::new(move |n| {
+                        dn_b2.fetch_add(n as usize, Ordering::SeqCst);
+                    })),
+                    meter_on_fill: false,
+                    limiter: Some(dn_lim.clone()),
+                }),
+                abort: None,
+                cancel: None,
+            },
+        ));
+
+        // up 写入 4096B 并被 GateLimiter 挡在 reserve 中:
+        // fill 口径下 on_bytes 必须立即可见,而对端 s_b 此时尚未收到任何字节
+        c_a.write_all(&[0x33u8; 4096]).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while up_entered.load(Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            up_bytes.load(Ordering::SeqCst),
+            4096,
+            "meter_on_fill=true 必须在限速/写入完成前即回调 on_bytes"
+        );
+        let mut probe = [0u8; 16];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), s_b.read(&mut probe))
+                .await
+                .is_err(),
+            "限速挡住期间 s_b 不得收到数据"
+        );
+
+        // 放行 up 限速并走完双向半关闭
+        up_release.notify_waiters();
+        c_a.shutdown().await.unwrap();
+        let mut got_up = Vec::new();
+        s_b.read_to_end(&mut got_up).await.unwrap();
+        assert_eq!(got_up.len(), 4096);
+        assert_eq!(up_lim_inner.net_consumed(), 4096);
+
+        // down 方向写入 8192B:送达后 on_bytes 与 limiter 净扣费严格相等
+        s_b.write_all(&[0x44u8; 8192]).await.unwrap();
+        s_b.shutdown().await.unwrap();
+        let mut got_dn = Vec::new();
+        c_a.read_to_end(&mut got_dn).await.unwrap();
+        assert_eq!(got_dn.len(), 8192);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dn_bytes.load(Ordering::SeqCst), 8192);
+        assert_eq!(dn_lim.net_consumed(), 8192);
+        assert_eq!(dn_lim.refunded.load(Ordering::SeqCst), 0);
+
+        // 2) down (meter_on_fill=false) 写半关闭故障时,未送达预留必须退款且 on_bytes 不虚报
+        let (ua3_cli, ua3_srv) = tokio::io::duplex(256 * 1024);
+        let (cb3_cli, cb3_srv) = tokio::io::duplex(256 * 1024);
+        let user3_cli = wrap_stream_as_client(Box::new(ua3_cli), true, MUX_STREAMS_UNLIMITED);
+        let user3_srv = wrap_stream_as_server(Box::new(ua3_srv), true, MUX_STREAMS_UNLIMITED);
+        let chan3_cli = wrap_stream_as_client(Box::new(cb3_cli), true, MUX_STREAMS_UNLIMITED);
+        let chan3_srv = wrap_stream_as_server(Box::new(cb3_srv), true, MUX_STREAMS_UNLIMITED);
+
+        let mut c3_a = user3_cli.open_stream().await.unwrap();
+        let mut c3_b = chan3_cli.open_stream().await.unwrap();
+        c3_a.write_u8(1).await.unwrap();
+        c3_b.write_u8(2).await.unwrap();
+        let mut s3_a = user3_srv.accept().await.unwrap();
+        let mut s3_b = chan3_srv.accept().await.unwrap();
+        assert_eq!(s3_a.read_u8().await.unwrap(), 1);
+        assert_eq!(s3_b.read_u8().await.unwrap(), 2);
+
+        let (a3_read, mut a3_write) = steal_mux_halves(&mut s3_a).unwrap();
+        let (b3_read, b3_write) = steal_mux_halves(&mut c3_b).unwrap();
+        drop(s3_a);
+        drop(c3_b);
+        // 先关闭写半,迫使后续 down write_chunk 立即返回 WriteZero
+        a3_write.close().await.unwrap();
+
+        let dn3_bytes = Arc::new(AtomicUsize::new(0));
+        let dn3_b2 = dn3_bytes.clone();
+        let dn3_lim = TestCountingLimiter::new();
+        let relay3 = tokio::spawn(mux_relay_mux(
+            a3_read,
+            a3_write,
+            b3_read,
+            b3_write,
+            MuxRelayHooks {
+                down: Some(MuxDirHook {
+                    on_bytes: Some(Arc::new(move |n| {
+                        dn3_b2.fetch_add(n as usize, Ordering::SeqCst);
+                    })),
+                    meter_on_fill: false,
+                    limiter: Some(dn3_lim.clone()),
+                }),
+                ..Default::default()
+            },
+        ));
+
+        s3_b.write_all(&[0x55u8; 4096]).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay3)
+            .await
+            .expect("write_chunk 失败后必须收敛")
+            .unwrap();
+        assert_eq!(
+            dn3_bytes.load(Ordering::SeqCst),
+            0,
+            "write_chunk 失败时 meter_on_fill=false 不得计入未送达字节"
+        );
+        assert_eq!(
+            dn3_lim.net_consumed(),
+            0,
+            "write_chunk 失败时预留令牌必须全额退还"
+        );
+        assert_eq!(dn3_lim.refunded.load(Ordering::SeqCst), 4096);
+    }
+
+    #[tokio::test]
+    async fn mux_relay_mux_zero_copy_pool_quiescent() {
+        // 验证稳态 mux_relay_mux 转发零拷贝、零 yamux::pool 分配。
+        // 块长 6KiB (> SMALL_FRAME_COPY=4KiB 走零拷贝切片,且 < MIN_RECYCLE=16KiB:
+        // 若有任何路径回落到 RhMuxStreamWrite::poll_write 走 pool::get(6KiB),
+        // yamux::pool::global_allocations() 必无条件自增)。
+        let (ua_cli, ua_srv) = tokio::io::duplex(256 * 1024);
+        let (cb_cli, cb_srv) = tokio::io::duplex(256 * 1024);
+        let user_cli = wrap_stream_as_client(Box::new(ua_cli), true, MUX_STREAMS_UNLIMITED);
+        let user_srv = wrap_stream_as_server(Box::new(ua_srv), true, MUX_STREAMS_UNLIMITED);
+        let chan_cli = wrap_stream_as_client(Box::new(cb_cli), true, MUX_STREAMS_UNLIMITED);
+        let chan_srv = wrap_stream_as_server(Box::new(cb_srv), true, MUX_STREAMS_UNLIMITED);
+
+        let mut ca_box = user_cli.open_stream().await.unwrap();
+        let mut cb_box = chan_cli.open_stream().await.unwrap();
+        let (mut ca_read, mut ca_write) = steal_mux_halves(&mut ca_box).unwrap();
+        let (b_read, mut b_write) = steal_mux_halves(&mut cb_box).unwrap();
+        drop(ca_box);
+        drop(cb_box);
+
+        // 驱动双向 lazy SYN 并等待两端 Staging 初始化完成
+        ca_write
+            .write_chunk(Bytes::from_static(b"warmup-up"))
+            .await
+            .unwrap();
+        b_write
+            .write_chunk(Bytes::from_static(b"warmup-dn"))
+            .await
+            .unwrap();
+        let mut s_a = user_srv.accept().await.unwrap();
+        let mut s_b = chan_srv.accept().await.unwrap();
+        let (a_read, a_write) = steal_mux_halves(&mut s_a).unwrap();
+        let (mut sb_read, mut sb_write) = steal_mux_halves(&mut s_b).unwrap();
+        drop(s_a);
+        drop(s_b);
+
+        let relay = tokio::spawn(mux_relay_mux(
+            a_read,
+            a_write,
+            b_read,
+            b_write,
+            MuxRelayHooks::default(),
+        ));
+
+        // 消费预热帧,确保四侧 Staging 均已处于 256KiB 稳态容量
+        assert_eq!(
+            sb_read.read_chunk().await.unwrap().as_deref(),
+            Some(&b"warmup-dn"[..])
+        );
+        assert_eq!(
+            sb_read.read_chunk().await.unwrap().as_deref(),
+            Some(&b"warmup-up"[..])
+        );
+        sb_write
+            .write_chunk(Bytes::from_static(b"warmup-back"))
+            .await
+            .unwrap();
+        assert_eq!(
+            ca_read.read_chunk().await.unwrap().as_deref(),
+            Some(&b"warmup-back"[..])
+        );
+
+        // 稳态双向传输(每轮总计 4×6KiB = 24KiB 落在当前 256KiB Staging 余量内),
+        // 允许极少数并行测试背景干扰下最多重试 4 轮,只要任一轮池增量 == 0 即证清零
+        // (若 mux_relay_mux 自身触碰 pool::get(6KiB),每轮必然 +8,4 轮全失败)。
+        let mut quiescent = false;
+        for round in 0..4u8 {
+            let chunk_up = Bytes::from(vec![0xA0 + round; 6 * 1024]);
+            let chunk_dn = Bytes::from(vec![0xB0 + round; 6 * 1024]);
+            let before = yamux::pool::global_allocations();
+
+            for _ in 0..4 {
+                ca_write.write_chunk(chunk_up.clone()).await.unwrap();
+                sb_write.write_chunk(chunk_dn.clone()).await.unwrap();
+            }
+            let mut got_up = 0usize;
+            while got_up < 4 * 6 * 1024 {
+                let c = sb_read.read_chunk().await.unwrap().expect("up chunk");
+                assert!(c.iter().all(|&x| x == 0xA0 + round));
+                got_up += c.len();
+            }
+            let mut got_dn = 0usize;
+            while got_dn < 4 * 6 * 1024 {
+                let c = ca_read.read_chunk().await.unwrap().expect("dn chunk");
+                assert!(c.iter().all(|&x| x == 0xB0 + round));
+                got_dn += c.len();
+            }
+
+            let after = yamux::pool::global_allocations();
+            if after == before {
+                quiescent = true;
+                break;
+            }
+        }
+        assert!(
+            quiescent,
+            "稳态 mux_relay_mux 传输期间 yamux::pool::global_allocations() 不得增加"
+        );
+
+        ca_write.close().await.unwrap();
+        sb_write.close().await.unwrap();
+        assert!(sb_read.read_chunk().await.unwrap().is_none());
+        assert!(ca_read.read_chunk().await.unwrap().is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
 
