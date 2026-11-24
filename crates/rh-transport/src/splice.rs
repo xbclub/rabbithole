@@ -10,7 +10,6 @@
 //! * 限速按返回字节扣减令牌,令牌不足时管道(有界)充当节流缓冲;
 //! * abort(流量封禁)→ 双向 SHUT_RDWR 模拟断连,唤醒对向泵。
 
-use crate::BoxedIo;
 use pin_project_lite::pin_project;
 use std::future::Future;
 use std::io;
