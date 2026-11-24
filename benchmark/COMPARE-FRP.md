@@ -2,8 +2,8 @@
 
 > **时效说明(2026-11-24 更新)**:本文是 2026-10-12 定下的**对比方法学**,
 > 其中的公平性原则(只换被测软件、对等配置、同一直连基线)至今有效,
-> `benchmark/peer-frp.sh` 即按此实现。现役最新官方 Release 同场实测(`rabbithole v0.8.8`
-> vs `frp v0.72.0`)见 [`results/v0.8.8-vs-frp-v0.72.0/REPORT.md`](results/v0.8.8-vs-frp-v0.72.0/REPORT.md) 与 [`benchmark/README.md`](README.md)。
+> `benchmark/peer-frp.sh` 即按此实现。现役最新官方 Release 纯 Go 三方同场实测(`rabbithole v0.8.8`
+> vs `v0.7.1` vs `frp v0.72.0`)见 [`results/v0.8.8-vs-v0.7.1-vs-frp-v0.72.0/REPORT.md`](results/v0.8.8-vs-v0.7.1-vs-frp-v0.72.0/REPORT.md) 与 [`benchmark/README.md`](README.md)。
 
 ## 1. 目标
 
@@ -14,7 +14,7 @@
 
 | 原则 | 落实方式 |
 |---|---|
-| **只换被测软件** | 同三台机器、同角色分工、同目标服务(target.py/iperf3)、同压测端、同端口规划、同场景与顺序、同就绪门控 |
+| **只换被测软件** | 同三台机器、同角色分工、同目标服务(`loadgen sink` / `loadgen target`)、同压测端(`loadgen`)、同端口规划、同场景与顺序、同就绪门控 |
 | **对等配置** | 传输多路复用:rabbithole `multiplex=true` ↔ frp `tcpMux=true`;连接池:`pool_size=4` ↔ `poolCount=4`;压缩:双方默认关;日志:双方 warn;fd:双方启动前提升到 65535 |
 | **同一直连基线** | 直连(压测端→B 目标,不经任何隧道)每轮重测,两侧共用同一目标端口与工具 |
 | **版本固定可复现** | rabbithole 官方 musl release(sha256 校验);frp 官方 release(校验官方 `frp_sha256_checksums.txt`,无 sidecar 时自计 `frp.sha256` 落结果目录) |
@@ -24,9 +24,9 @@
 
 ```
 [test3: 压测端]           [test1: 服务端]              [test2: 客户端+目标]
-iperf3 -c  ──10GbE──►  frps :17100  ──隧道──►  frpc ─┬─ iperf3 -s :19101
-loadgen.py             :20001 tcp 转发口              ├─ target.py :19102/19103
-                       :20003 udp                      └─ http     :19104
+loadgen src ──10GbE──►  frps :17100  ──隧道──►  frpc ─┬─ loadgen sink :19101
+loadgen                :20001 tcp 转发口              ├─ loadgen target :19102/19103
+                       :20003 udp                      └─ http           :19104
                        :20004 vhost http
 直连基线: test3 ──直接──► test2 :1910x(不经任何隧道)
 ```

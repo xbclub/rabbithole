@@ -1,0 +1,31 @@
+{
+  "role": "server",
+  "run_id": "go-bench-v088",
+  "recorded_at": "2026-11-24T10:04:37.482717+00:00",
+  "host": "ubuntu",
+  "os": "Linux-5.15.0-203-generic-x86_64-with-glibc2.35",
+  "config": {
+    "source": "/tmp/peer-go-v088/server.toml",
+    "proto": "tcp",
+    "multiplex": "true",
+    "relay_mode": "splice"
+  },
+  "env": {
+    "RH_NOTSENT_LOWAT": "unset",
+    "RH_QUIC_CC": "unset"
+  },
+  "identity": {
+    "pid": 48383,
+    "exe_sha256": "3ee40a6ed86805764449cb4ba99a87e1816c178ee10896d4e8b7676f93275d95",
+    "version": "rh-server 0.8.8",
+    "source": "proc_exe"
+  },
+  "nofile": {
+    "role": "server",
+    "want": 65535,
+    "soft": "65535",
+    "hard": "65535",
+    "ok": true,
+    "recorded_at": "2026-11-24T10:04:35+00:00"
+  }
+}
