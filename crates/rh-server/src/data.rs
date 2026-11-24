@@ -1945,6 +1945,17 @@ fn udp_session_admit(
     true
 }
 
+fn decode_udp_channel_frame(
+    buf: &mut bytes::BytesMut,
+) -> std::io::Result<Option<(rh_protocol::FrameType, bytes::Bytes)>> {
+    rh_protocol::frame::decode_frame(buf).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("udp channel frame: {e}"),
+        )
+    })
+}
+
 /// B-1:通道读源/写侧(mux 偷半 → chunk 组帧/零拷贝 chunk 写;非 mux
 /// 先试无锁 into_split,再回落同步锁拆分)。与 rh-client::udpchan 的
 /// ChanReader/ChanWriter 同型(该侧私有,不跨 crate 抽公共)。
@@ -1966,15 +1977,8 @@ impl UdpChanReader {
                 .await
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}"))),
             Self::Chunks { r, buf } => loop {
-                match rh_protocol::frame::decode_frame(buf) {
-                    Ok(Some(f)) => return Ok(f),
-                    Ok(None) => {}
-                    Err(e) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("udp channel frame: {e}"),
-                        ))
-                    }
+                if let Some(f) = decode_udp_channel_frame(buf)? {
+                    return Ok(f);
                 }
                 match r.read_chunk().await? {
                     Some(c) => buf.extend_from_slice(&c),
@@ -1984,6 +1988,54 @@ impl UdpChanReader {
                             "udp channel eof",
                         ))
                     }
+                }
+            },
+        }
+    }
+
+    /// 非阻塞排空下一帧(无就绪完整帧返回 `Ok(None)`,不挂起)。
+    /// `Chunks` 优先解 `buf` 内余帧并尝试 `try_read_chunk`;`Stream` 先解
+    /// `fbuf` 内已读字节,不足时以非阻塞 `poll_read` 尝试一次拉取。
+    async fn try_read_frame(
+        &mut self,
+        fbuf: &mut bytes::BytesMut,
+    ) -> std::io::Result<Option<(rh_protocol::FrameType, bytes::Bytes)>> {
+        match self {
+            Self::Stream(r) => loop {
+                use tokio::io::AsyncRead as _;
+                if let Some(f) = decode_udp_channel_frame(fbuf)? {
+                    return Ok(Some(f));
+                }
+                if fbuf.len() > rh_protocol::frame::HEADER_LEN + rh_protocol::frame::MAX_FRAME_LEN {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "udp channel frame exceeds limit",
+                    ));
+                }
+                let mut tmp = [0u8; 8192];
+                let n = std::future::poll_fn(|cx| {
+                    let mut rb = tokio::io::ReadBuf::new(&mut tmp);
+                    match std::pin::Pin::new(&mut *r).poll_read(cx, &mut rb) {
+                        std::task::Poll::Ready(Ok(())) => {
+                            std::task::Poll::Ready(Ok(Some(rb.filled().len())))
+                        }
+                        std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                        std::task::Poll::Pending => std::task::Poll::Ready(Ok(None)),
+                    }
+                })
+                .await?;
+                match n {
+                    Some(0) | None => return Ok(None),
+                    Some(k) => fbuf.extend_from_slice(&tmp[..k]),
+                }
+            },
+            Self::Chunks { r, buf } => loop {
+                if let Some(f) = decode_udp_channel_frame(buf)? {
+                    return Ok(Some(f));
+                }
+                match r.try_read_chunk().await? {
+                    Some(c) => buf.extend_from_slice(&c),
+                    None => return Ok(None),
                 }
             },
         }
@@ -2005,6 +2057,14 @@ impl UdpChanWriter {
                 .write_chunk(bytes::Bytes::copy_from_slice(f))
                 .await
                 .is_ok(),
+        }
+    }
+
+    /// 整块写出已成帧的 `Bytes`(可含多帧拼接批次);`Chunks` 零拷贝移交 `write_chunk`。
+    async fn write_bytes(&mut self, buf: bytes::Bytes) -> bool {
+        match self {
+            Self::Stream(w) => w.write_all(&buf).await.is_ok(),
+            Self::Chunks(w) => w.write_chunk(buf).await.is_ok(),
         }
     }
 }
@@ -2197,11 +2257,27 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
 /// 测试实现直接返回 `Err`,生产实现原样转发,不改变任何行为。
 trait UdpRecv {
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+
+    async fn recv_batch(
+        &self,
+        batch: &mut rh_transport::udp_batch::UdpRecvBatch,
+    ) -> std::io::Result<usize> {
+        let (n, peer) = self.recv_from(batch.first_buf_mut()).await?;
+        batch.set_single(n, peer);
+        Ok(1)
+    }
 }
 
 impl UdpRecv for Arc<UdpSocket> {
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         UdpSocket::recv_from(self, buf).await
+    }
+
+    async fn recv_batch(
+        &self,
+        batch: &mut rh_transport::udp_batch::UdpRecvBatch,
+    ) -> std::io::Result<usize> {
+        rh_transport::udp_batch::recv_from_batch(self, batch).await
     }
 }
 
@@ -2221,22 +2297,22 @@ async fn udp_pump_up<S: UdpRecv>(
     rule_cancel: &tokio_util::sync::CancellationToken,
     shutdown: &tokio_util::sync::CancellationToken,
 ) {
+    use bytes::BufMut as _;
     use std::fmt::Write as _;
     let mut up_frame = bytes::BytesMut::new();
     let mut addr_buf = String::with_capacity(24);
-    let mut pkt_buf = vec![
-        0u8;
-        state
-            .limits
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .udp_packet_size
-            .max(1500)
-    ];
+    let pkt_cap = state
+        .limits
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .udp_packet_size
+        .max(1500);
+    let mut batch = rh_transport::udp_batch::UdpRecvBatch::new(pkt_cap);
+    let mut admitted = [false; rh_transport::udp_batch::UDP_BATCH_MAX];
     loop {
-        let (n, peer) = tokio::select! {
-            r = sock.recv_from(&mut pkt_buf) => match r {
-                Ok(v) => v,
+        let count = tokio::select! {
+            r = sock.recv_batch(&mut batch) => match r {
+                Ok(n) => n,
                 Err(_) => {
                     // 监听 socket 失效:规则级退出。
                     //
@@ -2275,43 +2351,64 @@ async fn udp_pump_up<S: UdpRecv>(
             _ = rule_cancel.cancelled() => return,
             _ = shutdown.cancelled() => return,
         };
+        if count == 0 {
+            continue;
+        }
         // ★配额击穿后上行也必须停(修前同义:下行早已切,上行此前照常计费转发)。
         if usage.flow_cut.load(std::sync::atomic::Ordering::Relaxed) {
             last_alive.store(epoch_ms(), std::sync::atomic::Ordering::Relaxed);
             continue;
         }
+        let mut admitted_count = 0usize;
+        let mut total_bytes = 0usize;
         {
-            // 准入判定与时间戳刷新合并进同一次加锁:up/down 两任务在高 pps
-            // 下互抢这把锁,拆成两次取锁纯付争抢成本。insert 提前到写之前,
+            // 准入判定与时间戳刷新合并进整批一次加锁:up/down 两任务在高 pps
+            // 下互抢这把锁,拆成多次取锁纯付争抢成本。insert 提前到写之前,
             // 写失败残留的 entry 由通道死亡路径的 clear() 与 retain GC 兜底。
+            let now = Instant::now();
             let mut s = sessions.lock().unwrap();
-            if !udp_session_admit(state, rt.as_ref(), &mut s, peer) {
+            for (i, (pkt, peer)) in batch.iter().enumerate() {
+                let ok = udp_session_admit(state, rt.as_ref(), &mut s, peer);
+                admitted[i] = ok;
+                if ok {
+                    s.insert(peer, now);
+                    admitted_count += 1;
+                    total_bytes += pkt.len();
+                }
+            }
+        }
+        if admitted_count == 0 {
+            continue;
+        }
+        state.metrics.count_user_in(total_bytes);
+        rt.bytes_in
+            .fetch_add(total_bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        usage.add_bytes(total_bytes as u64);
+        // B1/P2-7:整批成帧进同一个复用缓冲(各包仍为独立标准 UDP_PACKET 帧,
+        // 与 rh-client 线格式完全兼容),再 split().freeze() 零拷贝整批写出。
+        up_frame.clear();
+        up_frame.reserve(admitted_count * (rh_protocol::frame::HEADER_LEN + 1 + 24) + total_bytes);
+        for (i, (pkt, peer)) in batch.iter().enumerate() {
+            if !admitted[i] {
                 continue;
             }
-            s.insert(peer, Instant::now());
+            addr_buf.clear();
+            let _ = write!(addr_buf, "{peer}");
+            let payload_len = 1 + addr_buf.len() + pkt.len();
+            rh_protocol::encode_frame_header(
+                &mut up_frame,
+                rh_protocol::FrameType::UDP_PACKET,
+                payload_len,
+            );
+            up_frame.put_u8(addr_buf.len() as u8);
+            up_frame.put_slice(addr_buf.as_bytes());
+            up_frame.put_slice(pkt);
         }
-        state.metrics.count_user_in(n);
-        rt.bytes_in
-            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        usage.add_bytes(n as u64);
-        // B1:一次成帧(帧头 + [addr_len][addr][data] 直接写进复用缓冲)。
-        addr_buf.clear();
-        use bytes::BufMut as _;
-        let _ = write!(addr_buf, "{peer}");
-        let payload_len = 1 + addr_buf.len() + n;
-        up_frame.clear();
-        rh_protocol::encode_frame_header(
-            &mut up_frame,
-            rh_protocol::FrameType::UDP_PACKET,
-            payload_len,
-        );
-        up_frame.put_u8(addr_buf.len() as u8);
-        up_frame.put_slice(addr_buf.as_bytes());
-        up_frame.put_slice(&pkt_buf[..n]);
+        let chunk = up_frame.split().freeze();
         // B-1:写阻塞必须可被打断 —— 死链 90s 后下行任务 cancel dead,
         // 本任务不能仍钉在 write 上(修前正是这个内联 await 拖停全局)。
         let ok = tokio::select! {
-            r = ch_w.write_frame(&up_frame) => r,
+            r = ch_w.write_bytes(chunk) => r,
             _ = dead.cancelled() => false,
         };
         if !ok {
@@ -2523,6 +2620,46 @@ async fn udp_pump_down(
     .await
 }
 
+fn push_udp_down_packet(
+    batch_items: &mut Vec<(bytes::Bytes, SocketAddr)>,
+    valid_seen: &mut bool,
+    payload: bytes::Bytes,
+) {
+    if let Some((src, _data)) = rh_protocol::message::udp_packet::decode(&payload) {
+        let offset = 1 + src.len();
+        if let Ok(addr) = src.parse::<SocketAddr>() {
+            batch_items.push((payload.slice(offset..), addr));
+        }
+        *valid_seen = true;
+    }
+}
+
+async fn handle_down_non_udp_frame(
+    ty: rh_protocol::FrameType,
+    framed_pong: &std::sync::OnceLock<bytes::Bytes>,
+    ctrl_tx: &mpsc::Sender<bytes::Bytes>,
+    dead: &tokio_util::sync::CancellationToken,
+    last_alive: &std::sync::atomic::AtomicI64,
+) -> bool {
+    if ty == rh_protocol::FrameType::PING {
+        let pong = framed_pong.get_or_init(|| {
+            rh_protocol::frame::encode_frame_bytes(
+                rh_protocol::FrameType::PONG,
+                &serde_json::to_vec(&rh_protocol::message::Pong {
+                    ts_ms: 0,
+                    probe: true,
+                })
+                .unwrap(),
+            )
+        });
+        if !ctrl_send(ctrl_tx, pong.clone(), dead).await {
+            return false;
+        }
+    }
+    last_alive.store(epoch_ms(), Ordering::Relaxed);
+    true
+}
+
 /// [`udp_pump_down`] 的本体,周期参数可注入(生产恒 `PumpTiming::PROD`)。
 #[allow(clippy::too_many_arguments)]
 async fn udp_pump_down_with(
@@ -2540,11 +2677,13 @@ async fn udp_pump_down_with(
     timing: PumpTiming,
 ) {
     use std::sync::atomic::Ordering;
-    let mut fbuf = bytes::BytesMut::with_capacity(2048);
+    let mut fbuf = bytes::BytesMut::with_capacity(64 * 1024);
+    let mut batch_items: Vec<(bytes::Bytes, SocketAddr)> =
+        Vec::with_capacity(rh_transport::udp_batch::UDP_BATCH_MAX);
+    let dummy_addr = SocketAddr::from(([0, 0, 0, 0], 0));
     let mut gc = tokio::time::interval(timing.gc_every);
     let mut last_ping_sent = ping_sent_anchor(Instant::now(), timing.ping_every);
     let alive = || last_alive.load(Ordering::Relaxed);
-    let touch = || last_alive.store(epoch_ms(), Ordering::Relaxed);
     // PING/PONG 载荷恒定,成帧一次缓存
     let framed_ping = std::sync::OnceLock::new();
     let framed_pong = std::sync::OnceLock::new();
@@ -2553,44 +2692,73 @@ async fn udp_pump_down_with(
             r = ch_r.read_frame(&mut fbuf) => {
                 match r {
                     Ok((rh_protocol::FrameType::UDP_PACKET, p)) => {
-                        if let Some((src, data)) = rh_protocol::message::udp_packet::decode(&p) {
-                            if let Ok(addr) = src.parse::<SocketAddr>() {
-                                if usage.flow_cut.load(Ordering::Relaxed) {
-                                    touch();
-                                    continue;
+                        batch_items.clear();
+                        let mut frames_drained = 1usize;
+                        let mut valid_seen = false;
+                        push_udp_down_packet(&mut batch_items, &mut valid_seen, p);
+                        let mut trailing_frame: Option<rh_protocol::FrameType> = None;
+                        let mut trailing_err = false;
+                        while frames_drained < rh_transport::udp_batch::UDP_BATCH_MAX {
+                            match ch_r.try_read_frame(&mut fbuf).await {
+                                Ok(Some((rh_protocol::FrameType::UDP_PACKET, p2))) => {
+                                    frames_drained += 1;
+                                    push_udp_down_packet(&mut batch_items, &mut valid_seen, p2);
                                 }
-                                // 与上行泵同款:准入 + 时间戳刷新一次加锁完成。
-                                // send_to 的错误本就被忽略(丢包语义),insert
-                                // 提前后行为等价。
-                                {
-                                    let mut s = sessions.lock().unwrap();
-                                    if !udp_session_admit(state, rt.as_ref(), &mut s, addr) {
-                                        touch();
-                                        continue;
-                                    }
-                                    s.insert(addr, Instant::now());
+                                Ok(Some((ty, _))) => {
+                                    trailing_frame = Some(ty);
+                                    break;
                                 }
-                                let _ = sock.send_to(data, addr).await;
-                                state.metrics.count_user_out(data.len());
-                                rt.bytes_out.fetch_add(data.len() as u64, Ordering::Relaxed);
-                                usage.add_bytes(data.len() as u64);
+                                Ok(None) => break,
+                                Err(_) => {
+                                    trailing_err = true;
+                                    break;
+                                }
                             }
-                            touch();
                         }
-                    }
-                    Ok((rh_protocol::FrameType::PING, _)) => {
-                        let pong = framed_pong.get_or_init(|| {
-                            rh_protocol::frame::encode_frame_bytes(
-                                rh_protocol::FrameType::PONG,
-                                &serde_json::to_vec(&rh_protocol::message::Pong { ts_ms: 0, probe: true }).unwrap(),
-                            )
-                        });
-                        if !ctrl_send(&ctrl_tx, pong.clone(), dead).await {
+                        if !batch_items.is_empty() && !usage.flow_cut.load(Ordering::Relaxed) {
+                            let mut out_arr: [(&[u8], SocketAddr); rh_transport::udp_batch::UDP_BATCH_MAX] =
+                                [(&[], dummy_addr); rh_transport::udp_batch::UDP_BATCH_MAX];
+                            let mut out_len = 0usize;
+                            let mut total_bytes = 0usize;
+                            {
+                                // 与上行泵同款:整批准入 + 时间戳刷新一次加锁完成。
+                                // send_to_batch 的错误沿用原丢包语义忽略,insert 提前后等价。
+                                let now = Instant::now();
+                                let mut s = sessions.lock().unwrap();
+                                for (data, addr) in &batch_items {
+                                    if udp_session_admit(state, rt.as_ref(), &mut s, *addr) {
+                                        s.insert(*addr, now);
+                                        total_bytes += data.len();
+                                        out_arr[out_len] = (data.as_ref(), *addr);
+                                        out_len += 1;
+                                    }
+                                }
+                            }
+                            if out_len > 0 {
+                                let _ = rh_transport::udp_batch::send_to_batch(sock, &out_arr[..out_len]).await;
+                                state.metrics.count_user_out(total_bytes);
+                                rt.bytes_out.fetch_add(total_bytes as u64, Ordering::Relaxed);
+                                usage.add_bytes(total_bytes as u64);
+                            }
+                        }
+                        if valid_seen {
+                            last_alive.store(epoch_ms(), Ordering::Relaxed);
+                        }
+                        if let Some(ty) = trailing_frame {
+                            if !handle_down_non_udp_frame(ty, &framed_pong, &ctrl_tx, dead, last_alive).await {
+                                break;
+                            }
+                        }
+                        if trailing_err {
+                            dead.cancel();
                             break;
                         }
-                        touch();
                     }
-                    Ok(_) => { touch(); }
+                    Ok((ty, _)) => {
+                        if !handle_down_non_udp_frame(ty, &framed_pong, &ctrl_tx, dead, last_alive).await {
+                            break;
+                        }
+                    }
                     Err(_) => {
                         // EOF/错误:通道死亡
                         dead.cancel();
@@ -5045,6 +5213,265 @@ mod udp_pump_failure_tests {
             !dead.is_cancelled(),
             "socket 失效**不是**通道死亡,不得 cancel dead"
         );
+    }
+
+    /// P2-7:上行多包在同一次 `recv_batch` 中被合并进单个 `BytesMut` 缓冲,
+    /// 经一次 `write_bytes` / `write_chunk` 送达对端,且每包仍保持标准独立
+    /// `UDP_PACKET` 线格式。
+    #[tokio::test]
+    async fn udp_pump_up_batches_multiple_packets_into_one_chunk() {
+        let st = state().await;
+        let rt = make_rt();
+        let sess_map = sessions();
+        let last_alive = Arc::new(AtomicI64::new(epoch_ms()));
+        let usage: Arc<ClientUsage> = Arc::new(ClientUsage::default());
+        let dead = tokio_util::sync::CancellationToken::new();
+        let sock_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rule_cancel = tokio_util::sync::CancellationToken::new();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel::<bytes::Bytes>(4);
+
+        let pump_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let pump_addr = pump_sock.local_addr().unwrap();
+        let sender1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let s1_addr = sender1.local_addr().unwrap();
+        let s2_addr = sender2.local_addr().unwrap();
+
+        let expected = vec![
+            (s1_addr, b"up-batch-1".to_vec()),
+            (s2_addr, b"up-batch-22".to_vec()),
+            (s1_addr, b"up-batch-333".to_vec()),
+            (s2_addr, b"up-batch-4444".to_vec()),
+        ];
+        // 在启动泵前先全部注入 loopback 接收队列,确保首次 recv_batch 整批收齐。
+        for (idx, (_, payload)) in expected.iter().enumerate() {
+            let s = if idx % 2 == 0 { &sender1 } else { &sender2 };
+            s.send_to(payload, pump_addr).await.unwrap();
+        }
+        tokio::task::yield_now().await;
+
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let server = rh_transport::wrap_stream_as_server(
+            Box::new(b),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let client = rh_transport::wrap_stream_as_client(
+            Box::new(a),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let accept_fut = server.accept();
+        let open_fut = client.open_stream();
+        let (srv_res, cli_res) = tokio::join!(accept_fut, open_fut);
+        let mut srv_stream = srv_res.unwrap();
+        let mut cli_stream = cli_res.unwrap();
+        let (mut peer_r, _peer_w) = rh_transport::mux::steal_mux_halves(&mut srv_stream).unwrap();
+        let (_cli_r, cli_w) = rh_transport::mux::steal_mux_halves(&mut cli_stream).unwrap();
+
+        let h = tokio::spawn({
+            let st = st.clone();
+            let rt = rt.clone();
+            let pump_sock = pump_sock.clone();
+            let sess_map = sess_map.clone();
+            let last_alive = last_alive.clone();
+            let usage = usage.clone();
+            let dead = dead.clone();
+            let sock_failed = sock_failed.clone();
+            let rule_cancel = rule_cancel.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                udp_pump_up(
+                    &st,
+                    &rt,
+                    &pump_sock,
+                    UdpChanWriter::Chunks(cli_w),
+                    ctrl_rx,
+                    &sess_map,
+                    &last_alive,
+                    &usage,
+                    &dead,
+                    &sock_failed,
+                    &rule_cancel,
+                    &shutdown,
+                )
+                .await
+            }
+        });
+
+        let chunk = tokio::time::timeout(Duration::from_secs(3), peer_r.read_chunk())
+            .await
+            .expect("peer read_chunk timeout")
+            .unwrap()
+            .expect("expected batched chunk");
+
+        let mut decode_buf = bytes::BytesMut::from(chunk.as_ref());
+        let mut decoded = Vec::new();
+        while let Some((ty, payload)) = rh_protocol::frame::decode_frame(&mut decode_buf).unwrap() {
+            assert_eq!(ty, rh_protocol::FrameType::UDP_PACKET);
+            let (src, data) = rh_protocol::message::udp_packet::decode(&payload).unwrap();
+            let addr: SocketAddr = src.parse().unwrap();
+            decoded.push((addr, data.to_vec()));
+        }
+        assert!(decode_buf.is_empty(), "单批 chunk 末尾不得残留半帧");
+        assert_eq!(
+            decoded, expected,
+            "4 个 UDP 包必须合并进同一次 write_chunk 且解码与原包完全一致"
+        );
+
+        let expected_bytes: u64 = expected.iter().map(|(_, p)| p.len() as u64).sum();
+        assert_eq!(rt.bytes_in.load(AtomicOrdering::Relaxed), expected_bytes);
+        assert_eq!(usage.bytes.load(AtomicOrdering::Relaxed), expected_bytes);
+        assert_eq!(sess_map.lock().unwrap().len(), 2);
+
+        rule_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// P2-7:下行从同一 chunk 与后续就绪 chunk 排空多帧 `UDP_PACKET` 并通过
+    /// `send_to_batch` 发送,同时严格保序处理中间插入的 `PING` → `PONG`。
+    #[tokio::test]
+    async fn udp_pump_down_batches_frames_and_preserves_ping_pong_order() {
+        let st = state().await;
+        let rt = make_rt();
+        let sess_map = sessions();
+        let last_alive = Arc::new(AtomicI64::new(epoch_ms()));
+        let usage: Arc<ClientUsage> = Arc::new(ClientUsage::default());
+        let dead = tokio_util::sync::CancellationToken::new();
+        let rule_cancel = tokio_util::sync::CancellationToken::new();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<bytes::Bytes>(8);
+
+        let pump_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let u1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let u2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let u1_addr = u1.local_addr().unwrap();
+        let u2_addr = u2.local_addr().unwrap();
+
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let server = rh_transport::wrap_stream_as_server(
+            Box::new(b),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let client = rh_transport::wrap_stream_as_client(
+            Box::new(a),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let (srv_res, cli_res) = tokio::join!(server.accept(), client.open_stream());
+        let mut srv_stream = srv_res.unwrap();
+        let mut cli_stream = cli_res.unwrap();
+        let (pump_r, _pump_w) = rh_transport::mux::steal_mux_halves(&mut srv_stream).unwrap();
+        let (_peer_r, mut peer_w) = rh_transport::mux::steal_mux_halves(&mut cli_stream).unwrap();
+
+        let encode_udp = |buf: &mut bytes::BytesMut, addr: SocketAddr, data: &[u8]| {
+            let payload = rh_protocol::message::udp_packet::encode(&addr.to_string(), data);
+            rh_protocol::frame::encode_frame(buf, rh_protocol::FrameType::UDP_PACKET, &payload);
+        };
+
+        // chunk1: [UDP1, UDP2, PING, UDP3, UDP4]
+        let mut chunk1 = bytes::BytesMut::new();
+        encode_udp(&mut chunk1, u1_addr, b"down-1");
+        encode_udp(&mut chunk1, u2_addr, b"down-2");
+        let ping_payload = serde_json::to_vec(&rh_protocol::message::Ping {
+            ts_ms: 0,
+            probe: true,
+        })
+        .unwrap();
+        rh_protocol::frame::encode_frame(&mut chunk1, rh_protocol::FrameType::PING, &ping_payload);
+        encode_udp(&mut chunk1, u1_addr, b"down-3");
+        encode_udp(&mut chunk1, u2_addr, b"down-4");
+
+        // 另写两个独立 chunk(测 try_read_chunk 跨 chunk 批排空)
+        let mut chunk2 = bytes::BytesMut::new();
+        encode_udp(&mut chunk2, u1_addr, b"down-5");
+        let mut chunk3 = bytes::BytesMut::new();
+        encode_udp(&mut chunk3, u2_addr, b"down-6");
+
+        peer_w.write_chunk(chunk1.freeze()).await.unwrap();
+        peer_w.write_chunk(chunk2.freeze()).await.unwrap();
+        peer_w.write_chunk(chunk3.freeze()).await.unwrap();
+
+        let h = tokio::spawn({
+            let st = st.clone();
+            let rt = rt.clone();
+            let pump_sock = pump_sock.clone();
+            let sess_map = sess_map.clone();
+            let last_alive = last_alive.clone();
+            let usage = usage.clone();
+            let dead = dead.clone();
+            let rule_cancel = rule_cancel.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                udp_pump_down_with(
+                    &st,
+                    &rt,
+                    &pump_sock,
+                    UdpChanReader::Chunks {
+                        r: pump_r,
+                        buf: bytes::BytesMut::with_capacity(2048),
+                    },
+                    ctrl_tx,
+                    &sess_map,
+                    &last_alive,
+                    &usage,
+                    &dead,
+                    &rule_cancel,
+                    &shutdown,
+                    PumpTiming::PROD,
+                )
+                .await
+            }
+        });
+
+        let pong_frame = tokio::time::timeout(Duration::from_secs(3), ctrl_rx.recv())
+            .await
+            .expect("PONG timeout")
+            .expect("ctrl channel closed without PONG");
+        let mut pong_buf = bytes::BytesMut::from(pong_frame.as_ref());
+        let (pong_ty, _) = rh_protocol::frame::decode_frame(&mut pong_buf)
+            .unwrap()
+            .expect("valid PONG frame");
+        assert_eq!(pong_ty, rh_protocol::FrameType::PONG);
+
+        async fn recv_n(sock: &UdpSocket, count: usize) -> Vec<Vec<u8>> {
+            let mut out = Vec::with_capacity(count);
+            let mut buf = [0u8; 64];
+            for _ in 0..count {
+                let (n, _) = tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf))
+                    .await
+                    .expect("udp recv timeout")
+                    .unwrap();
+                out.push(buf[..n].to_vec());
+            }
+            out
+        }
+
+        let (got_u1, got_u2) = tokio::join!(recv_n(&u1, 3), recv_n(&u2, 3));
+        assert_eq!(
+            got_u1,
+            vec![b"down-1".to_vec(), b"down-3".to_vec(), b"down-5".to_vec()]
+        );
+        assert_eq!(
+            got_u2,
+            vec![b"down-2".to_vec(), b"down-4".to_vec(), b"down-6".to_vec()]
+        );
+
+        let expected_bytes = 6 * 6u64;
+        assert_eq!(rt.bytes_out.load(AtomicOrdering::Relaxed), expected_bytes);
+        assert_eq!(usage.bytes.load(AtomicOrdering::Relaxed), expected_bytes);
+        assert_eq!(sess_map.lock().unwrap().len(), 2);
+
+        rule_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
 

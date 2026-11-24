@@ -1473,6 +1473,18 @@ impl YamuxCarrier {
     fn new(inner: BoxedIo) -> Self {
         Self { inner }
     }
+
+    fn poll_read_buf(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        rb: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut self.inner).poll_read(cx, rb) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(rb.filled().len())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 impl futures::AsyncRead for YamuxCarrier {
@@ -1482,11 +1494,7 @@ impl futures::AsyncRead for YamuxCarrier {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let mut rb = ReadBuf::new(buf);
-        match Pin::new(&mut self.inner).poll_read(cx, &mut rb) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(rb.filled().len())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
+        self.poll_read_buf(cx, &mut rb)
     }
 }
 
@@ -1540,6 +1548,19 @@ impl yamux::Writev2 for YamuxCarrier {
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
         Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn supports_read_uninit(&self) -> bool {
+        true
+    }
+
+    fn poll_read_uninit(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [std::mem::MaybeUninit<u8>],
+    ) -> Poll<io::Result<usize>> {
+        let mut rb = ReadBuf::uninit(buf);
+        self.poll_read_buf(cx, &mut rb)
     }
 }
 

@@ -19,6 +19,9 @@ repository = "https://github.com/paritytech/yamux"
 name = "yamux"
 path = "src/lib.rs"
 
+[features]
+test-probes = []
+
 [dependencies]
 futures = { version = "0.3", features = ["std", "executor"], default-features = false }
 log = "0.4"

@@ -21,6 +21,7 @@ pub mod quic;
 pub mod splice;
 pub mod tcp;
 pub mod tls;
+pub mod udp_batch;
 pub mod ws;
 
 use std::fmt;

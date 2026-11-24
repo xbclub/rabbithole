@@ -51,6 +51,10 @@ pub(crate) const MAX_FRAME_BODY_LEN: usize = crate::MIB;
 /// 不阻塞 WU 回程节奏的形态。
 const READ_RESERVE: usize = 64 * 1024;
 
+/// P2-1: staging 批量接收池化初始容量(256 KiB = 4 × 64 KiB 主力帧,
+/// 经 `crate::pool` 借用并在多帧间摊销复用)。
+const STAGING_POOL_CAP: usize = 256 * 1024;
+
 /// 小帧 copy-out 阈值(≤ READ_RESERVE)。goal-repair C1:帧体不完整时
 /// staging 按 `missing.max(READ_RESERVE)` 预留,交错大帧会驱动 backing
 /// 扩容迁移;若小帧仍以零拷贝切片交付,未消费的小切片会把整段
@@ -131,6 +135,21 @@ pub trait Writev2: AsyncWrite {
             (Some(a), None) => self.poll_write2(cx, &a[..], &[]),
             (None, _) => Poll::Ready(Ok(0)),
         }
+    }
+
+    /// P2-2: 载体是否支持直接读入未初始化缓冲(免去 Staging 零填 memset)。
+    fn supports_read_uninit(&self) -> bool {
+        false
+    }
+
+    /// P2-2: 直接读入未初始化缓冲。仅在 `supports_read_uninit() == true` 时被调用。
+    /// 实现者必须保证返回 `Poll::Ready(Ok(n))` 时 `buf[..n]` 已全部初始化。
+    fn poll_read_uninit(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut [std::mem::MaybeUninit<u8>],
+    ) -> Poll<io::Result<usize>> {
+        unreachable!("poll_read_uninit called when supports_read_uninit() == false")
     }
 }
 
@@ -264,11 +283,29 @@ impl Staging {
             // 容量足够:BytesMut::reserve 短路返回,无任何搬移,水位保持。
             return;
         }
-        let new_cap = (len + additional).max(cap.saturating_mul(2));
-        let mut nb = BytesMut::with_capacity(new_cap);
+        let new_cap = if additional >= READ_RESERVE {
+            (len + additional)
+                .max(cap.saturating_mul(2))
+                .max(STAGING_POOL_CAP)
+        } else {
+            (len + additional).max(cap.saturating_mul(2))
+        };
+        let mut nb = if new_cap >= 16 * 1024 {
+            crate::pool::get(new_cap)
+        } else {
+            BytesMut::with_capacity(new_cap)
+        };
         nb.extend_from_slice(&self.buf);
         self.buf = nb;
         self.zeroed = len;
+    }
+
+    /// P2-2: 返回空闲区前至多 `want` 字节的未初始化切片,供 `poll_read_uninit`
+    /// 直接写入(免去零填 memset)。
+    fn uninit_spare(&mut self, want: usize) -> &mut [std::mem::MaybeUninit<u8>] {
+        let spare = self.buf.spare_capacity_mut();
+        let take = want.min(spare.len());
+        &mut spare[..take]
     }
 
     /// 确保空闲区前 `want` 字节已初始化,返回该可写切片
@@ -330,6 +367,18 @@ impl Staging {
         #[allow(unsafe_code)]
         unsafe {
             self.buf.advance_mut(n);
+        }
+    }
+
+    /// P2-2: 通过未初始化空闲切片读入 n 字节后推进长度并同步已初始化水位
+    /// (载体已按 `Writev2::poll_read_uninit` 契约初始化前 n 字节)。
+    fn appended_uninit(&mut self, n: usize) {
+        #[allow(unsafe_code)]
+        unsafe {
+            self.buf.advance_mut(n);
+        }
+        if self.zeroed < self.buf.len() {
+            self.zeroed = self.buf.len();
         }
     }
 }
@@ -585,14 +634,24 @@ where
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
+fn spare_empty_pending<E>(cx: &mut Context<'_>) -> Poll<Option<Result<Frame<()>, E>>> {
+    // reserve 后仍无空闲(理论不可达):自唤醒让出,避免
+    // 无 waker 的 Pending 挂死,也不自旋
+    if crate::sched_diag::enabled() {
+        crate::sched_diag::on_spare_empty();
+    }
+    cx.waker().wake_by_ref();
+    Poll::Pending
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Writev2> Stream for Io<T> {
     type Item = Result<Frame<()>, FrameDecodeError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
         loop {
             // 1) staging 中已有完整帧则直接交付(零拷贝切片)
-            if this.read.len() >= header::HEADER_SIZE {
+            let read_limit = if this.read.len() >= header::HEADER_SIZE {
                 let hdr = {
                     let bytes: &[u8; header::HEADER_SIZE] = this.read.buf[..header::HEADER_SIZE]
                         .try_into()
@@ -621,30 +680,44 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
                 }
                 // 帧体不完整:按缺口预留
                 let missing = body_len - (this.read.len() - header::HEADER_SIZE);
-                this.read.reserve(missing.max(READ_RESERVE));
+                let need = missing.max(READ_RESERVE);
+                this.read.reserve(need);
+                need
             } else {
                 // 帧头不完整(或 staging 空):批量预留
                 this.read.reserve(READ_RESERVE);
-            }
+                READ_RESERVE
+            };
 
-            // 2) 从底层读入 staging 空闲区(已按需零填,满足初始化契约)
-            let spare = this.read.zeroed_spare(usize::MAX);
-            if spare.is_empty() {
-                // reserve 后仍无空闲(理论不可达):自唤醒让出,避免
-                // 无 waker 的 Pending 挂死,也不自旋
-                if crate::sched_diag::enabled() {
-                    crate::sched_diag::on_spare_empty();
+            // 2) 从底层读入 staging 空闲区:支持 uninit 时直读未初始化内存,
+            // 否则按需零填后走 AsyncRead::poll_read。单次读上限严格钳制在
+            // read_limit(稳态 64KiB),守住 round-8 WU 信用回路节奏。
+            let n = if this.io.supports_read_uninit() {
+                let spare = this.read.uninit_spare(read_limit);
+                if spare.is_empty() {
+                    return spare_empty_pending(cx);
                 }
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            let n = match ready!(Pin::new(&mut this.io).poll_read(cx, spare)) {
-                Ok(0) => 0,
-                Ok(n) => {
-                    this.read.appended(n);
-                    n
+                match ready!(Pin::new(&mut this.io).poll_read_uninit(cx, spare)) {
+                    Ok(0) => 0,
+                    Ok(n) => {
+                        this.read.appended_uninit(n);
+                        n
+                    }
+                    Err(e) => return Poll::Ready(Some(Err(FrameDecodeError::Io(e)))),
                 }
-                Err(e) => return Poll::Ready(Some(Err(FrameDecodeError::Io(e)))),
+            } else {
+                let spare = this.read.zeroed_spare(read_limit);
+                if spare.is_empty() {
+                    return spare_empty_pending(cx);
+                }
+                match ready!(Pin::new(&mut this.io).poll_read(cx, spare)) {
+                    Ok(0) => 0,
+                    Ok(n) => {
+                        this.read.appended(n);
+                        n
+                    }
+                    Err(e) => return Poll::Ready(Some(Err(FrameDecodeError::Io(e)))),
+                }
             };
             if n == 0 {
                 // EOF:staging 干净(帧边界)= 正常关闭;残留半帧 = 协议错
@@ -1370,6 +1443,225 @@ mod tests {
         assert_eq!(
             st.flush_calls, 1,
             "carrier flush runs exactly once after drain"
+        );
+    }
+
+    /// P2-2 测试载体:支持 `Writev2::poll_read_uninit`,记录单次提供给
+    /// 载体的切片长度与是否发生 `AsyncRead::poll_read` 回退。
+    struct UninitMockIo {
+        data: Vec<u8>,
+        off: usize,
+        max_read_buf_seen: usize,
+        read_buf_lens: Vec<usize>,
+        poll_read_calls: usize,
+    }
+
+    impl UninitMockIo {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data,
+                off: 0,
+                max_read_buf_seen: 0,
+                read_buf_lens: Vec::new(),
+                poll_read_calls: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for UninitMockIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            self.get_mut().poll_read_calls += 1;
+            Poll::Ready(Err(io::Error::other("unexpected zeroed poll_read")))
+        }
+    }
+
+    impl AsyncWrite for UninitMockIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Writev2 for UninitMockIo {
+        fn poll_write2(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            a: &[u8],
+            b: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(a.len() + b.len()))
+        }
+
+        fn supports_read_uninit(&self) -> bool {
+            true
+        }
+
+        fn poll_read_uninit(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [std::mem::MaybeUninit<u8>],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.max_read_buf_seen = this.max_read_buf_seen.max(buf.len());
+            this.read_buf_lens.push(buf.len());
+            let n = (this.data.len() - this.off).min(buf.len());
+            for (dst, &src) in buf[..n].iter_mut().zip(&this.data[this.off..this.off + n]) {
+                dst.write(src);
+            }
+            this.off += n;
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    fn build_64k_frames_wire(count: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut wire = Vec::with_capacity(count * (header::HEADER_SIZE + 64 * 1024));
+        let mut bodies = Vec::with_capacity(count);
+        for i in 0..count {
+            let body: Vec<u8> = (0..(64 * 1024))
+                .map(|j| ((i * 37 + j * 13 + 7) & 0xFF) as u8)
+                .collect();
+            let f = data_frame((i * 2 + 1) as u32, body.clone());
+            wire.extend_from_slice(&encode_frame(&f));
+            bodies.push(body);
+        }
+        (wire, bodies)
+    }
+
+    /// P2-2:支持 `supports_read_uninit` 的载体读取多帧 64KiB 数据时,
+    /// `Staging` 零填字节数必须恒为 0,且受 round-8 守卫约束单次传给
+    /// 载体的可读切片长度不得超过 `READ_RESERVE`(64KiB)。
+    #[test]
+    fn p2_uninit_carrier_zero_fill_is_zero() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (wire, expected) = build_64k_frames_wire(4);
+        let mut io = Io::new(crate::connection::Id::next(), UninitMockIo::new(wire));
+
+        let mut got = Vec::new();
+        while let Some(frame) = futures::executor::block_on(io.try_next()).unwrap() {
+            got.push(frame.body);
+        }
+
+        assert_eq!(got.len(), expected.len(), "all 4 64KiB frames decoded");
+        for (i, (actual, want)) in got.iter().zip(&expected).enumerate() {
+            assert_eq!(&actual[..], &want[..], "frame {i} payload mismatch");
+        }
+        assert_eq!(
+            io.read.fill_bytes.load(Relaxed),
+            0,
+            "P2-2: uninit carrier must cause zero memset fill bytes"
+        );
+        assert_eq!(
+            io.io.poll_read_calls, 0,
+            "uninit carrier must never fall back to AsyncRead::poll_read"
+        );
+        assert!(
+            !io.io.read_buf_lens.is_empty(),
+            "poll_read_uninit must be called"
+        );
+        assert!(
+            io.io.max_read_buf_seen <= READ_RESERVE,
+            "round-8 guard: single uninit read slice {} exceeded READ_RESERVE ({READ_RESERVE})",
+            io.io.max_read_buf_seen
+        );
+        assert_eq!(
+            io.io.max_read_buf_seen, READ_RESERVE,
+            "64KiB frames should read up to READ_RESERVE per poll"
+        );
+        assert!(
+            io.read.zeroed >= io.read.len() && io.read.zeroed <= io.read.buf.capacity(),
+            "staging watermark invariant must hold after uninit reads"
+        );
+    }
+
+    /// P2-1:多个 64KiB 主力帧共享同一个 256KiB 池化 staging backing
+    /// (前 3 帧连续切分在同一块内、零重分配),跨过 256KiB 边界时平滑
+    /// 从池中借入下一块并保持载荷完整。
+    #[test]
+    fn p2_staging_reuses_pool_across_frames() {
+        // 先验证 Staging::reserve(READ_RESERVE) 直接向池借入 ≥ STAGING_POOL_CAP
+        let mut st = Staging::new();
+        st.reserve(READ_RESERVE);
+        assert!(
+            st.buf.capacity() >= STAGING_POOL_CAP,
+            "Staging::reserve(READ_RESERVE) must allocate at least STAGING_POOL_CAP ({STAGING_POOL_CAP}), got {}",
+            st.buf.capacity()
+        );
+        drop(st);
+
+        // 预先向池归还一块 256KiB 缓冲,验证从池借取路径干净可用
+        crate::pool::put(BytesMut::with_capacity(STAGING_POOL_CAP));
+        let _allocs = crate::pool::global_allocations();
+
+        let (wire, expected) = build_64k_frames_wire(5);
+        let mut io = Io::new(crate::connection::Id::next(), UninitMockIo::new(wire));
+
+        // 前 3 帧合计 3 × (12 + 65536) = 196,644B ≤ 256KiB,必须共享同一块 staging backing
+        let f1 = futures::executor::block_on(io.try_next())
+            .unwrap()
+            .expect("frame 1");
+        let f2 = futures::executor::block_on(io.try_next())
+            .unwrap()
+            .expect("frame 2");
+        let f3 = futures::executor::block_on(io.try_next())
+            .unwrap()
+            .expect("frame 3");
+
+        let p1 = f1.body.as_ptr() as usize;
+        let p2 = f2.body.as_ptr() as usize;
+        let p3 = f3.body.as_ptr() as usize;
+        let stride = header::HEADER_SIZE + 64 * 1024;
+        assert_eq!(
+            p2,
+            p1 + stride,
+            "frame 2 must share frame 1's 256KiB staging backing"
+        );
+        assert_eq!(
+            p3,
+            p2 + stride,
+            "frame 3 must share frame 1/2's 256KiB staging backing"
+        );
+        assert_eq!(
+            io.read.buf.as_ptr() as usize,
+            p3 + 64 * 1024,
+            "staging cursor must advance contiguously within the same 256KiB backing"
+        );
+        assert_eq!(&f1.body[..], &expected[0][..]);
+        assert_eq!(&f2.body[..], &expected[1][..]);
+        assert_eq!(&f3.body[..], &expected[2][..]);
+
+        // 释放前 3 帧后继续读取跨越 256KiB 边界的第 4、5 帧:平滑借入新块且载荷保真
+        drop((f1, f2, f3));
+        let f4 = futures::executor::block_on(io.try_next())
+            .unwrap()
+            .expect("frame 4");
+        let f5 = futures::executor::block_on(io.try_next())
+            .unwrap()
+            .expect("frame 5");
+        assert!(
+            futures::executor::block_on(io.try_next())
+                .unwrap()
+                .is_none(),
+            "stream should reach clean EOF"
+        );
+        assert_eq!(&f4.body[..], &expected[3][..]);
+        assert_eq!(&f5.body[..], &expected[4][..]);
+        assert!(
+            io.read.buf.capacity() >= STAGING_POOL_CAP - 2 * stride,
+            "rollover buffer must be sized to STAGING_POOL_CAP"
         );
     }
 }

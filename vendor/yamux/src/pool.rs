@@ -64,10 +64,8 @@ pub(crate) struct Pool {
     large_bytes: AtomicUsize,
     rotor: AtomicUsize,
     /// 新分配计数(诊断缝:命中率回归断言用)。
-    /// L-C c:cfg(test) 门控 —— 修前生产热路径每 get/miss 一次原子递增,
-    /// 违反自家「无人观察的计数不上热路径」红线(C-4/A-1 同族);
-    /// 测试用私有实例,门控后全局池零开销。
-    #[cfg(test)]
+    /// L-C c:cfg(any(test, feature = "test-probes")) 门控 —— 生产热路径零开销。
+    #[cfg(any(test, feature = "test-probes"))]
     allocations: AtomicUsize,
 }
 
@@ -96,7 +94,7 @@ impl Pool {
             ],
             large_bytes: AtomicUsize::new(0),
             rotor: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-probes"))]
             allocations: AtomicUsize::new(0),
         }
     }
@@ -120,7 +118,7 @@ impl Pool {
         // 10-20× 且挤占主力路径的池存量;小缓冲本就被 put 拒收
         // (< MIN_RECYCLE),精确分配即正常释放,闭环一致。
         if min < MIN_RECYCLE {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-probes"))]
             self.allocations.fetch_add(1, Ordering::Relaxed);
             return BytesMut::with_capacity(min);
         }
@@ -170,14 +168,14 @@ impl Pool {
                     return b;
                 }
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-probes"))]
             self.allocations.fetch_add(1, Ordering::Relaxed);
             return BytesMut::with_capacity(min);
         }
         if min > CLASS_MAX {
             // 池内条目容量恒 ≤ CLASS_MAX,必然 miss:跳过扫描,避免
             // 途中误淘汰较小条目。
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-probes"))]
             self.allocations.fetch_add(1, Ordering::Relaxed);
             return BytesMut::with_capacity(min);
         }
@@ -216,7 +214,7 @@ impl Pool {
                 return b;
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-probes"))]
         self.allocations.fetch_add(1, Ordering::Relaxed);
         BytesMut::with_capacity(min.max(CLASS))
     }
@@ -282,6 +280,12 @@ pub fn get(min: usize) -> BytesMut {
 /// 归还缓冲;容量过小或超限、或池满则丢弃(正常释放)。见 [`Pool::put`]。
 pub fn put(b: BytesMut) {
     POOL.put(b)
+}
+
+/// 全局池新分配次数(仅 `test` / `test-probes` 探针用)。
+#[cfg(any(test, feature = "test-probes"))]
+pub fn global_allocations() -> usize {
+    POOL.allocations.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]

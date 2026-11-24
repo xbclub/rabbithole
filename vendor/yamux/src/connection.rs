@@ -1179,6 +1179,7 @@ mod halves {
     /// 注释);字段与构造器不外露。
     pub struct SplitSocket<T> {
         io: SplitBiLock<T>,
+        uninit_read: bool,
     }
 
     // 手写 Clone:derive 会给 T 加 Clone 约束,这里只克隆 Arc。
@@ -1186,12 +1187,30 @@ mod halves {
         fn clone(&self) -> Self {
             SplitSocket {
                 io: self.io.clone(),
+                uninit_read: self.uninit_read,
             }
         }
     }
-    pub(crate) fn split_socket<T>(io: T) -> SplitSocket<T> {
+    pub(crate) fn split_socket<T: Writev2>(io: T) -> SplitSocket<T> {
+        let uninit_read = io.supports_read_uninit();
         SplitSocket {
             io: SplitBiLock::new(io),
+            uninit_read,
+        }
+    }
+
+    impl<T> SplitSocket<T> {
+        fn poll_read_lock(&self, cx: &mut Context<'_>) -> Poll<SplitBiLockGuard<'_, T>> {
+            // round-26 诊断:统计读半因拿不到锁而 Pending 的次数。
+            match self.io.poll_lock(cx) {
+                std::task::Poll::Ready(g) => std::task::Poll::Ready(g),
+                std::task::Poll::Pending => {
+                    if crate::sched_diag::enabled() {
+                        crate::sched_diag::on_read_lock_miss();
+                    }
+                    std::task::Poll::Pending
+                }
+            }
         }
     }
 
@@ -1202,16 +1221,7 @@ mod halves {
             buf: &mut [u8],
         ) -> Poll<io::Result<usize>> {
             let this = self.get_mut();
-            // round-26 诊断:统计读半因拿不到锁而 Pending 的次数。
-            let mut guard = match this.io.poll_lock(cx) {
-                std::task::Poll::Ready(g) => g,
-                std::task::Poll::Pending => {
-                    if crate::sched_diag::enabled() {
-                        crate::sched_diag::on_read_lock_miss();
-                    }
-                    return std::task::Poll::Pending;
-                }
-            };
+            let mut guard = ready!(this.poll_read_lock(cx));
             Pin::new(&mut *guard).poll_read(cx, buf)
         }
     }
@@ -1258,6 +1268,20 @@ mod halves {
             let this = self.get_mut();
             let mut guard = ready!(this.io.poll_lock(cx));
             Pin::new(&mut *guard).poll_writev(cx, bufs)
+        }
+
+        fn supports_read_uninit(&self) -> bool {
+            self.uninit_read
+        }
+
+        fn poll_read_uninit(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [std::mem::MaybeUninit<u8>],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let mut guard = ready!(this.poll_read_lock(cx));
+            Pin::new(&mut *guard).poll_read_uninit(cx, buf)
         }
     }
 
