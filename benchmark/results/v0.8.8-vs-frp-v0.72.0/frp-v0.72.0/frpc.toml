@@ -1,0 +1,37 @@
+serverAddr = "172.16.1.6"
+auth.token = "rh-bench-token"
+
+serverPort = 17100
+transport.protocol = "tcp"
+transport.poolCount = 4
+transport.tcpMux = true
+
+log.level = "warn"
+
+[[proxies]]
+name = "tcp-echo"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 19102
+remotePort = 20001
+
+[[proxies]]
+name = "iperf"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 19101
+remotePort = 20002
+
+[[proxies]]
+name = "udp-echo"
+type = "udp"
+localIP = "127.0.0.1"
+localPort = 19103
+remotePort = 20003
+
+[[proxies]]
+name = "web"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 19104
+customDomains = ["bench.test"]

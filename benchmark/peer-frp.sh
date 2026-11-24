@@ -2,7 +2,7 @@
 # rabbithole benchmark —— frp 对照基准(与 peer.sh 同拓扑/同场景/同记录格式)。
 #
 # 与 peer.sh 的差异仅两点:
-#   1. 被测软件换成 frp v0.71.0(官方 release,固定 tag + 实测 sha256 记录);
+#   1. 被测软件换成官方 frp release(默认 v0.72.0,固定 tag + sha256 校验记录);
 #   2. frp 的规则在 frpc.toml 静态声明,无需服务端 API 下发,drive 无需凭据。
 #
 # 角色(与 peer.sh 一致,由运行者用自己的通道投放):
@@ -11,7 +11,7 @@
 #   peer-frp.sh drive  <A_IP> <B_IP> [label]   # test3:门控 + 全场景(带直连基线)
 #
 # 环境变量:
-#   FRP_VERSION   frp 版本(默认 v0.71.0,即 rabbithole README 的对标版本)
+#   FRP_VERSION   frp 版本(默认 v0.72.0,可用环境变量覆盖)
 #   PROTO         控制面协议 tcp|tls|ws|wss|quic|kcp(默认 tcp)
 #   PEER_DIR      工作目录(默认 /tmp/frp-peer,与 rabbithole 轮隔离)
 #   PEER_DURATION iperf3 每档秒数(默认 10)
@@ -27,7 +27,7 @@ source "$BENCH_SELF_DIR/lib/common.sh"
 
 require_cmd python3 curl jq iperf3
 
-FRP_VERSION="${FRP_VERSION:-v0.71.0}"
+FRP_VERSION="${FRP_VERSION:-v0.72.0}"
 FRP_ASSET="frp_${FRP_VERSION#v}_linux_amd64.tar.gz"   # tag 带 v,包名不带
 FRP_URL="https://github.com/fatedier/frp/releases/download/${FRP_VERSION}/${FRP_ASSET}"
 PROTO="${PROTO:-tcp}"

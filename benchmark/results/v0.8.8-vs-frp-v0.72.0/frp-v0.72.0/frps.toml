@@ -1,0 +1,9 @@
+bindAddr = "0.0.0.0"
+bindPort = 17100
+kcpBindPort = 17101
+quicBindPort = 17102
+vhostHTTPPort = 20004
+
+auth.token = "rh-bench-token"
+
+log.level = "warn"

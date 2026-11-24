@@ -58,8 +58,11 @@ benchmark/runs/
 # Raw measurement data (jsonl): per-run probe/instrumentation records, kept on
 # disk only. They are machine-generated, large, and may carry environment
 # specifics (internal host addresses) that should not enter version control.
-# Analysis conclusions belong in the markdown reports instead.
+# Curated official release comparison result sets under `benchmark/results/`
+# are tracked explicitly.
 *.jsonl
+!benchmark/results/
+!benchmark/results/**
 
 # Python bytecode cache
 __pycache__/

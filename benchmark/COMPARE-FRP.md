@@ -1,14 +1,14 @@
 # rabbithole vs frp 性能对比方案
 
-> **时效说明(2026-10-22 补注)**:本文是 2026-10-12 定下的**对比方法学**,
+> **时效说明(2026-11-24 更新)**:本文是 2026-10-12 定下的**对比方法学**,
 > 其中的公平性原则(只换被测软件、对等配置、同一直连基线)至今有效,
-> `benchmark/peer-frp.sh` 即按此实现。文中"被测版本 v0.3.0"是当时的取值,
-> 现役对 frp 的结论见 `docs/deep-review-performance-report.md`(2026-10-21)。
+> `benchmark/peer-frp.sh` 即按此实现。现役最新官方 Release 同场实测(`rabbithole v0.8.8`
+> vs `frp v0.72.0`)见 [`results/v0.8.8-vs-frp-v0.72.0/REPORT.md`](results/v0.8.8-vs-frp-v0.72.0/REPORT.md) 与 [`benchmark/README.md`](README.md)。
 
 ## 1. 目标
 
-在与 rabbithole 基准完全相同的条件下测量 frp v0.71.0(rabbithole README 声明对标的
-基线版本),得到逐指标的「rabbithole / frp / 直连基线」三方对比。
+在与 rabbithole 基准完全相同的条件下测量最新官方 **frp** Release(当前默认 `v0.72.0`,
+此前基线版本为 `v0.71.0`),得到逐指标的「rabbithole / frp / 直连基线」三方对比。
 
 ## 2. 公平性原则(方案的核心)
 
@@ -17,7 +17,7 @@
 | **只换被测软件** | 同三台机器、同角色分工、同目标服务(target.py/iperf3)、同压测端、同端口规划、同场景与顺序、同就绪门控 |
 | **对等配置** | 传输多路复用:rabbithole `multiplex=true` ↔ frp `tcpMux=true`;连接池:`pool_size=4` ↔ `poolCount=4`;压缩:双方默认关;日志:双方 warn;fd:双方启动前提升到 65535 |
 | **同一直连基线** | 直连(压测端→B 目标,不经任何隧道)每轮重测,两侧共用同一目标端口与工具 |
-| **版本固定可复现** | rabbithole v0.3.0(release,sha256 校验);frp v0.71.0(官方 release;frp 不提供 sidecar 校验文件,记录实测 sha256 于结果目录) |
+| **版本固定可复现** | rabbithole 官方 musl release(sha256 校验);frp 官方 release(校验官方 `frp_sha256_checksums.txt`,无 sidecar 时自计 `frp.sha256` 落结果目录) |
 | **逐轮对齐** | 每种控制面协议各跑一轮,frp 与 rabbithole 轮次相邻执行,避免环境漂移 |
 
 ## 3. 拓扑与端口(与 rabbithole 基准完全一致)
