@@ -647,16 +647,17 @@ async fn copy_relay_pair(
     // 且 splice 仅 Linux 可用,macOS/Windows 的非 mux 模式 100% 走本函数。
     // user 侧剥 CountedUserIo 计量壳(A-2 同款),channel 侧走
     // split_boxed_io;包装类型(压缩流等)照旧回落同步锁拆分。
-    let (mut u_r, mut u_w): RelayHalves = match split_counted_tcp_user(user) {
-        Ok((r, w)) => (r, w),
-        Err(io) => match rh_transport::split_boxed_io(io) {
-            Ok((r, w)) => (Box::new(r), Box::new(w)),
-            Err(io) => {
-                let (r, w) = tokio::io::split(io);
-                (Box::new(r), Box::new(w))
-            }
-        },
-    };
+    let ((mut u_r, mut u_w), _user_quota_guard): (RelayHalves, Option<crate::control::QuotaGuard>) =
+        match split_counted_user(user) {
+            Ok((halves, g)) => (halves, g),
+            Err(io) => match rh_transport::split_boxed_io(io) {
+                Ok((r, w)) => ((Box::new(r), Box::new(w)), None),
+                Err(io) => {
+                    let (r, w) = tokio::io::split(io);
+                    ((Box::new(r), Box::new(w)), None)
+                }
+            },
+        };
     let (mut c_r, mut c_w): RelayHalves = match rh_transport::split_boxed_io(channel) {
         Ok((r, w)) => (Box::new(r), Box::new(w)),
         Err(io) => {
@@ -937,8 +938,10 @@ async fn mux_forward_chunked(
     // 按方向重包计量;失败(非该包装)回落 mux_relay 自带的
     // split_boxed_io / tokio::io::split 逻辑。修前服务端用户侧 100%
     // 走 tokio::io::split 的同步锁拆半。
-    match split_counted_tcp_user(user) {
-        Ok((a_r, a_w)) => {
+    match split_counted_user(user) {
+        Ok(((a_r, a_w), _user_quota_guard)) => {
+            // P0-3:S3b/S3c 的 visitor 侧在 CountedUserIo<BoxedIo> 内层还包着 QuotaIo,
+            // _user_quota_guard 保活至 mux_relay_split 结束,限额占用期与原 QuotaIo::Drop 等价。
             rh_transport::mux::mux_relay_split(a_r, a_w, b_r, b_w, limiter, Some(cancel)).await
         }
         Err(user) => rh_transport::mux::mux_relay(user, b_r, b_w, limiter, Some(cancel)).await,
@@ -1231,14 +1234,14 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountedUserIo<T
     }
 }
 
-/// A2:拆半后的读侧计量(user 模式:read → 入站)。
+/// A2 / P0-3:拆半后的读侧计量(user 模式:read → 入站)。
 /// 与 CountedUserIo.poll_read 的行为逐字节等价(flow_cut 检查 + 计 in)。
-struct CountedTcpReadHalf {
-    inner: tokio::net::tcp::OwnedReadHalf,
+struct CountedReadHalf<R> {
+    inner: R,
     st: CountState,
 }
 
-impl tokio::io::AsyncRead for CountedTcpReadHalf {
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountedReadHalf<R> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1262,15 +1265,15 @@ impl tokio::io::AsyncRead for CountedTcpReadHalf {
     }
 }
 
-/// A2:拆半后的写侧计量(user 模式:write → 出站)。
+/// A2 / P0-3:拆半后的写侧计量(user 模式:write → 出站)。
 /// 与 CountedUserIo.poll_write/poll_write_vectored 行为等价
 /// (flow_cut 检查 + 计 out + 向量写透传)。
-struct CountedTcpWriteHalf {
-    inner: tokio::net::tcp::OwnedWriteHalf,
+struct CountedWriteHalf<W> {
+    inner: W,
     st: CountState,
 }
 
-impl tokio::io::AsyncWrite for CountedTcpWriteHalf {
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountedWriteHalf<W> {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1312,9 +1315,8 @@ impl tokio::io::AsyncWrite for CountedTcpWriteHalf {
     }
 
     fn is_write_vectored(&self) -> bool {
-        // OwnedWriteHalf 支持(TcpStream 走 writev);显式声明,
-        // 不让默认 false 退化 YamuxCarrier 的批量写。
-        true
+        // 透传内层能力位:OwnedWriteHalf 为 true,BoxedIo 按实际内层如实上报。
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(
@@ -1338,46 +1340,98 @@ type RelayHalves = (
     Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
 );
 
-/// A2:剥 `CountedUserIo<TcpStream>` 壳 → `into_split` 无锁拆半 →
-/// 按方向重包计量(user 模式:读半计 in、写半计 out)。
+/// A2 / P0-3:剥 `CountedUserIo<TcpStream>` 或 `CountedUserIo<BoxedIo>` 壳
+/// (后者同时剥内层 `QuotaIo` 二层壳,对应 S3b stcp / S3c sudp 的 visitor 流)→
+/// 无锁拆半 → 按方向重包计量(user 模式:读半计 in、写半计 out)。
 ///
-/// 服务端用户侧恒为该包装(serve_tcp_user),修前 `split_boxed_io` 的
-/// 精确类型探测必然 miss → `tokio::io::split` 的同步 Mutex 拆半,
-/// round-69 的无锁拆半在服务端主路径上从未生效(实测 futex 占 75%
-/// syscall 时间即此病灶)。非该类型 / upstream(reversed)模式原样返还。
-fn split_counted_tcp_user(io: rh_transport::BoxedIo) -> Result<RelayHalves, rh_transport::BoxedIo> {
-    {
+/// 非该类型 / upstream(reversed)模式 / 内层不支持无锁拆半时无损重建原样返还
+/// (包含 QuotaGuard 经 `rewrap` 还原,不提前递减 `data_conn_count`)。
+fn split_counted_user(
+    io: rh_transport::BoxedIo,
+) -> Result<(RelayHalves, Option<crate::control::QuotaGuard>), rh_transport::BoxedIo> {
+    let is_tcp = {
         let dynio: &dyn rh_transport::Io = &*io;
-        if !dynio.as_any().is::<CountedUserIo<tokio::net::TcpStream>>() {
-            return Err(io);
+        dynio.as_any().is::<CountedUserIo<tokio::net::TcpStream>>()
+    };
+    if is_tcp {
+        let any = io.into_any_box();
+        let boxed = any
+            .downcast::<CountedUserIo<tokio::net::TcpStream>>()
+            .expect("probed above: concrete type is CountedUserIo<TcpStream>");
+        let CountedUserIo {
+            inner: tcp,
+            st,
+            reversed,
+        } = *boxed;
+        if reversed {
+            return Err(Box::new(CountedUserIo {
+                inner: tcp,
+                st,
+                reversed,
+            }) as rh_transport::BoxedIo);
         }
+        let (r, w) = tcp.into_split();
+        return Ok((
+            (
+                Box::new(CountedReadHalf {
+                    inner: r,
+                    st: st.clone(),
+                }),
+                Box::new(CountedWriteHalf { inner: w, st }),
+            ),
+            None,
+        ));
+    }
+
+    let is_boxed = {
+        let dynio: &dyn rh_transport::Io = &*io;
+        dynio.as_any().is::<CountedUserIo<rh_transport::BoxedIo>>()
+    };
+    if !is_boxed {
+        return Err(io);
     }
     let any = io.into_any_box();
     let boxed = any
-        .downcast::<CountedUserIo<tokio::net::TcpStream>>()
-        .expect("probed above: concrete type is CountedUserIo<TcpStream>");
+        .downcast::<CountedUserIo<rh_transport::BoxedIo>>()
+        .expect("probed above: concrete type is CountedUserIo<BoxedIo>");
     let CountedUserIo {
-        inner: tcp,
+        inner,
         st,
         reversed,
     } = *boxed;
     if reversed {
-        // upstream 模式方向反转(http vhost 上游),本路径(user 侧转发)
-        // 不出现;防御性重建原样返还,回落 tokio::io::split 保持原语义。
         return Err(Box::new(CountedUserIo {
-            inner: tcp,
+            inner,
             st,
             reversed,
         }) as rh_transport::BoxedIo);
     }
-    let (r, w) = tcp.into_split();
-    Ok((
-        Box::new(CountedTcpReadHalf {
-            inner: r,
-            st: st.clone(),
-        }),
-        Box::new(CountedTcpWriteHalf { inner: w, st }),
-    ))
+    // P0-3:S3b(stcp)/S3c(sudp) 的 visitor_stream 经 route_data_stream 包了 QuotaIo,
+    // 须先剥二层壳再交 split_boxed_io;失败时经 QuotaGuard::rewrap 无损还原。
+    let (inner, quota_guard) = crate::control::QuotaIo::peel(inner);
+    match rh_transport::split_boxed_io(inner) {
+        Ok((r, w)) => Ok((
+            (
+                Box::new(CountedReadHalf {
+                    inner: r,
+                    st: st.clone(),
+                }),
+                Box::new(CountedWriteHalf { inner: w, st }),
+            ),
+            quota_guard,
+        )),
+        Err(inner) => {
+            let inner = match quota_guard {
+                Some(g) => g.rewrap(inner),
+                None => inner,
+            };
+            Err(Box::new(CountedUserIo {
+                inner,
+                st,
+                reversed: false,
+            }) as rh_transport::BoxedIo)
+        }
+    }
 }
 
 /// TCP 监听服务循环(独享端口或组成员共享)。
@@ -1874,6 +1928,38 @@ fn epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// P0-1:服务端 UDP 通道剥 `QuotaIo` 壳并优先无锁拆半(mux 零拷贝 Chunks → split_boxed_io → tokio::io::split)。
+/// 返回的 `QuotaGuard` 由调用方保活至双向泵结束。
+fn split_udp_channel(
+    stream: BoxedIo,
+) -> (
+    UdpChanReader,
+    UdpChanWriter,
+    Option<crate::control::QuotaGuard>,
+) {
+    let (mut stream, quota_guard) = crate::control::QuotaIo::peel(stream);
+    let (reader, writer) = match rh_transport::mux::steal_mux_halves(&mut stream) {
+        Some((mr, mw)) => (
+            UdpChanReader::Chunks {
+                r: mr,
+                buf: bytes::BytesMut::with_capacity(2048),
+            },
+            UdpChanWriter::Chunks(mw),
+        ),
+        None => match rh_transport::split_boxed_io(stream) {
+            Ok((r, w)) => (UdpChanReader::Stream(r), UdpChanWriter::Stream(w)),
+            Err(io) => {
+                let (r, w) = tokio::io::split(io);
+                (
+                    UdpChanReader::Stream(Box::new(r)),
+                    UdpChanWriter::Stream(Box::new(w)),
+                )
+            }
+        },
+    };
+    (reader, writer, quota_guard)
+}
+
 pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: Arc<UdpSocket>) {
     let (new_tx, mut new_rx) = mpsc::channel::<BoxedIo>(4);
     *rt.udp_new_channel_tx.lock().await = Some(new_tx);
@@ -1884,7 +1970,7 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
     let usage = rt.usage(&state);
     loop {
         // 等待第一条/重建通道
-        let mut stream = tokio::select! {
+        let stream = tokio::select! {
             s = new_rx.recv() => match s {
                 Some(s) => s,
                 None => {
@@ -1911,25 +1997,9 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
         // - 下行任务(隧道→用户)独占读半,持会话 GC、保活与探活节奏;
         // - 会话表(Mutex)与存活时钟(原子 epoch ms)共享;
         // - 通道死亡(任一方向 IO 错误)经 dead 令牌互相收敛。
-        let (reader, writer) = match rh_transport::mux::steal_mux_halves(&mut stream) {
-            Some((mr, mw)) => (
-                UdpChanReader::Chunks {
-                    r: mr,
-                    buf: bytes::BytesMut::with_capacity(2048),
-                },
-                UdpChanWriter::Chunks(mw),
-            ),
-            None => match rh_transport::split_boxed_io(stream) {
-                Ok((r, w)) => (UdpChanReader::Stream(r), UdpChanWriter::Stream(w)),
-                Err(io) => {
-                    let (r, w) = tokio::io::split(io);
-                    (
-                        UdpChanReader::Stream(Box::new(r)),
-                        UdpChanWriter::Stream(Box::new(w)),
-                    )
-                }
-            },
-        };
+        // P0-1:先剥 route_data_stream 包装的 QuotaIo 壳再拆半,
+        // _quota_guard 保活至 tokio::join!(up, down) 结束,限额占用期与原 QuotaIo::Drop 等价。
+        let (reader, writer, _quota_guard) = split_udp_channel(stream);
         let dead = tokio_util::sync::CancellationToken::new();
         // 控制帧通道:下行收 PING 回 PONG / 保活发 PING,写半独占于
         // 上行任务,经此转发(PING/PONG 与上行数据帧在同一写半按序发出)。
@@ -1994,6 +2064,7 @@ pub async fn udp_serve_loop(state: Arc<AppState>, rt: Arc<ProxyRuntime>, sock: A
             })
         };
         let _ = tokio::join!(up, down);
+        drop(_quota_guard);
         // ★先查 sock_failed,再查 dead —— 顺序是语义,不是风格。
         //
         // 监听 socket 失效(recv_from 持续报错,如 fd 被外部关闭、网卡
@@ -3227,6 +3298,187 @@ mod tests {
             sess.data_conn_count.load(Ordering::Relaxed),
             0,
             "guard 释放即递减(与 QuotaIo::Drop 等价)"
+        );
+    }
+
+    /// P0-1 / P0-5:服务端 UDP 通道经 route_data_stream 包装 QuotaIo 后,
+    /// split_udp_channel 必须先剥 QuotaIo 壳并命中 RhMuxStream 零拷贝 Chunks 路径,
+    /// 且 QuotaGuard 存活期间不提前递减 data_conn_count,drop 后恰好递减 1。
+    #[tokio::test]
+    async fn p0_1_udp_channel_peels_quota_and_splits_mux_lockfree() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let sess = crate::session::Session::new(
+            "c-udp-p0".into(),
+            "s-udp-p0".into(),
+            10,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        );
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = rh_transport::wrap_stream_as_server(
+            Box::new(b),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let client = rh_transport::wrap_stream_as_client(
+            Box::new(a),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let srv = tokio::spawn(async move {
+            let mut s = server.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"UP!!");
+            s.write_all(b"DN!!").await.unwrap();
+        });
+
+        let raw = client.open_stream().await.unwrap();
+        let wrapped = crate::control::QuotaIo::new(raw, sess.clone());
+        let (reader, writer, guard) = split_udp_channel(wrapped);
+
+        assert!(guard.is_some(), "QuotaIo 壳必须剥出 QuotaGuard");
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "QuotaGuard 存活期间不得提前递减 data_conn_count"
+        );
+        let (mut mr, mut mw) = match (reader, writer) {
+            (UdpChanReader::Chunks { r, .. }, UdpChanWriter::Chunks(w)) => (r, w),
+            _ => panic!(
+                "QuotaIo(RhMuxStream) 必须命中 UdpChanReader::Chunks / UdpChanWriter::Chunks"
+            ),
+        };
+
+        mw.write_chunk(bytes::Bytes::from_static(b"UP!!"))
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        while got.len() < 4 {
+            let c = mr.read_chunk().await.unwrap().expect("eof");
+            got.extend_from_slice(&c);
+        }
+        assert_eq!(&got, b"DN!!");
+        srv.await.unwrap();
+
+        drop(guard);
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            0,
+            "QuotaGuard 释放后 data_conn_count 必须恰好减回 0"
+        );
+    }
+
+    /// P0-3 / P0-5:split_counted_user 覆盖 CountedUserIo<BoxedIo> 的三类形态:
+    /// 1) S3a(tcpmux):内层裸 RhMuxStream → 无锁拆半 + 计量正常;
+    /// 2) S3b/S3c(stcp/sudp):内层二层壳 QuotaIo<RhMuxStream> → 剥二层壳无锁拆半 + guard 保活;
+    /// 3) 不可拆半回落:内层 QuotaIo<DuplexStream> → 返回 Err 且经 QuotaGuard::rewrap 还原,
+    ///    data_conn_count 绝不提前递减。
+    #[tokio::test]
+    async fn p0_3_split_counted_user_handles_boxed_and_nested_quota() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let st = sec_state().await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let sess = crate::session::Session::new(
+            "c-p03".into(),
+            "s-p03".into(),
+            10,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        );
+
+        // 1) S3a: CountedUserIo<BoxedIo(RhMuxStream)>
+        let (a1, b1) = tokio::io::duplex(64 * 1024);
+        let server1 = rh_transport::wrap_stream_as_server(
+            Box::new(b1),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let client1 = rh_transport::wrap_stream_as_client(
+            Box::new(a1),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let srv1 = tokio::spawn(async move {
+            let mut s = server1.accept().await.unwrap();
+            s.write_all(b"S3A_IN").await.unwrap();
+            let mut out = [0u8; 7];
+            s.read_exact(&mut out).await.unwrap();
+            assert_eq!(&out, b"S3A_OUT");
+        });
+        let raw1: BoxedIo = client1.open_stream().await.unwrap();
+        let counted1: BoxedIo = Box::new(CountedUserIo::user(raw1, &st, None));
+        let ((mut r1, mut w1), g1) = split_counted_user(counted1)
+            .ok()
+            .expect("S3a CountedUserIo<BoxedIo(RhMuxStream)> 必须命中无锁拆半");
+        assert!(g1.is_none());
+        w1.write_all(b"S3A_OUT").await.unwrap();
+        let mut buf1 = [0u8; 6];
+        r1.read_exact(&mut buf1).await.unwrap();
+        assert_eq!(&buf1, b"S3A_IN");
+        srv1.await.unwrap();
+
+        // 2) S3b/S3c: CountedUserIo<BoxedIo(QuotaIo<RhMuxStream>)>
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let (a2, b2) = tokio::io::duplex(64 * 1024);
+        let server2 = rh_transport::wrap_stream_as_server(
+            Box::new(b2),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let client2 = rh_transport::wrap_stream_as_client(
+            Box::new(a2),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let srv2 = tokio::spawn(async move {
+            let mut s = server2.accept().await.unwrap();
+            s.write_all(b"S3BC_IN").await.unwrap();
+            let mut out = [0u8; 8];
+            s.read_exact(&mut out).await.unwrap();
+            assert_eq!(&out, b"S3BC_OUT");
+        });
+        let raw2 = crate::control::QuotaIo::new(client2.open_stream().await.unwrap(), sess.clone());
+        let counted2: BoxedIo = Box::new(CountedUserIo::user(raw2, &st, None));
+        let ((mut r2, mut w2), g2) = split_counted_user(counted2)
+            .ok()
+            .expect("S3b/S3c CountedUserIo<QuotaIo<RhMuxStream>> 必须剥二层壳并无锁拆半");
+        assert!(g2.is_some(), "二层 QuotaIo 必须剥出 QuotaGuard");
+        assert_eq!(sess.data_conn_count.load(Ordering::Relaxed), 1);
+        w2.write_all(b"S3BC_OUT").await.unwrap();
+        let mut buf2 = [0u8; 7];
+        r2.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"S3BC_IN");
+        srv2.await.unwrap();
+        drop(g2);
+        assert_eq!(sess.data_conn_count.load(Ordering::Relaxed), 0);
+
+        // 3) 不可拆半回落: CountedUserIo<BoxedIo(QuotaIo<DuplexStream>)>
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let (_peer, local) = tokio::io::duplex(1024);
+        let raw3 = crate::control::QuotaIo::new(Box::new(local), sess.clone());
+        let counted3: BoxedIo = Box::new(CountedUserIo::user(raw3, &st, None));
+        let restored = match split_counted_user(counted3) {
+            Err(io) => io,
+            Ok(_) => panic!("DuplexStream 内层不得命中无锁拆半"),
+        };
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "拆半失败回落时必须经 QuotaGuard::rewrap 还原,不得提前递减 data_conn_count"
+        );
+        drop(restored);
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            0,
+            "回落流 drop 后 data_conn_count 才应归零"
         );
     }
 
@@ -4938,16 +5190,18 @@ pub async fn copy_bidirectional_bounded(
     // 对齐 copy_relay 的拆半纪律:user 侧先剥 CountedUserIo(TcpStream)
     // 走 owned 拆半,channel 侧 split_boxed_io;包装类型(压缩流等)
     // 回落共享锁拆分。缓冲对齐全仓 64KiB 口径。
-    let (mut a_r, mut a_w): RelayHalves = match split_counted_tcp_user(user) {
-        Ok((r, w)) => (r, w),
-        Err(io) => match rh_transport::split_boxed_io(io) {
-            Ok((r, w)) => (Box::new(r), Box::new(w)),
-            Err(io) => {
-                let (r, w) = tokio::io::split(io);
-                (Box::new(r), Box::new(w))
-            }
-        },
-    };
+    let ((mut a_r, mut a_w), _user_quota_guard): (RelayHalves, Option<crate::control::QuotaGuard>) =
+        match split_counted_user(user) {
+            Ok((halves, g)) => (halves, g),
+            Err(io) => match rh_transport::split_boxed_io(io) {
+                Ok((r, w)) => ((Box::new(r), Box::new(w)), None),
+                Err(io) => {
+                    let (r, w) = tokio::io::split(io);
+                    ((Box::new(r), Box::new(w)), None)
+                }
+            },
+        };
+    let (channel, _ch_quota_guard) = crate::control::QuotaIo::peel(channel);
     let (mut b_r, mut b_w): RelayHalves = match rh_transport::split_boxed_io(channel) {
         Ok((r, w)) => (Box::new(r), Box::new(w)),
         Err(io) => {

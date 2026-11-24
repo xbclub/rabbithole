@@ -543,6 +543,29 @@ fn parse_addr_cached(src: &str) -> Option<std::net::SocketAddr> {
 /// 与代理侧同样走"唯一写任务 + 批聚合":visitor 侧的写半此前由主循环独占,
 /// 虽无锁争用,但每包一帧(11B 头)在大包量下 syscall 开销同样可观,
 /// 且 PING/PONG 与 UDP_PACKET 混在同一写任务里可保证**帧序**。
+/// P0-2 / P0-5:visitor 侧 UDP 通道拆半(支持 PrependedIo(RhMuxStream) 直达零拷贝 Chunks)。
+fn split_visitor_channel(mut channel: BoxedIo) -> (ChanReader, ChanWriter) {
+    match rh_transport::mux::steal_mux_halves(&mut channel) {
+        Some((mr, mw)) => (
+            ChanReader::Chunks {
+                r: mr,
+                buf: bytes::BytesMut::with_capacity(2048),
+            },
+            ChanWriter::Chunks(mw),
+        ),
+        None => match rh_transport::split_boxed_io(channel) {
+            Ok((r, w)) => (ChanReader::Stream(r), ChanWriter::Stream(w)),
+            Err(io) => {
+                let (r, w) = tokio::io::split(io);
+                (
+                    ChanReader::Stream(Box::new(r)),
+                    ChanWriter::Stream(Box::new(w)),
+                )
+            }
+        },
+    }
+}
+
 pub async fn run_visitor_side(
     channel: BoxedIo,
     sock: Arc<UdpSocket>,
@@ -551,27 +574,7 @@ pub async fn run_visitor_side(
 ) {
     // N10:与 run_proxy_side 同款 —— 优先偷 mux 半(写侧 chunk 零拷贝,
     // 读侧 chunk 组帧,消掉同步锁);非 mux 先试无锁 into_split。
-    let mut channel = channel;
-    let (mut r, w): (ChanReader, ChanWriter) =
-        match rh_transport::mux::steal_mux_halves(&mut channel) {
-            Some((mr, mw)) => (
-                ChanReader::Chunks {
-                    r: mr,
-                    buf: bytes::BytesMut::with_capacity(2048),
-                },
-                ChanWriter::Chunks(mw),
-            ),
-            None => match rh_transport::split_boxed_io(channel) {
-                Ok((r, w)) => (ChanReader::Stream(r), ChanWriter::Stream(w)),
-                Err(io) => {
-                    let (r, w) = tokio::io::split(io);
-                    (
-                        ChanReader::Stream(Box::new(r)),
-                        ChanWriter::Stream(Box::new(w)),
-                    )
-                }
-            },
-        };
+    let (mut r, w) = split_visitor_channel(channel);
     let (tx, rx) = mpsc::channel::<Pending>(WRITE_QUEUE);
     let writer = tokio::spawn(writer_task(w, rx));
     // 先冲通道到位前缓冲的本地包(仍在写任务里按序写出)
@@ -1096,5 +1099,46 @@ mod session_leak_tests {
             .await
             .expect("A4:取消会话任务后 writer 必须收敛(修前会永挂)")
             .unwrap();
+    }
+
+    /// P0-2 / P0-5:sudp 访问器经 session.rs 交付 PrependedIo(RhMuxStream) 时,
+    /// split_visitor_channel 必须命中零拷贝 Chunks 路径而非回落 tokio::io::split,
+    /// 且非空前缀按序优先交付。
+    #[tokio::test]
+    async fn visitor_channel_prepended_mux_hits_chunks_lockfree() {
+        use tokio::io::AsyncWriteExt;
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = rh_transport::wrap_stream_as_server(
+            Box::new(b),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let client = rh_transport::wrap_stream_as_client(
+            Box::new(a),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let srv = tokio::spawn(async move {
+            let mut s = server.accept().await.unwrap();
+            s.write_all(b"REST").await.unwrap();
+        });
+
+        let raw = client.open_stream().await.unwrap();
+        let wrapped = rh_transport::PrependedIo::wrap(raw, b"PRE_".to_vec());
+        let (r, w) = split_visitor_channel(wrapped);
+        let mut mr = match (r, w) {
+            (ChanReader::Chunks { r, .. }, ChanWriter::Chunks(_)) => r,
+            _ => {
+                panic!("PrependedIo(RhMuxStream) 必须命中 ChanReader::Chunks / ChanWriter::Chunks")
+            }
+        };
+        let mut got = Vec::new();
+        while got.len() < 8 {
+            let c = mr.read_chunk().await.unwrap().expect("eof");
+            got.extend_from_slice(&c);
+        }
+        assert_eq!(&got, b"PRE_REST");
+        srv.await.unwrap();
     }
 }

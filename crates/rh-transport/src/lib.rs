@@ -99,6 +99,36 @@ pub fn split_boxed_io(io: BoxedIo) -> Result<(BoxedIo, BoxedIo), BoxedIo> {
     // 具体类型的 vtable(直接对 Box 调用会命中 blanket impl 的转发,
     // 返回的是 Box 层的 Any,见 PrependedIo::peel 的取证注释)。
     let dynio: &dyn Io = &*io;
+    if dynio.as_any().is::<PrependedIo>() {
+        // P0-2:支持 PrependedIo(含多层嵌套)剥壳递归无锁拆半。
+        // 成功时把非空前缀回挂到读半(MuxHalfRead 直接注入 front 避免多套一层壳,
+        // 其它读半用 PrependedIo::wrap 保持字节序);失败时必须把前缀原样包回 Err,
+        // 绝不丢字节。
+        let (prefix, inner) = PrependedIo::peel(io);
+        return match split_boxed_io(inner) {
+            Ok((r, w)) => {
+                if prefix.is_empty() {
+                    Ok((r, w))
+                } else {
+                    let is_mux_r = {
+                        let dynr: &dyn Io = &*r;
+                        dynr.as_any().is::<MuxHalfRead>()
+                    };
+                    if is_mux_r {
+                        let any = r.into_any_box();
+                        let mut mr = *any
+                            .downcast::<MuxHalfRead>()
+                            .expect("probed above: concrete type is MuxHalfRead");
+                        mr.0.set_front_prefix(bytes::Bytes::from(prefix));
+                        Ok((Box::new(mr) as BoxedIo, w))
+                    } else {
+                        Ok((PrependedIo::wrap(r, prefix), w))
+                    }
+                }
+            }
+            Err(inner) => Err(PrependedIo::wrap(inner, prefix)),
+        };
+    }
     if dynio.as_any().is::<mux::RhMuxStream>() {
         let any = io.into_any_box();
         let mut s = *any
@@ -123,6 +153,18 @@ pub fn split_boxed_io(io: BoxedIo) -> Result<(BoxedIo, BoxedIo), BoxedIo> {
         return Ok((
             Box::new(QuicHalfRead(recv)) as BoxedIo,
             Box::new(QuicHalfWrite(send)) as BoxedIo,
+        ));
+    }
+    #[cfg(unix)]
+    if dynio.as_any().is::<tokio::net::UnixStream>() {
+        let any = io.into_any_box();
+        let us = any
+            .downcast::<tokio::net::UnixStream>()
+            .expect("probed above: concrete type is UnixStream");
+        let (r, w) = (*us).into_split();
+        return Ok((
+            Box::new(UnixHalfRead(r)) as BoxedIo,
+            Box::new(UnixHalfWrite(w)) as BoxedIo,
         ));
     }
     if !dynio.as_any().is::<tokio::net::TcpStream>() {
@@ -337,6 +379,21 @@ impl PrependedIo {
             }
             Err(_) => unreachable!("as_any 已确认具体类型为 PrependedIo"),
         }
+    }
+
+    /// 供同 crate 拆半/偷半路径递归探测内层流使用。
+    pub(crate) fn inner_mut(&mut self) -> &mut BoxedIo {
+        &mut self.inner
+    }
+
+    /// 仅在确认内层拆半/偷半成功后消费剩余未读前缀(失败时不调用,零字节丢失)。
+    pub(crate) fn take_remaining_prefix(&mut self) -> Vec<u8> {
+        if self.pos >= self.prefix.len() {
+            return Vec::new();
+        }
+        let rem = self.prefix[self.pos..].to_vec();
+        self.pos = self.prefix.len();
+        rem
     }
 }
 
@@ -2093,5 +2150,255 @@ impl tokio::io::AsyncWrite for QuicHalfWrite {
             Ok(()) => std::task::Poll::Ready(Ok(())),
             Err(e) => std::task::Poll::Ready(Err(other_err(format!("quic finish: {e}")))),
         }
+    }
+}
+
+/// Unix 域套接字的读半(`tokio::net::unix::OwnedReadHalf`)。
+#[cfg(unix)]
+pub struct UnixHalfRead(tokio::net::unix::OwnedReadHalf);
+
+#[cfg(unix)]
+impl tokio::io::AsyncRead for UnixHalfRead {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+#[cfg(unix)]
+impl tokio::io::AsyncWrite for UnixHalfRead {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "read half cannot write",
+        )))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// Unix 域套接字的写半(`tokio::net::unix::OwnedWriteHalf`)。
+#[cfg(unix)]
+pub struct UnixHalfWrite(tokio::net::unix::OwnedWriteHalf);
+
+#[cfg(unix)]
+impl tokio::io::AsyncRead for UnixHalfWrite {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "write half cannot read",
+        )))
+    }
+}
+
+#[cfg(unix)]
+impl tokio::io::AsyncWrite for UnixHalfWrite {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod p0_split_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn steal_mux_halves_peels_nested_prepended_in_order() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = wrap_stream_as_server(Box::new(b), true, MUX_STREAMS_UNLIMITED);
+        let client = wrap_stream_as_client(Box::new(a), true, MUX_STREAMS_UNLIMITED);
+
+        let srv = tokio::spawn(async move {
+            let mut s = server.accept().await.unwrap();
+            s.write_all(b"BODY").await.unwrap();
+            let mut echo = [0u8; 4];
+            s.read_exact(&mut echo).await.unwrap();
+            assert_eq!(&echo, b"PING");
+        });
+
+        let raw = client.open_stream().await.unwrap();
+        let inner = PrependedIo::wrap(raw, b"IN_".to_vec());
+        let mut outer = PrependedIo::wrap(inner, b"OUT_".to_vec());
+        assert!(
+            !mux::is_mux_stream(&outer),
+            "is_mux_stream 对 PrependedIo 保持 false"
+        );
+
+        let (mut r, mut w) = mux::steal_mux_halves(&mut outer)
+            .expect("PrependedIo(PrependedIo(RhMuxStream)) 必须命中 steal_mux_halves");
+        w.write_chunk(bytes::Bytes::from_static(b"PING"))
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        while got.len() < 11 {
+            let chunk = r.read_chunk().await.unwrap().expect("eof");
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(&got, b"OUT_IN_BODY");
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn steal_mux_halves_miss_preserves_prefix() {
+        let (mut peer, local) = tokio::io::duplex(1024);
+        let mut wrapped = PrependedIo::wrap(Box::new(local), b"HEAD_".to_vec());
+        assert!(
+            mux::steal_mux_halves(&mut wrapped).is_none(),
+            "非 mux 流不得命中 steal_mux_halves"
+        );
+        peer.write_all(b"TAIL").await.unwrap();
+        drop(peer);
+        let mut out = Vec::new();
+        wrapped.read_to_end(&mut out).await.unwrap();
+        assert_eq!(&out, b"HEAD_TAIL");
+    }
+
+    #[tokio::test]
+    async fn split_boxed_io_supports_prepended_tcp_and_preserves_prefix_on_fallback() {
+        // 1. PrependedIo(PrependedIo(TcpStream)) 必须命中无锁拆半且前缀保序
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            s.write_all(b"TCP_BODY").await.unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"PONG");
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let inner = PrependedIo::wrap(Box::new(tcp), b"B_".to_vec());
+        let outer = PrependedIo::wrap(inner, b"A_".to_vec());
+        let (mut r, mut w) = split_boxed_io(outer)
+            .ok()
+            .expect("PrependedIo(TcpStream) 必须命中 split_boxed_io");
+        w.write_all(b"PONG").await.unwrap();
+        let mut got = [0u8; 12];
+        r.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"A_B_TCP_BODY");
+        srv.await.unwrap();
+
+        // 2. 不支持无锁拆半的内层(DuplexStream)回落 Err 时前缀绝不丢失
+        let (mut peer, local) = tokio::io::duplex(1024);
+        let wrapped = PrependedIo::wrap(Box::new(local), b"KEEP_".to_vec());
+        let mut back = match split_boxed_io(wrapped) {
+            Err(io) => io,
+            Ok(_) => panic!("DuplexStream 不应命中 split_boxed_io"),
+        };
+        peer.write_all(b"REST").await.unwrap();
+        drop(peer);
+        let mut all = Vec::new();
+        back.read_to_end(&mut all).await.unwrap();
+        assert_eq!(&all, b"KEEP_REST");
+    }
+
+    #[tokio::test]
+    async fn split_boxed_io_supports_prepended_mux() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = wrap_stream_as_server(Box::new(b), true, MUX_STREAMS_UNLIMITED);
+        let client = wrap_stream_as_client(Box::new(a), true, MUX_STREAMS_UNLIMITED);
+
+        let srv = tokio::spawn(async move {
+            let mut s = server.accept().await.unwrap();
+            s.write_all(b"MUX_BODY").await.unwrap();
+            let mut buf = [0u8; 2];
+            s.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"OK");
+        });
+
+        let raw = client.open_stream().await.unwrap();
+        let wrapped = PrependedIo::wrap(raw, b"PRE_".to_vec());
+        let (mut r, mut w) = split_boxed_io(wrapped)
+            .ok()
+            .expect("PrependedIo(RhMuxStream) 必须命中 split_boxed_io");
+        w.write_all(b"OK").await.unwrap();
+        let mut got = [0u8; 12];
+        r.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"PRE_MUX_BODY");
+        srv.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn split_boxed_io_supports_unix_stream_and_prepended_unix() {
+        let (mut a, b) = tokio::net::UnixStream::pair().unwrap();
+        let (mut r, mut w) = split_boxed_io(Box::new(b))
+            .ok()
+            .expect("UnixStream 必须命中 split_boxed_io");
+        assert!(
+            w.is_write_vectored(),
+            "UnixHalfWrite 应透传 is_write_vectored"
+        );
+        w.write_all(b"HELLO").await.unwrap();
+        a.write_all(b"WORLD").await.unwrap();
+        let mut buf_a = [0u8; 5];
+        a.read_exact(&mut buf_a).await.unwrap();
+        assert_eq!(&buf_a, b"HELLO");
+        let mut buf_b = [0u8; 5];
+        r.read_exact(&mut buf_b).await.unwrap();
+        assert_eq!(&buf_b, b"WORLD");
+
+        // 带 PrependedIo 包装的 UnixStream 同样无锁拆半且前缀保序
+        let (mut c, d) = tokio::net::UnixStream::pair().unwrap();
+        let wrapped = PrependedIo::wrap(Box::new(d), b"U_".to_vec());
+        let (mut ur, mut uw) = split_boxed_io(wrapped)
+            .ok()
+            .expect("PrependedIo(UnixStream) 必须命中 split_boxed_io");
+        uw.write_all(b"123").await.unwrap();
+        c.write_all(b"456").await.unwrap();
+        let mut out_c = [0u8; 3];
+        c.read_exact(&mut out_c).await.unwrap();
+        assert_eq!(&out_c, b"123");
+        let mut out_u = [0u8; 5];
+        ur.read_exact(&mut out_u).await.unwrap();
+        assert_eq!(&out_u, b"U_456");
     }
 }

@@ -677,11 +677,11 @@ pub async fn mux_relay(
     // 平均每次 10.8ms**。同期 `recvfrom` 只占 10.9%、`writev` 8.1% ——
     // 也就是说进程绝大多数时间在**等锁**,不是在收发数据。
     //
-    // 裸 TCP 可拆成两个独立 fd(`into_split`),各有独立的 tokio IO 注册,
-    // 读写之间没有任何共享锁。mux 流(steal_halves)与 QUIC BiStream
-    // (天然两独立半)同样被 `split_boxed_io` 识别;包装类型
-    // (CountedUserIo/QuotaIo/PrependedIo/压缩流)不支持,回落到
-    // `tokio::io::split`。
+    // 裸 TCP/UnixStream 可拆成两个独立 fd(`into_split`),各有独立的 tokio IO 注册,
+    // 读写之间没有任何共享锁。mux 流(steal_halves)、QUIC BiStream(天然两独立半)
+    // 以及 PrependedIo(含嵌套,剥壳回挂前缀)同样被 `split_boxed_io` 识别;
+    // 跨 crate 包装(CountedUserIo/QuotaIo)由调用方先剥壳走 `mux_relay_split`,
+    // 仅剩余不支持无锁拆半的少数末端 IO(如本机 TLS/自定义插件)回落 `tokio::io::split`。
     // 两种拆分方式产出不同类型,统一擦除成 trait object 供泵使用。
     let (a_r, a_w): (
         Box<dyn tokio::io::AsyncRead + Send + Unpin>,
@@ -1405,12 +1405,24 @@ pub fn is_mux_stream(io: &BoxedIo) -> bool {
     io.as_any().downcast_ref::<RhMuxStream>().is_some()
 }
 
-/// 从未包装 mux 流中偷出读/写半(经 &mut,壳由调用方丢弃);
-/// 非 mux 流返回 None。读半自带兼容路径余量,不丢数据。
+/// 从 mux 流(含多层 PrependedIo 包装)中偷出读/写半(经 &mut,壳由调用方丢弃);
+/// 非 mux 流返回 None 且不消费任何前缀。读半自带兼容路径与前缀余量,不丢数据。
 pub fn steal_mux_halves(io: &mut BoxedIo) -> Option<(RhMuxStreamRead, RhMuxStreamWrite)> {
-    io.as_any_mut()
-        .downcast_mut::<RhMuxStream>()?
-        .steal_halves()
+    let dynio: &mut dyn crate::Io = &mut **io;
+    if let Some(s) = dynio.as_any_mut().downcast_mut::<RhMuxStream>() {
+        return s.steal_halves();
+    }
+    if let Some(p) = dynio.as_any_mut().downcast_mut::<crate::PrependedIo>() {
+        // 先递归偷内层:失败时直接返回 None,绝不消费外层前缀;
+        // 成功后再按由内向外顺序 push_front,保证外层前缀先于内层前缀交付。
+        let (mut r, w) = steal_mux_halves(p.inner_mut())?;
+        let rem = p.take_remaining_prefix();
+        if !rem.is_empty() {
+            r.set_front_prefix(Bytes::from(rem));
+        }
+        return Some((r, w));
+    }
+    None
 }
 
 /// yamux 连接载体:futures IO 视图的 BoxedIo + 向量写(writev)。

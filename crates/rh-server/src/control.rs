@@ -1232,6 +1232,18 @@ pub(crate) struct QuotaGuard {
     sess: Arc<Session>,
 }
 
+impl QuotaGuard {
+    /// P0-3:剥壳后若内层无法无锁拆半需回落时,无损重新包回 QuotaIo,
+    /// 不触发 QuotaGuard::Drop,避免 data_conn_count 提前递减。
+    pub(crate) fn rewrap(self, inner: rh_transport::BoxedIo) -> rh_transport::BoxedIo {
+        let md = std::mem::ManuallyDrop::new(self);
+        // SAFETY:md 置于 ManuallyDrop,绝不运行 QuotaGuard::Drop;
+        // ptr::read 独占移出 sess 转交给 QuotaIo,data_conn_count 由新 QuotaIo::Drop 恰好递减一次。
+        let sess = unsafe { std::ptr::read(&md.sess) };
+        QuotaIo::new(inner, sess)
+    }
+}
+
 impl Drop for QuotaGuard {
     fn drop(&mut self) {
         self.sess

@@ -1034,6 +1034,68 @@ mod tests {
         let _ = srv.await;
     }
 
+    /// P0-2 / P0-5:PrependedIo 包装的 RhMuxStream 经 compress_stream 必须命中
+    /// split_boxed_io(SPLIT_FALLBACKS 不增加),且前缀与后续压缩帧按序完整交付。
+    #[tokio::test]
+    async fn prepended_mux_inner_splits_lockfree_and_roundtrips() {
+        use crate::{
+            wrap_stream_as_client, wrap_stream_as_server, PrependedIo, MUX_STREAMS_UNLIMITED,
+        };
+
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let server = wrap_stream_as_server(Box::new(b), true, MUX_STREAMS_UNLIMITED);
+        let client = wrap_stream_as_client(Box::new(a), true, MUX_STREAMS_UNLIMITED);
+
+        // 先构造一段合法 snappy 压缩帧作为 PrependedIo 前缀(模拟同批读入残留)
+        let prefix_plain = b"hello-prefix-";
+        let mut enc = snap::raw::Encoder::new();
+        let compressed = enc.compress_vec(prefix_plain).unwrap();
+        let mut framed_prefix = Vec::new();
+        let mut v = compressed.len();
+        while v >= 0x80 {
+            framed_prefix.push(((v & 0x7f) as u8) | 0x80);
+            v >>= 7;
+        }
+        framed_prefix.push(v as u8);
+        framed_prefix.extend_from_slice(&compressed);
+
+        let srv = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = server.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let inner: crate::BoxedIo =
+            PrependedIo::wrap(client.open_stream().await.unwrap(), framed_prefix);
+        let before = SPLIT_FALLBACKS.with(|c| c.get());
+        let mut s = compress_stream(inner).await;
+        assert_eq!(
+            SPLIT_FALLBACKS.with(|c| c.get()),
+            before,
+            "PrependedIo(RhMuxStream) 内层必须命中 split_boxed_io,不得回落 tokio::io::split"
+        );
+
+        s.write_all(b"tail").await.unwrap();
+        let mut back = [0u8; 17];
+        tokio::time::timeout(std::time::Duration::from_secs(5), s.read_exact(&mut back))
+            .await
+            .expect("echo deadline")
+            .unwrap();
+        assert_eq!(&back, b"hello-prefix-tail");
+        drop(s);
+        let _ = srv.await;
+    }
+
     // ---- 新增:JoinDuplex 向量写透传 --------------------------------------
 
     // 回归:JoinDuplex 修前只覆写标量 poll_write,向量写落到 tokio 默认

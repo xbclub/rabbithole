@@ -298,21 +298,28 @@ demux 统一为 tokio 原生 `recv_from` 逐包收(唤醒点即收包点,无就�
 
 ## 11. mux_relay 回落侧的 tokio::io::split 拆半(B-2 后半)
 
-**不做。**(内部判定,非 frp 对齐)
+**仅保留无法无锁拆半的少数外设/TLS 包装回落。**(内部判定,非 frp 对齐)
 
-### 依据:跨 crate 剥壳不可行,残余影响弱(任务书 B-2,判据入库 @ d1ccf6e)
+### 依据与演进
 
-建议的修法是"对包装类型剥壳/downcast 拆半走 mux_relay_split",但
-包装类型(CountedUserIo/QuotaIo)定义在 rh-server / rh-client,
-rh-transport 无从命名,downcast 目标不存在。而真正热的路径(服务端)
-已先剥壳走 mux_relay_split(mux.rs:634 注释,审查时点);残余的
-Err 回落调用仅剩客户端插件目标回落,锁内是本机 TLS/socket IO,
-任务书复核自证影响弱 —— 改动面与收益不成比例。
+1. 跨 crate 包装类型(`CountedUserIo`/`QuotaIo`)定义在 `rh-server`,
+   `rh-transport` 无法直接命名 downcast;因此应在**调用方侧先剥壳**再交由
+   `rh-transport::split_boxed_io` / `mux_relay_split`,而非把服务端类型塞入传输层。
+2. 已在对应调用方与传输层补齐全部热路径无锁拆半:
+   - 服务端主路径(`CountedUserIo<TcpStream>`)、次级路径(`CountedUserIo<BoxedIo>`,
+     含 S3a tcpmux 与 S3b/S3c stcp/sudp 内层的二层 `QuotaIo` 壳)均由 `split_counted_user`
+     剥壳后进入 `mux_relay_split`,并保活 `QuotaGuard` 至转发结束;
+   - 服务端 UDP 通道(`udp_serve_loop`)先经 `QuotaIo::peel` 再进 `steal_mux_halves`/`split_boxed_io`;
+   - 传输层 `steal_mux_halves` 与 `split_boxed_io` 已支持(含嵌套)`PrependedIo` 剥壳回挂及
+     `#[cfg(unix)] UnixStream` 无锁拆半(覆盖 sudp 访问器、带前缀压缩流、unix 插件)。
+3. `mux_relay`(`crates/rh-transport/src/mux.rs:662`,注释见 `:669-696`)的 `Err` 回落
+   仅剩底层本身不支持无锁拆半的少数包装(如本机 TLS/自定义 IO 插件),维持
+   `tokio::io::split` 兜底即可。
 
 ### 我们的现状
 
-B-2 的 compress 侧已完成(两条独立单向 duplex,`JoinDuplex` 拼合,
-@ 2416b8a);mux_relay 回落侧维持共享锁双泵形态,行为不变。
+B-2 的 compress 侧(`JoinDuplex`,@ 2416b8a)及服务端/传输层全部主要包装壳的无锁拆半均已完成;
+仅无法无锁拆半的少数末端 IO 维持 `mux_relay` 的共享锁回落形态。
 
 ---
 
