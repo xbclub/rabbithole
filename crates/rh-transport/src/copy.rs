@@ -1,11 +1,12 @@
-//! 通用批量字节拷贝泵(P3):ReadBuf 直读(单块 ≤64KiB 红线)+ 就绪抢收成批 +
+//! 通用批量字节拷贝泵(P3):ReadBuf 直读(单块 ≤64KiB 红线)+ 有界分片共享池按需借还 +
 //! writev 聚合 + 写期间持续预取 + 取消安全限速预留。
 
 use bytes::{BufMut as _, BytesMut};
 use std::collections::VecDeque;
 use std::io::{self, IoSlice};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 
@@ -18,6 +19,151 @@ pub const COPY_BATCH_SEGS: usize = 64;
 const DEFAULT_COPY_BATCH_BYTES: usize = 256 * 1024;
 const MIN_COPY_BATCH_BYTES: usize = 1024;
 const MAX_COPY_BATCH_BYTES: usize = 1024 * 1024;
+
+const COPY_POOL_SHARDS: usize = 8;
+const COPY_POOL_SHARD_CAP: usize = 32;
+const COPY_POOL_MAX_IDLE: usize = COPY_POOL_SHARDS * COPY_POOL_SHARD_CAP;
+const COPY_POOL_CLASS_MAX: usize = COPY_CHUNK_CAP + 8 * 1024;
+
+// 全局空闲池硬上界:256 × 64KiB = 16 MiB,杜绝高并发空闲连接长驻放大 RSS。
+const _: () = assert!(COPY_POOL_MAX_IDLE * COPY_CHUNK_CAP <= 16 * 1024 * 1024);
+
+static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static HOME_SHARD: usize = NEXT_SHARD.fetch_add(1, Ordering::Relaxed) & (COPY_POOL_SHARDS - 1);
+}
+
+fn home_shard() -> usize {
+    HOME_SHARD.with(|&idx| idx)
+}
+
+struct CopyBufPool {
+    shards: [Mutex<Vec<BytesMut>>; COPY_POOL_SHARDS],
+    #[cfg(test)]
+    allocations: AtomicUsize,
+    #[cfg(test)]
+    live: AtomicUsize,
+}
+
+impl CopyBufPool {
+    const fn new() -> Self {
+        Self {
+            shards: [
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+                Mutex::new(Vec::new()),
+            ],
+            #[cfg(test)]
+            allocations: AtomicUsize::new(0),
+            #[cfg(test)]
+            live: AtomicUsize::new(0),
+        }
+    }
+
+    fn get(&self) -> PooledBuf<'_> {
+        let start = home_shard();
+        for i in 0..COPY_POOL_SHARDS {
+            let idx = (start + i) & (COPY_POOL_SHARDS - 1);
+            let popped = {
+                let mut g = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
+                g.pop()
+            };
+            if let Some(mut bm) = popped {
+                bm.clear();
+                #[cfg(test)]
+                self.live.fetch_add(1, Ordering::Relaxed);
+                return PooledBuf {
+                    pool: self,
+                    buf: Some(bm),
+                };
+            }
+        }
+        #[cfg(test)]
+        {
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            self.live.fetch_add(1, Ordering::Relaxed);
+        }
+        PooledBuf {
+            pool: self,
+            buf: Some(BytesMut::with_capacity(COPY_CHUNK_CAP)),
+        }
+    }
+
+    fn recycle(&self, bm: BytesMut) {
+        #[cfg(test)]
+        self.live.fetch_sub(1, Ordering::Relaxed);
+        self.put_raw(bm);
+    }
+
+    fn put_raw(&self, mut bm: BytesMut) {
+        bm.clear();
+        if !(COPY_CHUNK_CAP..=COPY_POOL_CLASS_MAX).contains(&bm.capacity()) {
+            return;
+        }
+        let start = home_shard();
+        for i in 0..COPY_POOL_SHARDS {
+            let idx = (start + i) & (COPY_POOL_SHARDS - 1);
+            let mut g = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
+            if g.len() < COPY_POOL_SHARD_CAP {
+                g.push(bm);
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn idle_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn live_count(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn allocations(&self) -> usize {
+        self.allocations.load(Ordering::Relaxed)
+    }
+}
+
+static COPY_POOL: CopyBufPool = CopyBufPool::new();
+
+struct PooledBuf<'a> {
+    pool: &'a CopyBufPool,
+    buf: Option<BytesMut>,
+}
+
+impl PooledBuf<'_> {
+    fn as_slice(&self) -> &[u8] {
+        self.buf.as_deref().unwrap_or(&[])
+    }
+
+    fn len(&self) -> usize {
+        self.buf.as_ref().map_or(0, BytesMut::len)
+    }
+
+    fn buf_mut(&mut self) -> &mut BytesMut {
+        self.buf.as_mut().expect("PooledBuf accessed after Drop")
+    }
+}
+
+impl Drop for PooledBuf<'_> {
+    fn drop(&mut self) {
+        if let Some(bm) = self.buf.take() {
+            self.pool.recycle(bm);
+        }
+    }
+}
 
 fn parse_copy_batch_bytes(val: Option<&str>) -> usize {
     val.and_then(|s| s.trim().parse::<usize>().ok())
@@ -32,102 +178,73 @@ pub fn copy_batch_bytes() -> usize {
     *V.get_or_init(|| parse_copy_batch_bytes(std::env::var("RH_COPY_BATCH_BYTES").ok().as_deref()))
 }
 
-enum TryChunk {
-    Data(BytesMut),
+enum TryChunk<'a> {
+    Data(PooledBuf<'a>),
     Eof,
     Empty,
 }
 
-struct BatchReader {
-    spare: Option<BytesMut>,
-    free: Vec<BytesMut>,
+/// 真实 waker 非阻塞读:按需借块并在 `Poll::Pending`/EOF/错误 时立刻还回全局池。
+async fn try_read_chunk<'a, R: AsyncRead + Unpin>(
+    pool: &'a CopyBufPool,
+    r: &mut R,
+) -> io::Result<TryChunk<'a>> {
+    std::future::poll_fn(|cx| {
+        let mut bm = pool.get();
+        let spare = bm.buf_mut().spare_capacity_mut();
+        let limit = spare.len().min(COPY_CHUNK_CAP);
+        let mut rb = ReadBuf::uninit(&mut spare[..limit]);
+        match Pin::new(&mut *r).poll_read(cx, &mut rb) {
+            Poll::Ready(Ok(())) => {
+                let n = rb.filled().len();
+                if n == 0 {
+                    return Poll::Ready(Ok(TryChunk::Eof));
+                }
+                // SAFETY: poll_read 只把已写入的前 n 字节标为 filled,且 n <= limit <= spare.len()。
+                unsafe { bm.buf_mut().advance_mut(n) };
+                Poll::Ready(Ok(TryChunk::Data(bm)))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Ready(Ok(TryChunk::Empty)),
+        }
+    })
+    .await
 }
 
-impl BatchReader {
-    fn new() -> Self {
-        Self {
-            spare: None,
-            free: Vec::with_capacity(8),
-        }
-    }
-
-    fn alloc_buf(&mut self) -> BytesMut {
-        self.free
-            .pop()
-            .unwrap_or_else(|| BytesMut::with_capacity(COPY_CHUNK_CAP))
-    }
-
-    fn recycle(&mut self, mut bm: BytesMut) {
-        bm.clear();
-        if self.free.len() < COPY_BATCH_SEGS {
-            self.free.push(bm);
-        }
-    }
-
-    /// 真实 waker 非阻塞读:无就绪数据返回 `TryChunk::Empty`(不挂起)。
-    async fn try_read_chunk<R: AsyncRead + Unpin>(&mut self, r: &mut R) -> io::Result<TryChunk> {
-        let mut spare_slot = self.spare.take().unwrap_or_else(|| self.alloc_buf());
-        let n = std::future::poll_fn(|cx| {
-            let spare = spare_slot.spare_capacity_mut();
-            let limit = spare.len().min(COPY_CHUNK_CAP);
-            let mut rb = ReadBuf::uninit(&mut spare[..limit]);
-            match Pin::new(&mut *r).poll_read(cx, &mut rb) {
-                Poll::Ready(Ok(())) => Poll::Ready(Ok::<usize, io::Error>(rb.filled().len())),
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Pending => Poll::Ready(Ok::<usize, io::Error>(usize::MAX)),
+/// 阻塞读一块:`Ok(None)` = EOF。在 `poll_fn` 内按需从共享池借用并在 `Poll::Pending`
+/// 挂起前立刻归还,确保空闲或被取消的连接长期驻留缓冲为 0。
+async fn read_chunk<'a, R: AsyncRead + Unpin>(
+    pool: &'a CopyBufPool,
+    r: &mut R,
+) -> io::Result<Option<PooledBuf<'a>>> {
+    std::future::poll_fn(|cx| {
+        let mut bm = pool.get();
+        let spare = bm.buf_mut().spare_capacity_mut();
+        let limit = spare.len().min(COPY_CHUNK_CAP);
+        let mut rb = ReadBuf::uninit(&mut spare[..limit]);
+        match Pin::new(&mut *r).poll_read(cx, &mut rb) {
+            Poll::Ready(Ok(())) => {
+                let n = rb.filled().len();
+                if n == 0 {
+                    return Poll::Ready(Ok(None));
+                }
+                // SAFETY: poll_read 只把已写入的前 n 字节标为 filled,且 n <= limit <= spare.len()。
+                unsafe { bm.buf_mut().advance_mut(n) };
+                Poll::Ready(Ok(Some(bm)))
             }
-        })
-        .await?;
-        if n == usize::MAX {
-            self.spare = Some(spare_slot);
-            return Ok(TryChunk::Empty);
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
         }
-        if n == 0 {
-            self.spare = Some(spare_slot);
-            return Ok(TryChunk::Eof);
-        }
-        // SAFETY: poll_read 只把已写入的前 n 字节标为 filled,且 n <= limit <= spare.len()。
-        unsafe { spare_slot.advance_mut(n) };
-        Ok(TryChunk::Data(spare_slot))
-    }
-
-    /// 阻塞读一块:`Ok(None)` = EOF。把未消费缓冲留在 `self.spare` 中,
-    /// 使 `select!` 取消读 future 时不丢失已分配的 64KiB 缓冲。
-    async fn read_chunk<R: AsyncRead + Unpin>(
-        &mut self,
-        r: &mut R,
-    ) -> io::Result<Option<BytesMut>> {
-        let n = std::future::poll_fn(|cx| {
-            if self.spare.is_none() {
-                self.spare = Some(self.alloc_buf());
-            }
-            let bm = self.spare.as_mut().expect("spare populated above");
-            let spare = bm.spare_capacity_mut();
-            let limit = spare.len().min(COPY_CHUNK_CAP);
-            let mut rb = ReadBuf::uninit(&mut spare[..limit]);
-            match Pin::new(&mut *r).poll_read(cx, &mut rb) {
-                Poll::Ready(Ok(())) => Poll::Ready(Ok(rb.filled().len())),
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Pending => Poll::Pending,
-            }
-        })
-        .await?;
-        if n == 0 {
-            return Ok(None);
-        }
-        let mut out = self.spare.take().expect("spare populated before read");
-        // SAFETY: poll_read 只把已写入的前 n 字节标为 filled,且 n <= limit <= spare.len()。
-        unsafe { out.advance_mut(n) };
-        Ok(Some(out))
-    }
+    })
+    .await
 }
 
 async fn write_vectored_batch<W: AsyncWrite + Unpin>(
     w: &mut W,
-    chunks: &[BytesMut],
+    chunks: &[PooledBuf<'_>],
     limiter: &Option<Arc<dyn crate::ChunkLimiter>>,
 ) -> io::Result<usize> {
-    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    let total: usize = chunks.iter().map(PooledBuf::len).sum();
     debug_assert!(total > 0, "caller flushes only non-empty batches");
     let mut res = match limiter {
         Some(l) => Some(l.reserve(total).await),
@@ -143,7 +260,8 @@ async fn write_vectored_batch<W: AsyncWrite + Unpin>(
             if nsegs == COPY_BATCH_SEGS {
                 break;
             }
-            let s = if i == 0 { &c[off..] } else { &c[..] };
+            let raw = c.as_slice();
+            let s = if i == 0 { &raw[off..] } else { raw };
             if !s.is_empty() {
                 slices[nsegs] = IoSlice::new(s);
                 nsegs += 1;
@@ -184,7 +302,7 @@ async fn write_vectored_batch<W: AsyncWrite + Unpin>(
     Ok(written)
 }
 
-/// 通用批量 copy 泵:ReadBuf 直读(单块 ≤ 64KiB 红线)+ 就绪抢收成批 +
+/// 通用批量 copy 泵:ReadBuf 直读(单块 ≤ 64KiB 红线)+ 有界共享池按需借还 +
 /// `poll_write_vectored` 批量聚合写出 + 写期间持续预取 + 取消安全限速预留。
 ///
 /// clean EOF 时刷新写端并返回 `Ok(total_bytes)`(不自动 `shutdown`,由上层
@@ -195,15 +313,23 @@ pub async fn copy_batched<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     w: &mut W,
     limiter: Option<Arc<dyn crate::ChunkLimiter>>,
 ) -> io::Result<u64> {
+    copy_batched_with_pool(&COPY_POOL, r, w, limiter).await
+}
+
+async fn copy_batched_with_pool<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    pool: &CopyBufPool,
+    r: &mut R,
+    w: &mut W,
+    limiter: Option<Arc<dyn crate::ChunkLimiter>>,
+) -> io::Result<u64> {
     let batch_limit = copy_batch_bytes();
     let has_limiter = limiter.is_some();
     let max_segs = if has_limiter { 1 } else { COPY_BATCH_SEGS };
 
-    let mut reader = BatchReader::new();
-    let mut pending: VecDeque<BytesMut> = VecDeque::new();
+    let mut pending: VecDeque<PooledBuf<'_>> = VecDeque::new();
     let mut pending_bytes: usize = 0;
-    let mut batch: Vec<BytesMut> = Vec::with_capacity(max_segs);
-    let mut prefetched: VecDeque<BytesMut> = VecDeque::new();
+    let mut batch: Vec<PooledBuf<'_>> = Vec::new();
+    let mut prefetched: VecDeque<PooledBuf<'_>> = VecDeque::new();
     let mut eof_seen = false;
     let mut read_err: Option<io::Error> = None;
     let mut total_copied: u64 = 0;
@@ -222,8 +348,28 @@ pub async fn copy_batched<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             batch.push(c);
         }
 
+        if batch.is_empty() {
+            if let Some(e) = read_err.take() {
+                return Err(e);
+            }
+            if eof_seen {
+                w.flush().await?;
+                return Ok(total_copied);
+            }
+            match read_chunk(pool, r).await? {
+                Some(c) => {
+                    batch_bytes += c.len();
+                    batch.push(c);
+                }
+                None => {
+                    w.flush().await?;
+                    return Ok(total_copied);
+                }
+            }
+        }
+
         while !eof_seen && batch_bytes < batch_limit && batch.len() < max_segs {
-            match reader.try_read_chunk(r).await {
+            match try_read_chunk(pool, r).await {
                 Ok(TryChunk::Data(c)) => {
                     batch_bytes += c.len();
                     batch.push(c);
@@ -240,26 +386,6 @@ pub async fn copy_batched<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             }
         }
 
-        if batch.is_empty() {
-            if let Some(e) = read_err.take() {
-                return Err(e);
-            }
-            if eof_seen {
-                w.flush().await?;
-                return Ok(total_copied);
-            }
-            match reader.read_chunk(r).await? {
-                Some(c) => {
-                    batch_bytes += c.len();
-                    batch.push(c);
-                }
-                None => {
-                    w.flush().await?;
-                    return Ok(total_copied);
-                }
-            }
-        }
-
         prefetched.clear();
         let mut prefetched_bytes = 0usize;
         let write_res =
@@ -272,10 +398,12 @@ pub async fn copy_batched<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     {
                         break write_fut.await;
                     }
-                    let read_fut = reader.read_chunk(r);
+                    let read_fut = read_chunk(pool, r);
                     futures::pin_mut!(read_fut);
-                    match futures::future::select(read_fut, write_fut.as_mut()).await {
-                        futures::future::Either::Left((nr, _)) => match nr {
+                    // 优先推进 write_fut:快速写出在首轮即返回,无需触碰读半与缓冲池。
+                    match futures::future::select(write_fut.as_mut(), read_fut).await {
+                        futures::future::Either::Left((res, _)) => break res,
+                        futures::future::Either::Right((nr, _)) => match nr {
                             Ok(Some(c)) => {
                                 prefetched_bytes += c.len();
                                 prefetched.push_back(c);
@@ -289,7 +417,6 @@ pub async fn copy_batched<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                 break write_fut.await;
                             }
                         },
-                        futures::future::Either::Right((res, _)) => break res,
                     }
                 }
             } else {
@@ -299,9 +426,7 @@ pub async fn copy_batched<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         let written = write_res?;
         total_copied += written as u64;
 
-        for bm in batch.drain(..) {
-            reader.recycle(bm);
-        }
+        batch.clear();
         pending_bytes += prefetched_bytes;
         pending.append(&mut prefetched);
 
@@ -724,5 +849,164 @@ mod tests {
         assert_eq!(parse_copy_batch_bytes(Some("1048576")), 1024 * 1024);
         assert_eq!(parse_copy_batch_bytes(Some("99999999")), 1024 * 1024);
         assert!((1024..=1024 * 1024).contains(&copy_batch_bytes()));
+    }
+
+    #[tokio::test]
+    async fn copy_batched_idle_connections_retain_zero_buffers() {
+        static POOL: CopyBufPool = CopyBufPool::new();
+        const CONNS: usize = 512;
+
+        let mut in_txs = Vec::with_capacity(CONNS);
+        let mut out_rxs = Vec::with_capacity(CONNS);
+        let mut tasks = Vec::with_capacity(CONNS);
+
+        for _ in 0..CONNS {
+            let (in_tx, mut in_rx) = tokio::io::duplex(4096);
+            let (mut out_tx, out_rx) = tokio::io::duplex(4096);
+            in_txs.push(in_tx);
+            out_rxs.push(out_rx);
+            tasks.push(tokio::spawn(async move {
+                copy_batched_with_pool(&POOL, &mut in_rx, &mut out_tx, None).await
+            }));
+        }
+
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            POOL.live_count(),
+            0,
+            "512 条空闲挂起连接不得长期持有任何 64KiB 读缓冲"
+        );
+
+        for tx in &mut in_txs {
+            tx.write_all(b"PING\n").await.unwrap();
+        }
+        for rx in &mut out_rxs {
+            let mut got = [0u8; 5];
+            tokio::time::timeout(Duration::from_secs(2), rx.read_exact(&mut got))
+                .await
+                .expect("ping roundtrip timeout")
+                .unwrap();
+            assert_eq!(&got, b"PING\n");
+        }
+
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            POOL.live_count(),
+            0,
+            "收发结束后回泊 Poll::Pending 必须全数归还缓冲"
+        );
+        assert!(POOL.idle_count() <= COPY_POOL_MAX_IDLE);
+        assert!(
+            POOL.allocations() < 128,
+            "共享池复用下 512 连接总分配 ({}) 应远低于 128",
+            POOL.allocations()
+        );
+
+        drop(in_txs);
+        for t in tasks {
+            assert_eq!(t.await.unwrap().unwrap(), 5);
+        }
+        assert_eq!(POOL.live_count(), 0);
+    }
+
+    struct PendingWriteIo;
+
+    impl AsyncWrite for PendingWriteIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_batched_drop_mid_write_returns_all_buffers() {
+        static POOL: CopyBufPool = CopyBufPool::new();
+        let (mut tx, mut rx) = tokio::io::duplex(256 * 1024);
+        tx.write_all(&vec![0xABu8; 128 * 1024]).await.unwrap();
+
+        let mut dst = PendingWriteIo;
+        let fut = Box::pin(copy_batched_with_pool(&POOL, &mut rx, &mut dst, None));
+        let mut fut = fut;
+        tokio::select! {
+            _ = &mut fut => panic!("PendingWriteIo 不可能自行完成"),
+            _ = async {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        assert!(POOL.live_count() > 0, "写背压阻塞期间批内应存在借出缓冲");
+        drop(fut);
+        assert_eq!(
+            POOL.live_count(),
+            0,
+            "写中途取消/丢弃 future 后必须全额归还借出缓冲"
+        );
+    }
+
+    #[test]
+    fn copy_pool_bounds_idle_and_reuses_cross_thread() {
+        let pool = CopyBufPool::new();
+        // 拒绝过小或过大缓冲,防止异常尺寸污染池体
+        pool.put_raw(BytesMut::with_capacity(128));
+        pool.put_raw(BytesMut::with_capacity(COPY_POOL_CLASS_MAX + 4096));
+        assert_eq!(pool.idle_count(), 0);
+
+        // 上限严格封顶在 COPY_POOL_MAX_IDLE (256)
+        for _ in 0..(COPY_POOL_MAX_IDLE + 64) {
+            pool.put_raw(BytesMut::with_capacity(COPY_CHUNK_CAP));
+        }
+        assert_eq!(pool.idle_count(), COPY_POOL_MAX_IDLE);
+
+        // 跨线程归还后主线程取用应 0 新分配复用
+        let fresh_pool = std::sync::Arc::new(CopyBufPool::new());
+        let worker_pool = fresh_pool.clone();
+        std::thread::spawn(move || {
+            for _ in 0..8 {
+                worker_pool.put_raw(BytesMut::with_capacity(COPY_CHUNK_CAP));
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(fresh_pool.idle_count(), 8);
+        let held: Vec<_> = (0..8).map(|_| fresh_pool.get()).collect();
+        assert_eq!(
+            fresh_pool.allocations(),
+            0,
+            "跨线程放入的缓冲必须被命中复用"
+        );
+        assert_eq!(fresh_pool.live_count(), 8);
+        drop(held);
+        assert_eq!(fresh_pool.live_count(), 0);
+        assert_eq!(fresh_pool.idle_count(), 8);
     }
 }
