@@ -105,7 +105,7 @@ class TestRunIperf(unittest.TestCase):
             'source peer.sh; RAW_DIR=$(mktemp -d); PEER_DURATION=2; '
             f'echo "$RAW_DIR"; run_iperf 127.0.0.1 {port} 1 "" {raw_id}'
         )
-        r = fx.run_bash(script, env_extra={"IPERF3_BIN": "iperf3"}, timeout=60)
+        r = fx.run_bash(script, env_extra={"THP_TOOL": "iperf3", "IPERF3_BIN": "iperf3"}, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
         raw_dir = lines[0]
@@ -166,7 +166,8 @@ class TestLoadgenFailureAccounting(unittest.TestCase):
                'out=$(run_loadgen t-x udp --host 127.0.0.1 --port 1 '
                '--size 4 --duration 0.2 --window 4 --drain 0.2); '
                'okval=$(printf \'%s\' "$out" | jq -r \'.ok\'); '
-               'loadgen_failed "$out" || true; echo "OK=$okval FAILS=$FAILS"')
+               'loadgen_failed "$out" || true; echo "OK=$okval FAILS=$FAILS"',
+               LOADGEN_BIN=fx.go_loadgen_bin())
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("OK=false", r.stdout, r.stdout)
         self.assertIn("FAILS=1", r.stdout, r.stdout)

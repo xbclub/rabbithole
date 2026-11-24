@@ -671,7 +671,7 @@ class TestR3LiveIperfCompat(unittest.TestCase):
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         tmp = tempfile.mkdtemp(prefix="rh-live-iperf-")
         try:
-            script = (f'cd {fx.BENCH} && source peer.sh; RAW_DIR={tmp}; PEER_DURATION=2; '
+            script = (f'cd {fx.BENCH} && export THP_TOOL=iperf3 IPERF3_BIN=iperf3 && source peer.sh; RAW_DIR={tmp}; PEER_DURATION=2; '
                       f'run_iperf 127.0.0.1 {port} 1 "" live322')
             r = subprocess.run(["bash", "-c", script], capture_output=True,
                                text=True, timeout=60)

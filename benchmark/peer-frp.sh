@@ -25,7 +25,7 @@ set -uo pipefail
 BENCH_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$BENCH_SELF_DIR/lib/common.sh"
 
-require_cmd python3 curl jq iperf3
+require_cmd python3 curl jq
 
 FRP_VERSION="${FRP_VERSION:-v0.72.0}"
 FRP_ASSET="frp_${FRP_VERSION#v}_linux_amd64.tar.gz"   # tag 带 v,包名不带
@@ -34,14 +34,19 @@ PROTO="${PROTO:-tcp}"
 PEER_DIR="${PEER_DIR:-/tmp/frp-peer}"
 PEER_DURATION="${PEER_DURATION:-10}"
 
-# 吞吐压测工具(与 peer.sh 同一开关,保证两侧可比):
-#   THP_TOOL=iperf3(默认) | loadgen(仓库自带 Go 压测器)
-THP_TOOL="${THP_TOOL:-iperf3}"
+# 吞吐压测工具(与 peer.sh 同一开关,默认 Go loadgen):
+#   THP_TOOL=loadgen(默认) | iperf3
+THP_TOOL="${THP_TOOL:-loadgen}"
 LOADGEN_BIN="${LOADGEN_BIN:-/tmp/rh-bin/loadgen}"
-if [ "$THP_TOOL" = "loadgen" ]; then
-  [ -x "$LOADGEN_BIN" ] || die "THP_TOOL=loadgen 但 LOADGEN_BIN 不可执行: $LOADGEN_BIN"
-fi
-export THP_TOOL LOADGEN_BIN
+IPERF3_BIN="${IPERF3_BIN:-iperf3}"
+export THP_TOOL LOADGEN_BIN IPERF3_BIN
+
+ensure_frp_tools() {
+  [ -x "$LOADGEN_BIN" ] || die "LOADGEN_BIN 不可执行: $LOADGEN_BIN"
+  if [ "$THP_TOOL" != "loadgen" ]; then
+    command -v "$IPERF3_BIN" >/dev/null 2>&1 || die "缺少命令: $IPERF3_BIN"
+  fi
+}
 
 CTL_PORT=17100; KCP_PORT=17101; QUIC_PORT=17102
 PROXY_BASE=20001
@@ -117,10 +122,11 @@ EOF
 # ============================================================
 frp_client() {  # <a_ip>
   local a_ip="$1"
+  ensure_frp_tools
   resolve_frp
   mkdir -p "$PEER_DIR"
 
-  python3 "$BENCH_PY/target.py" \
+  "$LOADGEN_BIN" target \
     --tcp-port "$T_TCP" --udp-port "$T_UDP" --http-port "$T_HTTP" \
     >"$PEER_DIR/target.log" 2>&1 &
   echo $! > "$PEER_DIR/target.pid"
@@ -129,7 +135,7 @@ frp_client() {  # <a_ip>
   if [ "$THP_TOOL" = "loadgen" ]; then
     "$LOADGEN_BIN" sink "$T_IPERF" 7200 200000 >"$PEER_DIR/iperf.log" 2>&1 &
   else
-    iperf3 -s -p "$T_IPERF" >"$PEER_DIR/iperf.log" 2>&1 &
+    "$IPERF3_BIN" -s -p "$T_IPERF" >"$PEER_DIR/iperf.log" 2>&1 &
   fi
   echo $! > "$PEER_DIR/iperf.pid"
   wait_port 127.0.0.1 "$T_IPERF" 10 || { err "iperf3 未就绪"; return 1; }
@@ -186,6 +192,7 @@ EOF
 # ============================================================
 frp_drive() {  # <a_ip> <b_ip> [label]
   local a_ip="$1" b_ip="$2" label="${3:-$PROTO}"
+  ensure_frp_tools
   local P_TCP=$PROXY_BASE P_IPERF=$((PROXY_BASE+1)) P_UDP=$((PROXY_BASE+2)) P_VHOST=$((PROXY_BASE+3))
   mkdir -p "$PEER_DIR"
 
@@ -218,11 +225,15 @@ PYEOF
   thp() {
     local host="$1" port="$2" streams="$3" rev="$4" out
     if [ "$THP_TOOL" = "loadgen" ]; then
-      # loadgen 仅单向发送,rev(下行)无对应能力 → 与 peer.sh 同口径
-      out="$("$LOADGEN_BIN" src "$host:$port" "$PEER_DURATION" "$streams" 2>/dev/null \
-        | jq -r '(.gbps // 0)*1000|floor' 2>/dev/null)"
+      if [ -n "$rev" ]; then
+        out="$("$LOADGEN_BIN" src -R "$host:$port" "$PEER_DURATION" "$streams" 2>/dev/null \
+          | jq -r '(.gbps // 0)*1000|floor' 2>/dev/null)"
+      else
+        out="$("$LOADGEN_BIN" src "$host:$port" "$PEER_DURATION" "$streams" 2>/dev/null \
+          | jq -r '(.gbps // 0)*1000|floor' 2>/dev/null)"
+      fi
     else
-      out="$(iperf3 -c "$host" -p "$port" -t "$PEER_DURATION" -P "$streams" $rev -J 2>/dev/null \
+      out="$("$IPERF3_BIN" -c "$host" -p "$port" -t "$PEER_DURATION" -P "$streams" $rev -J 2>/dev/null \
         | jq -r '.end.sum_received.bits_per_second/1e6|floor // 0' 2>/dev/null)"
     fi
     [ -n "$out" ] && [ "$out" != "null" ] || out=0
@@ -249,9 +260,9 @@ PYEOF
   # ---------- 延迟 ----------
   hdr "延迟 (5000 往返)"
   local d_lat t_lat d_nc
-  d_lat="$(python3 "$BENCH_PY/loadgen.py" --host "$b_ip" --port "$T_TCP" latency --count 5000 --warmup 200)"
-  t_lat="$(python3 "$BENCH_PY/loadgen.py" --host "$a_ip" --port "$P_TCP" latency --count 5000 --warmup 200)"
-  d_nc="$(python3 "$BENCH_PY/loadgen.py" --host "$a_ip" --port "$P_TCP" latency --count 500 --newconn)"
+  d_lat="$("$LOADGEN_BIN" --host "$b_ip" --port "$T_TCP" latency --count 5000 --warmup 200)"
+  t_lat="$("$LOADGEN_BIN" --host "$a_ip" --port "$P_TCP" latency --count 5000 --warmup 200)"
+  d_nc="$("$LOADGEN_BIN" --host "$a_ip" --port "$P_TCP" latency --count 500 --newconn)"
   rec "{\"metric\":\"latency\",\"path\":\"direct\",\"data\":$d_lat,\"proto\":\"frp-$PROTO\"}"
   rec "{\"metric\":\"latency\",\"path\":\"tunnel\",\"data\":$t_lat,\"proto\":\"frp-$PROTO\"}"
   rec "{\"metric\":\"latency_newconn\",\"path\":\"tunnel\",\"data\":$d_nc,\"proto\":\"frp-$PROTO\"}"
@@ -266,36 +277,37 @@ print(f'  新建连接 p50={n[\"p50_ms\"]}ms p99={n[\"p99_ms\"]}ms')"
   # ---------- 建连速率 ----------
   hdr "连接建立速率"
   local d_cr t_cr
-  d_cr="$(python3 "$BENCH_PY/loadgen.py" --host "$b_ip" --port "$T_TCP" connect --connections 3000 --parallel 64)"
-  t_cr="$(python3 "$BENCH_PY/loadgen.py" --host "$a_ip" --port "$P_TCP" connect --connections 3000 --parallel 64)"
+  d_cr="$("$LOADGEN_BIN" --host "$b_ip" --port "$T_TCP" connect --connections 3000 --parallel 64)"
+  t_cr="$("$LOADGEN_BIN" --host "$a_ip" --port "$P_TCP" connect --connections 3000 --parallel 64)"
   rec "{\"metric\":\"connect_rate\",\"direct\":$d_cr,\"tunnel\":$t_cr,\"proto\":\"frp-$PROTO\"}"
   log "  直连 $(echo "$d_cr"|jq -r .rate_per_s)/s  隧道 $(echo "$t_cr"|jq -r .rate_per_s)/s"
 
   # ---------- UDP ----------
   hdr "UDP (1200B)"
   local d_u t_u
-  d_u="$(python3 "$BENCH_PY/loadgen.py" --host "$b_ip" --port "$T_UDP" udp --size 1200 --duration 8 --window 32)"
-  t_u="$(python3 "$BENCH_PY/loadgen.py" --host "$a_ip" --port "$P_UDP" udp --size 1200 --duration 8 --window 32)"
+  d_u="$("$LOADGEN_BIN" --host "$b_ip" --port "$T_UDP" udp --size 1200 --duration 8 --window 32 --drain "${PEER_UDP_DRAIN:-5}")"
+  t_u="$("$LOADGEN_BIN" --host "$a_ip" --port "$P_UDP" udp --size 1200 --duration 8 --window 32 --drain "${PEER_UDP_DRAIN:-5}")"
   rec "{\"metric\":\"udp\",\"direct\":$d_u,\"tunnel\":$t_u,\"proto\":\"frp-$PROTO\"}"
   log "  直连 $(echo "$d_u"|jq -r .mbps)Mbps 丢=$(echo "$d_u"|jq -r .loss_pct)%  隧道 $(echo "$t_u"|jq -r .mbps)Mbps 丢=$(echo "$t_u"|jq -r .loss_pct)%"
 
   # ---------- HTTP vhost ----------
   hdr "HTTP vhost QPS"
   local d_h t_h
-  d_h="$(python3 "$BENCH_PY/loadgen.py" --host "$b_ip" --port "$T_HTTP" http --connections 16 --duration 8)"
-  t_h="$(python3 "$BENCH_PY/loadgen.py" --host "$a_ip" --port "$P_VHOST" http --connections 16 --duration 8 --host-header bench.test)"
+  d_h="$("$LOADGEN_BIN" --host "$b_ip" --port "$T_HTTP" http --connections 16 --duration 8)"
+  t_h="$("$LOADGEN_BIN" --host "$a_ip" --port "$P_VHOST" http --connections 16 --duration 8 --host-header bench.test)"
   rec "{\"metric\":\"http\",\"direct\":$d_h,\"tunnel\":$t_h,\"proto\":\"frp-$PROTO\"}"
   log "  直连 $(echo "$d_h"|jq -r .qps)QPS  隧道 $(echo "$t_h"|jq -r .qps)QPS"
 
   # ---------- 并发(高水位放最后;非 tcp 轮可跳过) ----------
   if [ "${PEER_CONCURRENT:-1}" = "1" ]; then
     hdr "并发连接 (直连 vs 隧道)"
+    local conc_hold="${PEER_CONC_HOLD:-5}"
     for n in 64 256 1024 4096; do
       local d_c t_c
-      d_c="$(python3 "$BENCH_PY/loadgen.py" --host "$b_ip" --port "$T_TCP" concurrent --connections "$n" --hold 3)"
-      t_c="$(python3 "$BENCH_PY/loadgen.py" --host "$a_ip" --port "$P_TCP" concurrent --connections "$n" --hold 3)"
+      d_c="$("$LOADGEN_BIN" --host "$b_ip" --port "$T_TCP" concurrent --connections "$n" --hold "$conc_hold")"
+      t_c="$("$LOADGEN_BIN" --host "$a_ip" --port "$P_TCP" concurrent --connections "$n" --hold "$conc_hold")"
       rec "{\"metric\":\"concurrent\",\"n\":$n,\"direct\":$d_c,\"tunnel\":$t_c,\"proto\":\"frp-$PROTO\"}"
-      log "  $n: 直连成功=$(echo "$d_c"|jq -r .established) 隧道成功=$(echo "$t_c"|jq -r .established) 建连p99=$(echo "$t_c"|jq -r .connect_p99_ms)ms"
+      log "  $n: 直连成功=$(echo "$d_c"|jq -r .established) verified=$(echo "$d_c"|jq -r .verified) 隧道成功=$(echo "$t_c"|jq -r .established) verified=$(echo "$t_c"|jq -r .verified) 建连p99=$(echo "$t_c"|jq -r .connect_p99_ms)ms"
     done
   fi
 

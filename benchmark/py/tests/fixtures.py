@@ -7,9 +7,11 @@
 """
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -20,8 +22,45 @@ import time
 BENCH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 PY_DIR = os.path.join(BENCH, "py")
 BEFORE_FIX = os.path.join(BENCH, "runs", "goal-repair", "harness", "before-fix")
+GO_LOADGEN_SRC = os.path.join(BENCH, "loadgen")
 
 sys.path.insert(0, PY_DIR)
+
+_GO_LOADGEN_BIN: str | None = None
+_GO_LOADGEN_TMPDIR: str | None = None
+
+
+def go_loadgen_bin() -> str:
+    """Build benchmark/loadgen once per test process and return its binary path."""
+    global _GO_LOADGEN_BIN, _GO_LOADGEN_TMPDIR
+    if _GO_LOADGEN_BIN and os.path.isfile(_GO_LOADGEN_BIN):
+        return _GO_LOADGEN_BIN
+    _GO_LOADGEN_TMPDIR = tempfile.mkdtemp(prefix="rh-go-loadgen-test-")
+    atexit.register(lambda d=_GO_LOADGEN_TMPDIR: shutil.rmtree(d, ignore_errors=True))
+    bin_path = os.path.join(_GO_LOADGEN_TMPDIR, "loadgen")
+    res = subprocess.run(
+        ["go", "build", "-o", bin_path, "."],
+        cwd=GO_LOADGEN_SRC,
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"failed to build Go loadgen: {res.stderr}\n{res.stdout}")
+    _GO_LOADGEN_BIN = bin_path
+    return bin_path
+
+
+def run_go_loadgen(*args: str, timeout: float = 60) -> dict:
+    """Run compiled Go loadgen subcommand and decode stdout JSON."""
+    proc = subprocess.run(
+        [go_loadgen_bin(), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if proc.returncode != 0 and not proc.stdout.strip():
+        raise RuntimeError(f"loadgen {args} failed ({proc.returncode}): {proc.stderr}")
+    return json.loads(proc.stdout.strip())
 
 
 def load_before_fix(module_filename: str):

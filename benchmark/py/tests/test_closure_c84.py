@@ -43,7 +43,7 @@ def _mk_tree(root: str) -> str:
         ("benchmark/peer.sh", "# peer\n"),
         ("benchmark/lib/common.sh", "# common\n"),
         ("benchmark/closure_c84.py", "# tool\n"),
-        ("benchmark/py/loadgen.py", "# lg\n"),
+        ("benchmark/loadgen/main.go", "// lg\n"),
         ("tests/e2e.sh", "# e2e\n"),
         ("console/dist/index.html", "<i>\n"),
         ("target/release/rh-server", "bin\n"),

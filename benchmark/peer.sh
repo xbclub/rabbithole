@@ -4,10 +4,10 @@
 # 拓扑:
 #
 #   [test3: driver]        [test1: server]            [test2: client]
-#   iperf3 -c  ──10GbE──►  rh-server :CTL    ──隧道──►  rh-client
-#   loadgen.py             :API 管理面                 ├ iperf3 -s :T_IPERF
-#   (独立压测机,           :20001+ 转发口              ├ target.py :T_TCP/UDP/HTTP
-#    不与被测抢 CPU)              │                      (目标都在 B 本机)
+#   loadgen src ──10GbE──► rh-server :CTL    ──隧道──►  rh-client
+#   (Go 压测器,             :API 管理面                 ├ loadgen sink   :T_IPERF
+#    不与被测抢 CPU)        :20001+ 转发口              ├ loadgen target :T_TCP/UDP/HTTP
+#                                 │                      (目标都在 B 本机)
 #                                 └── 规则由 drive 经 API 下发
 #
 #   基线:  driver ──直连──► B:T_IPERF       (不经 rabbithole)
@@ -65,15 +65,9 @@ T_TCP="${T_TCP:-19102}"
 T_UDP="${T_UDP:-19103}"
 T_HTTP="${T_HTTP:-19104}"
 
-# 吞吐压测工具。默认 iperf3(保持既有行为与历史数据可比)。
-#   THP_TOOL=iperf3   系统 iperf3 单线程,-P 不扩展吞吐;多线程版见 IPERF3_BIN
-#   THP_TOOL=loadgen  仓库自带 Go 压测器(benchmark/loadgen)
-#
-# ★为什么需要 loadgen:TLS 下的吞吐量级会显著高于明文,
-# iperf3 3.9 单线程与 Python loadgen 的天花板都在 2 Gbps 量级;
-# 用它去测 TLS 会把两边都压到同一数字,测到的是压测器瓶颈而不是产品差异
-# (见 benchmark/loadgen/main.go 顶部注释,该坑在明文场景已踩过一次)。
-# loadgen 与 iperf3 的字节口径一致(只计有效载荷),结果可对照。
+# 吞吐压测工具。默认 loadgen(仓库自带 Go 压测器 benchmark/loadgen)。
+#   THP_TOOL=loadgen  Go 压测器(默认;支持双向 upload / download -R,无 cwnd 塌陷伪影)
+#   THP_TOOL=iperf3   系统 iperf3 兼容选项(单线程,-P 不扩展吞吐;多线程版见 IPERF3_BIN)
 # 数据通道是否开启端到端 snappy 压缩(use_compression)。
 #   PEER_COMPRESS=0  默认,规则不开压缩(走 splice / chunk 快路径)
 #   PEER_COMPRESS=1  规则开压缩 → 客户端恒回落 forward::splice 的 copy 路径
@@ -92,22 +86,23 @@ PEER_COMPRESS="${PEER_COMPRESS:-0}"
 # 代理侧按用户源地址建会话,单源压测永远测不到多会话争用。
 PEER_UDP_SOURCES="${PEER_UDP_SOURCES:-1}"
 
-THP_TOOL="${THP_TOOL:-iperf3}"
+THP_TOOL="${THP_TOOL:-loadgen}"
 IPERF3_BIN="${IPERF3_BIN:-iperf3}"
 LOADGEN_BIN="${LOADGEN_BIN:-/tmp/rh-bin/loadgen}"
-# 必须 export:run_iperf 在 `$(...)` 子 shell 里执行,未导出的普通变量
-# 在那里不可见 —— 会导致 THP_TOOL 回落成 iperf3,而解析分支仍按 loadgen
-# 判断(空 JSON → 全部 INVALID(exit=0))。这个不一致极难从输出看出来。
-# PEER_COMPRESS 同样必须 export(role_* 由 `$(...)`/子 shell 分派,
-# 未导出时预算里的压缩开关在子进程看不到 → 规则静默不开压缩,
-# 与 THP_TOOL 曾踩的坑同型)。
 export THP_TOOL LOADGEN_BIN PEER_COMPRESS PEER_UDP_SOURCES
-if [ "$THP_TOOL" = "loadgen" ]; then
-  [ -x "$LOADGEN_BIN" ] || die "THP_TOOL=loadgen 但 LOADGEN_BIN 不可执行: $LOADGEN_BIN"
-else
-  command -v "$IPERF3_BIN" >/dev/null 2>&1 \
-    || die "iperf3 不可用: IPERF3_BIN=$IPERF3_BIN (三机上 /tmp/rh-bin/iperf3 可用)"
-fi
+
+ensure_loadgen_bin() {
+  [ -x "$LOADGEN_BIN" ] || die "LOADGEN_BIN 不可执行: $LOADGEN_BIN"
+}
+
+ensure_thp_tool() {
+  if [ "$THP_TOOL" = "loadgen" ]; then
+    ensure_loadgen_bin
+  else
+    command -v "$IPERF3_BIN" >/dev/null 2>&1 \
+      || die "iperf3 不可用: IPERF3_BIN=$IPERF3_BIN (三机上 /tmp/rh-bin/iperf3 可用)"
+  fi
+}
 
 # 并发最高档 → 本轮 fd 需求(每连接 1 fd + 余量 512;4096 档即 ≥4608,
 # 统一推荐 65535。依据见 docs/performance-2026-10-history.md §4)
@@ -156,10 +151,12 @@ run_iperf() {
   local t0 t1 rc mbps
   t0="$(epoch_us)"
   if [ "$THP_TOOL" = "loadgen" ]; then
-    # loadgen src <host:port> <seconds> <conns>:与 iperf3 -c/-P 语义对齐。
-    # 它只有单向发送(sink 读空),故忽略 $rev —— 下行样本会如实记为同口径
-    # 的单向数据,而不是伪装成双向。
-    "$LOADGEN_BIN" src "$dst:$port" "$PEER_DURATION" "$streams" >"$j" 2>"$e"
+    ensure_loadgen_bin
+    if [ -n "$rev" ]; then
+      "$LOADGEN_BIN" src -R "$dst:$port" "$PEER_DURATION" "$streams" >"$j" 2>"$e"
+    else
+      "$LOADGEN_BIN" src "$dst:$port" "$PEER_DURATION" "$streams" >"$j" 2>"$e"
+    fi
     rc=$?
   else
     "$IPERF3_BIN" -c "$dst" -p "$port" -t "$PEER_DURATION" -P "$streams" $rev -J >"$j" 2>"$e"
@@ -196,7 +193,8 @@ run_loadgen() {
   local tag="$1"; shift
   LG_SEQ=$((LG_SEQ+1))
   local out rc errf="$RAW_DIR/$tag.stderr"
-  out="$(python3 "$BENCH_PY/loadgen.py" "$@" 2>"$errf")"; rc=$?
+  [ -x "$LOADGEN_BIN" ] || die "LOADGEN_BIN 不可执行: $LOADGEN_BIN"
+  out="$("$LOADGEN_BIN" "$@" 2>"$errf")"; rc=$?
   if [ "$rc" -eq 0 ] && printf '%s' "$out" | jq -e 'type=="object" and (has("error")|not) and (has("env_error")|not)' >/dev/null 2>&1; then
     printf '%s' "$out"
   else
@@ -273,11 +271,13 @@ peer_client() {  # <a_addr> <client_id> <secret>
   require_run_env client
   raise_nofile 65535
   check_nofile client "$(conc_fd_need)" || return 1
+  ensure_loadgen_bin
+  ensure_thp_tool
   resolve_binaries
   mkdir -p "$PEER_DIR"
 
-  # 目标服务(绑定 0.0.0.0,直连基线要从别的机器访问)
-  python3 "$BENCH_PY/target.py" \
+  # 目标服务(Go loadgen target,绑定 0.0.0.0,直连基线要从别的机器访问)
+  "$LOADGEN_BIN" target \
     --tcp-port "$T_TCP" --udp-port "$T_UDP" --http-port "$T_HTTP" \
     >"$PEER_DIR/target.log" 2>&1 &
   echo $! > "$PEER_DIR/target.pid"
@@ -327,6 +327,8 @@ peer_drive() {  # <a_ip> <b_ip> <api_port> <token> <client_id> [label]
   # ★F-Drive-Nofile:drive 自己也要持有 4096+ 个 socket(G5 由本机发起)
   raise_nofile 65535
   check_nofile drive "$(conc_fd_need)" || return 1
+  ensure_loadgen_bin
+  ensure_thp_tool
   mkdir -p "$PEER_DIR"
 
   local API="http://$a_ip:$api_port"
@@ -484,7 +486,7 @@ PYEOF
   done
 
   # ---------- 延迟 ----------
-  hdr "延迟 (python, 5000 往返)"
+  hdr "延迟 (loadgen, 5000 往返)"
   local d_lat t_lat d_nc
   d_lat="$(run_loadgen "lat-$label-direct" --host "$b_ip" --port "$T_TCP" latency --count 5000 --warmup 200)"
   t_lat="$(run_loadgen "lat-$label-tunnel" --host "$a_ip" --port "$P_TCP" latency --count 5000 --warmup 200)"

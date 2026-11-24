@@ -8,42 +8,71 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
+import subprocess
 import sys
-import threading
+import tempfile
+import time
 import unittest
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import fixtures as fx  # noqa: E402
-import loadgen as new_loadgen  # noqa: E402
-import target as bench_target  # noqa: E402
 
 old_loadgen = fx.load_before_fix("loadgen.py")
 
 
-def conc_args(host, port, *, connections=48, hold=1.5, timeout=10.0):
-    return argparse.Namespace(host=host, port=port, connections=connections,
-                              hold=hold, timeout=timeout)
+def run_go_conc(host, port, *, connections=48, hold=1.5, timeout=10.0):
+    return fx.run_go_loadgen(
+        "--host", host, "--port", str(port), "--timeout", str(timeout),
+        "concurrent",
+        "--connections", str(connections),
+        "--hold", str(hold),
+        timeout=60,
+    )
 
 
 class RealTarget:
-    """起 target.py 的 PING/PONG 行协议服务。"""
+    """起 Go loadgen target 的 PING/PONG 行协议服务。"""
 
     def __init__(self):
-        self.srv = bench_target.TcpTarget(("127.0.0.1", 0), bench_target.TcpHandler)
-        self.port = self.srv.server_address[1]
-        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
-        self.thread.start()
+        self.port = fx.free_port()
+        self._tmp = tempfile.mkdtemp(prefix="rh-target-test-")
+        ready = os.path.join(self._tmp, "ready")
+        self.proc = subprocess.Popen(
+            [fx.go_loadgen_bin(), "target", "--tcp-port", str(self.port), "--ready-file", ready],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if os.path.isfile(ready):
+                return
+            if self.proc.poll() is not None:
+                err = self.proc.stderr.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"go loadgen target exited early: {err}")
+            time.sleep(0.02)
+        self.close()
+        raise RuntimeError("go loadgen target readiness timeout")
 
     def close(self):
-        self.srv.shutdown()
-        self.srv.server_close()
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+        if self.proc.stderr:
+            self.proc.stderr.close()
+        shutil.rmtree(self._tmp, ignore_errors=True)
 
 
 class TestConcurrentVerified(unittest.TestCase):
     def test_verified_equals_connections_on_real_target(self):
         t = RealTarget()
         try:
-            out = new_loadgen.run_concurrent(conc_args("127.0.0.1", t.port))
+            out = run_go_conc("127.0.0.1", t.port)
         finally:
             t.close()
         self.assertEqual(out["established"], 48, out)
@@ -60,8 +89,7 @@ class TestConcurrentVerified(unittest.TestCase):
         srv = fx.AcceptOnlyServer()
         srv.start()
         try:
-            out = new_loadgen.run_concurrent(
-                conc_args("127.0.0.1", srv.port, connections=24, hold=1.0))
+            out = run_go_conc("127.0.0.1", srv.port, connections=24, hold=1.0)
         finally:
             srv.close()
         self.assertEqual(out["established"], 24, out)

@@ -14,14 +14,21 @@ import unittest
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import fixtures as fx  # noqa: E402
-import loadgen as new_loadgen  # noqa: E402
 
 old_loadgen = fx.load_before_fix("loadgen.py")
 
 
-def udp_args(host, port, *, duration=1.0, drain=3.0, window=32, size=1200):
-    return argparse.Namespace(host=host, port=port, size=size, duration=duration,
-                              window=window, drain=drain, rto=0.5, timeout=15.0)
+def run_go_udp(host, port, *, duration=1.0, drain=3.0, window=32, size=1200):
+    return fx.run_go_loadgen(
+        "--host", host, "--port", str(port),
+        "udp",
+        "--size", str(size),
+        "--duration", str(duration),
+        "--window", str(window),
+        "--drain", str(drain),
+        "--rto", "0.5",
+        timeout=30,
+    )
 
 
 class TestUdpDrain(unittest.TestCase):
@@ -30,7 +37,7 @@ class TestUdpDrain(unittest.TestCase):
         srv = fx.DelayedUdpEcho(hold_n=20, release_after=1.6)
         srv.start()
         try:
-            out = new_loadgen.run_udp(udp_args("127.0.0.1", srv.port))
+            out = run_go_udp("127.0.0.1", srv.port)
         finally:
             srv.close()
         # late_recv 含被扣押的 20 个 + 截止时刻仍在途的自然存量;
@@ -62,7 +69,7 @@ class TestUdpDrain(unittest.TestCase):
         srv = fx.DelayedUdpEcho(dup_n=5, dup_from=30)
         srv.start()
         try:
-            out = new_loadgen.run_udp(udp_args("127.0.0.1", srv.port))
+            out = run_go_udp("127.0.0.1", srv.port)
         finally:
             srv.close()
         self.assertEqual(out["dup"], 5, out)
@@ -74,7 +81,7 @@ class TestUdpDrain(unittest.TestCase):
         srv = fx.DelayedUdpEcho(corrupt_n=3, corrupt_from=40)
         srv.start()
         try:
-            out = new_loadgen.run_udp(udp_args("127.0.0.1", srv.port))
+            out = run_go_udp("127.0.0.1", srv.port)
         finally:
             srv.close()
         self.assertEqual(out["corrupt"], 3, out)
@@ -86,7 +93,7 @@ class TestUdpDrain(unittest.TestCase):
         srv = fx.DelayedUdpEcho()
         srv.start()
         try:
-            out = new_loadgen.run_udp(udp_args("127.0.0.1", srv.port))
+            out = run_go_udp("127.0.0.1", srv.port)
         finally:
             srv.close()
         for field in ("late_recv", "dup", "recv_unique", "drain_seconds"):

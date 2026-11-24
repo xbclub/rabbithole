@@ -64,7 +64,7 @@ for proto in "${protos[@]}"; do
     lbl="$impl-$proto"
     echo "== [$lbl] 清理"
     kill_role "$HOST_A" "rh-server|frps" "$PEER_DIR"
-    kill_role "$HOST_B" "rh-client|frpc|target.py|loadgen|iperf3" "$PEER_DIR"
+    kill_role "$HOST_B" "rh-client|frpc|loadgen|iperf3" "$PEER_DIR"
     kill_role "$HOST_C" "loadgen|iperf3" "/tmp/peer-results-$lbl"
     # 证据/工作目录必须在起进程前存在(脚本只写文件不建父目录)
     tex "$HOST_A" "mkdir -p $PEER_DIR" 30 >/dev/null

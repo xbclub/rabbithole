@@ -617,7 +617,7 @@ def governed_kill(tm: Tm, asset: dict, pid: int, ident: str, tag: str,
     才 KILL。进程组仅当 PGID==PID(我们自己 setsid 创建的组)才整组治理,
     否则只杀该 PID。绝不按名字扫杀。"""
     expect_names = expect_names or ("rh-server", "rh-client", "ipython3", "python3",
-                                    "iperf3", "bash", "sh", "target.py", "cpu_sampler.py")
+                                    "iperf3", "bash", "sh", "loadgen", "cpu_sampler.py")
     recorded = {}
     for ln in ident.strip().splitlines():
         if ln.startswith("exe="):
