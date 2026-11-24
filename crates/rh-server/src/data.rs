@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -58,10 +58,6 @@ pub async fn close_proxy_channels(rt: &Arc<ProxyRuntime>) {
     //
     // 注意:这里刻意只做"什么都不改"。字段保留 Some(sender),泵继续等下一个。
 }
-
-/// copy 路径读缓冲下/上限(R3 红线 2 常量锁:上限 64KiB 不得放宽)。
-const COPY_MIN_BUF: usize = 32 * 1024;
-const COPY_MAX_BUF: usize = 64 * 1024;
 
 // ---------------- TCP 池 ----------------
 
@@ -468,7 +464,7 @@ async fn try_chunk_relay(
         Ok((b_r, b_w)) => {
             state.metrics.count_relay_path("chunk");
             debug!(proxy = rt.id, "relay path: chunk");
-            mux_forward_chunked(rt, user, b_r, b_w, rule_bucket, client_bucket).await;
+            mux_forward_chunked(state, rt, user, b_r, b_w, rule_bucket, client_bucket).await;
             Ok(())
         }
         // 非 mux / 偷取失败:prefix 已原样回包(见 mux_steal_or_rewrap),
@@ -668,7 +664,7 @@ async fn copy_relay_pair(
         // 规则取消(禁用/删除)级联关闭在途转发(§4.1);取消路径收尾
         // 有界等待(shutdown 永久 Pending 不得卡死,rule-cancel 回归)
         let (by_cancel, clean) = tokio::select! {
-            clean = copy_limited(&mut u_r, &mut c_w, bucket2, cb2) => (false, clean),
+            res = rh_transport::copy::copy_batched(&mut u_r, &mut c_w, mk_limiter(&bucket2, &cb2)) => (false, res.is_ok()),
             _ = cancel.cancelled() => (true, false),
         };
         if by_cancel {
@@ -693,7 +689,7 @@ async fn copy_relay_pair(
     let dn_err = dn_errored.clone();
     let t2 = tokio::spawn(async move {
         let (by_cancel, clean) = tokio::select! {
-            clean = copy_limited(&mut c_r, &mut u_w, bucket, client_bucket) => (false, clean),
+            res = rh_transport::copy::copy_batched(&mut c_r, &mut u_w, mk_limiter(&bucket, &client_bucket)) => (false, res.is_ok()),
             _ = cancel2.cancelled() => (true, false),
         };
         if by_cancel {
@@ -814,41 +810,6 @@ struct RelayFailCtx {
     user_src: String,
 }
 
-/// 返回 true = 以 clean EOF 结束(对向写端关闭,半关闭语义);
-/// false = 读/写 IO 错误(调用方收尾走有界 grace,与 mux 泵同口径)。
-async fn copy_limited<R, W>(
-    r: &mut R,
-    w: &mut W,
-    bucket: Option<Arc<TokenBucket>>,
-    client_bucket: Option<Arc<TokenBucket>>,
-) -> bool
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    // 缓冲按需增长(读满翻倍,上限 64KiB):见 forward.rs 同名函数
-    let mut buf = vec![0u8; COPY_MIN_BUF];
-    loop {
-        let n = match r.read(&mut buf).await {
-            Ok(0) => return true,
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        if n == buf.len() && buf.len() < COPY_MAX_BUF {
-            buf.resize((buf.len() * 2).min(COPY_MAX_BUF), 0);
-        }
-        if let Some(b) = &bucket {
-            b.acquire(n).await;
-        }
-        if let Some(b) = &client_bucket {
-            b.acquire(n).await;
-        }
-        if w.write_all(&buf[..n]).await.is_err() {
-            return false;
-        }
-    }
-}
-
 /// 双桶限速适配(goal-repair A5:预留式取消安全;两桶串行预留,
 /// 中途取消时已预留部分由 Reservation::drop 自动退还)。
 fn mk_limiter(
@@ -902,9 +863,60 @@ fn mk_limiter(
     }))
 }
 
+/// P2-5:剥用户侧 `CountedUserIo<BoxedIo>`(+ 可选内层 `QuotaIo`)壳并偷出
+/// `RhMuxStream` 读/写半,供两端均为 yamux 流的零拷贝 `mux_relay_mux` 使用。
+///
+/// 非 `CountedUserIo<BoxedIo>` / `reversed`(`upstream` 反向计量)/ 内层非 mux
+/// 时无损还原(含 `QuotaGuard::rewrap`)并返回 `Err`,绝不提前递减 `data_conn_count`。
+fn peel_mux_user(
+    io: BoxedIo,
+) -> Result<
+    (
+        rh_transport::mux::RhMuxStreamRead,
+        rh_transport::mux::RhMuxStreamWrite,
+        CountState,
+        Option<crate::control::QuotaGuard>,
+    ),
+    BoxedIo,
+> {
+    let (mut inner, st, quota_guard) = peel_counted_user_boxed(io)?;
+    match rh_transport::mux::steal_mux_halves(&mut inner) {
+        Some((a_r, a_w)) => Ok((a_r, a_w, st, quota_guard)),
+        None => Err(rewrap_counted_user(inner, st, quota_guard)),
+    }
+}
+
+/// P2-5:装配 `mux_relay_mux` 双向计量、双桶限速与 `flow_cut` 熔断钩子,
+/// 与 `CountedUserIo` (`poll_read` 计 in、`poll_write` 计 out、超限断流) 同口径。
+fn mk_mux_hooks(
+    st: CountState,
+    rule_bucket: &Option<Arc<TokenBucket>>,
+    client_bucket: &Option<Arc<TokenBucket>>,
+    cancel: rh_transport::CancelFuture,
+) -> rh_transport::mux::MuxRelayHooks {
+    let limiter = mk_limiter(rule_bucket, client_bucket);
+    let st_up = st.clone();
+    let st_dn = st.clone();
+    rh_transport::mux::MuxRelayHooks {
+        up: Some(rh_transport::mux::MuxDirHook {
+            on_bytes: Some(Arc::new(move |n| st_up.count_in(n as usize))),
+            meter_on_fill: true,
+            limiter: limiter.clone(),
+        }),
+        down: Some(rh_transport::mux::MuxDirHook {
+            on_bytes: Some(Arc::new(move |n| st_dn.count_out(n as usize))),
+            meter_on_fill: false,
+            limiter,
+        }),
+        abort: Some(Arc::new(move || st.flow_cut())),
+        cancel: Some(cancel),
+    }
+}
+
 /// Y1 零拷贝 mux 中继装配:限速双桶(皆空不装,预留式取消安全)+
 /// 规则取消级联。与 splice_forward 的钩子装配同构;计量由 CountedUserIo 承担。
 async fn mux_forward_chunked(
+    state: &Arc<AppState>,
     rt: &Arc<ProxyRuntime>,
     user: BoxedIo,
     b_r: rh_transport::mux::RhMuxStreamRead,
@@ -912,12 +924,25 @@ async fn mux_forward_chunked(
     rule_bucket: &Option<Arc<TokenBucket>>,
     client_bucket: &Option<Arc<TokenBucket>>,
 ) {
-    let limiter = mk_limiter(rule_bucket, client_bucket);
     // 规则禁用/删除级联(与用户态/splice 路径同语义)
     let rc = rt.rule_cancel.clone();
     let cancel: rh_transport::CancelFuture = futures::FutureExt::shared(futures::FutureExt::boxed(
         async move { rc.cancelled().await },
     ));
+    // P2-5:两端均为 yamux 流(S3a tcpmux / S3b stcp / S3c sudp)时,
+    // 剥 user 侧 CountedUserIo(+QuotaIo)并偷出 RhMuxStream 读/写半,
+    // 走零拷贝 mux_relay_mux(消除池化拷贝与 tokio::io::split 互斥锁)。
+    let user = match peel_mux_user(user) {
+        Ok((a_r, a_w, st, _user_quota_guard)) => {
+            state.metrics.count_relay_path("chunk_mux");
+            note_server_user_lockless();
+            let hooks = mk_mux_hooks(st, rule_bucket, client_bucket, cancel);
+            rh_transport::mux::mux_relay_mux(a_r, a_w, b_r, b_w, hooks).await;
+            return;
+        }
+        Err(user) => user,
+    };
+    let limiter = mk_limiter(rule_bucket, client_bucket);
     // A2:先剥 CountedUserIo 壳无锁拆半(into_split 两个独立 fd),
     // 按方向重包计量;失败(非该包装)回落 mux_relay 自带的
     // split_boxed_io / tokio::io::split 逻辑。修前服务端用户侧 100%
@@ -1325,6 +1350,54 @@ type RelayHalves = (
     Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
 );
 
+fn peel_counted_user_boxed(
+    io: BoxedIo,
+) -> Result<(BoxedIo, CountState, Option<crate::control::QuotaGuard>), BoxedIo> {
+    let is_boxed = {
+        let dynio: &dyn rh_transport::Io = &*io;
+        dynio.as_any().is::<CountedUserIo<rh_transport::BoxedIo>>()
+    };
+    if !is_boxed {
+        return Err(io);
+    }
+    let any = io.into_any_box();
+    let boxed = any
+        .downcast::<CountedUserIo<rh_transport::BoxedIo>>()
+        .expect("probed above: concrete type is CountedUserIo<BoxedIo>");
+    let CountedUserIo {
+        inner,
+        st,
+        reversed,
+    } = *boxed;
+    if reversed {
+        return Err(Box::new(CountedUserIo {
+            inner,
+            st,
+            reversed,
+        }) as rh_transport::BoxedIo);
+    }
+    // P0-3:S3b(stcp)/S3c(sudp) 的 visitor_stream 经 route_data_stream 包了 QuotaIo,
+    // 须先剥二层壳再交内层拆半/偷半;失败时经 QuotaGuard::rewrap 无损还原。
+    let (inner, quota_guard) = crate::control::QuotaIo::peel(inner);
+    Ok((inner, st, quota_guard))
+}
+
+fn rewrap_counted_user(
+    inner: BoxedIo,
+    st: CountState,
+    quota_guard: Option<crate::control::QuotaGuard>,
+) -> BoxedIo {
+    let inner = match quota_guard {
+        Some(g) => g.rewrap(inner),
+        None => inner,
+    };
+    Box::new(CountedUserIo {
+        inner,
+        st,
+        reversed: false,
+    }) as rh_transport::BoxedIo
+}
+
 /// A2 / P0-3:剥 `CountedUserIo<TcpStream>` 或 `CountedUserIo<BoxedIo>` 壳
 /// (后者同时剥内层 `QuotaIo` 二层壳,对应 S3b stcp / S3c sudp 的 visitor 流)→
 /// 无锁拆半 → 按方向重包计量(user 模式:读半计 in、写半计 out)。
@@ -1368,32 +1441,7 @@ fn split_counted_user(
         ));
     }
 
-    let is_boxed = {
-        let dynio: &dyn rh_transport::Io = &*io;
-        dynio.as_any().is::<CountedUserIo<rh_transport::BoxedIo>>()
-    };
-    if !is_boxed {
-        return Err(io);
-    }
-    let any = io.into_any_box();
-    let boxed = any
-        .downcast::<CountedUserIo<rh_transport::BoxedIo>>()
-        .expect("probed above: concrete type is CountedUserIo<BoxedIo>");
-    let CountedUserIo {
-        inner,
-        st,
-        reversed,
-    } = *boxed;
-    if reversed {
-        return Err(Box::new(CountedUserIo {
-            inner,
-            st,
-            reversed,
-        }) as rh_transport::BoxedIo);
-    }
-    // P0-3:S3b(stcp)/S3c(sudp) 的 visitor_stream 经 route_data_stream 包了 QuotaIo,
-    // 须先剥二层壳再交 split_boxed_io;失败时经 QuotaGuard::rewrap 无损还原。
-    let (inner, quota_guard) = crate::control::QuotaIo::peel(inner);
+    let (inner, st, quota_guard) = peel_counted_user_boxed(io)?;
     match rh_transport::split_boxed_io(inner) {
         Ok((r, w)) => Ok((
             (
@@ -1405,17 +1453,7 @@ fn split_counted_user(
             ),
             quota_guard,
         )),
-        Err(inner) => {
-            let inner = match quota_guard {
-                Some(g) => g.rewrap(inner),
-                None => inner,
-            };
-            Err(Box::new(CountedUserIo {
-                inner,
-                st,
-                reversed: false,
-            }) as rh_transport::BoxedIo)
-        }
+        Err(inner) => Err(rewrap_counted_user(inner, st, quota_guard)),
     }
 }
 
@@ -2807,6 +2845,7 @@ fn conv_proxy_proto(v: rh_protocol::ProxyProtoVersion) -> rh_protocol::message::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     /// round-34:池取用必须是 FIFO——先建好的通道先被取走。
     ///
@@ -2963,8 +3002,11 @@ mod tests {
     // R3(红线 2 锁):copy 路径读缓冲上限必须保持 64KiB。
     #[test]
     fn copy_buf_cap_is_64kib() {
-        assert_eq!(COPY_MAX_BUF, 64 * 1024, "copy 路径读缓冲上限红线(64KiB)");
-        const _: () = assert!(COPY_MIN_BUF <= COPY_MAX_BUF);
+        assert_eq!(
+            rh_transport::copy::COPY_CHUNK_CAP,
+            64 * 1024,
+            "copy 路径读缓冲上限红线(64KiB)"
+        );
     }
 
     /// poll_shutdown 永久 Pending 的用户侧 IO(主代理 cancel-close 复现同款:
@@ -3563,7 +3605,7 @@ mod tests {
     #[tokio::test]
     async fn p0_1_udp_channel_peels_quota_and_splits_mux_lockfree() {
         use std::sync::atomic::Ordering;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let sess = crate::session::Session::new(
@@ -3638,7 +3680,7 @@ mod tests {
     #[tokio::test]
     async fn p0_3_split_counted_user_handles_boxed_and_nested_quota() {
         use std::sync::atomic::Ordering;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let st = sec_state().await;
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
@@ -3843,7 +3885,7 @@ mod tests {
     // 修前:assign_forward 回落直接 `channel = ch`,prefix 丢弃。
     #[tokio::test]
     async fn nonmux_fallback_preserves_prefix_and_guard() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let sess = crate::session::Session::new(
@@ -3918,7 +3960,7 @@ mod tests {
     // B(外层残留)→ A(内层残留)→ 流数据——与原包装链逐字节等价。
     #[tokio::test]
     async fn nested_prefix_rewrap_preserves_order() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let (mut wire, wire_local) = tokio::io::duplex(64 * 1024);
         let inner: BoxedIo = rh_transport::PrependedIo::wrap(Box::new(wire_local), vec![0xA1u8; 8]);
@@ -4862,6 +4904,187 @@ mod tests {
             "relay 完成后 data_conn_count 必须归 0"
         );
     }
+
+    /// P2-5:peel_mux_user 对 reversed=true(upstream 反向计量)与非 mux
+    /// QuotaIo<DuplexStream> 均必须拒绝(Err)并经 QuotaGuard::rewrap 无损还原,
+    /// 不得提前递减 data_conn_count。
+    #[tokio::test]
+    async fn p2_5_peel_mux_user_rejects_reversed_and_restores_quota() {
+        let st = sec_state().await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let sess = Session::new(
+            "c-p25-peel".into(),
+            "s-p25-peel".into(),
+            10,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        );
+
+        // 1) reversed=true (CountedUserIo::upstream) 包 QuotaIo<RhMuxStream>
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let (s1, mut c1) = sec_mux_stream_pair().await;
+        let raw1 = crate::control::QuotaIo::new(s1, sess.clone());
+        let rev_io: BoxedIo = Box::new(CountedUserIo::upstream(raw1, &st, None));
+        let mut restored1 = match peel_mux_user(rev_io) {
+            Err(io) => io,
+            Ok(_) => panic!("reversed=true 不得命中 peel_mux_user"),
+        };
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "reversed=true 拒绝时不得提前递减 data_conn_count"
+        );
+        c1.write_all(b"REV_IN").await.unwrap();
+        let mut buf1 = [0u8; 6];
+        restored1.read_exact(&mut buf1).await.unwrap();
+        assert_eq!(&buf1, b"REV_IN", "reversed=true 还原流读半不得丢失数据");
+        restored1.write_all(b"REV_OUT").await.unwrap();
+        let mut out1 = [0u8; 7];
+        c1.read_exact(&mut out1).await.unwrap();
+        assert_eq!(&out1, b"REV_OUT", "reversed=true 还原流写半必须正常工作");
+        drop(restored1);
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            0,
+            "reversed=true 还原流 drop 后 data_conn_count 才应归 0"
+        );
+
+        // 2) 非 mux QuotaIo<DuplexStream> (reversed=false)
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let (mut peer2, local2) = tokio::io::duplex(4096);
+        let raw2 = crate::control::QuotaIo::new(Box::new(local2), sess.clone());
+        let non_mux_io: BoxedIo = Box::new(CountedUserIo::user(raw2, &st, None));
+        let mut restored2 = match peel_mux_user(non_mux_io) {
+            Err(io) => io,
+            Ok(_) => panic!("DuplexStream 内层不得命中 peel_mux_user"),
+        };
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "非 mux 拒绝时必须经 QuotaGuard::rewrap 还原,不得提前递减 data_conn_count"
+        );
+        peer2.write_all(b"DUP_IN").await.unwrap();
+        let mut buf2 = [0u8; 6];
+        restored2.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"DUP_IN", "非 mux 还原流读半必须无损");
+        restored2.write_all(b"DUP_OUT").await.unwrap();
+        let mut out2 = [0u8; 7];
+        peer2.read_exact(&mut out2).await.unwrap();
+        assert_eq!(&out2, b"DUP_OUT", "非 mux 还原流写半必须无损");
+        drop(restored2);
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            0,
+            "非 mux 还原流 drop 后 data_conn_count 才应归 0"
+        );
+    }
+
+    /// P2-3:压缩通道外层 JoinDuplex 在 copy_relay_pair 内必须命中无锁拆半
+    /// (split_probe::snapshot().channel_lockless +1,channel_fallback +0)且
+    /// 经 copy_batched 双向正常往返与半关闭收敛。
+    #[tokio::test]
+    async fn p2_3_compressed_channel_join_duplex_hits_lockless_split_in_copy_relay() {
+        let state = sec_state().await;
+        let rt = sec_rt(3202, sec_tcp_spec());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let user_tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let u_peer = listener.accept().await.unwrap().0;
+        let user: BoxedIo = Box::new(CountedUserIo::user(user_tcp, &state, Some(rt.clone())));
+
+        let (ch_s, ch_c) = sec_mux_stream_pair().await;
+        let comp_fb_before = rh_transport::compress::split_fallback_count();
+        let ch_comp = compress_stream(ch_s).await;
+        assert_eq!(
+            rh_transport::compress::split_fallback_count(),
+            comp_fb_before,
+            "compress_stream(RhMuxStream) 内层也不得回落 tokio::io::split"
+        );
+        let peer_comp = compress_stream(ch_c).await;
+
+        let before = split_probe::snapshot();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let relay = tokio::spawn(copy_relay_pair(
+            user,
+            ch_comp,
+            None,
+            None,
+            cancel,
+            test_fail_ctx(),
+        ));
+
+        let (mut u_r, mut u_w) = u_peer.into_split();
+        let (mut c_r, mut c_w) = tokio::io::split(peer_comp);
+
+        let up = sec_pseudo_random(64 * 1024 + 123, 0xaaaa_1111_2222_3333);
+        let up2 = up.clone();
+        let w_up = tokio::spawn(async move {
+            u_w.write_all(&up2).await.unwrap();
+            u_w
+        });
+        let mut got_up = vec![0u8; up.len()];
+        c_r.read_exact(&mut got_up).await.unwrap();
+        assert_eq!(got_up, up, "压缩 channel copy_relay_pair up 方向必须穿透");
+        let mut u_w = w_up.await.unwrap();
+
+        let down = sec_pseudo_random(64 * 1024 + 456, 0xbbbb_4444_5555_6666);
+        let down2 = down.clone();
+        let w_dn = tokio::spawn(async move {
+            c_w.write_all(&down2).await.unwrap();
+            c_w
+        });
+        let mut got_down = vec![0u8; down.len()];
+        u_r.read_exact(&mut got_down).await.unwrap();
+        assert_eq!(
+            got_down, down,
+            "压缩 channel copy_relay_pair down 方向必须穿透"
+        );
+        let mut c_w = w_dn.await.unwrap();
+
+        c_w.shutdown().await.unwrap();
+        u_w.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), relay)
+            .await
+            .expect("压缩 channel copy_relay_pair 必须收敛")
+            .unwrap();
+
+        let mut eof = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), c_r.read(&mut eof))
+                .await
+                .expect("c_r EOF 超时")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), u_r.read(&mut eof))
+                .await
+                .expect("u_r EOF 超时")
+                .unwrap(),
+            0
+        );
+
+        let after = split_probe::snapshot();
+        assert_eq!(
+            after.channel_lockless,
+            before.channel_lockless + 1,
+            "compress_stream 外层 JoinDuplex 必须命中 channel 无锁拆半"
+        );
+        assert_eq!(
+            after.channel_fallback, before.channel_fallback,
+            "channel 侧不得发生 split fallback"
+        );
+        assert_eq!(
+            after.user_lockless,
+            before.user_lockless + 1,
+            "user 侧 CountedUserIo<TcpStream> 也必须走无锁拆半"
+        );
+        assert_eq!(
+            after.user_fallback, before.user_fallback,
+            "user 侧不得发生 split fallback"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5783,45 +6006,26 @@ mod group_listener_ownership_tests {
 /// move 进独立任务。这里用 `select!` 在同一 future 内并发双向 copy:先完成
 /// 的一向关闭对向写半,然后在 `halfclose_grace` 内等第二向自然结束;超时
 /// 则直接返回(拆半句柄随函数返回 drop → fd 释放)。
-/// M1:64KiB 缓冲的单向搬运(io::copy 默认 8KiB 的口径修正)。
-/// 单缓冲贯穿整个中继生命周期,读满写尽循环;EOF 返回累计字节。
-async fn copy_64k<R, W>(r: &mut R, w: &mut W) -> std::io::Result<u64>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        let n = r.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(total);
-        }
-        w.write_all(&buf[..n]).await?;
-        total += n as u64;
-    }
-}
-
 pub async fn copy_bidirectional_bounded(
     user: rh_transport::BoxedIo,
     channel: rh_transport::BoxedIo,
 ) -> std::io::Result<(u64, u64)> {
-    // M1:修前 tokio::io::split 共享锁双泵 + io::copy 默认 8KiB 缓冲,
-    // 是 E-1(客户端)在服务端 passthrough/visitor 路径的孪生。现
-    // 对齐 copy_relay 的拆半纪律:user 侧先剥 CountedUserIo(TcpStream)
-    // 走 owned 拆半,channel 侧 split_boxed_io;包装类型(压缩流等)
-    // 回落共享锁拆分。缓冲对齐全仓 64KiB 口径。
+    // M1 / P2-3:user 侧先剥 CountedUserIo 走无锁拆半,channel 侧 split_boxed_io;
+    // 搬运走 copy_batched(64KiB ReadBuf 直读 + writev 聚合 + 持续预取)。
     let ((mut a_r, mut a_w), _user_quota_guard) = split_user_halves(user);
     let (channel, _ch_quota_guard) = crate::control::QuotaIo::peel(channel);
     let (mut b_r, mut b_w) = split_channel_halves(channel);
     let up = async {
-        let n = copy_64k(&mut a_r, &mut b_w).await.ok();
+        let n = rh_transport::copy::copy_batched(&mut a_r, &mut b_w, None)
+            .await
+            .ok();
         let _ = b_w.shutdown().await;
         n
     };
     let down = async {
-        let n = copy_64k(&mut b_r, &mut a_w).await.ok();
+        let n = rh_transport::copy::copy_batched(&mut b_r, &mut a_w, None)
+            .await
+            .ok();
         let _ = a_w.shutdown().await;
         n
     };

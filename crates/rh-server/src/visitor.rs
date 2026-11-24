@@ -1068,4 +1068,292 @@ mod tests {
             "channel 侧不得发生 split fallback"
         );
     }
+
+    /// P2-5:S3a (`CountedUserIo<BoxedIo(RhMuxStream)>` via `relay_user_channel`)
+    /// 与 S3b (`QuotaIo<RhMuxStream>` via `splice_relay`) 均必须命中 `chunk_mux`
+    /// (同时保持 `chunk` +1)、`user_lockless` +1、七项计量逐字节相等、
+    /// `data_conn_count` 转发期保活为 1 且结束后归 0,并验证 `flow_cut` 立即中止
+    /// `mux_relay_mux` 中继。
+    #[tokio::test]
+    async fn p2_5_s3a_and_s3b_hit_chunk_mux_and_preserve_quota_and_metering() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        fn snapshot_metering(
+            state: &Arc<AppState>,
+            rt: &Arc<crate::state::ProxyRuntime>,
+        ) -> (u64, u64, u64, u64, u64, u64, u64) {
+            let usage = rt.usage(state);
+            (
+                state.metrics.bytes_in_total.get(),
+                state.metrics.bytes_out_total.get(),
+                state.metrics.console_bytes_in.load(Ordering::Relaxed),
+                state.metrics.console_bytes_out.load(Ordering::Relaxed),
+                rt.bytes_in.load(Ordering::Relaxed),
+                rt.bytes_out.load(Ordering::Relaxed),
+                usage.bytes.load(Ordering::Relaxed),
+            )
+        }
+
+        // 1) S3a: CountedUserIo<BoxedIo(RhMuxStream)> via relay_user_channel
+        {
+            let state = state().await;
+            let rt = Arc::new(crate::state::ProxyRuntime::new(
+                4201,
+                "cid".to_string(),
+                tcp_spec(),
+            ));
+            state.proxies.runtimes.insert(4201, rt.clone());
+
+            let chunk0 = relay_path_count(&state, "chunk");
+            let chunk_mux0 = relay_path_count(&state, "chunk_mux");
+            let m0 = snapshot_metering(&state, &rt);
+            let split_before = crate::data::split_probe::snapshot();
+            let mux_before = rh_transport::mux::mux_relay_split_stats();
+
+            let (u_s, u_c) = proxy_channel_pair().await;
+            let (ch_s, ch_c) = proxy_channel_pair().await;
+            let sess = make_quota_session("cid", "sid-s3a");
+            let channel = crate::control::QuotaIo::new(ch_s, sess.clone());
+            let user = crate::data::CountedUserIo::user(u_s, &state, Some(rt.clone()));
+
+            let st = state.clone();
+            let rt2 = rt.clone();
+            let relay = tokio::spawn(async move {
+                crate::data::relay_user_channel(&st, &rt2, user, channel).await
+            });
+
+            let (mut u_r, mut u_w) = tokio::io::split(u_c);
+            let (mut ch_r, mut ch_w) = tokio::io::split(ch_c);
+
+            let up = pseudo_random(64 * 1024 + 333, 0x1111_2222_3333_4444);
+            let up2 = up.clone();
+            let w_up = tokio::spawn(async move {
+                u_w.write_all(&up2).await.unwrap();
+                u_w
+            });
+            let mut got_up = vec![0u8; up.len()];
+            ch_r.read_exact(&mut got_up).await.unwrap();
+            assert_eq!(got_up, up, "S3a up 方向必须穿透");
+            let mut u_w = w_up.await.unwrap();
+
+            let down = pseudo_random(64 * 1024 + 555, 0x5555_6666_7777_8888);
+            let down2 = down.clone();
+            let w_dn = tokio::spawn(async move {
+                ch_w.write_all(&down2).await.unwrap();
+                ch_w
+            });
+            let mut got_down = vec![0u8; down.len()];
+            u_r.read_exact(&mut got_down).await.unwrap();
+            assert_eq!(got_down, down, "S3a down 方向必须穿透");
+            let mut ch_w = w_dn.await.unwrap();
+
+            assert_eq!(
+                sess.data_conn_count.load(Ordering::Relaxed),
+                1,
+                "S3a 转发进行中 data_conn_count 不得提前递减"
+            );
+
+            ch_w.shutdown().await.unwrap();
+            u_w.shutdown().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), relay)
+                .await
+                .expect("S3a 双向 EOF 后 relay_user_channel 必须收敛")
+                .unwrap();
+
+            let mut eof = [0u8; 1];
+            assert_eq!(ch_r.read(&mut eof).await.unwrap(), 0);
+            assert_eq!(u_r.read(&mut eof).await.unwrap(), 0);
+
+            let m1 = snapshot_metering(&state, &rt);
+            let split_after = crate::data::split_probe::snapshot();
+            let mux_after = rh_transport::mux::mux_relay_split_stats();
+
+            assert_eq!(relay_path_count(&state, "chunk"), chunk0 + 1);
+            assert_eq!(relay_path_count(&state, "chunk_mux"), chunk_mux0 + 1);
+            assert_eq!(split_after.user_lockless, split_before.user_lockless + 1);
+            assert_eq!(split_after.user_fallback, split_before.user_fallback);
+            assert_eq!(mux_after.1, mux_before.1);
+            assert_eq!(sess.data_conn_count.load(Ordering::Relaxed), 0);
+            assert_eq!(m1.0 - m0.0, up.len() as u64, "S3a bytes_in_total");
+            assert_eq!(m1.1 - m0.1, down.len() as u64, "S3a bytes_out_total");
+            assert_eq!(m1.2 - m0.2, up.len() as u64, "S3a console_bytes_in");
+            assert_eq!(m1.3 - m0.3, down.len() as u64, "S3a console_bytes_out");
+            assert_eq!(m1.4 - m0.4, up.len() as u64, "S3a rt.bytes_in");
+            assert_eq!(m1.5 - m0.5, down.len() as u64, "S3a rt.bytes_out");
+            assert_eq!(
+                m1.6 - m0.6,
+                (up.len() + down.len()) as u64,
+                "S3a ClientUsage.bytes"
+            );
+        }
+
+        // 2) S3b: QuotaIo<RhMuxStream> via splice_relay
+        {
+            let state = state().await;
+            let rt = Arc::new(crate::state::ProxyRuntime::new(
+                4202,
+                "cid".to_string(),
+                tcp_spec(),
+            ));
+            state.proxies.runtimes.insert(4202, rt.clone());
+
+            let chunk0 = relay_path_count(&state, "chunk");
+            let chunk_mux0 = relay_path_count(&state, "chunk_mux");
+            let m0 = snapshot_metering(&state, &rt);
+            let split_before = crate::data::split_probe::snapshot();
+            let mux_before = rh_transport::mux::mux_relay_split_stats();
+
+            let psess = make_quota_session("pcid", "psid-s3b");
+            let vsess = make_quota_session("vcid", "vsid-s3b");
+            let (s_p, c_p) = proxy_channel_pair().await;
+            let (s_v, c_v) = proxy_channel_pair().await;
+            let proxy_stream = crate::control::QuotaIo::new(s_p, psess.clone());
+            let visitor_stream = crate::control::QuotaIo::new(s_v, vsess.clone());
+
+            let mut relay = tokio::spawn(splice_relay(
+                state.clone(),
+                4202,
+                proxy_stream,
+                visitor_stream,
+            ));
+
+            let (mut cv_r, mut cv_w) = tokio::io::split(c_v);
+            let (mut cp_r, mut cp_w) = tokio::io::split(c_p);
+
+            let up = pseudo_random(64 * 1024 + 123, 0x2222_3333_4444_5555);
+            let up2 = up.clone();
+            let w_up = tokio::spawn(async move {
+                cv_w.write_all(&up2).await.unwrap();
+                cv_w
+            });
+            let mut got_up = vec![0u8; up.len()];
+            cp_r.read_exact(&mut got_up).await.unwrap();
+            assert_eq!(got_up, up, "S3b up 方向必须穿透");
+            let mut cv_w = w_up.await.unwrap();
+
+            let down = pseudo_random(64 * 1024 + 456, 0x6666_7777_8888_9999);
+            let down2 = down.clone();
+            let w_dn = tokio::spawn(async move {
+                cp_w.write_all(&down2).await.unwrap();
+                cp_w
+            });
+            let mut got_down = vec![0u8; down.len()];
+            cv_r.read_exact(&mut got_down).await.unwrap();
+            assert_eq!(got_down, down, "S3b down 方向必须穿透");
+            let mut cp_w = w_dn.await.unwrap();
+
+            assert_eq!(
+                psess.data_conn_count.load(Ordering::Relaxed),
+                1,
+                "S3b proxy 侧 data_conn_count 不得提前递减"
+            );
+            assert_eq!(
+                vsess.data_conn_count.load(Ordering::Relaxed),
+                1,
+                "S3b visitor 侧 data_conn_count 不得提前递减"
+            );
+
+            cp_w.shutdown().await.unwrap();
+            cv_w.shutdown().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), &mut relay)
+                .await
+                .expect("S3b 双向 EOF 后 splice_relay 必须收敛")
+                .unwrap();
+
+            let mut eof = [0u8; 1];
+            assert_eq!(cp_r.read(&mut eof).await.unwrap(), 0);
+            assert_eq!(cv_r.read(&mut eof).await.unwrap(), 0);
+
+            let m1 = snapshot_metering(&state, &rt);
+            let split_after = crate::data::split_probe::snapshot();
+            let mux_after = rh_transport::mux::mux_relay_split_stats();
+
+            assert_eq!(relay_path_count(&state, "chunk"), chunk0 + 1);
+            assert_eq!(relay_path_count(&state, "chunk_mux"), chunk_mux0 + 1);
+            assert_eq!(split_after.user_lockless, split_before.user_lockless + 1);
+            assert_eq!(split_after.user_fallback, split_before.user_fallback);
+            assert_eq!(mux_after.1, mux_before.1);
+            assert_eq!(psess.data_conn_count.load(Ordering::Relaxed), 0);
+            assert_eq!(vsess.data_conn_count.load(Ordering::Relaxed), 0);
+            assert_eq!(m1.0 - m0.0, up.len() as u64, "S3b bytes_in_total");
+            assert_eq!(m1.1 - m0.1, down.len() as u64, "S3b bytes_out_total");
+            assert_eq!(m1.2 - m0.2, up.len() as u64, "S3b console_bytes_in");
+            assert_eq!(m1.3 - m0.3, down.len() as u64, "S3b console_bytes_out");
+            assert_eq!(m1.4 - m0.4, up.len() as u64, "S3b rt.bytes_in");
+            assert_eq!(m1.5 - m0.5, down.len() as u64, "S3b rt.bytes_out");
+            assert_eq!(
+                m1.6 - m0.6,
+                (up.len() + down.len()) as u64,
+                "S3b ClientUsage.bytes"
+            );
+        }
+
+        // 3) flow_cut aborts active mux_relay_mux immediately (without waiting for halfclose_grace)
+        {
+            let state = state().await;
+            let rt = Arc::new(crate::state::ProxyRuntime::new(
+                4203,
+                "cid".to_string(),
+                tcp_spec(),
+            ));
+            state.proxies.runtimes.insert(4203, rt.clone());
+            let chunk_mux0 = relay_path_count(&state, "chunk_mux");
+
+            let psess = make_quota_session("pcid", "psid-cut");
+            let vsess = make_quota_session("vcid", "vsid-cut");
+            let (s_p, c_p) = proxy_channel_pair().await;
+            let (s_v, c_v) = proxy_channel_pair().await;
+            let proxy_stream = crate::control::QuotaIo::new(s_p, psess.clone());
+            let visitor_stream = crate::control::QuotaIo::new(s_v, vsess.clone());
+
+            let mut relay = tokio::spawn(splice_relay(
+                state.clone(),
+                4203,
+                proxy_stream,
+                visitor_stream,
+            ));
+
+            let (mut cv_r, mut cv_w) = tokio::io::split(c_v);
+            let (mut cp_r, _cp_w) = tokio::io::split(c_p);
+
+            // 通路建立且确认已走 chunk_mux;对端保持静默(不发数据不关闭)
+            cv_w.write_u8(0x5A).await.unwrap();
+            assert_eq!(cp_r.read_u8().await.unwrap(), 0x5A);
+            assert_eq!(relay_path_count(&state, "chunk_mux"), chunk_mux0 + 1);
+
+            // 设流量上限并在边界投喂 16 字节:on_bytes -> add_bytes 置 flow_cut,
+            // mux_relay_mux 在写出前经 hooks.abort 立即断连并释放两侧 QuotaGuard
+            rt.usage(&state).set_quota(crate::state::ClientQuota {
+                flow_limit: 10,
+                ..Default::default()
+            });
+            let _ = cv_w.write_all(&[0x7Fu8; 16]).await;
+            tokio::time::timeout(Duration::from_secs(2), &mut relay)
+                .await
+                .expect("flow_cut 触发后 mux_relay_mux 必须立即收敛(不得等 30s halfclose_grace)")
+                .unwrap();
+
+            assert!(
+                rt.usage(&state).flow_cut.load(Ordering::Relaxed),
+                "flow_limit 超限后 flow_cut 必须置位"
+            );
+            let mut tail_p = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), cp_r.read_to_end(&mut tail_p))
+                .await
+                .expect("proxy 对端必须观测到流关闭")
+                .unwrap();
+            assert!(
+                !tail_p.contains(&0x7F),
+                "flow_cut 触发后新字节不得再被转发,实际={tail_p:?}"
+            );
+            let mut tail_v = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), cv_r.read_to_end(&mut tail_v))
+                .await
+                .expect("visitor 对端必须观测到流关闭")
+                .unwrap();
+            assert_eq!(psess.data_conn_count.load(Ordering::Relaxed), 0);
+            assert_eq!(vsess.data_conn_count.load(Ordering::Relaxed), 0);
+        }
+    }
 }

@@ -7,7 +7,7 @@ use rh_protocol::message::{forward_flags, StartForward};
 use rh_protocol::ProxySpec;
 use rh_transport::BoxedIo;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 /// S6 客户端半:RH_SECONDARY_FASTPATH=0 禁用 tcpmux passthrough 每流
 /// chunk 接线(S5)。与 rh-server data.rs secondary_fastpath_enabled 同
@@ -21,6 +21,16 @@ fn secondary_fastpath_enabled() -> bool {
     })
 }
 fn secondary_fastpath_from_env(v: Option<&str>) -> bool {
+    !v.map(|s| s.trim() == "0").unwrap_or(false)
+}
+
+/// P2-4 裸 TCP chunk 中继开关:`RH_BARE_FASTPATH=0` 禁用(trim 后匹配),
+/// 默认启用。进程内 OnceLock 只解析一次;真值表由纯函数覆盖。
+fn bare_fastpath_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| bare_fastpath_from_env(std::env::var("RH_BARE_FASTPATH").ok().as_deref()))
+}
+fn bare_fastpath_from_env(v: Option<&str>) -> bool {
     !v.map(|s| s.trim() == "0").unwrap_or(false)
 }
 
@@ -226,6 +236,22 @@ pub async fn handle_start_forward(
                 }
             }
         }
+    }
+
+    // P2-4 裸 TCP chunk 中继快路径(跨平台):非 Linux 平台或 Linux splice
+    // 回落后,双方均为未压缩裸 TCP 且 relay_mode != "copy" 时走 chunk_relay
+    // (ReadBuf 直读 + 批量 writev + 无锁拆半 + run_relay_pair 收敛)。
+    if bare_fastpath_enabled()
+        && client_chunk_gate(
+            fwd.flags & forward_flags::COMPRESSED == 0,
+            &sess.cfg.relay_mode,
+        )
+        && rh_transport::plain_tcp(&peer).is_some()
+        && rh_transport::plain_tcp(&local).is_some()
+    {
+        let limiter = mk_client_limiter(&bucket);
+        rh_transport::chunk_relay::chunk_relay(peer, local, limiter, None).await;
+        return Ok(());
     }
 
     splice(peer, local, bucket).await;
@@ -552,20 +578,21 @@ pub async fn splice(a: BoxedIo, b: BoxedIo, bucket: Option<Arc<rh_core::ratelimi
             (Box::new(r), Box::new(w))
         }
     };
-    let bucket2 = bucket.clone();
+    let lim_up = mk_client_limiter(&bucket);
+    let lim_dn = lim_up.clone();
     // 本向以错误(非 EOF)结束时置位:对向数据通路已死,不得永存
     let up_errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let dn_errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let up_err = up_errored.clone();
     let t1 = tokio::spawn(async move {
-        let clean = copy_limited(&mut ar, &mut bw, bucket).await;
+        let clean = copy_and_shutdown(&mut ar, &mut bw, lim_up).await;
         if !clean {
             up_err.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     });
     let dn_err = dn_errored.clone();
     let t2 = tokio::spawn(async move {
-        let clean = copy_limited(&mut br, &mut aw, bucket2).await;
+        let clean = copy_and_shutdown(&mut br, &mut aw, lim_dn).await;
         if !clean {
             dn_err.store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -599,45 +626,21 @@ pub async fn splice(a: BoxedIo, b: BoxedIo, bucket: Option<Arc<rh_core::ratelimi
     rh_transport::join_relay_pumps(&mut g1, &mut g2).await;
 }
 
-/// 带限速的拷贝;EOF 时对写端做 shutdown(半关闭传递)。
-/// 缓冲按需增长(读满即翻倍,上限 64KiB):批量流减少 syscall/唤醒次数,
-/// 大量慢连接停留在小缓冲,内存不随并发数线性膨胀。
-/// 返回 true = clean EOF(半关闭,shutdown 无界等待,红线);
-/// false = 读/写 IO 错误(shutdown 受 ERROR_CLOSE_GRACE 约束)。
-pub async fn copy_limited<R, W>(
+/// P2-3:经 [`rh_transport::copy::copy_batched`] 搬运并按 clean/error 语义收尾写半。
+/// 返回 `true` 表示 clean EOF(无界等待完整半关闭传递);`false` 表示读/写 IO 错误
+/// (写侧 shutdown 受 `ERROR_CLOSE_GRACE` 约束)。
+async fn copy_and_shutdown<R, W>(
     r: &mut R,
     w: &mut W,
-    bucket: Option<Arc<rh_core::ratelimit::TokenBucket>>,
+    limiter: Option<Arc<dyn rh_transport::ChunkLimiter>>,
 ) -> bool
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    const MIN_BUF: usize = 16 * 1024;
-    const MAX_BUF: usize = 64 * 1024;
-    let mut buf = vec![0u8; MIN_BUF];
-    let mut clean = true;
-    loop {
-        match r.read(&mut buf).await {
-            Ok(0) => break,
-            Err(_) => {
-                clean = false;
-                break;
-            }
-            Ok(n) => {
-                if n == buf.len() && buf.len() < MAX_BUF {
-                    buf.resize((buf.len() * 2).min(MAX_BUF), 0);
-                }
-                if let Some(b) = &bucket {
-                    b.acquire(n).await;
-                }
-                if w.write_all(&buf[..n]).await.is_err() {
-                    clean = false;
-                    break;
-                }
-            }
-        }
-    }
+    let clean = rh_transport::copy::copy_batched(r, w, limiter)
+        .await
+        .is_ok();
     if clean {
         // clean EOF:无界等完整半关闭传递(红线,不加硬超时防截断)
         let _ = w.shutdown().await;
@@ -652,7 +655,7 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
     /// Drop 探针 IO(审计 src/main.rs 同款手法):子泵终止(所有权释放)时翻转。
     struct DropIo {
@@ -1718,5 +1721,150 @@ mod tests {
             fb1, fb0,
             "mux_relay 对 UnixStream 不得回落 tokio::io::split(fb0={fb0}, fb1={fb1})"
         );
+    }
+
+    // ================= P2-3 / P2-4:copy_batched 与裸 TCP chunk_relay =================
+
+    #[test]
+    fn bare_fastpath_env_truth_table() {
+        assert!(bare_fastpath_from_env(None), "未设置=默认启用");
+        assert!(bare_fastpath_from_env(Some("1")), "\"1\" 启用");
+        assert!(!bare_fastpath_from_env(Some("0")), "仅 \"0\" 禁用");
+        assert!(!bare_fastpath_from_env(Some(" 0 ")), "trim 后 \"0\" 禁用");
+        assert!(
+            bare_fastpath_from_env(Some("false")),
+            "非 \"0\" 值不生效(默认启用)"
+        );
+    }
+
+    #[tokio::test]
+    async fn splice_compress_stream_join_duplex_hits_lockless_split() {
+        let _serial = SPLIT_PROBE_LOCK.lock().await;
+        let before = LOCKLESS_SPLITS.load(Ordering::Relaxed);
+
+        let (net_a, net_b) = tokio::io::duplex(64 * 1024);
+        let comp_a = rh_transport::compress_stream(Box::new(net_a)).await;
+        let comp_b = rh_transport::compress_stream(Box::new(net_b)).await;
+        let (local_relay, local_peer) = tokio::io::duplex(64 * 1024);
+
+        let relay =
+            tokio::spawn(SPLIT_PROBE_SCOPE.scope((), splice(comp_a, Box::new(local_relay), None)));
+
+        let (mut peer_r, mut peer_w) = rh_transport::split_boxed_io(comp_b)
+            .ok()
+            .expect("compress_stream 外层 JoinDuplex 必须命中 split_boxed_io");
+        let (mut local_r, mut local_w) = tokio::io::split(local_peer);
+
+        let up = pseudo_random(96 * 1024 + 13, 0x1357_2468_ace0_bdf1);
+        let dn = pseudo_random(80 * 1024 + 29, 0xfdb0_eca8_6420_9753);
+        let up_len = up.len();
+        let dn_len = dn.len();
+        let up_tx = up.clone();
+        let dn_tx = dn.clone();
+
+        let side_peer = tokio::spawn(async move {
+            let ((), got_dn) = tokio::join!(
+                async {
+                    peer_w.write_all(&up_tx).await.unwrap();
+                    peer_w.shutdown().await.unwrap();
+                },
+                async {
+                    let mut v = Vec::with_capacity(dn_len);
+                    peer_r.read_to_end(&mut v).await.unwrap();
+                    v
+                }
+            );
+            got_dn
+        });
+        let side_local = tokio::spawn(async move {
+            let ((), got_up) = tokio::join!(
+                async {
+                    local_w.write_all(&dn_tx).await.unwrap();
+                    local_w.shutdown().await.unwrap();
+                },
+                async {
+                    let mut v = Vec::with_capacity(up_len);
+                    local_r.read_to_end(&mut v).await.unwrap();
+                    v
+                }
+            );
+            got_up
+        });
+
+        let (got_dn, got_up) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(side_peer, side_local)
+        })
+        .await
+        .expect("compress_stream splice 双向 roundtrip 超时");
+        assert_eq!(got_up.unwrap(), up, "压缩通道→本地数据必须逐字节一致");
+        assert_eq!(got_dn.unwrap(), dn, "本地→压缩通道数据必须逐字节一致");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), relay)
+            .await
+            .expect("compress_stream splice clean EOF 收敛超时")
+            .unwrap();
+
+        let after = LOCKLESS_SPLITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "compress_stream 外层 JoinDuplex 必须命中 splice 的 split_boxed_io 无锁拆半(实际增量 {})",
+            after - before
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_fastpath_chunk_relay_roundtrips_tcp_pair() {
+        let (out_a, a_relay) = tcp_pair().await;
+        let (b_relay, out_b) = tcp_pair().await;
+
+        let a_box: BoxedIo = Box::new(a_relay);
+        let b_box: BoxedIo = Box::new(b_relay);
+        assert!(
+            rh_transport::plain_tcp(&a_box).is_some(),
+            "裸 TcpStream 必须命中 plain_tcp"
+        );
+        assert!(
+            rh_transport::plain_tcp(&b_box).is_some(),
+            "裸 TcpStream 必须命中 plain_tcp"
+        );
+
+        let relay = tokio::spawn(rh_transport::chunk_relay::chunk_relay(
+            a_box, b_box, None, None,
+        ));
+
+        let payload_ab = pseudo_random(256 * 1024 + 17, 0x1111_2222_3333_4444);
+        let payload_ba = pseudo_random(128 * 1024 + 29, 0x5555_6666_7777_8888);
+        let (mut a_r, mut a_w) = out_a.into_split();
+        let (mut b_r, mut b_w) = out_b.into_split();
+
+        let tx_ab = payload_ab.clone();
+        let tx_ba = payload_ba.clone();
+        let side_a = async {
+            a_w.write_all(&tx_ab).await.unwrap();
+            a_w.shutdown().await.unwrap();
+            let mut got = Vec::new();
+            a_r.read_to_end(&mut got).await.unwrap();
+            got
+        };
+        let side_b = async {
+            let mut got = Vec::new();
+            b_r.read_to_end(&mut got).await.unwrap();
+            b_w.write_all(&tx_ba).await.unwrap();
+            b_w.shutdown().await.unwrap();
+            got
+        };
+
+        let (got_ba, got_ab) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(side_a, side_b)
+        })
+        .await
+        .expect("chunk_relay 裸 TCP 双向半关闭超时");
+
+        assert_eq!(got_ab, payload_ab, "a→b 方向内容必须逐字节一致");
+        assert_eq!(got_ba, payload_ba, "b→a 方向内容必须逐字节一致");
+        tokio::time::timeout(std::time::Duration::from_secs(10), relay)
+            .await
+            .expect("chunk_relay clean EOF 收敛超时")
+            .unwrap();
     }
 }
