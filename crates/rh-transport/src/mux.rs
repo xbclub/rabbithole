@@ -644,6 +644,38 @@ where
     }
 }
 
+// 测试探针:`mux_relay` 对 a 侧无锁拆半与回落 `tokio::io::split` 的累计次数。
+// 仅测试读取;生产构建(`test-probes` 关闭且非 test)编译为空函数,零开销。
+#[cfg(any(test, feature = "test-probes"))]
+thread_local! {
+    static MUX_RELAY_LOCKLESS_SPLITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MUX_RELAY_SPLIT_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-probes"))]
+fn note_mux_relay_lockless_split() {
+    MUX_RELAY_LOCKLESS_SPLITS.with(|c| c.set(c.get() + 1));
+}
+#[cfg(not(any(test, feature = "test-probes")))]
+fn note_mux_relay_lockless_split() {}
+
+#[cfg(any(test, feature = "test-probes"))]
+fn note_mux_relay_split_fallback() {
+    MUX_RELAY_SPLIT_FALLBACKS.with(|c| c.set(c.get() + 1));
+}
+#[cfg(not(any(test, feature = "test-probes")))]
+fn note_mux_relay_split_fallback() {}
+
+/// 仅测试用:返回当前线程 `mux_relay` 对 a 侧拆半的
+/// `(无锁拆半次数, 回落 tokio::io::split 次数)`。
+#[cfg(any(test, feature = "test-probes"))]
+pub fn mux_relay_split_stats() -> (usize, usize) {
+    (
+        MUX_RELAY_LOCKLESS_SPLITS.with(|c| c.get()),
+        MUX_RELAY_SPLIT_FALLBACKS.with(|c| c.get()),
+    )
+}
+
 /// 零拷贝 mux 双向中继:a 为对端普通 IO(用户连接/本地目标),b 为 mux 流半。
 /// * up:a 读 → 池化块(内核单次拷贝)→ mux 帧体(零拷贝);
 /// * down:mux 块(Bytes 引用)→ a 写(内核单次拷贝)。
@@ -687,8 +719,12 @@ pub async fn mux_relay(
         Box<dyn tokio::io::AsyncRead + Send + Unpin>,
         Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
     ) = match crate::split_boxed_io(a) {
-        Ok((r, w)) => (Box::new(r), Box::new(w)),
+        Ok((r, w)) => {
+            note_mux_relay_lockless_split();
+            (Box::new(r), Box::new(w))
+        }
         Err(io) => {
+            note_mux_relay_split_fallback();
             let (r, w) = tokio::io::split(io);
             (Box::new(r), Box::new(w))
         }
@@ -5650,6 +5686,60 @@ mod tests {
                 "客户端池成员必须带重拨配方,否则载体故障无法补位"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mux_relay_split_stats_tracks_lockless_and_fallback() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = wrap_stream_as_server(Box::new(b), true, MUX_STREAMS_UNLIMITED);
+        let client = wrap_stream_as_client(Box::new(a), true, MUX_STREAMS_UNLIMITED);
+
+        // 1) TcpStream 走无锁拆半
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp_a = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (tcp_peer, _) = listener.accept().await.unwrap();
+        drop(tcp_peer);
+
+        let c1 = client.open_stream().await.unwrap();
+        let mut s1 = server.accept().await.unwrap();
+        let (r1, w1) = steal_mux_halves(&mut s1).expect("steal");
+        drop(s1);
+        drop(c1);
+
+        let (lockless0, fallback0) = mux_relay_split_stats();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mux_relay(Box::new(tcp_a), r1, w1, None, None),
+        )
+        .await
+        .expect("tcp mux_relay finish");
+        assert_eq!(
+            mux_relay_split_stats(),
+            (lockless0 + 1, fallback0),
+            "TcpStream 应命中无锁拆半探针"
+        );
+
+        // 2) DuplexStream 回落 tokio::io::split
+        let (dup_a, dup_b) = tokio::io::duplex(64);
+        drop(dup_b);
+        let c2 = client.open_stream().await.unwrap();
+        let mut s2 = server.accept().await.unwrap();
+        let (r2, w2) = steal_mux_halves(&mut s2).expect("steal");
+        drop(s2);
+        drop(c2);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mux_relay(Box::new(dup_a), r2, w2, None, None),
+        )
+        .await
+        .expect("duplex mux_relay finish");
+        assert_eq!(
+            mux_relay_split_stats(),
+            (lockless0 + 1, fallback0 + 1),
+            "DuplexStream 应命中回落拆半探针"
+        );
     }
 }
 

@@ -299,7 +299,7 @@ async fn relay_udp(
             crate::data::relay_user_channel(&st, &rt, b, a).await;
         } else {
             let _ =
-                crate::data::copy_bidirectional_bounded(a, Box::new(b) as rh_transport::BoxedIo)
+                crate::data::copy_bidirectional_bounded(Box::new(b) as rh_transport::BoxedIo, a)
                     .await;
         }
         st.udp_relays.lock().await.remove(&vid);
@@ -432,9 +432,11 @@ async fn splice_relay(
     if let Some(rt) = rt {
         crate::data::relay_user_channel(&state, &rt, b, proxy_stream).await;
     } else {
+        // user 位传 CountedUserIo(b)、channel 位传 QuotaIo(proxy_stream),
+        // 与 copy_bidirectional_bounded(user, channel) 对齐,使两侧都能剥壳并走无锁拆半。
         let _ = crate::data::copy_bidirectional_bounded(
-            proxy_stream,
             Box::new(b) as rh_transport::BoxedIo,
+            proxy_stream,
         )
         .await;
     }
@@ -881,6 +883,189 @@ mod tests {
         assert_eq!(
             copy, 1,
             "copy 模式必须回落 copy(chunk={chunk}, copy={copy})"
+        );
+    }
+
+    fn make_quota_session(cid: &str, sid: &str) -> Arc<crate::session::Session> {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let sess = crate::session::Session::new(
+            cid.into(),
+            sid.into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        );
+        sess.data_conn_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        sess
+    }
+
+    /// 驱动双侧 QuotaIo<RhMuxStream> 经 splice_relay 的通用断言骨架:
+    /// 双向数据穿透、转发进行中两侧 data_conn_count 均为 1、clean EOF 收敛且释放归 0。
+    async fn run_dual_quota_mux_splice_case(
+        state: Arc<AppState>,
+        proxy_id: u64,
+    ) -> (
+        crate::data::split_probe::Counts,
+        crate::data::split_probe::Counts,
+        (usize, usize),
+        (usize, usize),
+    ) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let psess = make_quota_session("pcid", "psid");
+        let vsess = make_quota_session("vcid", "vsid");
+        let (s_p, c_p) = proxy_channel_pair().await;
+        let (s_v, c_v) = proxy_channel_pair().await;
+        let proxy_stream = crate::control::QuotaIo::new(s_p, psess.clone());
+        let visitor_stream = crate::control::QuotaIo::new(s_v, vsess.clone());
+
+        let split_before = crate::data::split_probe::snapshot();
+        let mux_before = rh_transport::mux::mux_relay_split_stats();
+
+        let mut relay = tokio::spawn(splice_relay(state, proxy_id, proxy_stream, visitor_stream));
+
+        let (mut cv_r, mut cv_w) = tokio::io::split(c_v);
+        let (mut cp_r, mut cp_w) = tokio::io::split(c_p);
+
+        let up = pseudo_random(64 * 1024 + 21, 0x0f0f_0f0f_0f0f_0f0f);
+        let up2 = up.clone();
+        let w_up = tokio::spawn(async move {
+            cv_w.write_all(&up2).await.unwrap();
+            cv_w
+        });
+        let mut got_up = vec![0u8; up.len()];
+        cp_r.read_exact(&mut got_up).await.unwrap();
+        assert_eq!(got_up, up, "visitor→proxy 方向必须穿透");
+        let mut cv_w = w_up.await.unwrap();
+
+        let down = pseudo_random(64 * 1024 + 43, 0xf0f0_f0f0_f0f0_f0f0);
+        let down2 = down.clone();
+        let w_dn = tokio::spawn(async move {
+            cp_w.write_all(&down2).await.unwrap();
+            cp_w
+        });
+        let mut got_down = vec![0u8; down.len()];
+        cv_r.read_exact(&mut got_down).await.unwrap();
+        assert_eq!(got_down, down, "proxy→visitor 方向必须穿透");
+        let mut cp_w = w_dn.await.unwrap();
+
+        assert_eq!(
+            psess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "转发进行中 proxy 侧 data_conn_count 不得提前递减"
+        );
+        assert_eq!(
+            vsess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "转发进行中 visitor 侧 data_conn_count 不得提前递减"
+        );
+
+        cp_w.shutdown().await.unwrap();
+        cv_w.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), &mut relay)
+            .await
+            .expect("双向 EOF 后 splice_relay 必须收敛")
+            .unwrap();
+
+        let mut eof = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), cp_r.read(&mut eof))
+                .await
+                .expect("cp_r EOF 超时")
+                .unwrap(),
+            0,
+            "proxy 侧必须收到 clean EOF"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), cv_r.read(&mut eof))
+                .await
+                .expect("cv_r EOF 超时")
+                .unwrap(),
+            0,
+            "visitor 侧必须收到 clean EOF"
+        );
+
+        assert_eq!(
+            psess.data_conn_count.load(Ordering::Relaxed),
+            0,
+            "完成后 proxy 侧 data_conn_count 必须归 0"
+        );
+        assert_eq!(
+            vsess.data_conn_count.load(Ordering::Relaxed),
+            0,
+            "完成后 visitor 侧 data_conn_count 必须归 0"
+        );
+
+        (
+            split_before,
+            crate::data::split_probe::snapshot(),
+            mux_before,
+            rh_transport::mux::mux_relay_split_stats(),
+        )
+    }
+
+    /// P0-5 / S3b 生产拓扑端到端:proxy_stream 与 visitor_stream 均包 QuotaIo<RhMuxStream>,
+    /// splice_relay → relay_user_channel 命中 chunk,user 侧无锁拆半 + 零 fallback。
+    #[tokio::test]
+    async fn p0_5_s3b_splice_relay_dual_quota_mux_lockless_e2e() {
+        let state = state().await;
+        let rt = Arc::new(crate::state::ProxyRuntime::new(
+            4101,
+            "cid".to_string(),
+            tcp_spec(),
+        ));
+        state.proxies.runtimes.insert(4101, rt);
+        let chunk0 = relay_path_count(&state, "chunk");
+
+        let (split_before, split_after, mux_before, mux_after) =
+            run_dual_quota_mux_splice_case(state.clone(), 4101).await;
+
+        assert_eq!(
+            relay_path_count(&state, "chunk"),
+            chunk0 + 1,
+            "S3b 必须命中 chunk 快路径"
+        );
+        assert_eq!(
+            split_after.user_lockless,
+            split_before.user_lockless + 1,
+            "visitor 侧 QuotaIo<RhMuxStream> 必须走无锁拆半"
+        );
+        assert_eq!(
+            split_after.user_fallback, split_before.user_fallback,
+            "visitor 侧不得发生 split fallback"
+        );
+        assert_eq!(
+            mux_after.1, mux_before.1,
+            "mux_relay 不得发生 split fallback"
+        );
+    }
+
+    /// P0-5 / rt=None 回落路径:双侧均包 QuotaIo<RhMuxStream> 时,
+    /// copy_bidirectional_bounded(CountedUserIo, QuotaIo) 两侧都必须走无锁拆半。
+    #[tokio::test]
+    async fn p0_5_splice_relay_proxy_missing_lockless_both_sides() {
+        let state = state().await;
+        let (split_before, split_after, _, _) = run_dual_quota_mux_splice_case(state, 4998).await;
+
+        assert_eq!(
+            split_after.user_lockless,
+            split_before.user_lockless + 1,
+            "rt=None 回落 copy_bidirectional_bounded 的 user 侧必须走无锁拆半"
+        );
+        assert_eq!(
+            split_after.channel_lockless,
+            split_before.channel_lockless + 1,
+            "rt=None 回落 copy_bidirectional_bounded 的 channel 侧必须走无锁拆半"
+        );
+        assert_eq!(
+            split_after.user_fallback, split_before.user_fallback,
+            "user 侧不得发生 split fallback"
+        );
+        assert_eq!(
+            split_after.channel_fallback, split_before.channel_fallback,
+            "channel 侧不得发生 split fallback"
         );
     }
 }

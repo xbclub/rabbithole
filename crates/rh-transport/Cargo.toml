@@ -10,6 +10,10 @@ license.workspace = true
 # 缓存行乒乓;关闭时递增点全部编译期移除(kcp.rs bump_counter 宏)。
 perf-counters = []
 
+# 跨 crate 单元测试观测探针(仅 rh-server / rh-client dev-dependencies 启用;
+# 生产构建关闭,探针调用点编译期为空函数,零开销)。
+test-probes = []
+
 [dependencies]
 rh-protocol = { workspace = true }
 

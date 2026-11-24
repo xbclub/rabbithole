@@ -1530,4 +1530,193 @@ mod tests {
             "非 \"0\" 值不生效(默认启用)"
         );
     }
+
+    // ================= Unix domain socket 插件端到端无锁拆半 =================
+
+    /// Unix domain socket 临时路径守卫(Drop 自动清理)。
+    #[cfg(unix)]
+    struct TempSockPath(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl TempSockPath {
+        fn new() -> Self {
+            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("rh-u-{}-{seq}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn unix_path(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TempSockPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_plugin_dial_and_splice_lockless() {
+        let _serial = SPLIT_PROBE_LOCK.lock().await;
+        let sock = TempSockPath::new();
+        let listener = tokio::net::UnixListener::bind(sock.path()).unwrap();
+
+        let up = pseudo_random(64 * 1024 + 17, 0x1234_5678_9abc_def0);
+        let down = pseudo_random(64 * 1024 + 39, 0x0fed_cba9_8765_4321);
+        let srv_expect_up = up.clone();
+        let srv_down = down.clone();
+
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut sr, mut sw) = stream.into_split();
+            let (got_up, ()) = tokio::join!(
+                async {
+                    let mut v = Vec::with_capacity(srv_expect_up.len());
+                    sr.read_to_end(&mut v).await.unwrap();
+                    v
+                },
+                async {
+                    sw.write_all(&srv_down).await.unwrap();
+                    sw.shutdown().await.unwrap();
+                }
+            );
+            assert_eq!(got_up, srv_expect_up, "Unix 服务端收到的上行数据必须完整");
+        });
+
+        let local = crate::plugins::dial_plugin(&rh_protocol::PluginSpec::UnixDomainSocket {
+            unix_path: sock.unix_path(),
+        })
+        .await
+        .expect("dial UnixDomainSocket plugin");
+
+        let (out_tcp, peer_tcp) = tcp_pair().await;
+        let (mut out_r, mut out_w) = out_tcp.into_split();
+
+        let before = LOCKLESS_SPLITS.load(Ordering::Relaxed);
+        let relay =
+            tokio::spawn(SPLIT_PROBE_SCOPE.scope((), splice(Box::new(peer_tcp), local, None)));
+
+        let cli_up = up.clone();
+        let ((), got_down) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                async {
+                    out_w.write_all(&cli_up).await.unwrap();
+                    out_w.shutdown().await.unwrap();
+                },
+                async {
+                    let mut v = Vec::with_capacity(down.len());
+                    out_r.read_to_end(&mut v).await.unwrap();
+                    v
+                }
+            )
+        })
+        .await
+        .expect("TCP↔Unix 双向传输必须在超时内完成");
+        assert_eq!(got_down, down, "TCP 对端收到的下行数据必须完整");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), relay)
+            .await
+            .expect("splice 必须在双向 clean EOF 后收敛")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), srv)
+            .await
+            .expect("Unix 服务端任务必须收敛")
+            .unwrap();
+
+        let after = LOCKLESS_SPLITS.load(Ordering::Relaxed);
+        assert!(
+            after >= before + 2,
+            "TcpStream 对端与 UnixStream 插件目标都必须走 split_boxed_io 无锁拆半(实际命中 {} 次)",
+            after - before
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_plugin_dial_and_mux_relay_lockless() {
+        let _serial = relay_path_probe::serial().await;
+        let sock = TempSockPath::new();
+        let listener = tokio::net::UnixListener::bind(sock.path()).unwrap();
+
+        let up = pseudo_random(64 * 1024 + 17, 0x2468_ace0_1357_9bdf);
+        let down_part1 = pseudo_random(32 * 1024 + 11, 0x1122_3344_5566_7788);
+        let down_part2 = pseudo_random(32 * 1024 + 28, 0x8877_6655_4433_2211);
+        let mut expected_down = Vec::with_capacity(down_part1.len() + down_part2.len());
+        expected_down.extend_from_slice(&down_part1);
+        expected_down.extend_from_slice(&down_part2);
+
+        let srv_expect_up = up.clone();
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut sr, mut sw) = stream.into_split();
+            sw.write_all(&down_part1).await.unwrap();
+            let mut got_up = Vec::with_capacity(srv_expect_up.len());
+            sr.read_to_end(&mut got_up).await.unwrap();
+            assert_eq!(got_up, srv_expect_up, "Unix 服务端收到的上行数据必须完整");
+            sw.write_all(&down_part2).await.unwrap();
+            sw.shutdown().await.unwrap();
+        });
+
+        let local = crate::plugins::dial_plugin(&rh_protocol::PluginSpec::UnixDomainSocket {
+            unix_path: sock.unix_path(),
+        })
+        .await
+        .expect("dial UnixDomainSocket plugin");
+
+        let (client, server) = mux_pair().await;
+        let mux_stream = client.open_stream().await.expect("open_stream");
+
+        let (lockless0, fb0) = rh_transport::mux::mux_relay_split_stats();
+        let relay = tokio::spawn(relay_stream(mux_stream, local, "splice"));
+
+        let peer = server.accept().await.expect("accept");
+        let (mut peer_r, mut peer_w) = tokio::io::split(peer);
+
+        let cli_up = up.clone();
+        let ((), got_down) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                async {
+                    peer_w.write_all(&cli_up).await.unwrap();
+                    peer_w.shutdown().await.unwrap();
+                },
+                async {
+                    let mut v = Vec::with_capacity(expected_down.len());
+                    peer_r.read_to_end(&mut v).await.unwrap();
+                    v
+                }
+            )
+        })
+        .await
+        .expect("mux↔Unix 双向传输必须在超时内完成");
+        assert_eq!(got_down, expected_down, "mux 对端收到的下行数据必须完整");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), relay)
+            .await
+            .expect("mux_relay 必须在双向 clean EOF 后收敛")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), srv)
+            .await
+            .expect("Unix 服务端任务必须收敛")
+            .unwrap();
+
+        let (lockless1, fb1) = rh_transport::mux::mux_relay_split_stats();
+        assert_eq!(
+            lockless1,
+            lockless0 + 1,
+            "mux_relay 必须对 UnixStream 走无锁拆半(lockless0={lockless0}, lockless1={lockless1})"
+        );
+        assert_eq!(
+            fb1, fb0,
+            "mux_relay 对 UnixStream 不得回落 tokio::io::split(fb0={fb0}, fb1={fb1})"
+        );
+    }
 }

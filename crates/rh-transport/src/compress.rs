@@ -139,19 +139,25 @@ impl tokio::io::AsyncWrite for JoinDuplex {
 // 读写都落在测试自己的线程 —— 并行跑的其它 compress 测试(它们也走
 // 回落分支)不会污染本计数,无需串行化。与下方 COUNTING 探针同款。
 //(`thread_local!` 是宏,`///` 文档注释无法附加到展开项,用普通注释。)
-#[cfg(test)]
+#[cfg(any(test, feature = "test-probes"))]
 thread_local! {
     static SPLIT_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// 回落计数(测试观测点)。生产编译为空函数——不改任何行为,只保证
 /// 调用点在两个 cfg 下都存在,避免代码路径分叉。
-#[cfg(test)]
+#[cfg(any(test, feature = "test-probes"))]
 fn note_split_fallback() {
     SPLIT_FALLBACKS.with(|c| c.set(c.get() + 1));
 }
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-probes")))]
 fn note_split_fallback() {}
+
+/// 仅测试用:返回当前线程 `compress_stream` 对 inner 回落 `tokio::io::split` 的累计次数。
+#[cfg(any(test, feature = "test-probes"))]
+pub fn split_fallback_count() -> usize {
+    SPLIT_FALLBACKS.with(|c| c.get())
+}
 
 fn varint_len(mut v: usize) -> usize {
     let mut n = 1;
@@ -1145,5 +1151,19 @@ mod tests {
         pump_r.read_exact(&mut got).await.unwrap();
         assert_eq!(&got[..a.len()], &a, "首段字节必须先行");
         assert_eq!(&got[a.len()..], &b, "次段字节必须按段序跟上");
+    }
+
+    #[tokio::test]
+    async fn split_fallback_count_tracks_non_splittable_inner() {
+        let (net_a, net_b) = tokio::io::duplex(1024);
+        let before = split_fallback_count();
+        let s = compress_stream(Box::new(net_a)).await;
+        assert_eq!(
+            split_fallback_count(),
+            before + 1,
+            "DuplexStream inner 应回落 tokio::io::split 并被 split_fallback_count 观测到"
+        );
+        drop(s);
+        drop(net_b);
     }
 }

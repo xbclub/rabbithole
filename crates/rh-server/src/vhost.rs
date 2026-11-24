@@ -178,9 +178,25 @@ impl<B> UpstreamPool<B> {
     }
 }
 
+/// 若开启压缩,先剥 `QuotaIo` 壳再包 `compress_stream`,避免 `compress_stream`
+/// 因外层 `QuotaIo` 回落 `tokio::io::split`;返回的 `QuotaGuard` 由调用方保活至
+/// 通道生命周期结束。
+async fn maybe_compress_channel(
+    channel: rh_transport::BoxedIo,
+    use_compression: bool,
+) -> (rh_transport::BoxedIo, Option<crate::control::QuotaGuard>) {
+    if use_compression {
+        let (inner, guard) = crate::control::QuotaIo::peel(channel);
+        (rh_transport::compress_stream(inner).await, guard)
+    } else {
+        (channel, None)
+    }
+}
+
 /// 新建一条上游 hyper 连接,返回 sender;conn 任务由这里 spawn。
 async fn new_upstream_sender(
     channel: rh_transport::BoxedIo,
+    quota_guard: Option<crate::control::QuotaGuard>,
     state: &Arc<AppState>,
     rt: &Arc<ProxyRuntime>,
 ) -> anyhow::Result<hyper::client::conn::http1::SendRequest<hyper::body::Incoming>> {
@@ -193,6 +209,7 @@ async fn new_upstream_sender(
     // conn 必须持续被 poll,否则连接不推进(这不是"每请求一个任务"的浪费:
     // 一个 conn 任务对应一条长连接的整个生命周期)。
     tokio::spawn(async move {
+        let _quota_guard = quota_guard;
         let _ = conn.with_upgrades().await;
     });
     Ok(sender)
@@ -494,12 +511,9 @@ async fn handle_http_request(
             if !send_start_forward(&mut channel, &rt, &spec_now, &peer.to_string()).await {
                 return Ok(service_unavailable());
             }
-            let channel = if spec_now.transport.use_compression {
-                rh_transport::compress_stream(channel).await
-            } else {
-                channel
-            };
-            new_upstream_sender(channel, &state, &rt).await?
+            let (channel, quota_guard) =
+                maybe_compress_channel(channel, spec_now.transport.use_compression).await;
+            new_upstream_sender(channel, quota_guard, &state, &rt).await?
         }
     };
 
@@ -932,11 +946,8 @@ async fn serve_https(
     if !send_start_forward(&mut channel, &rt, &spec, &peer.to_string()).await {
         return Ok(());
     }
-    let channel = if spec.transport.use_compression {
-        rh_transport::compress_stream(channel).await
-    } else {
-        channel
-    };
+    let (channel, _quota_guard) =
+        maybe_compress_channel(channel, spec.transport.use_compression).await;
     let Some(_conn_guard) = crate::data::try_open_user_conn(&state, Some(&rt)) else {
         return Ok(()); // F2 配额超限
     };
@@ -1214,12 +1225,8 @@ async fn serve_tcpmux(
             &serde_json::to_vec(&fwd)?,
         )
         .await?;
-        let channel = if spec.transport.use_compression {
-            rh_transport::compress_stream(channel).await
-        } else {
-            channel
-        };
-        let mut channel = channel;
+        let (mut channel, _quota_guard) =
+            maybe_compress_channel(channel, spec.transport.use_compression).await;
         // CONNECT 后已读入的用户数据(如 yamux 首帧)前转进通道
         if !tail.is_empty() && channel.write_all(&tail).await.is_err() {
             return Ok(());
@@ -1251,15 +1258,12 @@ async fn serve_tcpmux(
             // 每个流:新通道 + 指派
             if let Some(mut ch) = crate::data::get_channel(&st2, &rt2).await {
                 let spec = rt2.spec.read().await.clone();
-                let ch = if send_start_forward(&mut ch, &rt2, &spec, &peer2.to_string()).await {
-                    if spec.transport.use_compression {
-                        rh_transport::compress_stream(ch).await
+                let (ch, _quota_guard) =
+                    if send_start_forward(&mut ch, &rt2, &spec, &peer2.to_string()).await {
+                        maybe_compress_channel(ch, spec.transport.use_compression).await
                     } else {
-                        ch
-                    }
-                } else {
-                    return;
-                };
+                        return;
+                    };
                 let _conn_guard = match crate::data::try_open_user_conn(&st2, Some(&rt2)) {
                     Some(g) => g,
                     None => return, // F2 配额超限
@@ -2221,5 +2225,155 @@ mod tests {
             copy, 1,
             "copy 模式必须回落 copy(chunk={chunk}, copy={copy})"
         );
+    }
+
+    async fn mux_raw_pair_with_session() -> (
+        rh_transport::BoxedIo,
+        rh_transport::BoxedIo,
+        Arc<crate::session::Session>,
+    ) {
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let sess = crate::session::Session::new(
+            "cid".into(),
+            "sid".into(),
+            1,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        );
+        sess.data_conn_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = rh_transport::wrap_stream_as_server(
+            Box::new(b),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let client = rh_transport::wrap_stream_as_client(
+            Box::new(a),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let raw = client.open_stream().await.unwrap();
+        let peer_raw = server.accept().await.unwrap();
+        (raw, peer_raw, sess)
+    }
+
+    /// P0-5:maybe_compress_channel(true) 必须先剥 QuotaIo 壳再调 compress_stream,
+    /// 使内层 RhMuxStream 命中无锁拆半(split_fallback_count 不增长),同时 QuotaGuard
+    /// 在压缩流存活期间保活 data_conn_count == 1,drop 后恰好减回 0。
+    #[tokio::test]
+    async fn vhost_maybe_compress_channel_peels_quota_lockfree() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (raw, peer_raw, sess) = mux_raw_pair_with_session().await;
+        let wrapped = crate::control::QuotaIo::new(raw, sess.clone());
+        assert_eq!(sess.data_conn_count.load(Ordering::Relaxed), 1);
+
+        let before = rh_transport::compress::split_fallback_count();
+        let (mut ch, guard) = maybe_compress_channel(wrapped, true).await;
+        assert_eq!(
+            rh_transport::compress::split_fallback_count(),
+            before,
+            "剥 QuotaIo 后 compress_stream(RhMuxStream) 不得回落 tokio::io::split"
+        );
+        assert!(guard.is_some(), "开启压缩时必须剥出 QuotaGuard");
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "QuotaGuard 存活期间不得提前递减 data_conn_count"
+        );
+
+        let mut peer = rh_transport::compress_stream(peer_raw).await;
+        let payload_up = b"vhost-compress-peel-up-payload";
+        let payload_dn = b"vhost-compress-peel-down-payload";
+        let peer_task = tokio::spawn(async move {
+            let mut got = vec![0u8; payload_up.len()];
+            peer.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, payload_up);
+            peer.write_all(payload_dn).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut eof = [0u8; 1];
+            assert_eq!(peer.read(&mut eof).await.unwrap(), 0);
+        });
+
+        ch.write_all(payload_up).await.unwrap();
+        ch.flush().await.unwrap();
+        let mut got_dn = vec![0u8; payload_dn.len()];
+        ch.read_exact(&mut got_dn).await.unwrap();
+        assert_eq!(&got_dn, payload_dn);
+        ch.shutdown().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), peer_task)
+            .await
+            .expect("peer_task 超时")
+            .unwrap();
+        drop(ch);
+
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "仅 drop 压缩流、guard 仍持有时 data_conn_count 不得提前归零"
+        );
+        drop(guard);
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            0,
+            "drop QuotaGuard 后 data_conn_count 必须恰好减回 0"
+        );
+    }
+
+    /// P0-5:HTTP vhost 池化上游连接(new_upstream_sender)必须把 QuotaGuard
+    /// 移入 conn 任务,在 new_upstream_sender 返回后仍保持 data_conn_count == 1,
+    /// 直至 sender 释放且对端关闭、conn 任务退出才递减归 0。
+    #[tokio::test]
+    async fn vhost_http_upstream_keeps_quota_guard_for_conn_lifetime() {
+        use std::sync::atomic::Ordering;
+
+        let state = call_site_state("splice").await;
+        let spec: rh_protocol::ProxySpec = serde_json::from_value(serde_json::json!({
+            "id": 5099,
+            "name": "http-upstream-quota",
+            "kind": "http",
+            "client_id": "cid",
+            "target_host": "127.0.0.1",
+            "target_port": 80,
+            "http": { "custom_domains": ["upstream-quota.example.com"] },
+        }))
+        .unwrap();
+        let rt = Arc::new(ProxyRuntime::new(spec.id, "cid".to_string(), spec));
+
+        let (raw, peer_raw, sess) = mux_raw_pair_with_session().await;
+        let peer_comp = rh_transport::compress_stream(peer_raw).await;
+
+        let wrapped = crate::control::QuotaIo::new(raw, sess.clone());
+        let before = rh_transport::compress::split_fallback_count();
+        let (ch, guard) = maybe_compress_channel(wrapped, true).await;
+        assert_eq!(
+            rh_transport::compress::split_fallback_count(),
+            before,
+            "剥 QuotaIo 后 compress_stream 不得回落 tokio::io::split"
+        );
+        assert!(guard.is_some());
+
+        let sender = new_upstream_sender(ch, guard, &state, &rt)
+            .await
+            .expect("http1 handshake must succeed");
+
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "new_upstream_sender 返回后后台 conn 任务必须持续持有 QuotaGuard"
+        );
+
+        drop(sender);
+        drop(peer_comp);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sess.data_conn_count.load(Ordering::Relaxed) != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "drop sender 并关闭对端后,conn 任务必须在超时内结束并释放 QuotaGuard"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 }

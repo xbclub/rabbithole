@@ -647,24 +647,8 @@ async fn copy_relay_pair(
     // 且 splice 仅 Linux 可用,macOS/Windows 的非 mux 模式 100% 走本函数。
     // user 侧剥 CountedUserIo 计量壳(A-2 同款),channel 侧走
     // split_boxed_io;包装类型(压缩流等)照旧回落同步锁拆分。
-    let ((mut u_r, mut u_w), _user_quota_guard): (RelayHalves, Option<crate::control::QuotaGuard>) =
-        match split_counted_user(user) {
-            Ok((halves, g)) => (halves, g),
-            Err(io) => match rh_transport::split_boxed_io(io) {
-                Ok((r, w)) => ((Box::new(r), Box::new(w)), None),
-                Err(io) => {
-                    let (r, w) = tokio::io::split(io);
-                    ((Box::new(r), Box::new(w)), None)
-                }
-            },
-        };
-    let (mut c_r, mut c_w): RelayHalves = match rh_transport::split_boxed_io(channel) {
-        Ok((r, w)) => (Box::new(r), Box::new(w)),
-        Err(io) => {
-            let (r, w) = tokio::io::split(io);
-            (Box::new(r), Box::new(w))
-        }
-    };
+    let ((mut u_r, mut u_w), _user_quota_guard) = split_user_halves(user);
+    let (mut c_r, mut c_w) = split_channel_halves(channel);
     let bucket2 = bucket.clone();
     let cb2 = client_bucket.clone();
     let cancel = rule_cancel.clone();
@@ -940,6 +924,7 @@ async fn mux_forward_chunked(
     // 走 tokio::io::split 的同步锁拆半。
     match split_counted_user(user) {
         Ok(((a_r, a_w), _user_quota_guard)) => {
+            note_server_user_lockless();
             // P0-3:S3b/S3c 的 visitor 侧在 CountedUserIo<BoxedIo> 内层还包着 QuotaIo,
             // _user_quota_guard 保活至 mux_relay_split 结束,限额占用期与原 QuotaIo::Drop 等价。
             rh_transport::mux::mux_relay_split(a_r, a_w, b_r, b_w, limiter, Some(cancel)).await
@@ -1430,6 +1415,109 @@ fn split_counted_user(
                 st,
                 reversed: false,
             }) as rh_transport::BoxedIo)
+        }
+    }
+}
+
+/// 拆半路径观测探针(仅测试读取;非测试构建由空函数消除,零运行时开销)。
+#[cfg(test)]
+pub(crate) mod split_probe {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Counts {
+        pub(crate) user_lockless: usize,
+        pub(crate) user_fallback: usize,
+        pub(crate) channel_lockless: usize,
+        pub(crate) channel_fallback: usize,
+    }
+
+    thread_local! {
+        static COUNTS: Cell<Counts> = const {
+            Cell::new(Counts {
+                user_lockless: 0,
+                user_fallback: 0,
+                channel_lockless: 0,
+                channel_fallback: 0,
+            })
+        };
+    }
+
+    pub(crate) fn snapshot() -> Counts {
+        COUNTS.with(|c| c.get())
+    }
+
+    pub(super) fn bump(f: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|c| {
+            let mut v = c.get();
+            f(&mut v);
+            c.set(v);
+        });
+    }
+}
+
+#[cfg(test)]
+fn note_server_user_lockless() {
+    split_probe::bump(|c| c.user_lockless += 1);
+}
+#[cfg(not(test))]
+fn note_server_user_lockless() {}
+
+#[cfg(test)]
+fn note_server_user_fallback() {
+    split_probe::bump(|c| c.user_fallback += 1);
+}
+#[cfg(not(test))]
+fn note_server_user_fallback() {}
+
+#[cfg(test)]
+fn note_server_channel_lockless() {
+    split_probe::bump(|c| c.channel_lockless += 1);
+}
+#[cfg(not(test))]
+fn note_server_channel_lockless() {}
+
+#[cfg(test)]
+fn note_server_channel_fallback() {
+    split_probe::bump(|c| c.channel_fallback += 1);
+}
+#[cfg(not(test))]
+fn note_server_channel_fallback() {}
+
+/// 拆半 user 侧 IO:优先剥 `CountedUserIo` 走无锁拆半,次选 `split_boxed_io`,
+/// 均不支持时回落 `tokio::io::split`,并按结果更新拆半探针。
+fn split_user_halves(user: BoxedIo) -> (RelayHalves, Option<crate::control::QuotaGuard>) {
+    match split_counted_user(user) {
+        Ok((halves, g)) => {
+            note_server_user_lockless();
+            (halves, g)
+        }
+        Err(io) => match rh_transport::split_boxed_io(io) {
+            Ok((r, w)) => {
+                note_server_user_lockless();
+                ((Box::new(r), Box::new(w)), None)
+            }
+            Err(io) => {
+                note_server_user_fallback();
+                let (r, w) = tokio::io::split(io);
+                ((Box::new(r), Box::new(w)), None)
+            }
+        },
+    }
+}
+
+/// 拆半 channel 侧 IO:优先 `split_boxed_io` 无锁拆半,不支持时回落
+/// `tokio::io::split`,并按结果更新拆半探针。
+fn split_channel_halves(channel: BoxedIo) -> RelayHalves {
+    match rh_transport::split_boxed_io(channel) {
+        Ok((r, w)) => {
+            note_server_channel_lockless();
+            (Box::new(r), Box::new(w))
+        }
+        Err(io) => {
+            note_server_channel_fallback();
+            let (r, w) = tokio::io::split(io);
+            (Box::new(r), Box::new(w))
         }
     }
 }
@@ -4499,6 +4587,113 @@ mod tests {
             .expect("规则取消后 relay 必须在 CANCEL_CLOSE_GRACE + join 兜底内收敛")
             .unwrap();
     }
+
+    /// P0-5 / S3a 端到端:user 为 `CountedUserIo<BoxedIo(RhMuxStream)>`、
+    /// channel 为 `QuotaIo<RhMuxStream>`,经 `relay_user_channel` 走默认
+    /// `current_thread` 运行时,双向穿透 + clean EOF,断言 `user_lockless` +1、
+    /// `user_fallback` +0、`mux_relay_split_stats().1` +0、完成后 `data_conn_count == 0`。
+    #[tokio::test]
+    async fn p0_5_s3a_relay_user_channel_lockless_e2e() {
+        let state = sec_state().await;
+        let rt = sec_rt(3201, sec_tcp_spec());
+        let chunk0 = relay_path_count(&state, "chunk");
+
+        let (u_s, u_c) = sec_mux_stream_pair().await;
+        let (ch_s, ch_c) = sec_mux_stream_pair().await;
+        let sess = sec_make_session();
+        sess.data_conn_count.fetch_add(1, Ordering::Relaxed);
+        let channel = crate::control::QuotaIo::new(ch_s, sess.clone());
+        let user = CountedUserIo::user(u_s, &state, Some(rt.clone()));
+
+        let before = split_probe::snapshot();
+        let mux_before = rh_transport::mux::mux_relay_split_stats();
+
+        let st = state.clone();
+        let rt2 = rt.clone();
+        let relay = tokio::spawn(async move { relay_user_channel(&st, &rt2, user, channel).await });
+
+        let (mut u_r, mut u_w) = tokio::io::split(u_c);
+        let (mut ch_r, mut ch_w) = tokio::io::split(ch_c);
+
+        let up = sec_pseudo_random(64 * 1024 + 333, 0x1111_2222_3333_4444);
+        let up2 = up.clone();
+        let w_up = tokio::spawn(async move {
+            u_w.write_all(&up2).await.unwrap();
+            u_w
+        });
+        let mut got_up = vec![0u8; up.len()];
+        ch_r.read_exact(&mut got_up).await.unwrap();
+        assert_eq!(got_up, up, "up 方向数据必须穿透");
+        let mut u_w = w_up.await.unwrap();
+
+        let down = sec_pseudo_random(64 * 1024 + 555, 0x5555_6666_7777_8888);
+        let down2 = down.clone();
+        let w_dn = tokio::spawn(async move {
+            ch_w.write_all(&down2).await.unwrap();
+            ch_w
+        });
+        let mut got_down = vec![0u8; down.len()];
+        u_r.read_exact(&mut got_down).await.unwrap();
+        assert_eq!(got_down, down, "down 方向数据必须穿透");
+        let mut ch_w = w_dn.await.unwrap();
+
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            1,
+            "转发进行中 data_conn_count 不得提前递减"
+        );
+
+        ch_w.shutdown().await.unwrap();
+        u_w.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), relay)
+            .await
+            .expect("双向 EOF 后 relay_user_channel 必须收敛")
+            .unwrap();
+
+        let mut eof = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), ch_r.read(&mut eof))
+                .await
+                .expect("ch_r EOF 超时")
+                .unwrap(),
+            0,
+            "channel 对端必须收到 clean EOF"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), u_r.read(&mut eof))
+                .await
+                .expect("u_r EOF 超时")
+                .unwrap(),
+            0,
+            "user 对端必须收到 clean EOF"
+        );
+
+        let after = split_probe::snapshot();
+        let mux_after = rh_transport::mux::mux_relay_split_stats();
+        assert_eq!(
+            relay_path_count(&state, "chunk"),
+            chunk0 + 1,
+            "S3a 必须命中 chunk 快路径"
+        );
+        assert_eq!(
+            after.user_lockless,
+            before.user_lockless + 1,
+            "CountedUserIo<BoxedIo(RhMuxStream)> 必须走无锁拆半"
+        );
+        assert_eq!(
+            after.user_fallback, before.user_fallback,
+            "user 侧不得发生 split fallback"
+        );
+        assert_eq!(
+            mux_after.1, mux_before.1,
+            "mux_relay 不得发生 split fallback"
+        );
+        assert_eq!(
+            sess.data_conn_count.load(Ordering::Relaxed),
+            0,
+            "relay 完成后 data_conn_count 必须归 0"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5190,25 +5385,9 @@ pub async fn copy_bidirectional_bounded(
     // 对齐 copy_relay 的拆半纪律:user 侧先剥 CountedUserIo(TcpStream)
     // 走 owned 拆半,channel 侧 split_boxed_io;包装类型(压缩流等)
     // 回落共享锁拆分。缓冲对齐全仓 64KiB 口径。
-    let ((mut a_r, mut a_w), _user_quota_guard): (RelayHalves, Option<crate::control::QuotaGuard>) =
-        match split_counted_user(user) {
-            Ok((halves, g)) => (halves, g),
-            Err(io) => match rh_transport::split_boxed_io(io) {
-                Ok((r, w)) => ((Box::new(r), Box::new(w)), None),
-                Err(io) => {
-                    let (r, w) = tokio::io::split(io);
-                    ((Box::new(r), Box::new(w)), None)
-                }
-            },
-        };
+    let ((mut a_r, mut a_w), _user_quota_guard) = split_user_halves(user);
     let (channel, _ch_quota_guard) = crate::control::QuotaIo::peel(channel);
-    let (mut b_r, mut b_w): RelayHalves = match rh_transport::split_boxed_io(channel) {
-        Ok((r, w)) => (Box::new(r), Box::new(w)),
-        Err(io) => {
-            let (r, w) = tokio::io::split(io);
-            (Box::new(r), Box::new(w))
-        }
-    };
+    let (mut b_r, mut b_w) = split_channel_halves(channel);
     let up = async {
         let n = copy_64k(&mut a_r, &mut b_w).await.ok();
         let _ = b_w.shutdown().await;

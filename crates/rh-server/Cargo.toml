@@ -68,6 +68,7 @@ rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 
 [dev-dependencies]
+rh-transport = { workspace = true, features = ["test-probes"] }
 tempfile = "3"
 # 半关闭有界兜底回归(round-51):start_paused 让默认 grace 在虚拟时钟内走完,
 # 单测不必真等 30 秒
