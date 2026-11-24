@@ -625,6 +625,7 @@ func cmdUDP(g globalOpts, args []string) int {
 		outstanding := len(unacked) - headIdx
 
 		for outstanding < *window && time.Now().Before(deadline) {
+			ts := time.Now()
 			binary.BigEndian.PutUint64(txBuf[:hdrLen], sent)
 			fillPatternSlice(txBuf[hdrLen:], int64(sent)*4096)
 			_, werr := socks[int(sent%uint64(nSrc))].Write(txBuf)
@@ -642,7 +643,6 @@ func cmdUDP(g globalOpts, args []string) int {
 				}
 				break
 			}
-			ts := time.Now()
 			pending[sent] = ts
 			unacked = append(unacked, udpInflight{seq: sent, ts: ts})
 			sent++

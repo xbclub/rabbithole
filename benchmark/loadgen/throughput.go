@@ -115,6 +115,13 @@ func runSink(port int, seconds float64, maxConns int) int {
 			}
 			_ = c.SetReadDeadline(time.Time{})
 
+			var connBytes int64
+			defer func() {
+				if connBytes > 0 {
+					total.Add(connBytes)
+				}
+			}()
+
 			switch hdr[0] {
 			case 'D':
 				// Reverse (download) mode: sink streams continuously to src.
@@ -126,7 +133,7 @@ func runSink(port int, seconds float64, maxConns int) int {
 					}
 					nw, werr := c.Write(readonlyZeroChunk)
 					if nw > 0 {
-						total.Add(int64(nw))
+						connBytes += int64(nw)
 					}
 					if werr != nil {
 						return
@@ -138,7 +145,7 @@ func runSink(port int, seconds float64, maxConns int) int {
 				for {
 					nr, rerr := c.Read(buf)
 					if nr > 0 {
-						total.Add(int64(nr))
+						connBytes += int64(nr)
 					}
 					if rerr != nil {
 						return
@@ -146,12 +153,12 @@ func runSink(port int, seconds float64, maxConns int) int {
 				}
 			default:
 				// Backwards-compatible raw stream: first byte already belongs to payload.
-				total.Add(int64(n))
+				connBytes += int64(n)
 				buf := make([]byte, thpBufSize)
 				for {
 					nr, rerr := c.Read(buf)
 					if nr > 0 {
-						total.Add(int64(nr))
+						connBytes += int64(nr)
 					}
 					if rerr != nil {
 						return
