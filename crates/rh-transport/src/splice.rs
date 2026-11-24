@@ -652,8 +652,11 @@ impl SpliceSock {
                 );
             }
         }
+        // SAFETY: `fd` 为 `OwnedFd`,持有有效的非阻塞 TCP socket 描述符,
+        // 且在 `AsyncFd` 生命周期内始终保持打开、fd 号不变。
+        let async_fd = unsafe { AsyncFd::register(fd)? };
         Ok(Self {
-            fd: Arc::new(AsyncFd::new(fd)?),
+            fd: Arc::new(async_fd),
         })
     }
 
