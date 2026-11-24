@@ -1646,40 +1646,51 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         // 平均 writev 被压到 384KiB(K=1 是 589KiB)。现在与 `pump_up`
         // (round-68)同构:循环发起新读,直到 pending 触顶
         // `DOWN_BATCH_BYTES` 或写完成。
-        let __ok =
-            if prefetch_enabled() && batch_bytes < DOWN_BATCH_BYTES && !batch_eof && !read_err {
-                let write_fut = flush(a_w, &mut batch, &mut batch_bytes, limiter);
-                futures::pin_mut!(write_fut);
-                loop {
-                    // 预取已够下一轮用:不再发起新读,专心等写完成。
-                    // C5:增量计数,不再每轮 O(n) 重算
-                    if pending_bytes >= DOWN_BATCH_BYTES || pending.len() >= SMALL_CHUNK_SEGS {
-                        break write_fut.await;
-                    }
-                    let read_fut = b_read.read_chunk();
-                    futures::pin_mut!(read_fut);
-                    match futures::future::select(read_fut, write_fut.as_mut()).await {
-                        futures::future::Either::Left((nr, _)) => match nr {
-                            Ok(Some(c)) if !c.is_empty() => {
-                                pending_bytes += c.len();
-                                pending.push_back(c)
-                            }
-                            Ok(_) => {
-                                batch_eof = true;
-                                break write_fut.await;
-                            }
-                            // ★读错误 ≠ clean EOF(同 pump_up)
-                            Err(_) => {
-                                read_err = true;
-                                break write_fut.await;
-                            }
-                        },
-                        futures::future::Either::Right((ok, _)) => break ok,
-                    }
+        //
+        // 无界快路径(`limiter.is_none()`)在 `batch` 凑满 `1 MiB` 时正是
+        // `flush()` 在 TCP Send-Q 上阻塞最久(10GbE 实测 10~23 ms)的时刻:
+        // 若按 `batch_bytes < DOWN_BATCH_BYTES` 门控反而跳过预取,会推迟
+        // `b_read.read_chunk()` 消费与 yamux WindowUpdate 回窗;预取队列由
+        // 下方 `pending_bytes >= DOWN_BATCH_BYTES || pending.len() >= SMALL_CHUNK_SEGS`
+        // 严格封顶 1 MiB/128 段。有限速桶(`limiter.is_some()`)时仍保留
+        // `batch_bytes < DOWN_BATCH_BYTES` 门槛,避免限速等待期间额外预取。
+        let __ok = if prefetch_enabled()
+            && !batch_eof
+            && !read_err
+            && (limiter.is_none() || batch_bytes < DOWN_BATCH_BYTES)
+        {
+            let write_fut = flush(a_w, &mut batch, &mut batch_bytes, limiter);
+            futures::pin_mut!(write_fut);
+            loop {
+                // 预取已够下一轮用:不再发起新读,专心等写完成。
+                // C5:增量计数,不再每轮 O(n) 重算
+                if pending_bytes >= DOWN_BATCH_BYTES || pending.len() >= SMALL_CHUNK_SEGS {
+                    break write_fut.await;
                 }
-            } else {
-                flush(a_w, &mut batch, &mut batch_bytes, limiter).await
-            };
+                let read_fut = b_read.read_chunk();
+                futures::pin_mut!(read_fut);
+                match futures::future::select(read_fut, write_fut.as_mut()).await {
+                    futures::future::Either::Left((nr, _)) => match nr {
+                        Ok(Some(c)) if !c.is_empty() => {
+                            pending_bytes += c.len();
+                            pending.push_back(c)
+                        }
+                        Ok(_) => {
+                            batch_eof = true;
+                            break write_fut.await;
+                        }
+                        // ★读错误 ≠ clean EOF(同 pump_up)
+                        Err(_) => {
+                            read_err = true;
+                            break write_fut.await;
+                        }
+                    },
+                    futures::future::Either::Right((ok, _)) => break ok,
+                }
+            }
+        } else {
+            flush(a_w, &mut batch, &mut batch_bytes, limiter).await
+        };
         if let Some(t) = __w0 {
             let el = t.elapsed();
             wr_ns += el.as_nanos() as u64;
@@ -4073,6 +4084,190 @@ mod tests {
         let (ns, n) = gap_snapshot();
         assert!(n > 0, "LOOP_GAP_N 必须 > 0(修前是遮蔽导致恒 0);实际 n={n}");
         assert!(ns > 0, "累计间隔应为正值,实际 {ns}");
+    }
+
+    /// 无界快路径(`limiter = None`)满批冲刷(`batch_bytes >= DOWN_BATCH_BYTES`)
+    /// 期间必须继续并发预取并推进 yamux WindowUpdate 回窗,不能在首个满批阻塞时
+    /// 把发送端卡死在流控窗口零点上。
+    #[tokio::test]
+    async fn pump_down_prefetches_and_grants_window_during_full_batch_flush() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Waker};
+        use tokio::io::AsyncWrite;
+
+        const CHUNK: usize = 256 * 1024;
+        const INIT_WIN: u32 = 3 * 1024 * 1024; // 半窗回补阈值 = 1.5 MiB
+        const FILL_CHUNKS: usize = 12; // 12 × 256 KiB = 3 MiB(打满初窗)
+        const TOTAL_CHUNKS: usize = 13;
+
+        struct GatedWriter {
+            entered: Option<tokio::sync::oneshot::Sender<()>>,
+            first_write_bytes: Arc<AtomicUsize>,
+            released: Arc<AtomicBool>,
+            waker: Arc<std::sync::Mutex<Option<Waker>>>,
+            out: Vec<u8>,
+        }
+
+        impl AsyncWrite for GatedWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.poll_write_vectored(cx, &[io::IoSlice::new(buf)])
+            }
+
+            fn poll_write_vectored(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                let total: usize = bufs.iter().map(|s| s.len()).sum();
+                let _ = self.first_write_bytes.compare_exchange(
+                    0,
+                    total,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                if let Some(tx) = self.entered.take() {
+                    let _ = tx.send(());
+                }
+                if !self.released.load(Ordering::SeqCst) {
+                    *self.waker.lock().unwrap() = Some(cx.waker().clone());
+                    if !self.released.load(Ordering::SeqCst) {
+                        return Poll::Pending;
+                    }
+                    *self.waker.lock().unwrap() = None;
+                }
+                for s in bufs {
+                    self.out.extend_from_slice(s);
+                }
+                Poll::Ready(Ok(total))
+            }
+
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mk_mux = |io: crate::BoxedIo, mode: yamux::Mode| {
+            let mut cfg = yamux::Config::default();
+            cfg.set_max_connection_receive_window(None);
+            cfg.set_max_num_streams(100);
+            cfg.set_split_send_size(6 * 1024 * 1024);
+            cfg.set_initial_stream_receive_window(INIT_WIN as usize);
+            cfg.set_shard_workers(DEFAULT_SHARD_WORKERS);
+            let conn: MuxConn = yamux::Connection::new(YamuxCarrier::new(io), cfg, mode);
+            let (rh, sh, w, sw) = conn.into_halves();
+            YamuxMultiplexer::spawn_drivers(rh, sh, w, sw)
+        };
+
+        let (a, b) = tokio::io::duplex(8 * 1024 * 1024);
+        let client_mux = mk_mux(Box::new(a) as crate::BoxedIo, yamux::Mode::Client);
+        let server_mux = mk_mux(Box::new(b) as crate::BoxedIo, yamux::Mode::Server);
+
+        let mut client_stream = client_mux.open_mux_stream().await.expect("open");
+        let mut server_io = server_mux.accept_stream().await.expect("accept");
+        let (mut b_read, b_write) = steal_mux_halves(&mut server_io).expect("srv halves");
+        drop(b_write);
+        let (cr, mut cw) = client_stream.steal_halves().expect("cli halves");
+        drop(cr);
+
+        let chunk_for = |i: usize| -> Bytes {
+            let b = (i as u8).wrapping_mul(37).wrapping_add(1);
+            Bytes::from(vec![b; CHUNK])
+        };
+
+        let (filled_tx, filled_rx) = tokio::sync::oneshot::channel::<()>();
+        let (extra_tx, extra_rx) = tokio::sync::oneshot::channel::<()>();
+        let sender = tokio::spawn(async move {
+            for i in 0..FILL_CHUNKS {
+                cw.write_chunk(chunk_for(i)).await.expect("write fill");
+            }
+            let _ = filled_tx.send(());
+            // 第 13 块必先受 3 MiB 初窗阻塞,直至服务端泵消费 >= 1.5 MiB 并回窗
+            cw.write_chunk(chunk_for(FILL_CHUNKS))
+                .await
+                .expect("write 13th chunk after window update");
+            let _ = extra_tx.send(());
+            cw.close().await.expect("close");
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), filled_rx)
+            .await
+            .expect("client fill timeout")
+            .expect("filled sender dropped");
+        // 等 12 块全部解帧入 b_read 缓冲,确保 pump_down 首批凑满 DOWN_BATCH_BYTES(1 MiB)
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let first_write_bytes = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(std::sync::Mutex::new(None::<Waker>));
+        let mut writer = GatedWriter {
+            entered: Some(entered_tx),
+            first_write_bytes: first_write_bytes.clone(),
+            released: released.clone(),
+            waker: waker.clone(),
+            out: Vec::new(),
+        };
+
+        let mut pump_fut = Box::pin(pump_down(&mut writer, &mut b_read, &None));
+
+        // 驱动 pump_down 进入首个满批 flush 并停在 GatedWriter 上;
+        // 并在 GatedWriter 仍阻塞时持续轮询 pump_down,验证预取分支与 WindowUpdate 推进。
+        tokio::select! {
+            _ = &mut pump_fut => panic!("pump_down finished before writer released"),
+            res = entered_rx => res.expect("entered_tx dropped"),
+        }
+        assert!(
+            first_write_bytes.load(Ordering::SeqCst) >= DOWN_BATCH_BYTES,
+            "首个 flush 必须凑满 DOWN_BATCH_BYTES({}, 实际 {}) 才能触发原缺陷分支",
+            DOWN_BATCH_BYTES,
+            first_write_bytes.load(Ordering::SeqCst)
+        );
+
+        tokio::select! {
+            _ = &mut pump_fut => panic!("pump_down finished before writer released"),
+            res = tokio::time::timeout(std::time::Duration::from_secs(2), extra_rx) => {
+                res.expect("满批冲刷阻塞期间未能预取并回窗放行第 13 块").expect("extra sender dropped");
+            }
+        }
+
+        // 放行 GatedWriter,验证余块与 EOF 完整落盘
+        released.store(true, Ordering::SeqCst);
+        if let Some(w) = waker.lock().unwrap().take() {
+            w.wake();
+        }
+        let clean = tokio::time::timeout(std::time::Duration::from_secs(2), pump_fut)
+            .await
+            .expect("pump_down clean EOF timeout");
+        assert!(clean, "clean EOF must return true");
+        tokio::time::timeout(std::time::Duration::from_secs(2), sender)
+            .await
+            .expect("sender join timeout")
+            .expect("sender panicked");
+
+        assert_eq!(writer.out.len(), TOTAL_CHUNKS * CHUNK);
+        for i in 0..TOTAL_CHUNKS {
+            let expected = (i as u8).wrapping_mul(37).wrapping_add(1);
+            let slice = &writer.out[i * CHUNK..(i + 1) * CHUNK];
+            assert!(
+                slice.iter().all(|&b| b == expected),
+                "chunk {i} content mismatch"
+            );
+        }
+
+        client_mux.shutdown();
+        server_mux.shutdown();
     }
 
     // R2(红线 2 锁):读块上限常量必须保持 64KiB。
