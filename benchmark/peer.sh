@@ -406,7 +406,7 @@ peer_drive() {  # <a_ip> <b_ip> <api_port> <token> <client_id> [label]
     "{\"client_id\":\"$cid\",\"name\":\"udp\",\"kind\":\"udp\",\"bind_port\":$P_UDP,\"target_host\":\"127.0.0.1\",\"target_port\":$T_UDP,\"enabled\":true}" >/dev/null \
     || { err "udp 规则失败"; return 1; }
   create_service "$API" "$token" \
-    "{\"client_id\":\"$cid\",\"name\":\"web\",\"kind\":\"http\",\"target_host\":\"127.0.0.1\",\"target_port\":$T_HTTP,\"http\":{\"custom_domains\":[\"bench.test\"]},\"enabled\":true}" >/dev/null \
+    "{\"client_id\":\"$cid\",\"name\":\"web\",\"kind\":\"http\",\"target_host\":\"127.0.0.1\",\"target_port\":$T_HTTP,\"http\":{\"custom_domains\":[\"bench.test\"]}${COMPRESS_JSON},\"enabled\":true}" >/dev/null \
     || { err "http 规则失败"; return 1; }
   # 隧道就绪门控:规则下发后等数据面真正可用,避免把建连竞态测进吞吐
   local gate_ok=0
