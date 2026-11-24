@@ -20,6 +20,22 @@ use tokio::io::ReadBuf;
 use tokio::io::{AsyncRead as _, AsyncWrite as _};
 use tokio::sync::{mpsc, oneshot};
 
+struct CarrierLeaseInner {
+    global: Arc<AtomicUsize>,
+    scope: Option<Arc<AtomicUsize>>,
+}
+
+impl Drop for CarrierLeaseInner {
+    fn drop(&mut self) {
+        self.global.fetch_sub(1, Ordering::AcqRel);
+        if let Some(s) = &self.scope {
+            s.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+type CarrierLease = Arc<CarrierLeaseInner>;
+
 /// yamux 流的 tokio 视图 + 零拷贝 chunk 通道(vendor yamux 专用)。
 /// 普通消费者按 AsyncRead/AsyncWrite 使用(语义与旧 Compat 路径等价,
 /// 读侧一次块内拷贝);转发路径可经 [`RhMuxStream::steal_halves`] 拆出
@@ -31,6 +47,8 @@ pub struct RhMuxStream {
     /// 兼容读路径:poll_read_chunk 取出后未消费完的余块
     /// (转发偷取时随读半前传,不丢数据)。
     pending: Option<Bytes>,
+    /// 所属池载体活跃流租约(仅池路径持有;steal_halves 后拆给读/写双半共持)。
+    lease: Option<CarrierLease>,
 }
 
 impl RhMuxStream {
@@ -38,7 +56,12 @@ impl RhMuxStream {
         Self {
             inner: Some(inner),
             pending: None,
+            lease: None,
         }
+    }
+
+    fn attach_lease(&mut self, lease: CarrierLease) {
+        self.lease = Some(lease);
     }
 
     /// 经 &mut 引用拆出读/写半(独占所有权场景;调用方随后丢弃壳)。
@@ -50,9 +73,17 @@ impl RhMuxStream {
         if let Some(b) = self.pending.take() {
             pending.push_back(b);
         }
+        let lease = self.lease.take();
         Some((
-            RhMuxStreamRead { inner: r, pending },
-            RhMuxStreamWrite { inner: w },
+            RhMuxStreamRead {
+                inner: r,
+                pending,
+                _lease: lease.clone(),
+            },
+            RhMuxStreamWrite {
+                inner: w,
+                _lease: lease,
+            },
         ))
     }
 }
@@ -136,6 +167,7 @@ pub struct RhMuxStreamRead {
     /// 先行交付队列(FIFO):剥壳注入的残留前缀(B1)、偷取时前传的
     /// 兼容读余量、聚合截断回退块。全部先于 inner 的后续数据交付。
     pending: std::collections::VecDeque<Bytes>,
+    _lease: Option<CarrierLease>,
 }
 
 impl RhMuxStreamRead {
@@ -198,6 +230,7 @@ impl RhMuxStreamRead {
 /// mux 流写半:零拷贝整块写入(块直接作帧体,不经池拷贝)+ FIN 半关闭。
 pub struct RhMuxStreamWrite {
     inner: yamux::StreamWriteHalf,
+    _lease: Option<CarrierLease>,
 }
 
 impl RhMuxStreamWrite {
@@ -2224,6 +2257,10 @@ impl YamuxMultiplexer {
     }
 
     pub async fn open_stream(&self) -> io::Result<BoxedIo> {
+        self.open_mux_stream().await.map(|s| Box::new(s) as BoxedIo)
+    }
+
+    pub(crate) async fn open_mux_stream(&self) -> io::Result<RhMuxStream> {
         let (tx, rx) = oneshot::channel();
         self.open_tx
             .send(tx)
@@ -2232,7 +2269,7 @@ impl YamuxMultiplexer {
         let stream = rx
             .await
             .map_err(|_| other("mux driver dropped request"))??;
-        Ok(Box::new(RhMuxStream::new(stream)))
+        Ok(RhMuxStream::new(stream))
     }
 
     pub async fn accept_stream(&self) -> io::Result<BoxedIo> {
@@ -2380,6 +2417,11 @@ struct PoolMember {
     /// shutdown——`reap_member` 在另一个任务里读同一字段,顺序颠倒会被
     /// 视为载体死亡并触发重拨(5s 重拨环)。锁内只做 Option 读写,无 await。
     redial: std::sync::Mutex<Option<PoolRedial>>,
+    /// 当前载体上的总活跃流数(含在途未归还的开流请求)。
+    active_streams: Arc<AtomicUsize>,
+    /// 按作用域(`scope`,如 `proxy_id`)统计的活跃流数,确保单条规则的预热池
+    /// 与活跃流均衡铺满各物理载体,不因其它规则交错建流发生 `3+1`/`4+0` 倾斜。
+    scope_active: std::sync::Mutex<std::collections::HashMap<u64, Arc<AtomicUsize>>>,
 }
 
 impl PoolMember {
@@ -2388,7 +2430,38 @@ impl PoolMember {
             id,
             mux,
             redial: std::sync::Mutex::new(redial),
+            active_streams: Arc::new(AtomicUsize::new(0)),
+            scope_active: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    fn scope_count(&self, scope: u64) -> usize {
+        let map = self.scope_active.lock().unwrap();
+        map.get(&scope)
+            .map(|c| c.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    fn acquire_lease(&self, scope: Option<u64>) -> CarrierLease {
+        self.active_streams.fetch_add(1, Ordering::AcqRel);
+        let scope_counter = scope.map(|sc| {
+            let mut map = self.scope_active.lock().unwrap();
+            if map.len() > 256 {
+                map.retain(|k, v| {
+                    *k == sc || v.load(Ordering::Relaxed) > 0 || Arc::strong_count(v) > 1
+                });
+            }
+            let counter = map
+                .entry(sc)
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                .clone();
+            counter.fetch_add(1, Ordering::AcqRel);
+            counter
+        });
+        Arc::new(CarrierLeaseInner {
+            global: self.active_streams.clone(),
+            scope: scope_counter,
+        })
     }
 
     /// 取重拨配方的克隆(shutdown 后仍可能被已在途的 redial_loop 观察)。
@@ -2408,6 +2481,8 @@ struct PoolInner {
     members: tokio::sync::RwLock<Vec<Arc<PoolMember>>>,
     /// 全局流分派轮转计数(open_stream 热路径原子自增,无锁)。
     rr: AtomicUsize,
+    /// 按作用域隔离的轮转基 cursor(等价负载下的决胜序),避免不同规则交替建流打乱轮转锁定。
+    scope_rr: std::sync::Mutex<std::collections::HashMap<u64, usize>>,
     /// 池死:成员表空且无在途重拨。
     dead: AtomicBool,
     /// 成员表变更通知(剔除/追加后唤醒等待中的 open_stream/accept)。
@@ -2456,6 +2531,17 @@ impl PoolInner {
         if ms.is_empty() && self.redialing.load(Ordering::Acquire) == 0 {
             self.dead.store(true, Ordering::Release);
         }
+    }
+
+    fn next_scope_rr(&self, scope: u64) -> usize {
+        let mut map = self.scope_rr.lock().unwrap();
+        if map.len() > 1024 && !map.contains_key(&scope) {
+            map.clear();
+        }
+        let entry = map.entry(scope).or_insert(0);
+        let seq = *entry;
+        *entry = seq.wrapping_add(1);
+        seq
     }
 
     /// 关停竞态兜底(round-9.1 复核):**写锁路径释放锁后**复查 shutdown
@@ -2554,6 +2640,7 @@ impl YamuxMultiplexerPool {
         let inner = Arc::new(PoolInner {
             members: tokio::sync::RwLock::new(members),
             rr: AtomicUsize::new(0),
+            scope_rr: std::sync::Mutex::new(std::collections::HashMap::new()),
             dead: AtomicBool::new(false),
             changed: tokio::sync::Notify::new(),
             shutdown: AtomicBool::new(false),
@@ -2590,6 +2677,7 @@ impl YamuxMultiplexerPool {
         let inner = Arc::new(PoolInner {
             members: tokio::sync::RwLock::new(members.clone()),
             rr: AtomicUsize::new(0),
+            scope_rr: std::sync::Mutex::new(std::collections::HashMap::new()),
             dead: AtomicBool::new(false),
             changed: tokio::sync::Notify::new(),
             shutdown: AtomicBool::new(false),
@@ -2758,18 +2846,25 @@ impl YamuxMultiplexerPool {
     /// (默认 usize::MAX = 全表,零漂移)。成员被剔除后表会压缩,后续成员
     /// 因此前移进入前缀——这是"前缀"而非"载体身份"的既有语义。
     pub async fn open_stream(&self) -> io::Result<BoxedIo> {
-        self.open_stream_inner().await.map(|(s, _id)| s)
+        self.open_stream_inner(None).await.map(|(s, _id)| s)
+    }
+
+    /// 客户端:按业务作用域(`scope`,如 `proxy_id`)打开均衡流——优先选当前
+    /// 该作用域活跃流最少(且全局/同域等价时按独立 cursor 轮转)的载体,
+    /// 彻底避免多规则交错 warmup 导致的单规则 `3+1` / `4+0` 载体倾斜。
+    pub async fn open_stream_for(&self, scope: u64) -> io::Result<BoxedIo> {
+        self.open_stream_inner(Some(scope)).await.map(|(s, _id)| s)
     }
 
     /// 打开一个流并返回其落点成员身份(round-10.1):报到循环据此精确摘除
     /// 失败的载体,不依赖易漂移的下标。语义与 open_stream 完全一致(同轮转/
     /// 同死亡重试),仅在成功返回时附带成员 id(非池/无成员时不可能出现)。
     pub async fn open_stream_tagged(&self) -> io::Result<(BoxedIo, u64)> {
-        self.open_stream_inner().await
+        self.open_stream_inner(None).await
     }
 
     /// open_stream 的实现本体:成功返回时附带落点成员 id。
-    async fn open_stream_inner(&self) -> io::Result<(BoxedIo, u64)> {
+    async fn open_stream_inner(&self, scope: Option<u64>) -> io::Result<(BoxedIo, u64)> {
         loop {
             let (alive, prefix_pending) = {
                 let ms = self.inner.members.read().await;
@@ -2843,20 +2938,43 @@ impl YamuxMultiplexerPool {
                     continue;
                 }
                 n => {
-                    let seq = self.inner.rr.fetch_add(1, Ordering::Relaxed);
-                    let m = alive[seq % n].clone();
+                    let start = match scope {
+                        Some(sc) => self.inner.next_scope_rr(sc),
+                        None => self.inner.rr.fetch_add(1, Ordering::Relaxed),
+                    } % n;
+                    let mut best_idx = start;
+                    let mut best_load = usize::MAX;
+                    for i in 0..n {
+                        let idx = (start + i) % n;
+                        let candidate = &alive[idx];
+                        let load = match scope {
+                            Some(sc) => candidate.scope_count(sc),
+                            None => candidate.active_streams.load(Ordering::Acquire),
+                        };
+                        if load < best_load {
+                            best_load = load;
+                            best_idx = idx;
+                            if load == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    let m = alive[best_idx].clone();
                     // 先取身份再移动成员:成功即死的分支会在返回前消费 m。
                     let member_id = m.id;
-                    match m.mux.open_stream().await {
-                        Ok(s) => {
+                    let lease = m.acquire_lease(scope);
+                    match m.mux.open_mux_stream().await {
+                        Ok(mut s) => {
+                            s.attach_lease(lease);
                             if m.mux.is_dead() {
                                 // 成功即死(连接在开流瞬间终结):顺手收敛,
                                 // 流本身随错误语义由上层处理
                                 self.reap(m).await;
                             }
-                            return Ok((s, member_id));
+                            return Ok((Box::new(s) as BoxedIo, member_id));
                         }
                         Err(e) => {
+                            drop(lease);
                             if m.mux.is_dead() {
                                 self.reap(m).await;
                                 continue; // 换下一个活跃载体
@@ -2868,6 +2986,20 @@ impl YamuxMultiplexerPool {
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    async fn member_active_counts(&self, scope: Option<u64>) -> Vec<(u64, usize)> {
+        let ms = self.inner.members.read().await;
+        ms.iter()
+            .map(|m| {
+                let c = match scope {
+                    Some(sc) => m.scope_count(sc),
+                    None => m.active_streams.load(Ordering::Acquire),
+                };
+                (m.id, c)
+            })
+            .collect()
     }
 
     /// 收缩轮转分派前缀(round-10 自动定容):仅前 n 个成员参与 open_stream
@@ -6758,5 +6890,129 @@ mod prefix_pending_wakeup_tests {
             !branch.contains("self.inner.changed.notified().await;"),
             "A9:不得直接 awaited(会丢唤醒);当前实现:\n{branch}"
         );
+    }
+}
+
+#[cfg(test)]
+mod carrier_balance_tests {
+    use super::*;
+
+    fn mk_pool_k(k: usize) -> (YamuxMultiplexerPool, Vec<YamuxMultiplexer>) {
+        let mut clients = Vec::with_capacity(k);
+        let mut servers = Vec::with_capacity(k);
+        for _ in 0..k {
+            let (a, b) = tokio::io::duplex(256 * 1024);
+            clients.push(YamuxMultiplexer::new(
+                Box::new(a),
+                yamux::Mode::Client,
+                64,
+                DEFAULT_SHARD_WORKERS,
+            ));
+            let s =
+                YamuxMultiplexer::new(Box::new(b), yamux::Mode::Server, 64, DEFAULT_SHARD_WORKERS);
+            servers.push(s);
+        }
+        (YamuxMultiplexerPool::new_client(clients, None), servers)
+    }
+
+    #[tokio::test]
+    async fn open_stream_for_keeps_halves_stealable_and_releases_once_both_halves_drop() {
+        let (pool, mut servers) = mk_pool_k(2);
+        let acc = tokio::spawn(async move {
+            let mut kept = Vec::new();
+            for s in &mut servers {
+                if let Ok(st) =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), s.accept_stream())
+                        .await
+                {
+                    kept.push(st);
+                }
+            }
+            kept
+        });
+
+        let mut st = pool.open_stream_for(101).await.unwrap();
+        assert!(is_mux_stream(&st), "池流仍必须是 RhMuxStream");
+        assert_eq!(
+            pool.member_active_counts(Some(101)).await,
+            vec![(1, 1), (2, 0)]
+        );
+        assert_eq!(pool.member_active_counts(None).await, vec![(1, 1), (2, 0)]);
+
+        let (r, w) = steal_mux_halves(&mut st).expect("steal_mux_halves 必须命中");
+        drop(st);
+        // 壳与读半释放前,写半仍存活 → 活跃计数必须保持 1
+        assert_eq!(
+            pool.member_active_counts(Some(101)).await,
+            vec![(1, 1), (2, 0)]
+        );
+        drop(r);
+        assert_eq!(
+            pool.member_active_counts(Some(101)).await,
+            vec![(1, 1), (2, 0)]
+        );
+        // 写半也释放 → 精确归 0
+        drop(w);
+        assert_eq!(
+            pool.member_active_counts(Some(101)).await,
+            vec![(1, 0), (2, 0)]
+        );
+        assert_eq!(pool.member_active_counts(None).await, vec![(1, 0), (2, 0)]);
+        drop(acc);
+    }
+
+    #[tokio::test]
+    async fn interleaved_scopes_and_single_pop_refill_stay_balanced_on_two_carriers() {
+        let (pool, servers) = mk_pool_k(2);
+        // 后台接流保持服务端不因队列满阻塞
+        let accept_tasks: Vec<_> = servers
+            .into_iter()
+            .map(|srv| {
+                tokio::spawn(async move {
+                    let mut hold = Vec::new();
+                    while let Ok(st) = srv.accept_stream().await {
+                        hold.push(st);
+                    }
+                    hold
+                })
+            })
+            .collect();
+
+        // 模拟多代理(scope=1 与 scope=2)交错建池 4 条,每代理在两载体上都必须精确 2+2
+        let mut s1 = Vec::new();
+        let mut s2 = Vec::new();
+        for _ in 0..2 {
+            s1.push(pool.open_stream_for(1).await.unwrap());
+            s2.push(pool.open_stream_for(2).await.unwrap());
+            s2.push(pool.open_stream_for(2).await.unwrap());
+            s1.push(pool.open_stream_for(1).await.unwrap());
+        }
+        assert_eq!(
+            pool.member_active_counts(Some(1)).await,
+            vec![(1, 2), (2, 2)],
+            "scope=1 即使交错 warmup 也必须精确 2+2"
+        );
+        assert_eq!(
+            pool.member_active_counts(Some(2)).await,
+            vec![(1, 2), (2, 2)],
+            "scope=2 即使交错 warmup 也必须精确 2+2"
+        );
+
+        // 模拟 1 流弹出一条后立即补池(无论释放发生在补池前还是补池后,最终仍回 2+2)
+        let popped = s1.remove(0);
+        drop(popped);
+        let refill = pool.open_stream_for(1).await.unwrap();
+        s1.push(refill);
+        assert_eq!(
+            pool.member_active_counts(Some(1)).await,
+            vec![(1, 2), (2, 2)],
+            "1 流释放+补池后必须自愈回 2+2"
+        );
+
+        drop(s1);
+        drop(s2);
+        for t in accept_tasks {
+            t.abort();
+        }
     }
 }

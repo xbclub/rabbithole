@@ -25,7 +25,7 @@ pub async fn bind_tcp_listener(
     bind_ip: std::net::IpAddr,
 ) -> std::io::Result<TcpListener> {
     let addr = SocketAddr::new(bind_ip, spec.bind_port);
-    TcpListener::bind(addr).await
+    rh_transport::bind_tcp_listener_addr(addr, rh_transport::DEFAULT_TCP_LISTEN_BACKLOG)
 }
 
 pub async fn bind_udp_socket(

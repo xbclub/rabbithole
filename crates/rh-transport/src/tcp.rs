@@ -17,6 +17,46 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsConnector;
 
+/// 默认 TCP 监听全连接队列长度(P0:突破 std/mio 128 硬编码)。
+///
+/// 4096 并发突发建连时,`TcpListener::bind` 内核 backlog=128 会导致队列溢出
+/// 并触发 Linux 1 秒 SYN 重传;提高到 4096(由内核 `somaxconn` 静默钳制)
+/// 可消弭 SYN 重传毛刺。
+pub const DEFAULT_TCP_LISTEN_BACKLOG: u32 = 4096;
+
+/// 以指定内核监听队列长度(`backlog`)绑定具体 IP/端口的 TCP 监听器(跨平台,无 Unix 专属调用)。
+pub fn bind_tcp_listener_addr(addr: SocketAddr, backlog: u32) -> io::Result<TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    #[cfg(not(windows))]
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(backlog)
+}
+
+/// 解析 `host:port` 并以指定 `backlog` 绑定 TCP 监听器。
+pub async fn bind_tcp_listener_host(
+    host: &str,
+    port: u16,
+    backlog: u32,
+) -> io::Result<TcpListener> {
+    let mut last_err = None;
+    for addr in tokio::net::lookup_host((host, port)).await? {
+        match bind_tcp_listener_addr(addr, backlog) {
+            Ok(listener) => return Ok(listener),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "could not resolve to any addresses",
+        )
+    }))
+}
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 在途握手上限(与 ready 队列容量同量级)。
@@ -347,7 +387,7 @@ async fn listen_stream_impl(
     mux_streams: Arc<AtomicUsize>,
     handshake_cap: usize,
 ) -> io::Result<TcpListenerShim> {
-    let listener = TcpListener::bind(cfg.bind_addr).await?;
+    let listener = bind_tcp_listener_addr(cfg.bind_addr, DEFAULT_TCP_LISTEN_BACKLOG)?;
     let local = listener.local_addr()?;
     let tls = if matches!(cfg.protocol, crate::Protocol::Tls | crate::Protocol::Wss) {
         // 必须用 `server_config_with_alpn(cfg.alpn)`:早先误用了
@@ -1298,5 +1338,67 @@ mod verify_write_dup_tests {
         let (_io, write_dup, yamux) = verify(server, None, false, true).await.unwrap();
         assert!(!yamux, "RHTP 魔数必须判为裸流(非 yamux)");
         assert!(write_dup.is_none(), "RHTP 裸流不消费写侧副本,不得白开 fd");
+    }
+}
+
+#[cfg(test)]
+mod listen_backlog_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bind_tcp_listener_helpers_accept_connections() {
+        let l1 = bind_tcp_listener_addr("127.0.0.1:0".parse().unwrap(), DEFAULT_TCP_LISTEN_BACKLOG)
+            .unwrap();
+        let addr1 = l1.local_addr().unwrap();
+        let accept1 = tokio::spawn(async move { l1.accept().await });
+        let _cli1 = tokio::net::TcpStream::connect(addr1).await.unwrap();
+        assert!(accept1.await.unwrap().is_ok());
+
+        let l2 = bind_tcp_listener_host("127.0.0.1", 0, DEFAULT_TCP_LISTEN_BACKLOG)
+            .await
+            .unwrap();
+        let addr2 = l2.local_addr().unwrap();
+        let accept2 = tokio::spawn(async move { l2.accept().await });
+        let _cli2 = tokio::net::TcpStream::connect(addr2).await.unwrap();
+        assert!(accept2.await.unwrap().is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bind_tcp_listener_applies_high_backlog_capped_by_somaxconn() {
+        let Ok(raw) = std::fs::read_to_string("/proc/sys/net/core/somaxconn") else {
+            eprintln!("无法读取 /proc/sys/net/core/somaxconn,跳过测试");
+            return;
+        };
+        let Ok(somaxconn) = raw.trim().parse::<u32>() else {
+            eprintln!("somaxconn 格式非数字: {raw:?},跳过测试");
+            return;
+        };
+        let l = bind_tcp_listener_addr("127.0.0.1:0".parse().unwrap(), DEFAULT_TCP_LISTEN_BACKLOG)
+            .unwrap();
+        let port = l.local_addr().unwrap().port();
+        let Ok(out) = std::process::Command::new("ss")
+            .args(["-ltnH", &format!("sport = :{port}")])
+            .output()
+        else {
+            eprintln!("ss 命令不可用,跳过测试");
+            return;
+        };
+        let line = String::from_utf8_lossy(&out.stdout);
+        let Some(send_q) = line
+            .lines()
+            .next()
+            .and_then(|row| row.split_whitespace().nth(2))
+            .and_then(|q| q.parse::<u32>().ok())
+        else {
+            eprintln!("未解析出 Send-Q: {line:?},跳过测试");
+            return;
+        };
+        let expected_min = DEFAULT_TCP_LISTEN_BACKLOG.min(somaxconn);
+        assert!(
+            send_q >= expected_min,
+            "监听队列应抬高至 min({DEFAULT_TCP_LISTEN_BACKLOG}, somaxconn={somaxconn})={expected_min},实得 Send-Q={send_q}"
+        );
+        drop(l);
     }
 }

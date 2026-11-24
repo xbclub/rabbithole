@@ -22,6 +22,7 @@ pub mod quic;
 #[cfg(target_os = "linux")]
 pub mod splice;
 pub mod tcp;
+pub use tcp::{bind_tcp_listener_addr, bind_tcp_listener_host, DEFAULT_TCP_LISTEN_BACKLOG};
 pub mod tls;
 pub mod udp_batch;
 pub mod ws;
@@ -1224,6 +1225,15 @@ impl Multiplexer {
             MultiplexerInner::Yamux(m) => m.open_stream().await,
             MultiplexerInner::YamuxPool(p) => p.open_stream().await,
             MultiplexerInner::Quic(q) => q.open_stream().await,
+        }
+    }
+
+    /// 客户端:按业务作用域(`scope`,如 `proxy_id`)从多载体池打开均衡的新流。
+    /// 非池变体直接回落 [`Self::open_stream`]。
+    pub async fn open_stream_for(&self, scope: u64) -> std::io::Result<BoxedIo> {
+        match &self.inner {
+            MultiplexerInner::YamuxPool(p) => p.open_stream_for(scope).await,
+            _ => self.open_stream().await,
         }
     }
 

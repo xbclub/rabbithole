@@ -2048,7 +2048,11 @@ async fn start_health(sess: &Arc<ClientSession>, id: u64, spec: &std::sync::Arc<
 // ---------------- 数据通道 ----------------
 
 async fn open_data_channel(sess: Arc<ClientSession>, m: CreateDataChannel) -> anyhow::Result<()> {
-    let mut stream = sess.mux.open_stream().await?;
+    let scope = match &m.entity {
+        ChannelEntity::Proxy { proxy_id } => *proxy_id,
+        ChannelEntity::Visitor { visitor_id, .. } => *visitor_id ^ (1u64 << 63),
+    };
+    let mut stream = sess.mux.open_stream_for(scope).await?;
     let mut buf = bytes::BytesMut::with_capacity(512);
     let hello = DataChannelHello {
         session_id: sess.session_id.clone(),

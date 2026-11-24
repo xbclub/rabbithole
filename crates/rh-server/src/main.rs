@@ -391,20 +391,32 @@ async fn main() -> anyhow::Result<()> {
     }
     // vhost 监听
     if cfg.vhost.http_port > 0 {
-        let l =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.vhost.http_port)).await?;
+        let l = rh_transport::bind_tcp_listener_host(
+            cfg.bind_addr.as_str(),
+            cfg.vhost.http_port,
+            rh_transport::DEFAULT_TCP_LISTEN_BACKLOG,
+        )
+        .await?;
         info!(port = cfg.vhost.http_port, "vhost http up");
         tokio::spawn(vhost::http_vhost_serve(state.clone(), l));
     }
     if cfg.vhost.https_port > 0 {
-        let l =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.vhost.https_port)).await?;
+        let l = rh_transport::bind_tcp_listener_host(
+            cfg.bind_addr.as_str(),
+            cfg.vhost.https_port,
+            rh_transport::DEFAULT_TCP_LISTEN_BACKLOG,
+        )
+        .await?;
         info!(port = cfg.vhost.https_port, "vhost https up");
         tokio::spawn(vhost::https_vhost_serve(state.clone(), l));
     }
     if cfg.vhost.tcpmux_port > 0 {
-        let l =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.vhost.tcpmux_port)).await?;
+        let l = rh_transport::bind_tcp_listener_host(
+            cfg.bind_addr.as_str(),
+            cfg.vhost.tcpmux_port,
+            rh_transport::DEFAULT_TCP_LISTEN_BACKLOG,
+        )
+        .await?;
         info!(port = cfg.vhost.tcpmux_port, "vhost tcpmux up");
         let pt = cfg.vhost.tcpmux_passthrough;
         tokio::spawn(vhost::tcpmux_serve(state.clone(), l, pt));

@@ -92,7 +92,12 @@ impl SshGateway {
             cfg.bind_addr.clone()
         };
         let addr = format!("{bind_ip}:{}", cfg.bind_port);
-        let l = tokio::net::TcpListener::bind(&addr).await?;
+        let l = rh_transport::bind_tcp_listener_host(
+            &bind_ip,
+            cfg.bind_port,
+            rh_transport::DEFAULT_TCP_LISTEN_BACKLOG,
+        )
+        .await?;
         tracing::info!(%addr, "ssh gateway up");
         loop {
             let (sock, _peer) = tokio::select! {
@@ -404,7 +409,10 @@ impl Handler for SshSession {
             }
             requested
         };
-        let l = match tokio::net::TcpListener::bind((bind_ip, bind_port)).await {
+        let l = match rh_transport::bind_tcp_listener_addr(
+            std::net::SocketAddr::new(bind_ip, bind_port),
+            rh_transport::DEFAULT_TCP_LISTEN_BACKLOG,
+        ) {
             Ok(l) => l,
             Err(_) => return Ok(false),
         };
