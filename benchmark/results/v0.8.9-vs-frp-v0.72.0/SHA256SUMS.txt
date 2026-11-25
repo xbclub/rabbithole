@@ -1,15 +1,30 @@
-# SHA-256 checksums of official Release artifacts & Go loadgen tested on 2026-11-25
-# Verified identically on test1 (172.16.1.6), test2 (172.16.1.17), and test3 (172.16.1.18).
+# SHA-256 checksums of official Release artifacts, the Go loadgen and the key evidence files
+# tested on 2026-11-25 02:10-02:49 UTC (rabbithole round 02:10, frp round 02:32)
 
 # rabbithole v0.8.9 (official GitHub Release, x86_64-unknown-linux-musl)
+# verified identically on test1 (172.16.1.6), test2 (172.16.1.17) and test3 (172.16.1.18)
 e00c55e91781bdcf9fdc0dd3b3e7f3e44d56a6bdde12e1aebe30e6df6a1878f2  rabbithole-v0.8.9-x86_64-unknown-linux-musl.tar.gz
 5dcabd70466f256e3c78b9782383d82ee7dfb4a3e7ce645ed50db05aa11837f0  rh-server  # rh-server 0.8.9
 d0448d75fccbe0a4721c1b3be875df66bd58e1c9d7ef9f1ade357fbeb6faa29e  rh-client  # rh-client 0.8.9
 
 # frp v0.72.0 (official GitHub Release, linux_amd64, published 2026-11-04)
+# verified on test1 and test2 (test3 only drives and holds no frp binary)
 daf719b32ca2778770bb92955e231a07414d754378b9af328aa2642862479804  frp_0.72.0_linux_amd64.tar.gz
 4ad311e0630cf12945041143b926f515458836e896ff93c253d43c98cf304b89  frps       # 0.72.0
 522352244a4872beaa0ad6fa136c8cc8d2e993e72bcf49f9c8a1d9683770d80e  frpc       # 0.72.0
 
-# Go loadgen + target runner (benchmark/loadgen, repo commit 0e75adf)
-2d594b2f7aed74b42c20a00eceadcb5270993336679668d9d68ad6e9f906c8cf  /tmp/rh-bin/loadgen
+# Go loadgen + target runner: benchmark/loadgen built from the clean tree of commit e5a33fa
+# (go1.27.3, embedded vcs.revision=e5a33fa..., vcs.modified=false); identical on all three machines
+65ff3dfb3cbe4d31cc43619035fd235b8230a4e419b133a7f97b9573c8629e49  /tmp/rh-bin/loadgen
+
+# key evidence files in this directory (paths relative to SHA256SUMS.txt)
+2f323b608344e61a19ce48159eceb9e92fb05a955e46353654ab3307a1bbe7db  rh-v0.8.9/results-go-v089-r2-20261125-021009.jsonl
+82b6edfc7bd459bd77a834585ef40cd5746cf77cf9f5d7ebcfb219f7777661dc  rh-v0.8.9/endpoints/server/cpu.jsonl.gz
+4dce7d7c8281e9abc8967d2810bc1b238e537cc63e8f35871a0d084f5210f6df  rh-v0.8.9/endpoints/client/cpu.jsonl.gz
+9089e2ae8a2596f243e367a78022534551a0b89b1c1a1a793b4494a7471116cc  rh-v0.8.9/endpoints/server/endpoint.json
+4aebc6ba4222ce3c2349326d7326376fff1f8ee7fe13138d2f674f478f967305  rh-v0.8.9/endpoints/client/endpoint.json
+9e5f552ea715d337da51642cac3dd90f1887ac95d4c8a3403df61f3def26c52f  frp-v0.72.0/results-frp-go-v072-r2.jsonl
+9bada8e64c3088353b39a842a5da7866f987e063af005e820a4930b5fc1c7ba3  frp-v0.72.0/frps.toml
+7c655b7414e6b017fda00aef5b42b9072396f0c32ff5e1e74ffd58824403c9ea  frp-v0.72.0/frpc.toml
+04895fff616a3ad2e7de99fdbac262a02e45fe3269af880f9a9eff3010b688f8  rh-v0.8.9/diag-conc4096/summary.json
+e615d4391a82ab218199b77c5659e34d0c99a4b13bb36e134841270cb486346b  rh-v0.8.9/diag-conc4096/tunnel-30x/rh-client.warn.log

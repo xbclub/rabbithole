@@ -1,11 +1,11 @@
 {
   "role": "client",
-  "run_id": "go-v089",
-  "recorded_at": "2026-11-25T00:22:14.714403+00:00",
+  "run_id": "go-v089-r2",
+  "recorded_at": "2026-11-25T02:09:16.641632+00:00",
   "host": "ubuntu",
   "os": "Linux-5.15.0-203-generic-x86_64-with-glibc2.35",
   "config": {
-    "source": "/tmp/peer-v089-clean/client.toml",
+    "source": "/tmp/peer-v089-r2/client.toml",
     "proto": "tcp",
     "multiplex": "true",
     "relay_mode": "splice"
@@ -15,7 +15,7 @@
     "RH_QUIC_CC": "unset"
   },
   "identity": {
-    "pid": 879182,
+    "pid": 879649,
     "exe_sha256": "d0448d75fccbe0a4721c1b3be875df66bd58e1c9d7ef9f1ade357fbeb6faa29e",
     "version": "rh-client 0.8.9",
     "source": "proc_exe"
@@ -26,7 +26,7 @@
     "soft": "65535",
     "hard": "65535",
     "ok": true,
-    "recorded_at": "2026-11-25T00:22:10+00:00"
+    "recorded_at": "2026-11-25T02:09:12+00:00"
   },
   "iperf3": "iperf 3.9 (cJSON 1.7.13)"
 }

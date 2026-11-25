@@ -249,14 +249,17 @@ loadgen src ──10GbE──► 转发口 20001..  ──隧道──► loadge
 
 - Python `loadgen.py` / `target.py` 及 `sink` `SetReadBuffer(4MiB)` 导致的 cwnd 塌陷伪影**均已移除与修复**（`2babafb` / `0e75adf`）。当前 `benchmark/peer.sh` 与 `benchmark/peer-frp.sh` 默认使用纯 Go `/tmp/rh-bin/loadgen`（`THP_TOOL=loadgen`），支持真双向 `-R` `download`、`loadgen sink` 与 Go `loadgen target`。
 - 三角色仍必须**显式导出**一致环境变量（`BENCH_BIN=/tmp/rh-bin LOADGEN_BIN=/tmp/rh-bin/loadgen THP_TOOL=loadgen PROTO=tcp RELAY=splice MUX=1 PEER_RUN_ID=... PEER_DIR=... PEER_REPEAT=5 PEER_DURATION=15`），test2 的 `sink` 与 `target` 由脚本自行启停，不要手工起 `iperf3 -s`。
+- **`loadgen` 必须从干净提交构建并核对出处**：`go version -m /tmp/rh-bin/loadgen | grep vcs` 应显示 `vcs.revision` 为本轮提交、`vcs.modified=false`。在 git 检出目录里 `go build` 会把 VCS 戳嵌进二进制，同一份源码在不同提交上的哈希本来就不同，**三机哈希一致只说明跑的是同一份，不能证明它是哪份源码编出来的**（2026-11-25 实测：三机上那份是脏工作区构建的，`vcs.modified=true`）。
 
 ### 硬性红线（不得违反）
 
 1. **已发版版本必须用官方 Release 产物，禁止自编 `cargo build`**：用 `gh release download vX.Y.Z -R xbclub/rabbithole -p "*x86_64-unknown-linux-musl*"` 并校验 `.sha256`；上传/替换 `/tmp/rh-bin/` 前**先 `rm -f` 再写**避免硬链接污染，且核对 `--version` 与 `sha256sum`。只有未发版提交或代码 A/B 对照才在 `test1` 源码构建并标明「非 Release 产物」。
 2. **源码走 git，不传源码 tar**：三机 `/tmp/rh-bench` 用有界 `timeout 20 env GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=8 git fetch -q origin main && git reset -q --hard` 同步；唯一允许本地编译上传的是 Go `benchmark/loadgen` 静态二进制。
-3. **远端操作走 `termark` + Python `Popen`，禁止 `setsid ... &` 与 `pkill -f`**：`termark exec` 裸跑 `&` 会因继承 fd 卡满 60s；超时断连不会杀远端 shell，故 `git fetch` 绝不能与 `rm -rf` 串联在同一命令内。启后台与删目录标准模板、精确 `awk` 杀进程命令见 [`docs/testing-guide.md`](docs/testing-guide.md) §4.2。
+3. **远端操作走 `termark` + Python `Popen`，禁止 `setsid ... &` 与 `pkill -f`**：`termark exec` 裸跑 `&` 会因继承 fd 卡满 60s；超时断连不会杀远端 shell，故 `git fetch` 绝不能与 `rm -rf` 串联在同一命令内。启后台与删目录标准模板、精确 `awk` 杀进程命令见 [`docs/testing-guide.md`](docs/testing-guide.md) §4.2。**清理 CPU 采样器只动本轮 `PEER_DIR` 的 pid 文件，杀之前核对 `/proc/PID/cmdline`**：三机留有二十多个历史目录的陈旧 `cpu.jsonl.pid`，其 PID 可能已被回收给无关进程（两小时内进程号就回绕一轮），不要按 `/tmp/peer*/cpu.jsonl.pid` 批量 kill。
 4. **+3 分钟 Sample 1 门控与基线对齐**：跑 full `peer.sh` 时先设 ~200s 定时检查第 1 组样品；若直连飙高而隧道全档平顶 ~2.2–2.3G，先做短时 A/B 区分 ESXi 限速与代码回退。两轮 `rh` vs `frp` 全 6 档 `direct` 中位数偏差应落在 `±15%` 内，禁止错位硬比或只跑一遍下结论。
-5. **证据回收与归档**：确认 `0` 无效/零值样本、`endpoints/*/identity.jsonl` `/proc/PID/exe` 哈希一致、`cpu.jsonl` 压缩为 `cpu.jsonl.gz` 后，按 [`docs/testing-guide.md`](docs/testing-guide.md) §4.5 归档入 `benchmark/results/` 并更新首页/基准文档，推送后必须追到 CI 全绿。
+5. **证据回收与归档**：确认 `0` 无效/零值样本、`endpoints/*/identity.jsonl` `/proc/PID/exe` 哈希一致、`cpu.jsonl` 压缩为 `cpu.jsonl.gz` 后，按 [`docs/testing-guide.md`](docs/testing-guide.md) §4.5 归档入 `benchmark/results/` 并更新首页/基准文档，推送后必须追到 CI 全绿。同一版本配对复测时用新结果替换同名目录（旧数据留在 git 历史里），并在新 `REPORT.md` 中保留与前一轮的对照表。
+6. **并发结论必须逐轮核对 `verified`，不得沿用「全 verified」的旧结论**：`[ ok ] 本轮全部子项有效` 只说明没有无效样本，校验失败（`verified < N`）不计在内。2026-11-25 实测，`4096` 并发突发下约 `0.009%` 的新建连接在首次 PING/PONG 时被隧道关闭（`rh-client` 日志 `data channel failed error=bad magic`，可复现、根因未定位，见 `benchmark/results/v0.8.9-vs-frp-v0.72.0/REPORT.md` §5）。发现 `verified < N` 就取 `client.log` 对照时间戳并如实写进报告。
+7. **不要对同一目标连续重复 `4096` 并发突发**：压测端每轮留下 4096 个 60 秒 TIME_WAIT，连续第 7 轮即耗尽全部 28,232 个临时端口，出现成片的 `connect_failed`——直连同样复现，是测试装置问题而非被测软件缺陷。复现类诊断要控制节奏（每分钟不超过 6 轮），并在直连上做同节奏对照。
 
 ## Workflow 守则
 

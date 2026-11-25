@@ -3,7 +3,8 @@
 > **时效说明(2026-11-25 更新)**:本文是 2026-10-12 定下的**对比方法学**,
 > 其中的公平性原则(只换被测软件、对等配置、同一直连基线)至今有效,
 > `benchmark/peer-frp.sh` 即按此实现。现役最新官方 Release 纯 Go 同场实测(`rabbithole v0.8.9`
-> vs `frp v0.72.0`)见 [`results/v0.8.9-vs-frp-v0.72.0/REPORT.md`](results/v0.8.9-vs-frp-v0.72.0/REPORT.md) 与 [`benchmark/README.md`](README.md)。
+> vs `frp v0.72.0`)见 [`results/v0.8.9-vs-frp-v0.72.0/REPORT.md`](results/v0.8.9-vs-frp-v0.72.0/REPORT.md) 与 [`benchmark/README.md`](README.md);
+> 最近一次复测于 2026-11-25 02:10–02:49 UTC(同日 00:22 UTC 另有一轮,归档在提交 `d12e4f3`,两轮对照见 REPORT §6)。
 
 ## 1. 目标
 
@@ -49,12 +50,14 @@ loadgen                :20001 tcp 转发口              ├─ loadgen target :
 | # | 场景 | 参数 | 基线 |
 |---|---|---|---|
 | 0 | 就绪门控 | PING 通过隧道才开始,≤30s | — |
-| 1 | 吞吐 | iperf3,上/下行 × 1/4/16 流 × 10s | 直连同目标 |
+| 1 | 吞吐 | `loadgen src`(默认;`THP_TOOL=iperf3` 切回 iperf3),上/下行 × 1/4/16 流 × `PEER_DURATION`s × `PEER_REPEAT` 次配对(定量对比用 `15s × 5`) | 直连同目标,同 spec 紧邻成对 |
 | 2 | 延迟 | 5000 次往返 + 500 次新建连接 | 直连 |
 | 3 | 建连速率 | 3000 次 connect+PING+close,64 并发 | 直连 |
-| 4 | UDP | 1200B × 8s,窗口 32 | 直连 |
+| 4 | UDP | 1200B × 8s,窗口 32;`peer.sh` 跑 `PEER_REPEAT` 次配对,`peer-frp.sh` 跑 1 次 | 直连 |
 | 5 | HTTP vhost | 16 连接 × 8s,Host=bench.test | 直连 |
-| 6 | 并发连接 | 64/256/1024/4096(仅 tcp 轮) | 直连同轮 |
+| 6 | 并发连接 | 64/256/1024/4096(仅 tcp 轮跑，其他协议用 `PEER_CONCURRENT=0` 跳过);`peer.sh` 跑 `PEER_CONC_REPEAT` 轮(定量对比用 3),`peer-frp.sh` 固定 1 轮 | 直连同轮 |
+
+> ⚠ **两脚本不对称的地方**:UDP 配对次数与并发轮数在 `frp` 侧固定为 1。对比表里 `rabbithole` 是多次的中位数、`frp` 是单次采样,并发建连 p99 这类轮间波动很大的指标(同一二进制三轮可差 2 倍)尤其要考虑这一点。
 
 ## 6. 执行流程
 
@@ -66,7 +69,8 @@ loadgen                :20001 tcp 转发口              ├─ loadgen target :
 # 2) test2  $ PROTO=tcp bash peer-frp.sh client <A_IP>
 # 3) test3  $ PROTO=tcp bash peer-frp.sh drive <A_IP> <B_IP> tcp
 # 4) 对每种 PROTO ∈ {tls,ws,wss,quic,kcp} 重复 1-3(PEER_CONCURRENT=0)
-# 5) 汇总: py/compare.py <rabbithole结果目录> <frp结果目录>
+# 5) 汇总:无效样本核验用 py/summarize.py;报告数字从两份 results-*.jsonl 取配对中位数
+#    (py/compare.py 是最早的单样本版本:表头版本号写死、吞吐只取末次样本,不要直接引用其输出)
 ```
 
 无凭据传递(frps/frpc 用固定 bench token),编排比 rabbithole 轮更简单。

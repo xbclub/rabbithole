@@ -167,16 +167,22 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
    cd /tmp/rh-bench && timeout 20 env GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=8 git fetch -q origin main && git reset -q --hard origin/main && git rev-parse --short HEAD
    ```
 
-3. **精确清理进程（严禁 `pkill -f`）**：`pkill -f` 会误杀包含关键字的当前 shell。清理前先停 CPU 采样器，再用精确进程名匹配，然后核对端口已释放：
+3. **精确清理进程（严禁 `pkill -f`）**：`pkill -f` 会误杀包含关键字的当前 shell。**先停被测进程，让 CPU 采样器自行收尾**（它检测到目标进程退出后会写一行 `process_gone`、刷盘并退出；平时每 200 条才落盘，直接 kill 会丢掉末尾尚未写盘的采样），再只处理**本轮** `PEER_DIR` 的采样器 pid 文件，最后核对端口已释放：
 
    ```bash
-   for p in /tmp/peer*/cpu.jsonl.pid; do [ -f "$p" ] && kill "$(cat "$p")" 2>/dev/null || true; done
+   D=/tmp/peer-vX.Y.Z            # 本轮的 PEER_DIR
    ps -eo pid,comm | awk '$2 ~ /^(rh-server|rh-client|frps|frpc|loadgen|iperf3)$/{print $1}' | xargs -r kill 2>/dev/null || true
-   sleep 0.3
+   sleep 1.5
    ps -eo pid,comm | awk '$2 ~ /^(rh-server|rh-client|frps|frpc|loadgen|iperf3)$/{print $1}' | xargs -r kill -9 2>/dev/null || true
+   SP=$(cat "$D/cpu.jsonl.pid" 2>/dev/null)
+   if [ -n "$SP" ] && [ -d "/proc/$SP" ] && tr '\0' ' ' < "/proc/$SP/cmdline" | grep -q 'cpu_sampler.py'; then kill "$SP"; fi
+   tail -1 "$D/cpu.jsonl"        # 期望：{"t_us":..,"ticks":null,"rss_kb":null,"process_gone":true}
+   gzip -kf "$D/cpu.jsonl"
    ss -ltnp | grep -E ':(17100|18080|19101|19102|19103|19104|20001|20002|20003|20004)\b' || echo "TCP free"
    ss -lunp | grep -E ':(17100|17101|17102|19103|20003)\b' || echo "UDP free"
    ```
+
+   > ⚠ **不要**用 `for p in /tmp/peer*/cpu.jsonl.pid; do kill "$(cat "$p")"; done` 批量清理。三机上留有二十多个历史目录的陈旧 pid 文件，其 PID 可能已被回收给无关进程：2026-11-25 实测，00:22 UTC 那轮的 `rh-client` 是 pid 879182，02:09 UTC 这轮是 879649——不到两小时进程号就回绕了一轮，按旧 pid 文件发信号可能打中正在跑的本轮进程或别的服务。
 
 ### 4.3 被测产物与工具准备
 
@@ -213,6 +219,15 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
 
 3. **`loadgen` 与 `frp` 校验**：三台 `/tmp/rh-bin/loadgen` 哈希必须一致（否则用 `cd benchmark/loadgen && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build` 重新 upload）；`test1`/`test2` 上 `/tmp/rh-bench/benchmark/.bin/frp-v0.72.0/{frps,frpc}` 需核对 `sha256sum` 与 `--version`。
 
+   **另需核对 `loadgen` 的出处**（哈希一致只说明三机跑的是同一份，不说明它是哪份源码编出来的）：
+
+   ```bash
+   termark exec <asset-id> 'go version -m /tmp/rh-bin/loadgen | grep vcs'   # 机器上没有 go 时先 download 到本地再看
+   # 期望：vcs.revision=<本轮提交>、vcs.modified=false
+   ```
+
+   在 git 检出目录里 `go build` 会把 VCS 戳嵌进二进制，同一份源码在不同提交上的哈希本来就不同，所以**不能靠比对哈希来代替这一步**。不满足时在本地干净工作区（`git status --porcelain` 无输出）先过 `gofmt` / `go vet` / `go test`，再构建并 `rm -f` 后上传三机。2026-11-25 实测：三机上的 `loadgen` 是在脏工作区构建的（`vcs.revision=a417596`、`vcs.modified=true`）；与干净构建逐字节比对后确认只差 VCS 戳（215 字节，代码段零差异），才判定前一轮数据可用。
+
 ### 4.4 背靠背完整实测流程（rabbithole → frp）
 
 两轮必须在连续相邻时间窗执行（`v0.8.9` 约 `20–21` 分钟，`frp v0.72.0` 约 `17–18` 分钟），三角色环境变量完全一致：
@@ -239,9 +254,17 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
 2. **+3 分钟 Sample 1 早停门控（必查）**：
    - 启动 `drive` 后约 200 秒查 `/tmp/drv.log` 第 1 次配对结果：
      - 正常形态：`16s` 隧道应达 `3.0+ Gbps`、`4s` 上行 `2.8+ Gbps`。
+     - `frp` 轮同样要查，但判据不同：`frp` 的 16 流隧道正常在 `2.6–3.1 Gbps`、单流 `1.6–1.9 Gbps`，只看是否「全档平顶 ~2.2–2.3G」以及直连是否飙高。两脚本的日志行格式不同（`peer.sh` 是 `[direct] 16流 upload 第1次:`，`peer-frp.sh` 是 `  直连 16s upload 第1次:`），过滤时别用错。
      - 若发现 `direct 1s` 高达 `3.7–4.8 Gbps` 而**隧道全部档位（含 `4s`/`16s`）被平顶压死在 `~2.2–2.3 Gbps`**，说明 `test1` 正处于 VMware ESXi 宿主机转发限速/抖动窗。立即在 `test1` 上查 `ss -tin "sport = :17100"` 确认是否 `K=2` 且双载体均衡，并做一轮 90 秒 2 臂（上个 Release vs 当前 Release）快速 A/B 验证；确认属环境波动后，在干净时间窗重跑完整 `peer.sh`。
 3. **收尾与 frp 背靠背轮**：
-   - `drive` 退出且打印 `[ ok ] 本轮全部子项有效` 后，先查记录数与零值/无效样本（`rh` 为 102 条），再停 `test1`/`test2` 的 `cpu_sampler`、`rh-server`/`rh-client`/`loadgen` 并压缩 `gzip -kf $PEER_DIR/cpu.jsonl`。
+   - `drive` 退出且打印 `[ ok ] 本轮全部子项有效` 后，先查记录数与零值/无效样本（`rh` 为 102 条），**再逐条核对并发记录的 `verified` 是否等于 `N`**——该提示只说明没有无效样本，校验失败不计在内：
+
+     ```bash
+     jq -c 'select(.metric=="concurrent" and .path=="tunnel") | {n,sample,established,verified,failed,failures}' results-*.jsonl
+     ```
+
+     若出现 `verified < N` 且 `failures` 里是 `state=ver_r, reason=EOF`，到 `test2` 取 `$PEER_DIR/client.log` 对照时间戳，看同一时刻有没有 `data channel failed error=bad magic`（日志带 ANSI 颜色码，先 `sed 's/\x1b\[[0-9;]*m//g'`）。这是产品侧待查问题，见 §4.6，要如实写进报告。
+   - 按 §4.2 第 3 条停掉 `test1`/`test2` 的 `rh-server`/`rh-client`/`loadgen`（采样器随之自行收尾）并压缩 `cpu.jsonl`。
    - 确认所有端口释放后，立即在相邻窗口用相同参数（`FRP_VERSION=v0.72.0`、`PROTO=tcp`、`PEER_REPEAT=5`、`PEER_DURATION=15`、`PEER_DIR=/tmp/frp-peer-v072`）在 `test1` → `test2` → `test3` 依次启动 `peer-frp.sh server`、`peer-frp.sh client 172.16.1.6`、`peer-frp.sh drive 172.16.1.6 172.16.1.17 frp-go-v072`。完成后查全 70 条记录无 0 值/错误并停进程。
 
 ### 4.5 证据回收、核验与归档规范
@@ -257,9 +280,10 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
    │   ├── schema.json
    │   ├── nofile.json
    │   ├── raw/                             # 每条压测的 .json/.stderr/.exit
-   │   └── endpoints/
-   │       ├── server/{endpoint.json,identity.jsonl,nofile.json,cpu.jsonl.gz}
-   │       └── client/{endpoint.json,identity.jsonl,nofile.json,cpu.jsonl.gz}
+   │   ├── endpoints/
+   │   │   ├── server/{endpoint.json,identity.jsonl,nofile.json,cpu.jsonl.gz}
+   │   │   └── client/{endpoint.json,identity.jsonl,nofile.json,cpu.jsonl.gz}
+   │   └── diag-*/                          # (可选)诊断证据,须在 REPORT 中注明不属于配对基准
    └── frp-v0.72.0/
        ├── results-frp-go-v072.jsonl        # 70 条
        ├── frps.toml
@@ -273,8 +297,25 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
 2. **验收门槛核查清单**：
    - 运行 `python3 benchmark/py/summarize.py benchmark/results/<pair-name>/rh-vX.Y.Z --out /tmp/sum`，确认 `无效样本/失败: 0 条`；若跑了六协议完整 `goal-repair` 集，再跑 `python3 benchmark/py/verify_goal.py --evidence <runs_dir>`。
    - 核对 `endpoints/{server,client}/identity.jsonl` 中 `/proc/PID/exe` SHA-256 与官方 Release 一致，`nofile.ok == true`（`65535`），`proto=tcp` / `relay_mode=splice` / `multiplex=true`。
-   - **双轮直连基线对齐校验**：比较 `rh` 轮与 `frp` 轮全 6 档 `direct` 中位数偏差；偏差均应在 `±15%` 以内，若因宿主机漂移超过 `15%–20%`，需同窗重跑对齐，严禁拿严重错位的两轮硬比。
+   - **双轮直连基线对齐校验**：比较 `rh` 轮与 `frp` 轮全 6 档 `direct` 中位数偏差；偏差均应在 `±15%` 以内，若因宿主机漂移超过 `15%–20%`，需同窗重跑对齐，严禁拿严重错位的两轮硬比。偏差有系统性偏向时（例如 `rh` 轮直连整体偏低），要在 `REPORT.md` 里写明：它会让「保留率」偏向直连较低的一侧，跨实现比较应以隧道绝对值的比值为准。
+   - **并发记录**：逐条核对 `verified == N`（§4.4 第 3 步）。`summarize.py` 的「无效样本 0 条」不覆盖校验失败。
+   - **`cpu.jsonl` 末尾若有一行 `rss_kb: 0`**：那是进程收到停止信号后正在退出时采到的（`VmRSS` 已消失），不是真实读数，统计 RSS 时排除。「终态」取压测结束时刻（最后一条并发记录的 `ended_us`）的采样，而不是停机瞬间。
 3. **同步更新文档与默认值**：撰写 `REPORT.md` 与 `SHA256SUMS.txt` 后，移除已被取代的旧 `benchmark/results/` 目录，并同步更新 `README.md`、`benchmark/README.md`、`benchmark/COMPARE-FRP.md` 及 `benchmark/lib/common.sh` 中的默认 `RH_VERSION`。提交前检查 `git status`（仅提交目标文件）并确认 GitHub Actions CI 全绿。
+
+   **同一版本配对的复测**：目录名不变（如 `v0.8.9-vs-frp-v0.72.0`），用新证据替换旧内容——旧数据留在 git 历史里，可随时取回。新 `REPORT.md` 里保留一张与前一轮的对照表（指标、两轮数值、旧结果所在提交），这是判断噪声范围最直接的依据：2026-11-25 两轮对照显示 `rabbithole` 侧多数指标相差 `±5%` 内，而 `frp` 单流上行相差 17%、并发建连 p99 同一二进制三轮可差 2 倍。
+
+### 4.6 重复并发压测的两个陷阱（2026-11-25 实测）
+
+1. **压测端临时端口耗尽（测试装置问题，不是被测软件缺陷）**。`loadgen concurrent --connections 4096` 每轮由压测端主动关闭 4096 条连接，留下同样数量的 60 秒 TIME_WAIT；压测端 `ip_local_port_range` 为 `32768–60999`（28,232 个端口），`tcp_tw_reuse=2`（只对回环生效）。对**同一目标**连续跑，第 7 轮时 TIME_WAIT 打满 28,232，只剩 `28,232 − 6×4096 = 3,656` 个端口，于是出现成片 `connect_failed`，之后按约 60 秒周期反复。直连目标（不经任何隧道）同样复现，可据此与被测软件区分：
+
+   | 连续轮次 | TIME_WAIT（目标端口） | 建立成功 / 4096 |
+   |---:|---:|---:|
+   | 1–6 | 4096 → 24,576 | 4096 |
+   | 7 | 28,232 | 3,656 |
+   | 8 | 28,232 | 0（隧道轮为 1） |
+
+   正式 `peer.sh` 不受影响：同一目标的 4096 突发间隔约 48 秒、只有 3 轮，峰值 8,192 个端口。做复现类诊断时每分钟不要超过 6 轮，并用 `ss -H -tan state time-wait | wc -l` 盯住压测端。
+2. **数据通道 `bad magic`（产品侧，待排查）**。`4096` 并发突发下约 `0.009%` 的新建连接在首次 PING/PONG 时被隧道关闭：`loadgen` 记录为 `state=ver_r, reason=EOF`，`rh-client` 同一时刻有 `data channel failed error=bad magic`，两者一一对应（33 次突发、121,086 条连接中出现 4 次、共 11 条，每次 1–5 条）；直连对照 107,966 条为 0。证据与代码位置见 `benchmark/results/v0.8.9-vs-frp-v0.72.0/REPORT.md` §5。跑并发档时务必核对 `verified`（§4.4 第 3 步），不要因为「无效样本 0 条」就写成全通过。
 
 ---
 
@@ -303,3 +344,7 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
 | `test1` 隧道全档被锁死 ~2.25 Gbps 而直连很高 | ESXi 宿主机时段性转发限速；`K=2` 均衡仍跑不满时可 A/B 验证 | 跑 +3m Sample 1 门控；A/B 确认无退化后换干净窗口整轮重跑 |
 | `drive` 报 `client_version 为空` 或样本全 0 | `token` 过期（401）、旧 `iperf3 -s` 占住 `:19101` 或 `loadgen sink` 到时退出 | 登录取新 `accessToken`；跑前清干净端口；依赖 `peer.sh` 自管 `sink` |
 | `RH/frp` 无法分辨，直连基线低或错位 >20% | 压测时段宿主机抖动 | 两轮背靠背相邻执行；比较全 6 档 `direct` 对齐度（`<=15%`） |
+| 连续多轮 `4096` 并发后出现成片 `connect_failed` | 压测端 TIME_WAIT 耗尽临时端口（每轮 4096 个 × 60s，第 7 轮打满 28,232） | 控制节奏（每分钟 ≤6 轮），并用直连做同节奏对照；`ss -H -tan state time-wait \| wc -l` 可直接看（§4.6） |
+| 并发 `verified` 比 `N` 少几条，`failures` 里是 `ver_r/EOF` | 数据通道在首包前被关闭，客户端同时刻有 `data channel failed error=bad magic`（产品侧，待排查） | 取 `client.log` 对照时间戳，如实写进报告，不要写成「全 verified」（§4.6） |
+| `cpu.jsonl` 末尾有一行 `rss_kb: 0` | 进程退出瞬间采到的（`VmRSS` 已消失） | 统计 RSS 时排除；终态取压测结束时刻的采样（§4.5） |
+| 按历史目录的 pid 文件清理后，本轮进程或别的服务被误杀 | 陈旧 `cpu.jsonl.pid` 的 PID 已被回收给别的进程 | 只处理本轮 `PEER_DIR` 的 pid 文件，杀之前核对 `/proc/PID/cmdline`（§4.2 第 3 条） |

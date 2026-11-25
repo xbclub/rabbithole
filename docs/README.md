@@ -17,7 +17,7 @@
 
 | 文档 | 内容 |
 |---|---|
-| [testing-guide.md](testing-guide.md) | **测试与性能基准操作手册（Agent Runbook）**：Rust/Go/前端质量门、8 套本机 E2E、`termark` 三机 10GbE 基准全流程、Sample 1 门控与证据归档规范 |
+| [testing-guide.md](testing-guide.md) | **测试与性能基准操作手册（Agent Runbook）**：Rust/Go/前端质量门、8 套本机 E2E、`termark` 三机 10GbE 基准全流程、Sample 1 门控与证据归档规范、重复并发压测的两个陷阱（压测端端口耗尽 / 数据通道 `bad magic`） |
 | [design.md](design.md) | P0 设计主文档:架构、RHCP 协议、数据面状态机、数据库、安全量化。**协议与状态机的唯一口径** |
 | [requirements-matrix.md](requirements-matrix.md) | frp v0.71.0 能力对照矩阵(A–E 五域 58 项 + X 实验项 3 项),逐项状态与证据指针 |
 | [acceptance.md](acceptance.md) | 验收记录。§1–§15 为 10-08~10-10 累积,§16 为现役控制台质量门 |

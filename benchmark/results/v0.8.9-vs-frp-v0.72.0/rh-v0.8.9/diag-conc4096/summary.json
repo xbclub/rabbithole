@@ -1,0 +1,456 @@
+{
+ "tunnel-30x": {
+  "iterations": 30,
+  "attempted": 122880,
+  "established": 108798,
+  "connect_failed": 14082,
+  "verify_failed": 10,
+  "iterations_with_verify_failed": [
+   3,
+   17,
+   26
+  ],
+  "iterations_with_connect_failed": 15,
+  "verify_failed_pct_of_established": 0.009191345429143918,
+  "rows": [
+   {
+    "i": 1,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 2,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 3,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 5,
+    "verify_eof_listed": 5
+   },
+   {
+    "i": 4,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 5,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 6,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 7,
+    "established": 3660,
+    "connect_failed": 436,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 8,
+    "established": 1,
+    "connect_failed": 4095,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 9,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 10,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 11,
+    "established": 4091,
+    "connect_failed": 5,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 12,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 13,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 14,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 15,
+    "established": 3660,
+    "connect_failed": 436,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 16,
+    "established": 1,
+    "connect_failed": 4095,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 17,
+    "established": 4092,
+    "connect_failed": 4,
+    "verify_failed": 2,
+    "verify_eof_listed": 2
+   },
+   {
+    "i": 18,
+    "established": 4095,
+    "connect_failed": 1,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 19,
+    "established": 4095,
+    "connect_failed": 1,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 20,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 21,
+    "established": 3996,
+    "connect_failed": 100,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 22,
+    "established": 4088,
+    "connect_failed": 8,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 23,
+    "established": 3771,
+    "connect_failed": 325,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 24,
+    "established": 1,
+    "connect_failed": 4095,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 25,
+    "established": 4037,
+    "connect_failed": 59,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 26,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 3,
+    "verify_eof_listed": 3
+   },
+   {
+    "i": 27,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 28,
+    "established": 4079,
+    "connect_failed": 17,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 29,
+    "established": 3691,
+    "connect_failed": 405,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 30,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   }
+  ]
+ },
+ "direct-30x": {
+  "iterations": 30,
+  "attempted": 122880,
+  "established": 107966,
+  "connect_failed": 14914,
+  "verify_failed": 0,
+  "iterations_with_verify_failed": [],
+  "iterations_with_connect_failed": 19,
+  "verify_failed_pct_of_established": 0.0,
+  "rows": [
+   {
+    "i": 1,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 2,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 3,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 4,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 5,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 6,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 7,
+    "established": 3656,
+    "connect_failed": 440,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 8,
+    "established": 0,
+    "connect_failed": 4096,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 9,
+    "established": 3332,
+    "connect_failed": 764,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 10,
+    "established": 4075,
+    "connect_failed": 21,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 11,
+    "established": 4095,
+    "connect_failed": 1,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 12,
+    "established": 3965,
+    "connect_failed": 131,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 13,
+    "established": 3707,
+    "connect_failed": 389,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 14,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 15,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 16,
+    "established": 866,
+    "connect_failed": 3230,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 17,
+    "established": 3332,
+    "connect_failed": 764,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 18,
+    "established": 4075,
+    "connect_failed": 21,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 19,
+    "established": 4095,
+    "connect_failed": 1,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 20,
+    "established": 3965,
+    "connect_failed": 131,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 21,
+    "established": 3707,
+    "connect_failed": 389,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 22,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 23,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 24,
+    "established": 866,
+    "connect_failed": 3230,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 25,
+    "established": 3332,
+    "connect_failed": 764,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 26,
+    "established": 4075,
+    "connect_failed": 21,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 27,
+    "established": 4095,
+    "connect_failed": 1,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 28,
+    "established": 3965,
+    "connect_failed": 131,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 29,
+    "established": 3707,
+    "connect_failed": 389,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   },
+   {
+    "i": 30,
+    "established": 4096,
+    "connect_failed": 0,
+    "verify_failed": 0,
+    "verify_eof_listed": 0
+   }
+  ]
+ },
+ "client_warn": {
+  "bad_magic": 10,
+  "connection_closed": 45
+ },
+ "direct_timewait_peak": 28232,
+ "direct_established_when_tw_saturated": 3656
+}
