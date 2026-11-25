@@ -1729,8 +1729,8 @@ mod halves {
                     next_syn_seq: 0,
                     pending_streams: std::collections::BTreeMap::new(),
                     next_deliver_seq: 0,
-                    pending_routes: VecDeque::new(),
-                    pending_by_shard: vec![0; shard_n],
+                    pending_routes: (0..shard_n).map(|_| VecDeque::new()).collect(),
+                    pending_total: 0,
                     teardown: None,
                     flush_signaled: false,
                     finished: false,
@@ -1800,12 +1800,14 @@ mod halves {
         /// 语义(整个 Framer park,TCP 停读)。没有上界就是无界内存增长,
         /// 等于把背压换成 OOM。
         ///
-        /// 顺序契约:同一 sid 恒路由同一分片,故同流帧在侧链内保持相对
-        /// 顺序(FIFO + 该分片内按插入序重试),流内 FIFO 不被破坏。
-        pending_routes: VecDeque<PendingRoute>,
-        /// 各分片在侧链中的滞留条数:重试时优先健康分片,并用于判断
-        /// "某分片是否已积压"(避免对同一分片无限堆积)。
-        pending_by_shard: Vec<usize>,
+        /// 顺序契约:按目标分片拆队列(每分片独立 `VecDeque`),同分片内
+        /// 严格 FIFO。重试时队首遇满即放回队首并换下一分片,绝不越过
+        /// 队首尝试同分片后续帧(修前共享 `VecDeque` 将失败帧挪到队尾,
+        /// Worker 并发排空通道时同流后帧越过前帧,导致 `START_FORWARD`
+        /// 与数据首包倒序、`bad magic`)。
+        pending_routes: Vec<VecDeque<shard::ShardMsg>>,
+        /// 全部反压侧链的总滞留帧数(上界 [`PENDING_ROUTE_CAP`])。
+        pending_total: usize,
         /// 终结排空态(§0.3-2/§0.3-3,复核修复):fatal 已决但尚未返回
         /// ——先冲洗反压侧链、交付 Workers 的全部建流产出(含
         /// fatal 排空新建的),全部落地后才返回终结结果。基线单任务逐帧
@@ -1830,12 +1832,6 @@ mod halves {
     /// 控制帧继续推进",不是无限缓冲。一旦某分片持续阻塞到侧链也满,
     /// 就必须回到真正的 TCP 停读——否则只是在消耗内存。
     const PENDING_ROUTE_CAP: usize = 4 * shard::SHARD_CHANNEL_CAP;
-
-    /// 反压侧链条目:目标分片 + 帧。
-    struct PendingRoute {
-        index: usize,
-        msg: shard::ShardMsg,
-    }
 
     /// on_frame 的路由结果:Done = 已路由/已本地处理;Backpressured =
     /// 分片通道满(生产者 waker 已登记 + 复查),消息暂存由调用方 park。
@@ -2001,10 +1997,10 @@ mod halves {
                 //    消化掉。**推进不了不等于要停读**——只要侧链还有余量,
                 //    就继续解后续帧(健康分片照常推进);只有侧链真正满了,
                 //    才回落到 TCP 停读。
-                if !self.pending_routes.is_empty() && self.drain_pending_routes(cx) {
+                if self.pending_total > 0 && self.drain_pending_routes(cx) {
                     continue; // 侧链已空,回到常规循环
                 }
-                if self.pending_routes.len() >= PENDING_ROUTE_CAP {
+                if self.pending_total >= PENDING_ROUTE_CAP {
                     self.shared.set_recv_waker(cx.waker());
                     if self.shared.error_hot() || self.workers_gone() {
                         continue;
@@ -2125,7 +2121,7 @@ mod halves {
                     // 流级 Ping(sid≠0):路由(§2.3 Ping 行)
                     let index = self.route_index(ping.header().stream_id());
                     let msg = shard::ShardMsg::Frame(Frame::from(ping));
-                    self.route(index, msg, cx)
+                    self.route_or_stash(index, msg, cx)
                 }
                 Tag::Data | Tag::WindowUpdate => {
                     let index = self.route_index(frame.header().stream_id());
@@ -2138,19 +2134,29 @@ mod halves {
                     } else {
                         shard::ShardMsg::Frame(frame)
                     };
-                    // 流内 FIFO:该分片已有帧滞留在侧链时,新帧必须排到
-                    // 它们后面(直接入侧链),不能抢在旧帧前投递。
-                    if self.pending_by_shard[index] > 0 {
-                        // 先判容量再 move(侧链满时 msg 要原样交回)
-                        if self.pending_routes.len() >= PENDING_ROUTE_CAP {
-                            return Ok(Routed::Backpressured { index, msg });
-                        }
-                        self.stash_pending_route(index, msg);
-                        return Ok(Routed::Done);
-                    }
-                    self.route(index, msg, cx)
+                    self.route_or_stash(index, msg, cx)
                 }
             }
+        }
+
+        /// 同分片已有侧链积压时直接入侧链尾保序,否则直投分片通道。
+        fn route_or_stash(
+            &mut self,
+            index: usize,
+            msg: shard::ShardMsg,
+            cx: &mut Context<'_>,
+        ) -> std::result::Result<Routed, ConnectionError> {
+            // 流内 FIFO:该分片已有帧滞留在侧链时,新帧必须排到
+            // 它们后面(直接入侧链),不能抢在旧帧前投递。
+            if !self.pending_routes[index].is_empty() {
+                // 先判容量再 move(侧链满时 msg 要原样交回)
+                if self.pending_total >= PENDING_ROUTE_CAP {
+                    return Ok(Routed::Backpressured { index, msg });
+                }
+                self.stash_pending_route(index, msg);
+                return Ok(Routed::Done);
+            }
+            self.route(index, msg, cx)
         }
 
         /// round-8 优化项 2:直接按缓存句柄数取模,免 `shared.workers`
@@ -2191,44 +2197,42 @@ mod halves {
         /// 把一条路由受阻的帧放进反压侧链(round-34)。返回 false = 侧链
         /// 已满,调用方必须回落到"整个 Framer park"(真正的 TCP 背压)。
         fn stash_pending_route(&mut self, index: usize, msg: shard::ShardMsg) -> bool {
-            if self.pending_routes.len() >= PENDING_ROUTE_CAP {
+            if self.pending_total >= PENDING_ROUTE_CAP {
                 return false;
             }
-            self.pending_by_shard[index] += 1;
-            self.pending_routes.push_back(PendingRoute { index, msg });
+            self.pending_routes[index].push_back(msg);
+            self.pending_total += 1;
             true
         }
 
-        /// 从侧链取出下一条可路由的帧并重试(round-34)。
+        /// 按分片逐队列重试侧链滞留帧(round-34 + 分片内 FIFO 修复)。
         ///
-        /// 轮转游标 `pending_cursor` 保证不饿死:每次从上次成功的位置往后
-        /// 扫,取第一条能进通道的。某分片仍满就跳过它、继续试别的——
-        /// 这正是"单分片阻塞不拖垮全载体"的落点。
+        /// 每个分片从队首连续投递;一旦遇满立即放回队首并 `break` 切换
+        /// 到下一个分片——既隔离满通道分片(不拖垮健康分片),又从结构上
+        /// 保证同分片、同流帧绝对不会在 Worker 并发排空时倒序。
         ///
         /// 返回 `true` = 侧链为空(全部投递完毕)。
         fn drain_pending_routes(&mut self, cx: &mut Context<'_>) -> bool {
-            // 每个条目本轮到多试一次:成功即出链,失败即挪到队尾让后一条
-            // 先试。`budget` 防止在"所有分片都满"时空转。
-            let mut budget = self.pending_routes.len();
-            while budget > 0 {
-                budget -= 1;
-                let Some(entry) = self.pending_routes.pop_front() else {
-                    break;
-                };
-                match self.try_route(entry.index, entry.msg, cx) {
-                    Ok(()) => self.pending_by_shard[entry.index] -= 1,
-                    Err((index, msg)) => {
-                        self.pending_routes.push_back(PendingRoute { index, msg });
+            for index in 0..self.pending_routes.len() {
+                while let Some(msg) = self.pending_routes[index].pop_front() {
+                    match self.try_route(index, msg, cx) {
+                        Ok(()) => self.pending_total -= 1,
+                        Err((_, msg)) => {
+                            // 严守分片内 FIFO:队首未投出立即放回队首并换下一分片,
+                            // 绝不尝试本分片后续帧(防止 Worker 并发排空时后帧越过前帧)。
+                            self.pending_routes[index].push_front(msg);
+                            break;
+                        }
                     }
                 }
             }
-            self.pending_routes.is_empty()
+            self.pending_total == 0
         }
 
         /// 侧链中该分片的滞留条数(诊断/测试用)。
         #[cfg(test)]
         fn pending_for_shard(&self, index: usize) -> usize {
-            self.pending_by_shard.get(index).copied().unwrap_or(0)
+            self.pending_routes.get(index).map_or(0, VecDeque::len)
         }
 
         /// 按到达序号交付下一条新流:从水位起连续推进,遇到空洞即停
@@ -2683,6 +2687,342 @@ mod halves {
             self.shared.send_dropped.store(true, Ordering::SeqCst);
             self.shared.wake_all_workers();
             self.shared.wake_all_send_workers();
+        }
+    }
+
+    #[cfg(test)]
+    mod pending_route_tests {
+        use super::*;
+        use futures::future::FutureExt;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::task::{Wake, Waker};
+
+        struct ThreadWaker(std::thread::Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        struct NoopSocket;
+        impl Writev2 for NoopSocket {
+            fn poll_write2(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                a: &[u8],
+                b: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(a.len() + b.len()))
+            }
+        }
+        impl AsyncRead for NoopSocket {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut [u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+        }
+        impl AsyncWrite for NoopSocket {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn data_msg(sid: u32, payload: &'static [u8]) -> shard::ShardMsg {
+            let f = Frame::data(StreamId::new(sid), bytes::Bytes::from_static(payload)).unwrap();
+            shard::ShardMsg::Frame(f.into())
+        }
+
+        fn syn_msg(seq: u64, sid: u32, payload: &'static [u8]) -> shard::ShardMsg {
+            let mut f =
+                Frame::data(StreamId::new(sid), bytes::Bytes::from_static(payload)).unwrap();
+            f.header_mut().syn();
+            shard::ShardMsg::Syn {
+                seq,
+                frame: f.into(),
+            }
+        }
+
+        /// 回归守卫(4096 并发 bad magic 根因):
+        /// 当分片 0 通道已满、侧链同时滞留同分片同流 `[F1, F2]` 与健康分片 1 `[H1]` 时:
+        /// 1. 一次 `drain_pending_routes` 必须把健康分片 1 排空(`pending_for_shard(1) == 0`);
+        /// 2. 分片 0 的 `F1` 遇到通道满必须留在队首(绝不旋转到 `F2` 之后);
+        /// 3. 分片 0 腾空后再排空并驱动 Worker,流 4 收到的字节严格为 `F1 || F2`。
+        #[test]
+        fn drain_pending_routes_preserves_shard_fifo_and_isolates_healthy_shards() {
+            let mut cfg = Config::default();
+            cfg.set_shard_workers(2);
+            let conn = Connection::new(NoopSocket, cfg, Mode::Client);
+            let (mut recv, _send, mut workers, _send_workers) = conn.into_halves();
+            let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+            let mut cx = Context::from_waker(&waker);
+
+            // N=2: sid 4 -> shard 0; sid 2 -> shard 1.
+            assert_eq!(shard::shard_index(StreamId::new(4), 2), 0);
+            assert_eq!(shard::shard_index(StreamId::new(2), 2), 1);
+
+            // 先建好流 4 并交付给测试。
+            assert!(recv.route_producers[0].try_push(syn_msg(0, 4, b"")).is_ok());
+            for _ in 0..4 {
+                let _ = workers[0].poll_unpin(&mut cx);
+            }
+            let mut stream4 = match recv.poll(&mut cx) {
+                Poll::Ready(Some(Ok(s))) => s,
+                other => panic!("expected stream 4, got {other:?}"),
+            };
+
+            // 塞满分片 0 通道(用同分片未知流 9998 占位,Worker 消费后会安全忽略)。
+            let cap = shard::shard_channel_cap();
+            for _ in 0..cap {
+                if recv.route_producers[0]
+                    .try_push(data_msg(9998, b"fill"))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            assert!(
+                recv.route_producers[0]
+                    .try_push(data_msg(9998, b"overflow"))
+                    .is_err(),
+                "shard 0 channel must be full"
+            );
+
+            // 侧链入队:分片 0 的 [F1, F2] 与分片 1 的 [H1]。
+            assert!(recv.stash_pending_route(0, data_msg(4, b"FIRST-")));
+            assert!(recv.stash_pending_route(0, data_msg(4, b"SECOND")));
+            assert!(recv.stash_pending_route(1, data_msg(2, b"HEALTHY")));
+
+            // 首次重试:分片 1 立即排空,分片 0 队首 F1 必须仍在队首(不得被挪到 F2 后面)。
+            assert!(!recv.drain_pending_routes(&mut cx));
+            assert_eq!(recv.pending_for_shard(1), 0);
+            assert_eq!(recv.pending_for_shard(0), 2);
+            assert_eq!(recv.pending_total, 2);
+            match recv.pending_routes[0].front() {
+                Some(shard::ShardMsg::Frame(f)) => {
+                    assert_eq!(
+                        f.clone().into_data().body(),
+                        b"FIRST-",
+                        "F1 must stay at front of shard 0 queue"
+                    );
+                }
+                _ => panic!("expected Frame(F1) at front of shard 0"),
+            }
+
+            // 模拟 Worker 0 排空满通道。
+            for _ in 0..8 {
+                let _ = workers[0].poll_unpin(&mut cx);
+            }
+
+            // 二次重试:分片 0 按 [F1, F2] 顺序全部投出。
+            assert!(recv.drain_pending_routes(&mut cx));
+            assert_eq!(recv.pending_for_shard(0), 0);
+            assert_eq!(recv.pending_total, 0);
+
+            for _ in 0..4 {
+                let _ = workers[0].poll_unpin(&mut cx);
+            }
+            let mut out = Vec::new();
+            let mut buf = [0u8; 64];
+            loop {
+                match Pin::new(&mut stream4).poll_read(&mut cx, &mut buf) {
+                    Poll::Ready(Ok(0)) | Poll::Pending => break,
+                    Poll::Ready(Ok(n)) => out.extend_from_slice(&buf[..n]),
+                    Poll::Ready(Err(e)) => panic!("unexpected read error: {e}"),
+                }
+            }
+            assert_eq!(&out, b"FIRST-SECOND");
+        }
+
+        struct BurstSocketState {
+            blocks: VecDeque<Vec<u8>>,
+            eof: bool,
+        }
+        struct BurstSocket(Arc<std::sync::Mutex<BurstSocketState>>);
+        impl Writev2 for BurstSocket {
+            fn poll_write2(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                a: &[u8],
+                b: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(a.len() + b.len()))
+            }
+        }
+        impl AsyncRead for BurstSocket {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut [u8],
+            ) -> Poll<io::Result<usize>> {
+                let mut st = self.0.lock().unwrap();
+                while let Some(front) = st.blocks.front_mut() {
+                    if front.is_empty() {
+                        st.blocks.pop_front();
+                        continue;
+                    }
+                    let n = front.len().min(buf.len());
+                    buf[..n].copy_from_slice(&front[..n]);
+                    front.drain(..n);
+                    if front.is_empty() {
+                        st.blocks.pop_front();
+                    }
+                    return Poll::Ready(Ok(n));
+                }
+                if st.eof {
+                    Poll::Ready(Ok(0))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+        impl AsyncWrite for BurstSocket {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn encode_data_frame(sid: u32, syn: bool, fin: bool, seq: u32) -> Vec<u8> {
+            let mut hdr = header::Header::data(StreamId::new(sid), 4);
+            if syn {
+                hdr.syn();
+            }
+            if fin {
+                hdr.fin();
+            }
+            let mut v = header::encode(&hdr).to_vec();
+            v.extend_from_slice(&seq.to_be_bytes());
+            v
+        }
+
+        /// 多线程并发突发测试:RecvHalf 与 ShardWorker 在不同线程并行推进,
+        /// 4 条流(覆盖两分片)各连发 1000 帧(远超 SHARD_CHANNEL_CAP=128 迫使反复进入
+        /// `pending_routes`),验证每条流收到的序号严格单调递增、零倒序零丢帧。
+        #[test]
+        fn drain_pending_routes_concurrent_burst_preserves_stream_order() {
+            const N_STREAMS: u32 = 4;
+            const FRAMES_PER_STREAM: u32 = 1000;
+
+            let mut blocks = VecDeque::new();
+            // 按流交替发送大量小帧,强制多次填满分片通道并触发侧链重排。
+            for seq in 0..FRAMES_PER_STREAM {
+                let mut batch = Vec::new();
+                for k in 0..N_STREAMS {
+                    let sid = (k + 1) * 2;
+                    let syn = seq == 0;
+                    let fin = seq + 1 == FRAMES_PER_STREAM;
+                    batch.extend_from_slice(&encode_data_frame(sid, syn, fin, seq));
+                }
+                blocks.push_back(batch);
+            }
+
+            let sock_state = Arc::new(std::sync::Mutex::new(BurstSocketState {
+                blocks,
+                eof: true,
+            }));
+            let mut cfg = Config::default();
+            cfg.set_shard_workers(2);
+            cfg.set_initial_stream_receive_window(8 * 1024 * 1024);
+            let conn = Connection::new(BurstSocket(sock_state), cfg, Mode::Client);
+            let (mut recv_half, _send_half, workers, _send_workers) = conn.into_halves();
+
+            let worker_handles: Vec<_> = workers
+                .into_iter()
+                .map(|mut w| {
+                    std::thread::spawn(move || {
+                        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+                        let mut cx = Context::from_waker(&waker);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(15);
+                        loop {
+                            assert!(std::time::Instant::now() < deadline, "worker stalled");
+                            match w.poll_unpin(&mut cx) {
+                                Poll::Ready(()) => break,
+                                Poll::Pending => {
+                                    std::thread::park_timeout(std::time::Duration::from_millis(2));
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            let recv_waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+            let mut recv_cx = Context::from_waker(&recv_waker);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut streams = Vec::new();
+            loop {
+                assert!(std::time::Instant::now() < deadline, "recv stalled");
+                match recv_half.poll(&mut recv_cx) {
+                    Poll::Ready(Some(Ok(s))) => streams.push(s),
+                    Poll::Ready(Some(Err(e))) => panic!("unexpected recv error: {e}"),
+                    Poll::Ready(None) => break,
+                    Poll::Pending => {
+                        std::thread::park_timeout(std::time::Duration::from_millis(2));
+                    }
+                }
+            }
+            for h in worker_handles {
+                h.join().expect("worker thread");
+            }
+
+            assert_eq!(streams.len(), N_STREAMS as usize);
+            let mut by_id: HashMap<u32, Vec<u8>> = HashMap::new();
+            for mut s in streams {
+                let id = s.id().val();
+                let mut data = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match Pin::new(&mut s).poll_read(&mut recv_cx, &mut buf) {
+                        Poll::Ready(Ok(0)) => break,
+                        Poll::Ready(Ok(n)) => data.extend_from_slice(&buf[..n]),
+                        Poll::Ready(Err(e)) => panic!("stream {id} read err: {e}"),
+                        Poll::Pending => panic!("stream {id} unexpected pending after EOF"),
+                    }
+                }
+                by_id.insert(id, data);
+            }
+
+            for k in 0..N_STREAMS {
+                let sid = (k + 1) * 2;
+                let data = by_id.get(&sid).expect("stream present");
+                assert_eq!(
+                    data.len(),
+                    (FRAMES_PER_STREAM * 4) as usize,
+                    "stream {sid} length mismatch"
+                );
+                for seq in 0..FRAMES_PER_STREAM {
+                    let off = (seq * 4) as usize;
+                    let got = u32::from_be_bytes(data[off..off + 4].try_into().unwrap());
+                    assert_eq!(got, seq, "stream {sid} frame {seq} out of order: got {got}");
+                }
+            }
         }
     }
 }

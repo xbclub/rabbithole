@@ -518,31 +518,50 @@ impl ShardWorker {
         self.shared.push_to_send(f.into());
     }
 
-    /// 冷路径:ctrl(流删除)排空 + 逐条 §2.5-D Worker 侧逻辑。
+    /// 冷路径:ctrl(流删除)全量排空 + 逐条 §2.5-D Worker 侧逻辑。
+    /// 必须循环拉取至 `ctrl_rx` 与 `ctrl_buf` 均空,避免 `ctrl_buf` 有余量
+    /// 或容量大于单次 `drain_into` 上限时将消息遗留在通道内。
     fn drain_ctrl(&mut self) -> bool {
-        self.ctrl_rx.drain_into(&mut self.ctrl_buf);
-        if self.ctrl_buf.is_empty() {
-            return false;
-        }
-        while let Some(ShardCtrl::Remove(sid)) = self.ctrl_buf.pop_front() {
-            log::trace!("{}: removing dropped stream {}", self.id, sid);
-            let Some(s) = self.streams.remove(&sid) else {
-                // 健康状态下不可达(opening 未命中 ⟺ 已收编于本表);防御忽略
-                log::trace!("{}: shard remove for unknown stream {}", self.id, sid);
-                continue;
-            };
-            if let Some(frame) = finalize_dropped_stream(&self.shared, sid, &s) {
-                self.shared.push_to_send(frame);
+        let mut progressed = false;
+        loop {
+            self.ctrl_rx.drain_into(&mut self.ctrl_buf);
+            if self.ctrl_buf.is_empty() {
+                break;
+            }
+            while let Some(ShardCtrl::Remove(sid)) = self.ctrl_buf.pop_front() {
+                progressed = true;
+                log::trace!("{}: removing dropped stream {}", self.id, sid);
+                let Some(s) = self.streams.remove(&sid) else {
+                    // 健康状态下不可达(opening 未命中 ⟺ 已收编于本表);防御忽略
+                    log::trace!("{}: shard remove for unknown stream {}", self.id, sid);
+                    continue;
+                };
+                if let Some(frame) = finalize_dropped_stream(&self.shared, sid, &s) {
+                    self.shared.push_to_send(frame);
+                }
             }
         }
-        true
+        progressed
     }
 
     /// 热路径:ring 排空(单轮 ≤ 通道容量,天然有界)+ 逐条 §2.3 处理。
     /// 全量版:终结排空/弃置排空专用(必须处理完在途数据,不受预算约束)。
+    /// 循环拉取至 `msg_rx` 与 `msg_buf` 均空:若先前预算让出时 `msg_buf`
+    /// 仍有残留,单次 `drain_into` 的 `room = cap - len` 会把尾部帧留在
+    /// `msg_rx` 内,随后 `framer_flushed` 置位会直接丢帧终结。
     fn drain_msgs(&mut self) -> bool {
-        let mut unbounded = usize::MAX;
-        self.drain_msgs_budgeted(&mut unbounded)
+        let mut progressed = false;
+        loop {
+            self.msg_rx.drain_into(&mut self.msg_buf);
+            if self.msg_buf.is_empty() {
+                break;
+            }
+            while let Some(msg) = self.msg_buf.pop_front() {
+                self.process_msg(msg);
+                progressed = true;
+            }
+        }
+        progressed
     }
 
     /// 预算版:热路径单次 poll 消费 ≤ *budget 条,剩余留在 msg_buf
@@ -911,16 +930,23 @@ impl Future for ShardWorker {
                 // + Framer 路由终结宣告(此后不再有新消息入通道——防
                 // "RecvHalf 冲洗 pending_route 的帧落入已终结 Worker"的
                 // 竞态丢失)。等待期间流状态已 Closed,只延后摘表/计数。
-                if this.pending_new.is_empty() && this.shared.framer_flushed.load(Ordering::Acquire)
-                {
-                    this.drain_local_streams();
-                    this.drain_opening_shard();
-                    this.finished = true;
-                    // 建流通道就此关闭:接收侧排空余量后观察到 None,其
-                    // 终结排空随之收敛——不依赖本 Future 被 drop(测试
-                    // 夹具与生产 spawn 均成立)
-                    this.new_streams.close_channel();
-                    return Poll::Ready(());
+                if this.shared.framer_flushed.load(Ordering::Acquire) {
+                    // 复查竞态窗口:若 RecvHalf 在本轮 drain_msgs 与读到
+                    // framer_flushed==true 之间投递了最后一批帧,必须继续
+                    // 排空后再终结。
+                    if this.msg_rx.has_pending() || this.ctrl_rx.has_pending() {
+                        continue;
+                    }
+                    if this.pending_new.is_empty() {
+                        this.drain_local_streams();
+                        this.drain_opening_shard();
+                        this.finished = true;
+                        // 建流通道就此关闭:接收侧排空余量后观察到 None,其
+                        // 终结排空随之收敛——不依赖本 Future 被 drop(测试
+                        // 夹具与生产 spawn 均成立)
+                        this.new_streams.close_channel();
+                        return Poll::Ready(());
+                    }
                 }
                 // 终结条件未满足:park(丢唤醒防线:登记后复查)。复查项
                 // 必须是"可做的工作":滞留消息可排空、容量恢复可交付、
