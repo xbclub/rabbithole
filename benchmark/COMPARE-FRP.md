@@ -1,9 +1,9 @@
 # rabbithole vs frp 性能对比方案
 
-> **时效说明(2026-11-24 更新)**:本文是 2026-10-12 定下的**对比方法学**,
+> **时效说明(2026-11-25 更新)**:本文是 2026-10-12 定下的**对比方法学**,
 > 其中的公平性原则(只换被测软件、对等配置、同一直连基线)至今有效,
-> `benchmark/peer-frp.sh` 即按此实现。现役最新官方 Release 纯 Go 三方同场实测(`rabbithole v0.8.8`
-> vs `v0.7.1` vs `frp v0.72.0`)见 [`results/v0.8.8-vs-v0.7.1-vs-frp-v0.72.0/REPORT.md`](results/v0.8.8-vs-v0.7.1-vs-frp-v0.72.0/REPORT.md) 与 [`benchmark/README.md`](README.md)。
+> `benchmark/peer-frp.sh` 即按此实现。现役最新官方 Release 纯 Go 同场实测(`rabbithole v0.8.9`
+> vs `frp v0.72.0`)见 [`results/v0.8.9-vs-frp-v0.72.0/REPORT.md`](results/v0.8.9-vs-frp-v0.72.0/REPORT.md) 与 [`benchmark/README.md`](README.md)。
 
 ## 1. 目标
 

@@ -1,0 +1,15 @@
+# SHA-256 checksums of official Release artifacts & Go loadgen tested on 2026-11-25
+# Verified identically on test1 (172.16.1.6), test2 (172.16.1.17), and test3 (172.16.1.18).
+
+# rabbithole v0.8.9 (official GitHub Release, x86_64-unknown-linux-musl)
+e00c55e91781bdcf9fdc0dd3b3e7f3e44d56a6bdde12e1aebe30e6df6a1878f2  rabbithole-v0.8.9-x86_64-unknown-linux-musl.tar.gz
+5dcabd70466f256e3c78b9782383d82ee7dfb4a3e7ce645ed50db05aa11837f0  rh-server  # rh-server 0.8.9
+d0448d75fccbe0a4721c1b3be875df66bd58e1c9d7ef9f1ade357fbeb6faa29e  rh-client  # rh-client 0.8.9
+
+# frp v0.72.0 (official GitHub Release, linux_amd64, published 2026-11-04)
+daf719b32ca2778770bb92955e231a07414d754378b9af328aa2642862479804  frp_0.72.0_linux_amd64.tar.gz
+4ad311e0630cf12945041143b926f515458836e896ff93c253d43c98cf304b89  frps       # 0.72.0
+522352244a4872beaa0ad6fa136c8cc8d2e993e72bcf49f9c8a1d9683770d80e  frpc       # 0.72.0
+
+# Go loadgen + target runner (benchmark/loadgen, repo commit 0e75adf)
+2d594b2f7aed74b42c20a00eceadcb5270993336679668d9d68ad6e9f906c8cf  /tmp/rh-bin/loadgen

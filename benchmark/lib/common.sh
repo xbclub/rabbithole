@@ -17,7 +17,7 @@ BENCH_PY="$BENCH_ROOT/py"
 BENCH_RUN="${BENCH_RUN:-$BENCH_ROOT/runs}"
 
 # 固定的基准版本:默认取最新公开 release,可用 RH_VERSION 覆盖。
-RH_VERSION="${RH_VERSION:-v0.8.8}"
+RH_VERSION="${RH_VERSION:-v0.8.9}"
 RH_REPO="${RH_REPO:-xbclub/rabbithole}"
 RH_ASSET="rabbithole-${RH_VERSION}-x86_64-unknown-linux-musl.tar.gz"
 RH_URL="https://github.com/${RH_REPO}/releases/download/${RH_VERSION}/${RH_ASSET}"
