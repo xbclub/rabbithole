@@ -17,7 +17,7 @@
    ```bash
    git checkout main
    git merge --no-ff <branch> -m "merge: <说明>"
-   cargo test --workspace                              # 必须全绿
+   ulimit -n 10240 && cargo test --workspace              # macOS 需先提 fd 上限;必须全绿
    cargo clippy --workspace --all-targets -- -D warnings
    ```
 
@@ -97,7 +97,7 @@ rhctl 归档命名是 `rhctl-<版本>-<os>-<arch>`(Go 生态惯例,非 Rust 三�
   内**,否则 Windows 编译失败。自查:
 
   ```bash
-  grep -rn "std::os::fd\|std::os::unix" --include=*.rs crates/ vendor/
+  grep -rn "std::os::fd\|std::os::unix" "--include=*.rs" crates/ vendor/
   ```
 
   逐个确认有 `cfg` 门控。注意 `#[cfg(test)]` 里的代码同样会参与编译,
@@ -123,10 +123,12 @@ rhctl 归档命名是 `rhctl-<版本>-<os>-<arch>`(Go 生态惯例,非 Rust 三�
 
 ### 提交前:三道门必须全绿
 
+> 完整测试分层与 E2E / 三机压测手顺见 **[`docs/testing-guide.md`](docs/testing-guide.md)**。
+
 ```bash
 cargo fmt --all -- --check                          # 格式
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+ulimit -n 10240 && cargo test --workspace           # macOS 需先提 nofile 上限
 ```
 
 三者都在 `.github/workflows/ci.yml` 里跑,本地先过一遍能省一个来回。
@@ -187,7 +189,7 @@ gh api --allow-escape-sequences "repos/<owner>/<repo>/actions/jobs/$JOB/logs" \
    里的代码同样参与编译。自查:
 
    ```bash
-   grep -rn "std::os::fd\|std::os::unix" --include=*.rs crates/ vendor/
+   grep -rn "std::os::fd\|std::os::unix" "--include=*.rs" crates/ vendor/
    ```
 
    逐个确认有 `cfg` 门控。这条**只能靠 `windows-check` job 验证** ——
@@ -218,232 +220,43 @@ gh api --allow-escape-sequences "repos/<owner>/<repo>/actions/jobs/$JOB/logs" \
   保证结果能绑定到 commit。
 - 不要手动 `gh release create`。
 
-## 性能基准(三机 peer 基准)
+## 测试与性能基准
 
-所有性能结论必须来自 `benchmark/peer.sh`(rh)与 `benchmark/peer-frp.sh`(frp
-对照),**不要自己另写压测脚本**。两脚本同拓扑、同端口、同记录格式,结果可比。
+> **完整可复制操作手册见 [`docs/testing-guide.md`](docs/testing-guide.md)**（涵盖：一、Rust/Go/前端本地门禁；二、`tests/` 全部 8+1 个本机多进程 E2E 脚本；三、三机 10GbE `termark` + Python `Popen` 编排模板、`+3 min` Sample 1 门控、证据回收核验与文档归档步骤；四、vhost 专项基准与 `RH_*` 性能诊断旋钮）。下文仅保留快速索引与硬性红线。
 
-### 拓扑
+### 四层测试路由
 
-```
+1. **第一层 · 提交前质量门**：Rust 三道门（`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`ulimit -n 10240 && cargo test --workspace`）+ Go 三道门（`cli/rhctl` 含 windows/linux 交叉编译、`benchmark/loadgen` 校验）+ 前端 `console/`（`typecheck`/`lint`/`test`/`build`）+ Windows Unix-fd 门控检查。详细命令见 [`docs/testing-guide.md`](docs/testing-guide.md) §2。
+2. **第二层 · 本机多进程功能 E2E**：先 `cargo build --release`（跑 `e2e-embed.sh` 前需先在 `console/` 执行 `pnpm build` 再重编服务端），按需执行 `tests/` 下的 `e2e.sh`、`e2e-transports.sh`、`e2e-relay-modes.sh`、`e2e-plugins.sh`、`e2e-vhost.sh`、`e2e-resilience.sh`、`e2e-embed.sh`、`xtcp-isolated.sh`、`load.sh`。避免并发执行多个 `e2e.sh`。用法列表见 [`docs/testing-guide.md`](docs/testing-guide.md) §3。
+3. **第三层 · 三机 10GbE 性能基准（`peer.sh` 与 `peer-frp.sh`）**：所有性能结论必须来自这两套对等脚本，**不要另写临时压测脚本**（会丢 20Hz CPU/RSS、端点实况 `endpoint.json`/`identity.jsonl`、`nofile.json` 与 `raw/` 失败留痕）。定量结论要求相邻同窗背靠背实测、`PEER_REPEAT=5`、`PEER_DURATION=15`、`PEER_CONC_REPEAT=3`。
+4. **第四层 · 专项与诊断**：HTTP/HTTPS vhost 拆分对照用 `benchmark/vhost-peer.sh`，多协议批跑用 `benchmark/run-pair.sh`；内核与载体排查常用 `ss -tin "sport = :17100"`、`RH_MUX_PREFETCH`、`RH_MUX_POOL_SIZE`、`RH_PUMP_STATS=1`。详见 [`docs/testing-guide.md`](docs/testing-guide.md) §5。
+
+### 三机拓扑与主机凭据
+
+```text
 [test3: 压测端]        [test1: 服务端]           [test2: 客户端+目标]
-loadgen src ───────►  转发口 20001..  ──隧道──►  目标服务 19101..19104
-                      控制面 17100 / API 18080
+loadgen src ──10GbE──► 转发口 20001..  ──隧道──► loadgen sink   :19101
+                       控制面 17100 / API 18080  loadgen target :19102..19104
 ```
-
-- **直连**:压测端 → test2 目标服务,不经隧道。这是**标尺**,反映机器与网络上限。
-- **隧道**:压测端 → test1 转发口 → 隧道 → test2 目标服务。
-- 唯一有意义的指标是**保留率 = 隧道 / 直连**。绝对值随机器浮动,跨环境不可比。
-
-### 主机与凭据
 
 | 角色 | termark id | 地址 |
 |---|---|---|
 | test1 服务端 | `cizwDkKnGqY47eBL` | 172.16.1.6 |
-| test2 客户端 | `Du9x3tHGGDhcZJNx` | 172.16.1.17 |
+| test2 客户端+目标 | `Du9x3tHGGDhcZJNx` | 172.16.1.17 |
 | test3 压测端 | `tN76t9aSo3zaCwJJ` | 172.16.1.18 |
 
-三台均 8 核、10GbE、`sudo -n` 可用、`python3` 就位;`/tmp/rh-bin/loadgen`
-(Go 压测器)必须提前放好 —— 三台没装 Go,只能本地交叉编译后上传。
+### 压测工具现状（纯 Go `loadgen`）
 
-### 流程
+- Python `loadgen.py` / `target.py` 及 `sink` `SetReadBuffer(4MiB)` 导致的 cwnd 塌陷伪影**均已移除与修复**（`2babafb` / `0e75adf`）。当前 `benchmark/peer.sh` 与 `benchmark/peer-frp.sh` 默认使用纯 Go `/tmp/rh-bin/loadgen`（`THP_TOOL=loadgen`），支持真双向 `-R` `download`、`loadgen sink` 与 Go `loadgen target`。
+- 三角色仍必须**显式导出**一致环境变量（`BENCH_BIN=/tmp/rh-bin LOADGEN_BIN=/tmp/rh-bin/loadgen THP_TOOL=loadgen PROTO=tcp RELAY=splice MUX=1 PEER_RUN_ID=... PEER_DIR=... PEER_REPEAT=5 PEER_DURATION=15`），test2 的 `sink` 与 `target` 由脚本自行启停，不要手工起 `iperf3 -s`。
 
-1. **代码进 git,机器拉取**。**rh 源码与 rh 二进制都不要用 tar 传**:
+### 硬性红线（不得违反）
 
-   ```bash
-   # 三台都执行
-   cd /tmp/rh-bench && git fetch -q origin <branch> \
-     && git reset -q --hard origin/<branch>
-   ```
-
-   基准结果必须能绑定到某个 commit。tar 传递无法追溯,事后无法复核。
-   (唯一例外是 `benchmark/loadgen` 的**静态二进制**:三台没装 Go,只能本地
-   `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build` 后 upload 到
-   `/tmp/rh-bin/loadgen`。它是工具不是被测对象,与 commit 无关。)
-
-2. **构建在 test1 上做**,不要本地交叉编译 rh:
-
-   > **⚠ 先问一句:被测版本有 Release 吗?**
-   >
-   > 只要被测版本**已经发过版**(`gh release view vX.Y.Z` 能查到),
-   > **直接下载 Release 产物,不要自己编译**:
-   >
-   > ```bash
-   > gh release download vX.Y.Z -R xbclub/rabbithole -D /tmp/rel-vX.Y.Z \
-   >   -p "*x86_64-unknown-linux-musl*"
-   > cd /tmp/rel-vX.Y.Z && shasum -a 256 -c *.sha256 && tar xzf *.tar.gz
-   > ```
-   >
-   > **为什么这是必须的**(2026-10-24 踩过):
-   > - **产物即事实**。用户拿到的是 Release 里那个二进制。自己编译出来的
-   >   即使 commit 相同,也可能因工具链/feature/依赖解析差异而不同 ——
-   >   测出来的数字不能代表用户实际跑的东西。
-   > - **能省一次构建**。`cargo build` 两套版本约 8-10 分钟,Release 下载
-   >   只要几秒,且带 `.sha256` 可校验完整性。
-   > - **省掉一类坑**。自己编译要 `sed` 关 `strip`、要处理 worktree、
-   >   要小心"版本号对得上但 commit 不对"(本次实测:test1 上那个
-   >   自报 `0.5.1` 的二进制其实是 `9fcce2f`,不是 v0.5.1 的 `a5d4276`)。
-   >   Release 产物由流水线从 tag 构建,产物与 commit 天然绑定。
-   >
-   > **只在下面两种情况下才自己编译**:
-   > - 被测的是**未发版的提交**(修完想立刻验证,还没打标签);
-   > - 需要**改代码做对照实验**(如临时关掉某个优化)。
-   >   这时才走下面的构建流程,并且要在结果里注明"非 Release 产物"。
-
-   构建流程(仅用于未发版的提交):
-
-   ```bash
-   cd /tmp/rh-bench && sed -i 's/^strip = true/strip = false/' Cargo.toml
-   ~/.cargo/bin/cargo build --release -p rh-server -p rh-client   # 约 4-5 分钟
-   ```
-
-   **`--version` 只能证明版本号,不能证明 commit**。要测某个 tag,用
-   `git worktree add /tmp/rh-vX.Y.Z vX.Y.Z` 检出该 tag 再构建,不要依赖
-   工作区当前状态(本次踩过:工作区在 `9fcce2f`,自报 `0.5.1`,与
-   `v0.5.1` 的 `a5d4276` 不是同一个东西)。
-
-   编译产物放 `/tmp/rh-bin/`。**注意硬链接**:`/tmp/rh-bin/rh-server` 可能是
-   多个历史版本的硬链接(count>1),`cp` 覆盖会改到同一 inode。换版本要先
-   `rm` 再 `cp`:
-
-   ```bash
-   rm -f /tmp/rh-bin/rh-server && cp target/release/rh-server /tmp/rh-bin/rh-server
-   /tmp/rh-bin/rh-server --version    # 必须核对版本,别拿旧二进制测
-   ```
-
-3. **三台同步脚本**,然后按角色启动(每个角色一个 termark 会话,`setsid` 后台)。
-   **三个角色的环境变量必须完全一致**,尤其 `THP_TOOL=loadgen`:
-
-   ```bash
-   # test1
-   cd /tmp/rh-bench/benchmark && BENCH_BIN=/tmp/rh-bin THP_TOOL=loadgen \
-     PEER_RUN_ID=<id> PROTO=<proto> RELAY=splice MUX=1 PEER_DIR=/tmp/peer \
-     setsid bash peer.sh server > /tmp/srv.out 2>&1 < /dev/null &
-
-   # test2(凭据取 test1 输出)
-   ... THP_TOOL=loadgen setsid bash peer.sh client <A_IP>:17100 <cid> <secret> \
-     > /tmp/cli.out 2>&1 &
-
-   # test3(先登录拿 token)
-   TOKEN=$(curl -s -X POST http://<A_IP>:18080/api/auth/login \
-     -H 'Content-Type: application/json' \
-     -d '{"username":"admin","password":"peer-Pass-1"}' | jq -r .data.accessToken)
-   ... THP_TOOL=loadgen setsid bash peer.sh drive <A_IP> <B_IP> 18080 \
-     $TOKEN <cid> <label>
-   ```
-
-   `PROTO`/`RELAY`/`MUX`/`PEER_RUN_ID`/`THP_TOOL` **必须显式给**,脚本的
-   隐式默认值(`iperf3`)不能依赖。test2 由脚本自己起 `loadgen sink`,
-   **不要手工起 `iperf3 -s`**。
-
-4. **等 drive 自己跑完**,别中途重跑。吞吐只是第一个场景,后面还有 UDP /
-   延迟 / 并发 / 建连速率 / HTTP vhost。
-
-### 压测器:一律用 loadgen,不用 iperf3
-
-**所有吞吐压测都必须 `THP_TOOL=loadgen`**,用仓库自带 Go 压测器
-(`benchmark/loadgen`)。三个角色都要显式带上这个环境变量:
-
-```bash
-THP_TOOL=loadgen PROTO=... RELAY=... MUX=1 PEER_RUN_ID=... ...
-```
-
-脚本里 `THP_TOOL` 的默认值仍是 `iperf3`(`benchmark/peer.sh:95`,为兼容
-历史数据保留),**不要依赖这个默认值** —— 不显式给就等于在用过时的压测器。
-
-**为什么不再用 iperf3**:系统 iperf3 3.9 是单线程,`-P` 不扩展吞吐,天花板
-就在 2 Gbps 量级。本机三台是 10GbE,直连基线动辄 2.5~3 Gbps,用 iperf3
-测会把**压测器瓶颈当成产品瓶颈**,rh 与 frp 被压到同一数字而不可分辨。
-`loadgen/main.go` 顶部记录了 Python 版压测器踩过的同一个坑:曾据此得出
-「rh 与 frp 都卡在 2.0~2.2G、都不随并发扩展」——那个结论是压测器造成的。
-
-Go 版每连接一个 goroutine、收发走 `io.Copy` 大缓冲快路径,可稳定压满 10GbE。
-
-切换是**成对**的:drive 侧用 `loadgen src`,**B 侧同时**把 `iperf3 -s` 换成
-`loadgen sink`(两者协议不兼容,混用会让样本静默变 0)。脚本已按
-`THP_TOOL` 自动处理,B 侧不要手工起 `iperf3 -s`。
-
-loadgen 只有单向发送,B 侧 sink 读空;`download` 档实际与 `upload` 同向,
-这是工具的已知局限,**不要把它当成"双向都测过了"**。
-
-### 结果在哪
-
-- test3: `/tmp/peer*/results-<label>-<时间戳>.jsonl` 与 `raw/`
-- 三台的 `endpoint.json` / `identity.jsonl` / `cpu.jsonl` / `nofile.json`
-
-判定:`python3 benchmark/py/summarize.py <证据目录>`、
-`python3 benchmark/py/verify_goal.py --evidence <证据目录>`。
-
-### 踩过的坑
-
-- **`loadgen sink` 的 `SetReadBuffer(4MiB)` 会把单流吞吐腰斩**。2026-10-24
-  实测:同一个 `loadgen src` 打 `loadgen sink` 只有 1.58 G,打 `nc -l` 能到
-  2.67 G,打 iperf3 自己的 sink 是 2.73–3.19 G。二分确认是 sink 侧的
-  `SetReadBuffer` 干的 —— 只要显式设 `SO_RCVBUF`(不管 256K/1M/2M/4M),
-  吞吐就掉到 1.6 G;不设是 3.01 G。
-
-  后果:直连基线被压到 1.6 G,而隧道读数是 2.1 G,于是出现
-  **「保留率 > 100%」的反物理读数**(实测 121%–132%,3 次重复极差 < 5%)。
-  **看到保留率 > 100% 直接判为伪影,不要当产品特性写进结论。**
-  机制用 `ss -tin` 可验:设了 `SO_RCVBUF` 时 `cwnd` 从 1571 塌到 94、
-  `delivery_rate` 从 2.68 G 掉到 0.98 G(注意 `rcv_space` 两种情况下都是
-  14480,所以**不是**窗口被钉死,别按那个方向解释)。
-  隧道为何没被同一个 sink 拖住,尚未查清(已排除「瓶颈分摊到两段」与
-  「小块读更平滑」两个猜测),但「>100% 是伪影」的判断不依赖它。
-  详见 `benchmark/README.md` 的「测量伪影」节。**尚未修复**(改压测器会让
-  历史数据不可比,需先决定是否重跑基线)。
-
-- **token 会过期**。drive 用过期 token 查 `/api/clients` 得 401,报
-  `client_version 为空,中止本轮`,**吞吐循环根本不会执行**,后面的 UDP 是
-  残留进程刷出来的。重跑前先重新登录拿 token。
-
-- **`THP_TOOL` 必须 export**。`run_iperf` 由 `$(...)` 子 shell 调用,未导出
-  的变量在那里不可见 → 实际跑 iperf3(空 JSON)而解析仍按 loadgen 判断,
-  结果全成 `INVALID(exit=0)`,极难从输出看出。
-
-- **B 侧端口被上一轮 iperf3 占住**。换 loadgen 后若 `iperf3 -s` 仍在监听
-  19101,sink 绑定失败**静默退出**,直连/隧道样本全变成 0~2 Mbps。跑前先
-  `ss -ltnp | grep 19101` 确认占用者是不是 `loadgen`。
-
-- **sink 有寿命**。`loadgen sink <port> <seconds>` 到点自行退出,后续样本
-  静默变 0。脚本给的是 7200s,手工起时别给短了。历史上还遇到过 sink 长跑
-  数小时后吞吐退化,重启即恢复 —— 怀疑有退化就重启 sink。
-
-- **`pkill -f` 会杀掉自己的 shell**。命令行里含 `rh-client` 等字样时,
-  `pkill -f rh-client` 会匹配到执行该命令的 shell 本身。用精确匹配:
-
-  ```bash
-  ps -eo pid,comm | awk '$2 ~ /^(rh-server|rh-client|loadgen)$/{print $1}' | xargs -r kill
-  ```
-
-- **`PEER_DIR` 残留会让创建客户端失败**。DB 在 `PEER_DIR` 内,同名客户端
-  冲突报 `UNIQUE constraint failed: clients.name`。重跑前 `rm -rf $PEER_DIR`。
-
-- **样本量不足时不要下结论**。`PEER_REPEAT=2` + 8s 时单档波动可达 ±70%,
-  会出现「隧道比直连还快」这种物理上不可能的读数。定量结论至少
-  `PEER_REPEAT=5` + 每档 15s。
-
-  **⚠ 这条有两种成因,别混用同一个解释**:
-  (a) **波动大**(单档极差占中位数几十%)= 样本量不足,加大 REPEAT/时长;
-  (b) **读数稳定但仍然 >100%**(如 3 次重复极差 < 5%)= **不是噪声**,
-  是上面那条 `loadgen sink` 伪影。2026-10-24 实测就是 (b):REPEAT=3 +
-  10s,保留率 121%–132%,极差 < 5%。判据:先看 **极差/中位数**,小于
-  5% 还 >100% 的,直接去查 sink,不要再加样本量。
-
-- **先看直连基线**。若直连只有 2.5 Gbps 而隧道也接近它,说明两边一起被
-  压测端或目标服务卡住,此时 rh 与 frp 的差异不可分辨,别硬解。
-
-### 不要做的事
-
-- 不要自己写临时压测脚本代替 `peer.sh` / `peer-frp.sh` —— 会丢掉证据采集
-  (CPU 采样、端点实况、nofile、无效样本留痕),事后无法复核。
-- 不要用 tar 传 rh 源码或 rh 二进制到测试机 —— 走 git,保证结果可绑定 commit。
-  (loadgen 这类压测工具是例外,见流程第 1 步。)
-- **被测版本已发版时,不要自己 `cargo build`** —— 直接 `gh release download`
-  拉产物。产物即用户实际拿到的东西,且与 commit 天然绑定。详见流程第 2 步
-  的⚠ 框。
-- 不要在 `PROTO`/`RELAY`/`MUX` 不一致的两端之间比较结果。
-- 不要只跑一遍就下结论,也不要拿单向样本冒充双向。
+1. **已发版版本必须用官方 Release 产物，禁止自编 `cargo build`**：用 `gh release download vX.Y.Z -R xbclub/rabbithole -p "*x86_64-unknown-linux-musl*"` 并校验 `.sha256`；上传/替换 `/tmp/rh-bin/` 前**先 `rm -f` 再写**避免硬链接污染，且核对 `--version` 与 `sha256sum`。只有未发版提交或代码 A/B 对照才在 `test1` 源码构建并标明「非 Release 产物」。
+2. **源码走 git，不传源码 tar**：三机 `/tmp/rh-bench` 用有界 `timeout 20 env GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=8 git fetch -q origin main && git reset -q --hard` 同步；唯一允许本地编译上传的是 Go `benchmark/loadgen` 静态二进制。
+3. **远端操作走 `termark` + Python `Popen`，禁止 `setsid ... &` 与 `pkill -f`**：`termark exec` 裸跑 `&` 会因继承 fd 卡满 60s；超时断连不会杀远端 shell，故 `git fetch` 绝不能与 `rm -rf` 串联在同一命令内。启后台与删目录标准模板、精确 `awk` 杀进程命令见 [`docs/testing-guide.md`](docs/testing-guide.md) §4.2。
+4. **+3 分钟 Sample 1 门控与基线对齐**：跑 full `peer.sh` 时先设 ~200s 定时检查第 1 组样品；若直连飙高而隧道全档平顶 ~2.2–2.3G，先做短时 A/B 区分 ESXi 限速与代码回退。两轮 `rh` vs `frp` 全 6 档 `direct` 中位数偏差应落在 `±15%` 内，禁止错位硬比或只跑一遍下结论。
+5. **证据回收与归档**：确认 `0` 无效/零值样本、`endpoints/*/identity.jsonl` `/proc/PID/exe` 哈希一致、`cpu.jsonl` 压缩为 `cpu.jsonl.gz` 后，按 [`docs/testing-guide.md`](docs/testing-guide.md) §4.5 归档入 `benchmark/results/` 并更新首页/基准文档，推送后必须追到 CI 全绿。
 
 ## Workflow 守则
 
