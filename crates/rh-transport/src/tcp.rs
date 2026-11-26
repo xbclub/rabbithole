@@ -210,6 +210,8 @@ async fn verify(
     set_tcp_keepalive(&stream);
     // round-41:载体发送缓冲调优(默认 0 = 不触碰,零漂移)
     apply_carrier_sndbuf(&stream);
+    // 限制内核载体未发送积压(默认 1 MiB,对齐 splice.rs;0 = 不设置)
+    apply_carrier_notsent_lowat(&stream);
     // round-E2:裸 TCP 分支(tls.is_none() && !ws_upgrade)产生写侧 fd
     // 副本,供 accept 交付时走 duplex mux。消费方向看 accept 的 match:
     // (true, Some(dup)) → wrap_stream_as_server_duplex —— **副本恰恰是
@@ -363,6 +365,57 @@ fn apply_carrier_sndbuf(stream: &tokio::net::TcpStream) {
     }
     use socket2::SockRef;
     let _ = SockRef::from(stream).set_send_buffer_size(want);
+}
+
+/// yamux TCP 载体默认 `TCP_NOTSENT_LOWAT`(1 MiB,与 `splice.rs` 对齐)。
+///
+/// 压测遥测显示 `:17100` 载体未设低水位时,内核 `Send-Q` / `notsent` 可堆积
+/// 2.2-3.9 MiB 未发送数据并抬高 RTT;设为 1 MiB 可约束多路复用的内核队列深度,
+/// 同时保留 >10x BDP 跑道避免 `app_limited`。可通过 `RH_NOTSENT_LOWAT` 覆盖
+/// (`0` = 不设置)。
+const DEFAULT_CARRIER_NOTSENT_LOWAT: u32 = 1024 * 1024;
+
+fn carrier_notsent_lowat() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        parse_carrier_notsent_lowat(std::env::var("RH_NOTSENT_LOWAT").ok().as_deref())
+    })
+}
+
+/// [`carrier_notsent_lowat`] 的纯函数解析内核。
+///
+/// 规则:`None`/空/非法 → `DEFAULT_CARRIER_NOTSENT_LOWAT` (1 MiB);
+/// `"0"` → 0(不设置);合法正值钳到 [16 KiB, 16 MiB]。
+fn parse_carrier_notsent_lowat(raw: Option<&str>) -> u32 {
+    match raw.and_then(|s| s.trim().parse::<u32>().ok()) {
+        None => DEFAULT_CARRIER_NOTSENT_LOWAT,
+        Some(0) => 0,
+        Some(n) => n.clamp(16 * 1024, 16 * 1024 * 1024),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_tcp_notsent_lowat(stream: &tokio::net::TcpStream, bytes: u32) {
+    if bytes == 0 {
+        return;
+    }
+    use std::os::fd::AsRawFd as _;
+    unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NOTSENT_LOWAT,
+            &bytes as *const u32 as *const libc::c_void,
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_tcp_notsent_lowat(_stream: &tokio::net::TcpStream, _bytes: u32) {}
+
+fn apply_carrier_notsent_lowat(stream: &tokio::net::TcpStream) {
+    set_tcp_notsent_lowat(stream, carrier_notsent_lowat());
 }
 
 /// mux_streams:并发流上限的有效值(0 已折算),每连接 accept 时读取 → 热改对新连接生效。
@@ -801,6 +854,8 @@ async fn dial_tcp(cfg: &ClientTransportConfig) -> io::Result<tokio::net::TcpStre
     set_tcp_keepalive(&stream);
     // round-41:载体发送缓冲调优(默认 0 = 不触碰,零漂移)
     apply_carrier_sndbuf(&stream);
+    // 限制内核载体未发送积压(默认 1 MiB,对齐 splice.rs;0 = 不设置)
+    apply_carrier_notsent_lowat(&stream);
     Ok(stream)
 }
 
@@ -919,6 +974,60 @@ mod sndbuf_tests {
             got >= target,
             "Linux 会翻倍,读回应 >= 目标:target={target} got={got} (wmem_max={sys_max:?})"
         );
+    }
+}
+
+#[cfg(test)]
+mod notsent_lowat_tests {
+    use super::*;
+
+    #[test]
+    fn parse_defaults_and_overrides() {
+        assert_eq!(parse_carrier_notsent_lowat(None), 1024 * 1024);
+        assert_eq!(parse_carrier_notsent_lowat(Some("")), 1024 * 1024);
+        assert_eq!(parse_carrier_notsent_lowat(Some("abc")), 1024 * 1024);
+        assert_eq!(parse_carrier_notsent_lowat(Some("0")), 0);
+        assert_eq!(parse_carrier_notsent_lowat(Some(" 524288 ")), 512 * 1024);
+        assert_eq!(parse_carrier_notsent_lowat(Some("1")), 16 * 1024);
+        assert_eq!(
+            parse_carrier_notsent_lowat(Some("999999999")),
+            16 * 1024 * 1024
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn set_tcp_notsent_lowat_applies_and_zero_is_noop() {
+        use std::os::fd::AsRawFd as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = accept.await.unwrap().unwrap();
+
+        let get_lowat = |s: &tokio::net::TcpStream| -> u32 {
+            let mut val: u32 = 0;
+            let mut len = std::mem::size_of::<u32>() as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockopt(
+                    s.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_NOTSENT_LOWAT,
+                    &mut val as *mut u32 as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt(TCP_NOTSENT_LOWAT) should succeed");
+            val
+        };
+
+        let initial = get_lowat(&client);
+        set_tcp_notsent_lowat(&client, 0);
+        assert_eq!(get_lowat(&client), initial, "0 必须保持原值不改");
+
+        set_tcp_notsent_lowat(&client, 1024 * 1024);
+        assert_eq!(get_lowat(&client), 1024 * 1024);
     }
 }
 
