@@ -12,7 +12,7 @@ use crate::{Config, ConnectionError, DEFAULT_CREDIT};
 /// 不随流数收缩、不随吞吐自增;(初窗 − DEFAULT_CREDIT)差额由建流授信
 /// ([`FlowController::take_creation_grant`],round-4/B1,对齐 frp
 /// OpenStream/AcceptStream 的 sendWindowUpdate 时机)一次性授出;读路径
-/// [`FlowController::next_window_update`] 只在 1/4 窗阈值过后回补已耗额度,
+/// [`FlowController::next_window_update`] 只在半窗阈值过后回补已耗额度,
 /// 不增窗。
 ///
 /// 内存护栏:聚合在途敞口 = 并发流数 × max_receive_window,唯一护栏是
@@ -39,7 +39,7 @@ impl FlowController {
         // receive_window 仍按规约从 DEFAULT_CREDIT 开始——(初窗 − 256KiB)
         // 的差额自 round-4/B1 起由 take_creation_grant 在建流时以带初始
         // flag 的 WU 帧授给对端(排队失败的兜底回落读路径
-        // next_window_update:max − receive_window ≥ max/4 恒成立,1/4 窗
+        // next_window_update:max − receive_window ≥ max/2 恒成立,半窗
         // 阈值同样放行),对端任何版本都只见到标准 WU。
         let max_receive_window = (config.initial_stream_receive_window as u32).max(DEFAULT_CREDIT);
         Self {
@@ -67,9 +67,8 @@ impl FlowController {
         let next_window_update =
             bytes_received.saturating_sub(buffer_len.try_into().unwrap_or(u32::MAX));
 
-        // Trigger a window update once at least 1/4 of max_receive_window has been consumed and drained
-        // (1.5 MiB on a 6 MiB window, keeping 4.5 MiB sender runway to avoid app_limited stalls under loaded RTT).
-        if next_window_update < self.max_receive_window / 4 {
+        // Don't send an update in case half or more of the window is still available to the sender.
+        if next_window_update < self.max_receive_window / 2 {
             return None;
         }
         Some(next_window_update)
@@ -352,34 +351,5 @@ mod tests {
                 i + 1
             );
         }
-    }
-
-    #[test]
-    fn quarter_window_threshold_grants_earlier_and_respects_full_buffer() {
-        let mut config = Config::default();
-        config.set_initial_stream_receive_window(6 * 1024 * 1024);
-        let mut s = make_controller(Arc::new(config));
-
-        assert_eq!(s.take_creation_grant(), 6 * 1024 * 1024 - DEFAULT_CREDIT);
-
-        let quarter = 1_572_864; // 1.5 MiB
-        s.consume_receive_window(quarter - 1).unwrap();
-        assert_eq!(s.pending_window_update(0), None);
-
-        s.consume_receive_window(1).unwrap();
-        assert_eq!(s.next_window_update(0), Some(quarter));
-        assert_eq!(s.receive_window, 6 * 1024 * 1024);
-
-        // Backpressure when buffered
-        s.consume_receive_window(3 * 1024 * 1024).unwrap();
-        assert_eq!(s.pending_window_update(3 * 1024 * 1024), None);
-
-        // Partial drain leaves 1.5 MiB buffer_len (1.5 MiB drained -> triggers update)
-        assert_eq!(s.next_window_update(quarter as usize), Some(quarter));
-        assert_eq!(s.receive_window, 6 * 1024 * 1024 - quarter);
-
-        // Full buffer backpressure: consume remaining receive_window (4.5 MiB) so bytes_received == 6 MiB
-        s.consume_receive_window(6 * 1024 * 1024 - quarter).unwrap();
-        assert_eq!(s.pending_window_update(6 * 1024 * 1024), None);
     }
 }
