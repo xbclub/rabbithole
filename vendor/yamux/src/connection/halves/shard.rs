@@ -458,22 +458,21 @@ impl ShardWorker {
         }
     }
 
-    /// 本地/收编双查(§2.5-C):本地表命中即得;未命中且为本侧出站奇偶
-    /// 时从 opening 收编(对端任何帧只可能在我们 SYN 上线后到达,遇
-    /// 未知+本侧奇偶 sid 查 opening 即得)。
-    fn lookup_stream(
+    /// 本地/收编双查(§2.5-C):本地表命中直接返回引用(免每帧 Arc::clone);
+    /// 未命中且为本侧出站奇偶时从 opening 收编(对端任何帧只可能在我们 SYN 上线后
+    /// 到达,遇未知+本侧奇偶 sid 查 opening 即得)。
+    fn lookup_stream_ref(
         &mut self,
         id: StreamId,
-    ) -> Option<Arc<Mutex<crate::connection::stream::Shared>>> {
-        if let Some(s) = self.streams.get(&id) {
-            return Some(s.clone());
+    ) -> Option<&Arc<Mutex<crate::connection::stream::Shared>>> {
+        if !self.streams.contains_key(&id) {
+            if !self.is_local_outbound(id) {
+                return None;
+            }
+            let s = self.shared.opening.lock().remove(&id)?;
+            self.streams.insert(id, s);
         }
-        if !self.is_local_outbound(id) {
-            return None;
-        }
-        let s = self.shared.opening.lock().remove(&id)?;
-        self.streams.insert(id, s.clone());
-        Some(s)
+        self.streams.get(&id)
     }
 
     fn is_local_outbound(&self, id: StreamId) -> bool {
@@ -621,9 +620,10 @@ impl ShardWorker {
             && matches!(frame.header().tag(), Tag::Data | Tag::WindowUpdate)
         {
             let id = frame.header().stream_id();
-            if let Some(s) = self.lookup_stream(id) {
+            let conn_id = self.id;
+            if let Some(s) = self.lookup_stream_ref(id) {
                 s.lock()
-                    .update_state(self.id, id, State::Open { acknowledged: true });
+                    .update_state(conn_id, id, State::Open { acknowledged: true });
             }
             if let Some(waker) = self.shared.new_outbound_stream_waker.lock().take() {
                 waker.wake();
@@ -762,12 +762,13 @@ impl ShardWorker {
     /// 逐行为等价,操作对象换成本地表 + opening 收编)。
     fn on_data(&mut self, frame: Frame<crate::frame::header::Data>) {
         let stream_id = frame.header().stream_id();
+        let conn_id = self.id;
 
         if frame.header().flags().contains(header::RST) {
             // stream reset
-            if let Some(s) = self.lookup_stream(stream_id) {
+            if let Some(s) = self.lookup_stream_ref(stream_id) {
                 let mut shared = s.lock();
-                shared.update_state(self.id, stream_id, State::Closed);
+                shared.update_state(conn_id, stream_id, State::Closed);
                 if let Some(w) = shared.reader.take() {
                     w.wake()
                 }
@@ -780,13 +781,13 @@ impl ShardWorker {
 
         let is_finish = frame.header().flags().contains(header::FIN); // half-close
 
-        if let Some(s) = self.lookup_stream(stream_id) {
+        if let Some(s) = self.lookup_stream_ref(stream_id) {
             let mut shared = s.lock();
 
             if let Err(_err) = shared.consume_receive_window(frame.body_len()) {
                 log::error!(
                     "{}/{}: frame body larger than window of stream",
-                    self.id,
+                    conn_id,
                     stream_id
                 );
                 drop(shared);
@@ -795,7 +796,7 @@ impl ShardWorker {
             }
 
             if is_finish {
-                shared.update_state(self.id, stream_id, State::RecvClosed);
+                shared.update_state(conn_id, stream_id, State::RecvClosed);
             }
 
             shared.buffer.push(frame.into_body());
@@ -818,12 +819,13 @@ impl ShardWorker {
     /// 逐行为等价)。
     fn on_window_update(&mut self, frame: Frame<crate::frame::header::WindowUpdate>) {
         let stream_id = frame.header().stream_id();
+        let conn_id = self.id;
 
         if frame.header().flags().contains(header::RST) {
             // stream reset
-            if let Some(s) = self.lookup_stream(stream_id) {
+            if let Some(s) = self.lookup_stream_ref(stream_id) {
                 let mut shared = s.lock();
-                shared.update_state(self.id, stream_id, State::Closed);
+                shared.update_state(conn_id, stream_id, State::Closed);
                 if let Some(w) = shared.reader.take() {
                     w.wake()
                 }
@@ -836,12 +838,12 @@ impl ShardWorker {
 
         let is_finish = frame.header().flags().contains(header::FIN); // half-close
 
-        if let Some(s) = self.lookup_stream(stream_id) {
+        if let Some(s) = self.lookup_stream_ref(stream_id) {
             let mut shared = s.lock();
             if let Err(err) = shared.increase_send_window_by(frame.header().credit()) {
                 log::error!(
                     "{}/{}: could not increase the send window, {err}",
-                    self.id,
+                    conn_id,
                     stream_id
                 );
                 drop(shared);
@@ -849,7 +851,7 @@ impl ShardWorker {
                 return;
             }
             if is_finish {
-                shared.update_state(self.id, stream_id, State::RecvClosed);
+                shared.update_state(conn_id, stream_id, State::RecvClosed);
 
                 if let Some(w) = shared.reader.take() {
                     w.wake()
@@ -875,7 +877,7 @@ impl ShardWorker {
         if frame.header().flags().contains(header::ACK) {
             return; // 防御:Framer 已本地 rtt.handle_pong
         }
-        if self.lookup_stream(stream_id).is_some() {
+        if self.lookup_stream_ref(stream_id).is_some() {
             let mut hdr = Header::ping(frame.header().id());
             hdr.ack();
             self.shared.push_to_send(Frame::new(hdr).into());
@@ -1082,6 +1084,8 @@ pub struct SendWorker {
     /// RST/FIN、stream_count 不减)。上界 = 存活流数;队首阻塞即止,其余
     /// Remove 在其后保序——多流并发 drop 时通道可能满,单槽会丢。
     ctrl_pending: VecDeque<(StreamId, u64)>,
+    /// 本分片是否已在共享原子槽 `ctrl_wait[index]` 置位;稳态为空时跳过 SeqCst 写。
+    ctrl_wait_armed: bool,
     finished: bool,
 }
 
@@ -1101,6 +1105,7 @@ impl SendWorker {
             pending_frame: None,
             out_pushed: 0,
             ctrl_pending: VecDeque::new(),
+            ctrl_wait_armed: false,
             finished: false,
         }
     }
@@ -1176,7 +1181,8 @@ impl SendWorker {
         // (FlushTask 读到 true 而唤已无滞留者),park 复查后重 Pending,
         // 无害(规格 §1.2/§1.3)。SeqCst:与置位/门读构成 SC 对写侧
         // (约束见 popped_count 文档),此处清零同理入对。
-        if self.ctrl_pending.is_empty() {
+        if self.ctrl_pending.is_empty() && self.ctrl_wait_armed {
+            self.ctrl_wait_armed = false;
             self.shared.ctrl_wait[self.index].store(false, Ordering::SeqCst);
         }
         progress
@@ -1211,6 +1217,7 @@ impl SendWorker {
         // 陈旧值在 Release/Acquire 下可同时成立(store-buffering 形态,
         // 空闲连接 Remove 滞留);四点全 SeqCst 后 SC 全序禁"双陈旧",
         // 约束详见 popped_count 文档
+        self.ctrl_wait_armed = true;
         self.shared.ctrl_wait[self.index].store(true, Ordering::SeqCst);
         // 水位 = 此刻推入序:drop 命令在本流全部数据命令之后被消费(命令
         // 通道 FIFO),且步骤 3 仅在 pending_frame 为空时运行(满即停),

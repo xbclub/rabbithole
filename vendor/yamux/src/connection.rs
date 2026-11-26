@@ -1977,16 +1977,35 @@ mod halves {
                 // 与到达顺序无关。故此处只把产出**收进重排队列**,再由
                 // `take_ordered_stream` 按到达序号交付——accept 线序与
                 // 分片哈希彻底解耦(这正是可以安全剥离奇偶位的前提)。
-                let mut absorbed = false;
-                let mut rxs = std::mem::take(&mut self.new_streams_rxs);
-                for rx in rxs.iter_mut() {
+                // round-33/34:顺序到达且待重排表为空时直接交付,免去 BTreeMap 插入/摘除开销;
+                // 乱序先到或已有空洞时仍落入 pending_streams 由 take_ordered_stream 重排。
+                for rx in &mut self.new_streams_rxs {
                     while let Poll::Ready(Some(msg)) = rx.poll_next_unpin(cx) {
-                        self.absorb_new_stream(msg);
-                        absorbed = true;
+                        match msg {
+                            shard::NewStream::Stream(seq, stream)
+                                if self.pending_streams.is_empty()
+                                    && seq == self.next_deliver_seq =>
+                            {
+                                self.next_deliver_seq += 1;
+                                log::trace!("{}: new inbound {}", self.shared.id, stream);
+                                return Poll::Ready(Some(Ok(stream)));
+                            }
+                            shard::NewStream::Skipped(seq)
+                                if self.pending_streams.is_empty()
+                                    && seq == self.next_deliver_seq =>
+                            {
+                                self.next_deliver_seq += 1;
+                            }
+                            shard::NewStream::Stream(seq, stream) => {
+                                self.pending_streams.insert(seq, Some(stream));
+                            }
+                            shard::NewStream::Skipped(seq) => {
+                                self.pending_streams.insert(seq, None);
+                            }
+                        }
                     }
                 }
-                self.new_streams_rxs = rxs;
-                if absorbed || !self.pending_streams.is_empty() {
+                if !self.pending_streams.is_empty() {
                     if let Some(stream) = self.take_ordered_stream() {
                         log::trace!("{}: new inbound {}", self.shared.id, stream);
                         return Poll::Ready(Some(Ok(stream)));
@@ -2346,6 +2365,11 @@ mod halves {
     }
 
     impl<S: AsyncRead + AsyncWrite + Unpin + crate::Writev2> SendHalf<S> {
+        #[cfg(test)]
+        pub(crate) fn has_outbound_waker(&self) -> bool {
+            self.shared.new_outbound_stream_waker.lock().is_some()
+        }
+
         /// 开新出站流(§2.5-A:opening 预注册 + 双计数器;ACK backlog
         /// 门控经共享 waker 由 Worker 的 ACK 处理唤醒——与未拆分路径
         /// 同语义)。
@@ -2367,17 +2391,19 @@ mod halves {
                 log::error!("{}: maximum number of streams reached", self.shared.id);
                 return Poll::Ready(Err(ConnectionError::TooManyStreams));
             }
-            // 先登记 waker 再查 backlog:ACK 恰在登记与检查之间到达时由
-            // 复查兜住(至多多一次虚假唤醒,不丢唤醒)——现行顺序保留
-            *self.shared.new_outbound_stream_waker.lock() = Some(cx.waker().clone());
+            // 先快检 backlog,未触上限时不加锁也不克隆 waker;触上限时先登记再
+            // SeqCst 复查,防 ACK 与登记交错丢唤醒。
             if self.shared.ack_backlog_count.load(Ordering::SeqCst) >= MAX_ACK_BACKLOG {
-                log::debug!(
-                    "{MAX_ACK_BACKLOG} streams waiting for ACK, registering task for wake-up \
-                     until remote acknowledges at least one stream"
-                );
-                // 未建流:回滚计数(重试不得重复累计)
-                self.shared.stream_count.fetch_sub(1, Ordering::SeqCst);
-                return Poll::Pending;
+                *self.shared.new_outbound_stream_waker.lock() = Some(cx.waker().clone());
+                if self.shared.ack_backlog_count.load(Ordering::SeqCst) >= MAX_ACK_BACKLOG {
+                    log::debug!(
+                        "{MAX_ACK_BACKLOG} streams waiting for ACK, registering task for wake-up \
+                         until remote acknowledges at least one stream"
+                    );
+                    // 未建流:回滚计数(重试不得重复累计)
+                    self.shared.stream_count.fetch_sub(1, Ordering::SeqCst);
+                    return Poll::Pending;
+                }
             }
 
             log::trace!("{}: creating new outbound stream", self.shared.id);
@@ -4057,6 +4083,71 @@ mod tests {
             written < storm_total,
             "inbound delivery must precede the storm drain on the wire, wrote {written}"
         );
+    }
+
+    #[test]
+    fn poll_new_outbound_skips_waker_lock_below_backlog_and_wakes_at_cap() {
+        struct CountWake(AtomicUsize);
+        impl futures::task::ArcWake for CountWake {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (socket, st) = TestSocket::new();
+        let conn = Connection::new(socket, Config::default(), Mode::Client);
+        let (mut recv_half, mut send_half, mut workers, mut send_workers) = conn.into_halves();
+
+        let wake_rec = Arc::new(CountWake(AtomicUsize::new(0)));
+        let woke_waker = futures::task::waker(wake_rec.clone());
+        let mut wcx = Context::from_waker(&woke_waker);
+
+        let mut cx = noop_cx();
+        let s0 = match send_half.poll_new_outbound(&mut cx) {
+            Poll::Ready(Ok(s)) => s,
+            other => panic!("expected Ready stream, got {other:?}"),
+        };
+        assert!(
+            !send_half.has_outbound_waker(),
+            "未达 ack backlog 上限时不得登记/残留 new_outbound_stream_waker"
+        );
+        let mut streams = vec![s0];
+        for _ in 1..MAX_ACK_BACKLOG {
+            match send_half.poll_new_outbound(&mut cx) {
+                Poll::Ready(Ok(s)) => streams.push(s),
+                other => panic!("expected Ready stream below cap, got {other:?}"),
+            }
+        }
+        assert!(
+            !send_half.has_outbound_waker(),
+            "满 MAX_ACK_BACKLOG 前的开流不得触碰 new_outbound_stream_waker"
+        );
+
+        assert!(matches!(
+            send_half.poll_new_outbound(&mut wcx),
+            Poll::Pending
+        ));
+        assert!(
+            send_half.has_outbound_waker(),
+            "达到 MAX_ACK_BACKLOG 时必须登记 waker"
+        );
+
+        let mut ack_hdr = header::Header::window_update(streams[0].id(), 0);
+        ack_hdr.ack();
+        st.borrow_mut()
+            .read_blocks
+            .lock()
+            .unwrap()
+            .push_back(header::encode(&ack_hdr).to_vec());
+        let _ = drive_recv_workers(&mut recv_half, &mut workers, &mut send_workers, &mut cx);
+        assert!(
+            wake_rec.0.load(Ordering::SeqCst) >= 1,
+            "对端 ACK 到达后必须唤醒等待开流的 waker"
+        );
+        assert!(matches!(
+            send_half.poll_new_outbound(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
     }
 
     /// S2(红→绿):G1 等价——SendHalf 开流后驱动发送半,wire 上流 1 首帧
