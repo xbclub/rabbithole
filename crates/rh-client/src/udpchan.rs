@@ -65,16 +65,22 @@ fn framed_pong() -> bytes::Bytes {
     .clone()
 }
 
+/// N3:UDP 数据帧追加成帧(帧头 + [addr_len][addr][data] 直写)——
+/// 供单包成帧与批收整批成帧共用,保证每包仍为独立标准 `UDP_PACKET` 帧。
+fn append_udp_packet(dst: &mut bytes::BytesMut, addr: &str, data: &[u8]) {
+    use bytes::BufMut as _;
+    frame::encode_frame_header(dst, FrameType::UDP_PACKET, 1 + addr.len() + data.len());
+    dst.put_u8(addr.len() as u8);
+    dst.put_slice(addr.as_bytes());
+    dst.put_slice(data);
+}
+
 /// N3:UDP 数据帧一次成帧(帧头 + [addr_len][addr][data] 直写)——
 /// 1 分配 1 拷贝。修前 `udp_packet::encode` 新 Vec(拷贝 1)+ 写任务
 /// 批聚合再整包拷(拷贝 2)。
 fn frame_udp_packet(addr: &str, data: &[u8]) -> bytes::Bytes {
-    use bytes::BufMut as _;
     let mut b = bytes::BytesMut::with_capacity(frame::HEADER_LEN + 1 + addr.len() + data.len());
-    frame::encode_frame_header(&mut b, FrameType::UDP_PACKET, 1 + addr.len() + data.len());
-    b.put_u8(addr.len() as u8);
-    b.put_slice(addr.as_bytes());
-    b.put_slice(data);
+    append_udp_packet(&mut b, addr, data);
     b.freeze()
 }
 
@@ -92,9 +98,62 @@ const WRITE_QUEUE: usize = 1024;
 /// UDP 单报文的物理上限(IPv4/IPv6 载荷最大 65507,取 64 KiB 缓冲足够)。
 const UDP_RECV_BUF: usize = 65536;
 
-/// 待写帧:**已成帧**的完整帧(帧头 + payload,N3)。
+/// `UdpRecvBatch` 池上限:空闲会话不长期占用 2 MiB 批收缓冲,仅活跃发送时借用。
+const RECV_BATCH_POOL_MAX: usize = 8;
+
+/// 待写帧:**已成帧**的完整帧或同源多帧连续字节切片(每个元素均为完整独立帧,N3)。
 struct Pending {
     framed: bytes::Bytes,
+}
+
+#[derive(Clone)]
+struct UdpRecvBatchPool(Arc<std::sync::Mutex<Vec<rh_transport::udp_batch::UdpRecvBatch>>>);
+
+struct PooledRecvBatch {
+    pool: Arc<std::sync::Mutex<Vec<rh_transport::udp_batch::UdpRecvBatch>>>,
+    batch: Option<rh_transport::udp_batch::UdpRecvBatch>,
+}
+
+impl UdpRecvBatchPool {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+    }
+
+    fn acquire(&self) -> PooledRecvBatch {
+        let batch = {
+            let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            g.pop()
+        }
+        .unwrap_or_else(|| rh_transport::udp_batch::UdpRecvBatch::new(UDP_RECV_BUF));
+        PooledRecvBatch {
+            pool: self.0.clone(),
+            batch: Some(batch),
+        }
+    }
+}
+
+impl std::ops::Deref for PooledRecvBatch {
+    type Target = rh_transport::udp_batch::UdpRecvBatch;
+    fn deref(&self) -> &Self::Target {
+        self.batch.as_ref().expect("batch taken only on drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledRecvBatch {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.batch.as_mut().expect("batch taken only on drop")
+    }
+}
+
+impl Drop for PooledRecvBatch {
+    fn drop(&mut self) {
+        if let Some(batch) = self.batch.take() {
+            let mut g = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            if g.len() < RECV_BATCH_POOL_MAX {
+                g.push(batch);
+            }
+        }
+    }
 }
 
 /// 构造读缓冲:hello 之后已抵达的字节(`prefix`)必须预置其中。
@@ -108,7 +167,9 @@ struct Pending {
 /// 抽成函数既统一了两条路径,也让"是否预置"这件事可被单测直接锁住
 /// (直接测 `run_proxy_side` 需要真 mux/真 socket,构造成本高)。
 fn read_buf_with_prefix(prefix: &[u8]) -> bytes::BytesMut {
-    bytes::BytesMut::from(prefix)
+    let mut b = bytes::BytesMut::with_capacity(prefix.len().max(64 * 1024));
+    b.extend_from_slice(prefix);
+    b
 }
 
 /// N10:通道读源。mux 偷出的读半无 AsyncRead 实现,走 chunk 组帧
@@ -153,6 +214,68 @@ impl ChanReader {
                             "udp channel eof",
                         ))
                     }
+                }
+            },
+        }
+    }
+
+    /// 非阻塞排空下一帧(无就绪完整帧返回 `Ok(None)`,不挂起)。
+    /// `Chunks` 优先解 `buf` 内余帧并尝试 `try_read_chunk`;`Stream` 先解
+    /// `fbuf` 内已读字节,不足时以非阻塞 `poll_read` 尝试一次拉取。
+    async fn try_read_frame(
+        &mut self,
+        fbuf: &mut bytes::BytesMut,
+    ) -> std::io::Result<Option<(FrameType, bytes::Bytes)>> {
+        match self {
+            Self::Stream(r) => loop {
+                use tokio::io::AsyncRead as _;
+                match frame::decode_frame(fbuf) {
+                    Ok(Some(f)) => return Ok(Some(f)),
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("udp channel frame: {e}"),
+                        ))
+                    }
+                }
+                if fbuf.len() > frame::HEADER_LEN + frame::MAX_FRAME_LEN {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "udp channel frame exceeds limit",
+                    ));
+                }
+                let mut tmp = [0u8; 8192];
+                let n = std::future::poll_fn(|cx| {
+                    let mut rb = tokio::io::ReadBuf::new(&mut tmp);
+                    match std::pin::Pin::new(&mut *r).poll_read(cx, &mut rb) {
+                        std::task::Poll::Ready(Ok(())) => {
+                            std::task::Poll::Ready(Ok(Some(rb.filled().len())))
+                        }
+                        std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                        std::task::Poll::Pending => std::task::Poll::Ready(Ok(None)),
+                    }
+                })
+                .await?;
+                match n {
+                    Some(0) | None => return Ok(None),
+                    Some(k) => fbuf.extend_from_slice(&tmp[..k]),
+                }
+            },
+            Self::Chunks { r, buf } => loop {
+                match frame::decode_frame(buf) {
+                    Ok(Some(f)) => return Ok(Some(f)),
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("udp channel frame: {e}"),
+                        ))
+                    }
+                }
+                match r.try_read_chunk().await? {
+                    Some(c) => buf.extend_from_slice(&c),
+                    None => return Ok(None),
                 }
             },
         }
@@ -212,27 +335,65 @@ async fn writev_all<W: tokio::io::AsyncWrite + Unpin>(
 async fn writer_task(mut w: ChanWriter, mut rx: mpsc::Receiver<Pending>) {
     match &mut w {
         ChanWriter::Chunks(hw) => {
+            let mut carry: Option<Pending> = None;
+            let mut frames: Vec<bytes::Bytes> = Vec::with_capacity(BATCH_MAX);
             'outer: loop {
                 // 阻塞等第一帧(空队列时不空转;有界队列让 send 侧承担背压)。
-                let Some(first) = rx.recv().await else {
-                    break; // 所有发送端已 drop = 通道结束
+                let first = match carry.take() {
+                    Some(p) => p,
+                    None => match rx.recv().await {
+                        Some(p) => p,
+                        None => break, // 所有发送端已 drop = 通道结束
+                    },
                 };
-                if hw.write_chunk(first.framed).await.is_err() {
-                    break;
-                }
-                // 贪心多取同前:队列里已经有货才继续,绝不额外等待。
-                while let Ok(next) = rx.try_recv() {
-                    if hw.write_chunk(next.framed).await.is_err() {
-                        // 排空剩余帧(仅丢弃),让 rx 尽快关闭
-                        while rx.try_recv().is_ok() {}
-                        break 'outer;
+                match rx.try_recv() {
+                    Err(_) => {
+                        // 单会话常见零拷贝快路径:直接移交 Bytes 给 yamux。
+                        if hw.write_chunk(first.framed).await.is_err() {
+                            while rx.try_recv().is_ok() {}
+                            break 'outer;
+                        }
+                    }
+                    Ok(second) => {
+                        if first.framed.len() + second.framed.len() > 64 * 1024 {
+                            carry = Some(second);
+                            if hw.write_chunk(first.framed).await.is_err() {
+                                while rx.try_recv().is_ok() {}
+                                break 'outer;
+                            }
+                        } else {
+                            frames.clear();
+                            let mut total = first.framed.len() + second.framed.len();
+                            frames.push(first.framed);
+                            frames.push(second.framed);
+                            while frames.len() < BATCH_MAX && total < 64 * 1024 {
+                                match rx.try_recv() {
+                                    Ok(next) => {
+                                        if total + next.framed.len() > 64 * 1024 {
+                                            carry = Some(next);
+                                            break;
+                                        }
+                                        total += next.framed.len();
+                                        frames.push(next.framed);
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            let mut merged = bytes::BytesMut::with_capacity(total);
+                            for f in &frames {
+                                merged.extend_from_slice(f);
+                            }
+                            if hw.write_chunk(merged.freeze()).await.is_err() {
+                                while rx.try_recv().is_ok() {}
+                                break 'outer;
+                            }
+                        }
                     }
                 }
             }
         }
         ChanWriter::Stream(sw) => {
-            // 帧持有缓冲复用;IoSlice 按自然借用每批构造(一个小 Vec,
-            // ≤32 项,可忽略——不值得为它引入 unsafe 生命周期延长)。
+            // 帧持有缓冲复用;IoSlice 用固定栈数组按自然借用构造。
             let mut frames: Vec<bytes::Bytes> = Vec::with_capacity(BATCH_MAX);
             loop {
                 let Some(first) = rx.recv().await else {
@@ -251,11 +412,11 @@ async fn writer_task(mut w: ChanWriter, mut rx: mpsc::Receiver<Pending>) {
                     }
                 }
                 // 一次 writev 写出 n 个**独立**帧(线格式与逐帧写完全一致)。
-                let mut slices: Vec<std::io::IoSlice<'_>> = frames
-                    .iter()
-                    .map(|f| std::io::IoSlice::new(f.as_ref()))
-                    .collect();
-                if writev_all(sw, &mut slices).await.is_err() {
+                let mut slices = [std::io::IoSlice::new(&[]); BATCH_MAX];
+                for (i, f) in frames.iter().enumerate() {
+                    slices[i] = std::io::IoSlice::new(f.as_ref());
+                }
+                if writev_all(sw, &mut slices[..frames.len()]).await.is_err() {
                     break;
                 }
             }
@@ -325,7 +486,11 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: std::sync::Arc<ProxySpec>, p
     // 也就不存在"跨 await 持锁"和"全部会话等同一把锁"。
     let writer = tokio::spawn(writer_task(w, rx));
 
+    let recv_pool = UdpRecvBatchPool::new();
     let mut sessions: HashMap<std::net::SocketAddr, Session> = HashMap::new();
+    let mut batch_items: Vec<(bytes::Bytes, std::net::SocketAddr)> =
+        Vec::with_capacity(rh_transport::udp_batch::UDP_BATCH_MAX);
+    let dummy_addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
     // hello 之后已抵达的字节必须预置进读缓冲,**两条载体路径都要**。
     //
     // 修前只有 Chunks 路径做了(见上方 `ChanReader::Chunks { buf: prefix }`),
@@ -356,13 +521,61 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: std::sync::Arc<ProxySpec>, p
             rr = r.read_frame(&mut fbuf) => {
                 match rr {
                     Ok((FrameType::UDP_PACKET, p)) => {
-                        if let Some((src, data)) = udp_packet::decode(&p) {
-                            if let Some(user) = parse_addr_cached(src) {
-                                if let Some(s) = get_session(&mut sessions, user, target, &tx).await {
-                                    let _ = s.send_to(data, target).await;
+                        batch_items.clear();
+                        let mut frames_drained = 1usize;
+                        let mut valid_seen = false;
+                        push_udp_proxy_packet(&mut batch_items, &mut valid_seen, p);
+                        let mut trailing_frame: Option<FrameType> = None;
+                        let mut trailing_err = false;
+                        while frames_drained < rh_transport::udp_batch::UDP_BATCH_MAX {
+                            match r.try_read_frame(&mut fbuf).await {
+                                Ok(Some((FrameType::UDP_PACKET, p2))) => {
+                                    frames_drained += 1;
+                                    push_udp_proxy_packet(&mut batch_items, &mut valid_seen, p2);
+                                }
+                                Ok(Some((ty, _))) => {
+                                    trailing_frame = Some(ty);
+                                    break;
+                                }
+                                Ok(None) => break,
+                                Err(_) => {
+                                    trailing_err = true;
+                                    break;
                                 }
                             }
+                        }
+                        let mut idx = 0usize;
+                        while idx < batch_items.len() {
+                            let user = batch_items[idx].1;
+                            let mut end = idx + 1;
+                            while end < batch_items.len() && batch_items[end].1 == user {
+                                end += 1;
+                            }
+                            if let Some(s) = get_session(&mut sessions, user, target, &tx, &recv_pool).await {
+                                let mut out_arr: [(&[u8], std::net::SocketAddr); rh_transport::udp_batch::UDP_BATCH_MAX] =
+                                    [(&[], dummy_addr); rh_transport::udp_batch::UDP_BATCH_MAX];
+                                let mut out_len = 0usize;
+                                for (data, _) in &batch_items[idx..end] {
+                                    out_arr[out_len] = (data.as_ref(), target);
+                                    out_len += 1;
+                                }
+                                let _ = rh_transport::udp_batch::send_to_batch(&s, &out_arr[..out_len]).await;
+                            }
+                            idx = end;
+                        }
+                        if valid_seen {
                             last_alive = Instant::now();
+                        }
+                        if let Some(ty) = trailing_frame {
+                            if ty == FrameType::PING
+                                && tx.send(Pending { framed: framed_ping_or_pong(false) }).await.is_err()
+                            {
+                                break;
+                            }
+                            last_alive = Instant::now();
+                        }
+                        if trailing_err {
+                            break;
                         }
                     }
                     Ok((FrameType::PING, _)) => {
@@ -416,6 +629,28 @@ pub async fn run_proxy_side(channel: BoxedIo, spec: std::sync::Arc<ProxySpec>, p
     let _ = writer.await;
 }
 
+fn push_udp_proxy_packet(
+    batch_items: &mut Vec<(bytes::Bytes, std::net::SocketAddr)>,
+    valid_seen: &mut bool,
+    payload: bytes::Bytes,
+) {
+    if let Some((src, _data)) = udp_packet::decode(&payload) {
+        let offset = 1 + src.len();
+        if let Some(user) = parse_addr_cached(src) {
+            batch_items.push((payload.slice(offset..), user));
+        }
+        *valid_seen = true;
+    }
+}
+
+fn framed_ping_or_pong(is_ping: bool) -> bytes::Bytes {
+    if is_ping {
+        framed_ping()
+    } else {
+        framed_pong()
+    }
+}
+
 /// 一个用户源地址对应的本地 socket 会话。
 struct Session {
     sock: Arc<UdpSocket>,
@@ -435,6 +670,7 @@ async fn get_session(
     user: std::net::SocketAddr,
     target: std::net::SocketAddr,
     tx: &mpsc::Sender<Pending>,
+    recv_pool: &UdpRecvBatchPool,
 ) -> Option<Arc<UdpSocket>> {
     if let Some(s) = sessions.get_mut(&user) {
         s.last = Instant::now();
@@ -461,27 +697,39 @@ async fn get_session(
             cancel: cancel.clone(),
         },
     );
-    // 回写任务:本地目标响应 → 通道帧(src = 该用户源地址)
+    // 回写任务:本地目标响应 → 池化 recvmmsg 批收整批成帧 → 通道(src = 该用户源地址)
     let sock2 = sock.clone();
     let tx2 = tx.clone();
+    let pool2 = recv_pool.clone();
     tokio::spawn(async move {
-        // 缓冲按会话首次收包时分配(不是建会话时就占 64 KiB):
-        // 大量空闲会话不再各自钉住一页。
-        let mut pkt: Option<Vec<u8>> = None;
         loop {
-            let buf = pkt.get_or_insert_with(|| vec![0u8; UDP_RECV_BUF]);
-            // A4:会话被 GC 取消(或整个通道退出)时必须能退出这个 await,
-            // 否则任务永久持有 sock2/tx2 → writer.await 永挂。
-            let n = tokio::select! {
-                r = sock2.recv_from(buf) => match r {
-                    Ok((n, _)) => n,
-                    Err(_) => break,
-                },
+            // 空闲挂起不占 UdpRecvBatch(2 MiB),就绪后临时借用并立即归还。
+            // A4:会话被 GC 取消(或整个通道退出)时必须能退出这个 await。
+            tokio::select! {
+                r = sock2.readable() => {
+                    if r.is_err() {
+                        break;
+                    }
+                }
                 _ = cancel.cancelled() => break,
+            }
+            let framed = {
+                let mut batch = pool2.acquire();
+                match rh_transport::udp_batch::try_recv_from_batch(&sock2, &mut batch) {
+                    Ok(0) => continue,
+                    Ok(count) => {
+                        let total_data: usize = batch.iter().map(|(pkt, _)| pkt.len()).sum();
+                        let needed = count * (frame::HEADER_LEN + 1 + addr_str.len()) + total_data;
+                        let mut out = bytes::BytesMut::with_capacity(needed);
+                        for (pkt, _) in batch.iter() {
+                            append_udp_packet(&mut out, &addr_str, pkt);
+                        }
+                        out.freeze()
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                }
             };
-            // 地址字符串复用会话里那份,不再每包格式化。
-            // N3:一次成帧(1 分配 1 拷贝;修前 encode 新 Vec + 批聚合再拷)。
-            let framed = frame_udp_packet(&addr_str, &buf[..n]);
             // ★send 必须与 cancel 同一个 select:A4 修好了 recv 侧的退出,
             // 但 send 一旦因队列满而阻塞,就再也观察不到 cancel ——
             // 任务永久持有 sock2/tx2,`writer.await` 永挂,每次重连泄漏
@@ -543,13 +791,28 @@ fn parse_addr_cached(src: &str) -> Option<std::net::SocketAddr> {
 /// 与代理侧同样走"唯一写任务 + 批聚合":visitor 侧的写半此前由主循环独占,
 /// 虽无锁争用,但每包一帧(11B 头)在大包量下 syscall 开销同样可观,
 /// 且 PING/PONG 与 UDP_PACKET 混在同一写任务里可保证**帧序**。
+fn visitor_addr_slot(peer: std::net::SocketAddr, len: usize) -> usize {
+    let mut h = peer.port() as usize;
+    match peer.ip() {
+        std::net::IpAddr::V4(ip) => {
+            h = h.wrapping_mul(31).wrapping_add(u32::from(ip) as usize);
+        }
+        std::net::IpAddr::V6(ip) => {
+            for seg in ip.segments() {
+                h = h.wrapping_mul(31).wrapping_add(seg as usize);
+            }
+        }
+    }
+    h % len
+}
+
 /// P0-2 / P0-5:visitor 侧 UDP 通道拆半(支持 PrependedIo(RhMuxStream) 直达零拷贝 Chunks)。
 fn split_visitor_channel(mut channel: BoxedIo) -> (ChanReader, ChanWriter) {
     match rh_transport::mux::steal_mux_halves(&mut channel) {
         Some((mr, mw)) => (
             ChanReader::Chunks {
                 r: mr,
-                buf: bytes::BytesMut::with_capacity(2048),
+                buf: bytes::BytesMut::with_capacity(64 * 1024),
             },
             ChanWriter::Chunks(mw),
         ),
@@ -586,13 +849,13 @@ pub async fn run_visitor_side(
             return;
         }
     }
-    let mut fbuf = bytes::BytesMut::with_capacity(2048);
-    // 按需分配:首次收包才占 64 KiB。
-    let mut pkt: Option<Vec<u8>> = None;
-    // B10:源地址字符串直接映射缓存(SocketAddr → String)。修前每包
-    // `peer.to_string()`(格式化 + 分配);proxy 侧已把地址提到建会话时
-    // 算一次,visitor 侧漏改。单用户命中率 ~100%,多用户按端口分槽。
-    let mut addr_cache: [Option<(std::net::SocketAddr, String)>; 4] = [const { None }; 4];
+    let mut fbuf = bytes::BytesMut::with_capacity(64 * 1024);
+    let mut recv_batch = rh_transport::udp_batch::UdpRecvBatch::new(UDP_RECV_BUF);
+    let mut batch_items: Vec<(bytes::Bytes, std::net::SocketAddr)> =
+        Vec::with_capacity(rh_transport::udp_batch::UDP_BATCH_MAX);
+    let dummy_addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+    // B10:源地址字符串直接映射缓存(SocketAddr → String),按完整 SocketAddr 哈希进 16 槽。
+    let mut addr_cache: [Option<(std::net::SocketAddr, String)>; 16] = [const { None }; 16];
     let mut last_alive = Instant::now();
     let mut last_ping = Instant::now();
     // 同 run_proxy_side:探活用固定周期 interval,不随事件重置。
@@ -600,29 +863,78 @@ pub async fn run_visitor_side(
     probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let _ = probe.tick().await;
     loop {
-        let buf = pkt.get_or_insert_with(|| vec![0u8; UDP_RECV_BUF]);
         tokio::select! {
-            rr = sock.recv_from(buf) => {
-                let Ok((n, peer)) = rr else { break };
-                let slot = (peer.port() as usize) % addr_cache.len();
-                if !matches!(&addr_cache[slot], Some((p, _)) if *p == peer) {
-                    addr_cache[slot] = Some((peer, peer.to_string()));
+            rr = rh_transport::udp_batch::recv_from_batch(&sock, &mut recv_batch) => {
+                let Ok(count) = rr else { break };
+                if count == 0 {
+                    continue;
                 }
-                let addr_str = addr_cache[slot].as_ref().map(|(_, s)| s.as_str()).unwrap_or("");
-                // N3:一次成帧(修前 encode 新 Vec + 批聚合再整包拷)
-                let framed = frame_udp_packet(addr_str, &buf[..n]);
-                if tx.send(Pending { framed }).await.is_err() {
+                let total_data: usize = recv_batch.iter().map(|(pkt, _)| pkt.len()).sum();
+                let mut out = bytes::BytesMut::with_capacity(
+                    count * (frame::HEADER_LEN + 1 + 48) + total_data,
+                );
+                for (pkt, peer) in recv_batch.iter() {
+                    let slot = visitor_addr_slot(peer, addr_cache.len());
+                    if !matches!(&addr_cache[slot], Some((p, _)) if *p == peer) {
+                        addr_cache[slot] = Some((peer, peer.to_string()));
+                    }
+                    let addr_str = addr_cache[slot].as_ref().map(|(_, s)| s.as_str()).unwrap_or("");
+                    // N3:整批多帧一次写入同一个 BytesMut(每包仍为独立标准 UDP_PACKET 帧)
+                    append_udp_packet(&mut out, addr_str, pkt);
+                }
+                if tx.send(Pending { framed: out.freeze() }).await.is_err() {
                     break;
                 }
             }
             rr = r.read_frame(&mut fbuf) => {
                 match rr {
                     Ok((FrameType::UDP_PACKET, p)) => {
-                        if let Some((src, data)) = udp_packet::decode(&p) {
-                            if let Some(addr) = parse_addr_cached(src) {
-                                let _ = sock.send_to(data, addr).await;
+                        batch_items.clear();
+                        let mut frames_drained = 1usize;
+                        let mut valid_seen = false;
+                        push_udp_proxy_packet(&mut batch_items, &mut valid_seen, p);
+                        let mut trailing_frame: Option<FrameType> = None;
+                        let mut trailing_err = false;
+                        while frames_drained < rh_transport::udp_batch::UDP_BATCH_MAX {
+                            match r.try_read_frame(&mut fbuf).await {
+                                Ok(Some((FrameType::UDP_PACKET, p2))) => {
+                                    frames_drained += 1;
+                                    push_udp_proxy_packet(&mut batch_items, &mut valid_seen, p2);
+                                }
+                                Ok(Some((ty, _))) => {
+                                    trailing_frame = Some(ty);
+                                    break;
+                                }
+                                Ok(None) => break,
+                                Err(_) => {
+                                    trailing_err = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !batch_items.is_empty() {
+                            let mut out_arr: [(&[u8], std::net::SocketAddr); rh_transport::udp_batch::UDP_BATCH_MAX] =
+                                [(&[], dummy_addr); rh_transport::udp_batch::UDP_BATCH_MAX];
+                            let mut out_len = 0usize;
+                            for (data, addr) in &batch_items {
+                                out_arr[out_len] = (data.as_ref(), *addr);
+                                out_len += 1;
+                            }
+                            let _ = rh_transport::udp_batch::send_to_batch(&sock, &out_arr[..out_len]).await;
+                        }
+                        if valid_seen {
+                            last_alive = Instant::now();
+                        }
+                        if let Some(ty) = trailing_frame {
+                            if ty == FrameType::PING
+                                && tx.send(Pending { framed: framed_pong() }).await.is_err()
+                            {
+                                break;
                             }
                             last_alive = Instant::now();
+                        }
+                        if trailing_err {
+                            break;
                         }
                     }
                     Ok((FrameType::PING, _)) => {
@@ -1140,5 +1452,182 @@ mod session_leak_tests {
         }
         assert_eq!(&got, b"PRE_REST");
         srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chan_reader_try_read_frame_drains_and_preserves_trailing_ping() {
+        use tokio::io::AsyncWriteExt;
+
+        // 1. Stream 路径
+        let (mut w, r) = tokio::io::duplex(64 * 1024);
+        let mut raw_bytes = bytes::BytesMut::new();
+        for i in 0..3 {
+            append_udp_packet(&mut raw_bytes, "10.0.0.1:1000", format!("p{i}").as_bytes());
+        }
+        raw_bytes.extend_from_slice(&framed_ping());
+        w.write_all(&raw_bytes).await.unwrap();
+
+        let mut cr = ChanReader::Stream(Box::new(r));
+        let mut fbuf = read_buf_with_prefix(&[]);
+        let (ty0, p0) = cr.read_frame(&mut fbuf).await.unwrap();
+        assert_eq!(ty0, FrameType::UDP_PACKET);
+        assert_eq!(udp_packet::decode(&p0).unwrap().1, b"p0");
+
+        let mut drained = Vec::new();
+        let mut trailing = None;
+        while let Some((ty, p)) = cr.try_read_frame(&mut fbuf).await.unwrap() {
+            if ty == FrameType::UDP_PACKET {
+                drained.push(udp_packet::decode(&p).unwrap().1.to_vec());
+            } else {
+                trailing = Some(ty);
+                break;
+            }
+        }
+        assert_eq!(drained, vec![b"p1".to_vec(), b"p2".to_vec()]);
+        assert_eq!(trailing, Some(FrameType::PING));
+        assert!(cr.try_read_frame(&mut fbuf).await.unwrap().is_none());
+        drop(w);
+
+        // 2. Chunks 路径
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = rh_transport::wrap_stream_as_server(
+            Box::new(b),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let client = rh_transport::wrap_stream_as_client(
+            Box::new(a),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let srv = tokio::spawn(async move {
+            let mut s = server.accept().await.unwrap();
+            s.write_all(&raw_bytes).await.unwrap();
+            s
+        });
+        let mut mr_box = client.open_stream().await.unwrap();
+        let (mr, _mw) = rh_transport::mux::steal_mux_halves(&mut mr_box).unwrap();
+        let mut cr = ChanReader::Chunks {
+            r: mr,
+            buf: read_buf_with_prefix(&[]),
+        };
+        let mut unused = bytes::BytesMut::new();
+        let (ty0, p0) = cr.read_frame(&mut unused).await.unwrap();
+        assert_eq!(ty0, FrameType::UDP_PACKET);
+        assert_eq!(udp_packet::decode(&p0).unwrap().1, b"p0");
+        let mut drained = Vec::new();
+        let mut trailing = None;
+        while let Some((ty, p)) = cr.try_read_frame(&mut unused).await.unwrap() {
+            if ty == FrameType::UDP_PACKET {
+                drained.push(udp_packet::decode(&p).unwrap().1.to_vec());
+            } else {
+                trailing = Some(ty);
+                break;
+            }
+        }
+        assert_eq!(drained, vec![b"p1".to_vec(), b"p2".to_vec()]);
+        assert_eq!(trailing, Some(FrameType::PING));
+        assert!(cr.try_read_frame(&mut unused).await.unwrap().is_none());
+        let _keep_srv = srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_chunks_coalesces_queued_frames_preserving_wire_format() {
+        use tokio::io::AsyncReadExt;
+
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let server = rh_transport::wrap_stream_as_server(
+            Box::new(b),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let client = rh_transport::wrap_stream_as_client(
+            Box::new(a),
+            true,
+            rh_transport::MUX_STREAMS_UNLIMITED,
+        );
+        let srv = tokio::spawn(async move {
+            let mut s = server.accept().await.unwrap();
+            let mut raw = Vec::new();
+            s.read_to_end(&mut raw).await.unwrap();
+            raw
+        });
+
+        let mut ch = client.open_stream().await.unwrap();
+        let (_mr, mw) = rh_transport::mux::steal_mux_halves(&mut ch).unwrap();
+        let (tx, rx) = mpsc::channel::<Pending>(128);
+        let wh = tokio::spawn(writer_task(ChanWriter::Chunks(mw), rx));
+
+        for i in 0..20usize {
+            let addr = format!("10.2.0.1:{}", 3000 + i);
+            tx.send(Pending {
+                framed: frame_udp_packet(&addr, format!("c{i}").as_bytes()),
+            })
+            .await
+            .unwrap();
+            if i == 9 {
+                tx.send(Pending {
+                    framed: framed_ping(),
+                })
+                .await
+                .unwrap();
+            }
+        }
+        tx.send(Pending {
+            framed: framed_pong(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        wh.await.unwrap();
+
+        let raw = srv.await.unwrap();
+        let mut off = 0usize;
+        let mut pkts = Vec::new();
+        let mut ping_pos = None;
+        let mut pong_pos = None;
+        let mut idx = 0usize;
+        while off < raw.len() {
+            assert_eq!(&raw[off..off + 4], b"RHTP");
+            let ty = u16::from_be_bytes([raw[off + 5], raw[off + 6]]);
+            let len = u32::from_be_bytes([raw[off + 7], raw[off + 8], raw[off + 9], raw[off + 10]])
+                as usize;
+            let payload = &raw[off + 11..off + 11 + len];
+            if ty == FrameType::UDP_PACKET.0 {
+                let (src, data) = udp_packet::decode(payload).unwrap();
+                pkts.push((src.to_string(), data.to_vec()));
+            } else if ty == FrameType::PING.0 {
+                ping_pos = Some(idx);
+            } else if ty == FrameType::PONG.0 {
+                pong_pos = Some(idx);
+            } else {
+                panic!("unexpected frame type {ty}");
+            }
+            off += 11 + len;
+            idx += 1;
+        }
+        assert_eq!(pkts.len(), 20);
+        for (i, (src, data)) in pkts.iter().enumerate() {
+            assert_eq!(src, &format!("10.2.0.1:{}", 3000 + i));
+            assert_eq!(data, format!("c{i}").as_bytes());
+        }
+        assert_eq!(ping_pos, Some(10));
+        assert_eq!(pong_pos, Some(21));
+    }
+
+    #[test]
+    fn recv_batch_pool_reuses_and_returns_on_drop() {
+        let pool = UdpRecvBatchPool::new();
+        let b1 = pool.acquire();
+        drop(b1);
+        assert_eq!(pool.0.lock().unwrap().len(), 1);
+
+        let mut held = Vec::new();
+        for _ in 0..(RECV_BATCH_POOL_MAX + 3) {
+            held.push(pool.acquire());
+        }
+        assert_eq!(pool.0.lock().unwrap().len(), 0);
+        drop(held);
+        assert_eq!(pool.0.lock().unwrap().len(), RECV_BATCH_POOL_MAX);
     }
 }

@@ -98,6 +98,44 @@ pub async fn recv_from_batch(
     }
 }
 
+/// 非阻塞批量接收最多 `UDP_BATCH_MAX` 个 UDP 数据报写入 `batch`,返回收到的包数。
+///
+/// 无就绪报文时返回 `Err(ErrorKind::WouldBlock)` 且清除 Tokio 可读就绪位,
+/// 供调用方归还池化缓冲后再 `sock.readable().await`(空闲会话零驻留)。
+pub fn try_recv_from_batch(
+    sock: &tokio::net::UdpSocket,
+    batch: &mut UdpRecvBatch,
+) -> std::io::Result<usize> {
+    batch.count = 0;
+
+    #[cfg(target_os = "linux")]
+    {
+        sock.try_io(tokio::io::Interest::READABLE, || {
+            recvmmsg_nonblock(sock, batch)
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let (n0, addr0) = sock.try_recv_from(&mut batch.bufs[0])?;
+        batch.lens[0] = n0.min(batch.pkt_cap);
+        batch.addrs[0] = addr0;
+        let mut count = 1usize;
+        while count < UDP_BATCH_MAX {
+            match sock.try_recv_from(&mut batch.bufs[count]) {
+                Ok((n, addr)) => {
+                    batch.lens[count] = n.min(batch.pkt_cap);
+                    batch.addrs[count] = addr;
+                    count += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        batch.count = count;
+        Ok(count)
+    }
+}
+
 /// 向 `sock` 批量发送 `pkts` 中的 UDP 数据报,返回已发送包数。
 pub async fn send_to_batch(
     sock: &tokio::net::UdpSocket,
@@ -361,5 +399,52 @@ mod tests {
             }
         }
         assert_eq!(received, payloads, "收到的批载荷必须与发出完全一致");
+    }
+
+    #[tokio::test]
+    async fn try_recv_from_batch_would_block_and_drains_burst() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx_addr = tx.local_addr().unwrap();
+
+        let mut batch = UdpRecvBatch::new(1500);
+        let empty = try_recv_from_batch(&rx, &mut batch);
+        assert_eq!(
+            empty.unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "空 socket 非阻塞批收必须返回 WouldBlock"
+        );
+
+        let payloads: Vec<Vec<u8>> = (0..10usize)
+            .map(|i| format!("try-udp-batch-{i:02}").into_bytes())
+            .collect();
+        let pkts: Vec<(&[u8], SocketAddr)> =
+            payloads.iter().map(|p| (p.as_slice(), rx_addr)).collect();
+        assert_eq!(send_to_batch(&tx, &pkts).await.unwrap(), payloads.len());
+
+        let mut received = Vec::with_capacity(payloads.len());
+        while received.len() < payloads.len() {
+            tokio::time::timeout(Duration::from_secs(2), rx.readable())
+                .await
+                .expect("readable timeout")
+                .unwrap();
+            match try_recv_from_batch(&rx, &mut batch) {
+                Ok(n) => {
+                    assert!(n >= 1);
+                    for (data, peer) in batch.iter() {
+                        assert_eq!(peer, tx_addr);
+                        received.push(data.to_vec());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("unexpected try_recv_from_batch error: {e}"),
+            }
+        }
+        assert_eq!(received, payloads);
+        assert_eq!(
+            try_recv_from_batch(&rx, &mut batch).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }
