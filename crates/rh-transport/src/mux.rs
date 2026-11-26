@@ -495,16 +495,54 @@ impl UpReader {
         &mut self,
         r: &mut R,
     ) -> io::Result<Option<Bytes>> {
+        struct SpareGuard<'a> {
+            slot: &'a mut Option<bytes::BytesMut>,
+            bm: Option<bytes::BytesMut>,
+        }
+        impl Drop for SpareGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(bm) = self.bm.take() {
+                    if bm.is_empty() {
+                        *self.slot = Some(bm);
+                    }
+                }
+            }
+        }
+
         let cap = if self.upgraded {
             up_chunk_cap()
         } else {
             INIT_BUF_CAP
         };
-        let chunk = read_chunk_into(r, cap, self.acquire(cap)).await?;
-        if chunk.as_ref().is_some_and(|c| c.len() >= INIT_BUF_CAP) {
+        let bm = self.acquire(cap);
+        let mut guard = SpareGuard {
+            slot: &mut self.spare,
+            bm: Some(bm),
+        };
+        let n = std::future::poll_fn(|cx| {
+            let bm = guard.bm.as_mut().expect("bm present while reading");
+            let spare = bm.spare_capacity_mut();
+            let limit = spare.len().min(cap);
+            let mut rb = ReadBuf::uninit(&mut spare[..limit]);
+            match Pin::new(&mut *r).poll_read(cx, &mut rb) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(rb.filled().len())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let mut bm = guard.bm.take().expect("bm present");
+        drop(guard);
+        // SAFETY(advance_mut):上面 poll_read 只把读端已写入的 n 字节标为
+        // filled 并仅暴露该前缀;声称已初始化的前 n 字节确已初始化。
+        unsafe { bm.advance_mut(n) };
+        if n >= INIT_BUF_CAP {
             self.upgraded = true;
         }
-        Ok(chunk)
+        Ok(Some(bm.freeze()))
     }
 }
 
@@ -1189,27 +1227,8 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
             batch_bytes += c.len();
             batch.push(c);
         }
-        while batch_bytes < UP_BATCH_BYTES && batch.len() < UP_BATCH_SEGS {
-            match reader.try_read_chunk(a_r).await {
-                Ok(TryChunk::Data(c)) => {
-                    batch_bytes += c.len();
-                    batch.push(c);
-                }
-                Ok(TryChunk::Eof) => {
-                    batch_eof = true;
-                    break;
-                }
-                // 收集阶段的错误原本不置 batch_eof,靠下一轮阻塞读重新发现;
-                // 现在显式记下,免得多跑一轮(语义与修前一致)。
-                Err(_) => {
-                    read_err = true;
-                    break;
-                }
-                Ok(TryChunk::Empty) => break,
-            }
-        }
         if batch.is_empty() {
-            // 本轮无料:阻塞等一块(唯一会等 RTT 的地方,EOF 在此收敛)
+            // 本轮无预取料:直接阻塞读第一块,跳过滴流小包多余的非阻塞 EAGAIN。
             match reader.read_chunk(a_r).await {
                 Ok(Some(c)) => {
                     batch_bytes += c.len();
@@ -1226,6 +1245,28 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
                         dump_up(read_ns, write_ns, slow_reads, slow_writes);
                     }
                     return false;
+                }
+            }
+        }
+        // 仅已升级(大流量)或已有块后才贪心非阻塞抢收,避免小包 RTT/HTTP 每次多付 EAGAIN。
+        if reader.upgraded {
+            while batch_bytes < UP_BATCH_BYTES && batch.len() < UP_BATCH_SEGS {
+                match reader.try_read_chunk(a_r).await {
+                    Ok(TryChunk::Data(c)) => {
+                        batch_bytes += c.len();
+                        batch.push(c);
+                    }
+                    Ok(TryChunk::Eof) => {
+                        batch_eof = true;
+                        break;
+                    }
+                    // 收集阶段的错误原本不置 batch_eof,靠下一轮阻塞读重新发现;
+                    // 现在显式记下,免得多跑一轮(语义与修前一致)。
+                    Err(_) => {
+                        read_err = true;
+                        break;
+                    }
+                    Ok(TryChunk::Empty) => break,
                 }
             }
         }
@@ -1271,8 +1312,14 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
         // 直接从这里取,不再等 RTT。
         prefetched.clear();
         let mut prefetched_bytes = 0usize;
-        // 预取窗口里 read_err 已置位时不再发起新读(错误已确定,继续读无意义)。
-        let ok = if prefetch_enabled() && batch_bytes < UP_BATCH_BYTES && !batch_eof && !read_err {
+        // 预取窗口里 read_err 已置位时不再发起新读(错误已确定,继续读无意义);
+        // 无界快路径(limiter.is_none())满 1MiB 时同样允许并发预取(对齐 pump_down cd5c13f),
+        // 且 select 优先 poll write_fut,小包快写首轮即完成而不触发读 poll/分配。
+        let ok = if prefetch_enabled()
+            && !batch_eof
+            && !read_err
+            && (limiter.is_none() || batch_bytes < UP_BATCH_BYTES)
+        {
             let write_fut = write_all;
             futures::pin_mut!(write_fut);
             loop {
@@ -1282,8 +1329,9 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
                 }
                 let read_fut = reader.read_chunk(a_r);
                 futures::pin_mut!(read_fut);
-                match futures::future::select(read_fut, write_fut.as_mut()).await {
-                    futures::future::Either::Left((nr, _)) => match nr {
+                match futures::future::select(write_fut.as_mut(), read_fut).await {
+                    futures::future::Either::Left((ok, _)) => break ok,
+                    futures::future::Either::Right((nr, _)) => match nr {
                         Ok(Some(c)) if !c.is_empty() => {
                             prefetched_bytes += c.len();
                             prefetched.push(c);
@@ -1298,7 +1346,6 @@ async fn pump_up<R: tokio::io::AsyncRead + Unpin>(
                             break write_fut.await;
                         }
                     },
-                    futures::future::Either::Right((ok, _)) => break ok,
                 }
             }
         } else {
@@ -1567,8 +1614,9 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
         let mut batch_eof = false;
         let mut read_err = false;
 
-        // 组装本轮批:先把预取队列整体并入(round-76),再抢收已就绪块,
-        // 直到上限。预取队列可能有多块——这正是与 round-31~75 的差别。
+        // 组装本轮批:先把预取队列整体并入(round-76),无料时直接阻塞等第一块,
+        // 仅来自预取队列或单块 ≥ 1024B(UDP/批量流)时再抢收已就绪块,小包 RTT 跳过多余锁/waker 克隆。
+        let had_pending = !pending.is_empty();
         while let Some(c) = pending.pop_front() {
             if batch_bytes >= DOWN_BATCH_BYTES || batch.len() >= SMALL_CHUNK_SEGS {
                 // R2:不得再加 pending_bytes —— 此块弹出时未扣减(扣减只在
@@ -1581,23 +1629,8 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
             batch_bytes += c.len();
             batch.push(c);
         }
-        while batch_bytes < DOWN_BATCH_BYTES && batch.len() < SMALL_CHUNK_SEGS {
-            match b_read.try_read_chunk().await {
-                Ok(Some(c)) if !c.is_empty() => {
-                    batch_bytes += c.len();
-                    batch.push(c);
-                }
-                Ok(Some(_)) => {}
-                // 读错误 ≠ clean EOF:置 read_err,由返回值判定统一收敛
-                Err(_) => {
-                    read_err = true;
-                    break;
-                }
-                Ok(None) => break,
-            }
-        }
         if batch.is_empty() {
-            // 本轮无料:阻塞等一块(这是唯一会等 RTT 的地方,EOF 在此收敛)
+            // 本轮无预取料:阻塞等一块(唯一会等 RTT 的地方,EOF 在此收敛)
             match b_read.read_chunk().await {
                 Ok(Some(c)) => {
                     batch_bytes += c.len();
@@ -1605,6 +1638,23 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                 }
                 Ok(None) => break 'outer true,
                 Err(_) => break 'outer false,
+            }
+        }
+        if had_pending || batch_bytes >= 1024 {
+            while batch_bytes < DOWN_BATCH_BYTES && batch.len() < SMALL_CHUNK_SEGS {
+                match b_read.try_read_chunk().await {
+                    Ok(Some(c)) if !c.is_empty() => {
+                        batch_bytes += c.len();
+                        batch.push(c);
+                    }
+                    Ok(Some(_)) => {}
+                    // 读错误 ≠ clean EOF:置 read_err,由返回值判定统一收敛
+                    Err(_) => {
+                        read_err = true;
+                        break;
+                    }
+                    Ok(None) => break,
+                }
             }
         }
         if let Some(t) = __t0 {
@@ -1669,8 +1719,9 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                 }
                 let read_fut = b_read.read_chunk();
                 futures::pin_mut!(read_fut);
-                match futures::future::select(read_fut, write_fut.as_mut()).await {
-                    futures::future::Either::Left((nr, _)) => match nr {
+                match futures::future::select(write_fut.as_mut(), read_fut).await {
+                    futures::future::Either::Left((ok, _)) => break ok,
+                    futures::future::Either::Right((nr, _)) => match nr {
                         Ok(Some(c)) if !c.is_empty() => {
                             pending_bytes += c.len();
                             pending.push_back(c)
@@ -1685,7 +1736,6 @@ async fn pump_down<W: tokio::io::AsyncWrite + Unpin>(
                             break write_fut.await;
                         }
                     },
-                    futures::future::Either::Right((ok, _)) => break ok,
                 }
             }
         } else {
@@ -5758,6 +5808,117 @@ mod tests {
         assert!(matches!(c, TryChunk::Data(_)), "应有数据");
         assert!(!reader.upgraded, "64 字节不足以升级");
         assert_eq!(reader.pool_borrows, 0, "非阻塞路径的初始相也不得借池(C4)");
+    }
+
+    #[tokio::test]
+    async fn up_reader_read_chunk_cancel_returns_buffer_to_spare() {
+        use std::future::Future as _;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct AlwaysPendingReader;
+        impl tokio::io::AsyncRead for AlwaysPendingReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        let mut reader = UpReader::default();
+        // 先读满升级到池相(且消耗一次池借用)
+        let data = vec![7u8; INIT_BUF_CAP * 2];
+        let mut mem = &data[..];
+        let c1 = reader.read_chunk(&mut mem).await.unwrap().unwrap();
+        assert_eq!(c1.len(), INIT_BUF_CAP);
+        assert!(reader.upgraded);
+        let _c2 = reader.read_chunk(&mut mem).await.unwrap().unwrap();
+        assert_eq!(reader.pool_borrows, 1);
+
+        // 对永 Pending reader poll 一次 read_chunk 后取消,缓冲必须归还 spare
+        {
+            let mut pending_r = AlwaysPendingReader;
+            let fut = reader.read_chunk(&mut pending_r);
+            futures::pin_mut!(fut);
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(
+            reader.spare.is_some(),
+            "read_chunk 取消时必须通过 SpareGuard 将未消费缓冲归还 spare"
+        );
+        let borrows_after_cancel = reader.pool_borrows;
+        assert_eq!(borrows_after_cancel, 2);
+
+        // 下一次 read_chunk 应直接复用 spare,不再触发额外 pool_borrow
+        let more = [9u8; 64];
+        let mut mem2 = &more[..];
+        let c3 = reader.read_chunk(&mut mem2).await.unwrap().unwrap();
+        assert_eq!(c3.len(), 64);
+        assert_eq!(
+            reader.pool_borrows, borrows_after_cancel,
+            "取消归还后的 spare 必须被直接复用"
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_up_small_packet_avoids_extra_eagain_polls() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll};
+
+        struct OneSmallChunkThenEof {
+            polls: Arc<AtomicUsize>,
+            sent: bool,
+        }
+        impl tokio::io::AsyncRead for OneSmallChunkThenEof {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                if !self.sent {
+                    self.sent = true;
+                    buf.put_slice(b"hello");
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let client = wrap_stream_as_client(Box::new(a) as crate::BoxedIo, true, 100);
+        let server = wrap_stream_as_server(Box::new(b) as crate::BoxedIo, true, 100);
+        let out = client.open_stream().await.expect("open");
+        let mut inp = server.accept().await.expect("accept");
+
+        let drain = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut buf = Vec::new();
+            let _ = inp.read_to_end(&mut buf).await;
+            buf
+        });
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut reader = OneSmallChunkThenEof {
+            polls: polls.clone(),
+            sent: false,
+        };
+        let mut io: crate::BoxedIo = out;
+        let (_r, mut w) = steal_mux_halves(&mut io).expect("mux halves");
+        let clean = pump_up(&mut reader, &mut w, &None).await;
+        assert!(clean);
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            2,
+            "5B 小包 + EOF 只能触发 2 次 poll_read(1 次读数据 + 1 次读 EOF),不得有多余 EAGAIN/prefetch poll"
+        );
+        w.close().await.unwrap();
+        let got = drain.await.unwrap();
+        assert_eq!(&got, b"hello");
     }
 
     // Y1 chunk 中继:真实 echo 目标 + 偷取 halves → mux_relay;
